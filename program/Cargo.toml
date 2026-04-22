@@ -1,0 +1,14 @@
+[package]
+version = "0.1.0"
+name = "zkcoins-program"
+edition = "2021"
+
+[dependencies]
+sp1-zkvm = { version="4.0.0", features = ["verify"] }
+bincode = { workspace = true }
+serde = { workspace = true }
+rand = { workspace = true } 
+lazy_static = { workspace = true } 
+derive_builder = "0.20.2"
+# Use patched version from sp1: https://docs.succinct.xyz/docs/sp1/writing-programs/patched-crates
+sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", package = "sha2" }

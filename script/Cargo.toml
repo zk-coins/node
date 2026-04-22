@@ -1,0 +1,14 @@
+[package]
+name = "zkcoins-prover"
+version = { workspace = true }
+edition = { workspace = true }
+publish = false
+
+[dependencies]
+bitcoin = { workspace = true }
+zkcoins-program = { path = "../program" }
+sp1-sdk = { workspace = true }
+tracing = "0.1.40"
+
+[build-dependencies]
+sp1-build = "4.0.0"

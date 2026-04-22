@@ -1,0 +1,13 @@
+[package]
+name = "shared"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zkcoins-program = { path = "../program/" }
+lazy_static = { workspace = true }
+bitcoin = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+hex = "0.4.3"

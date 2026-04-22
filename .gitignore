@@ -1,0 +1,6 @@
+target/
+.env
+*.pem
+minting_secret.bin
+*.bin
+.DS_Store

@@ -1,0 +1,26 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bitcoin = { workspace = true }
+bitcoin_hashes = { version = "0.16.0", features = ["std"] }
+sha2 = { workspace = true }
+serde = { workspace = true } 
+bincode = { workspace = true } 
+hex = "0.4.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "net", "time"] }
+esplora-client = { git = "https://github.com/BitVM/rust-esplora-client", branch = "master" }
+axum = { version = "0.7.9", features = ["json", "multipart"] }
+anyhow = "1.0"
+zkcoins-prover = { path = "../script/" }
+zkcoins-program = { path = "../program/" }
+shared = { path = "../shared/" }
+lazy_static = { workspace = true }
+tower-http = { version = "0.5", features = ["fs"] }
+
+
+
+[features]
+default = []
