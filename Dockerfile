@@ -1,12 +1,4 @@
 FROM rust:1.81-bookworm AS builder
-
-# Install SP1 toolchain (required for program compilation)
-RUN curl -L https://sp1up.succinct.xyz | bash && \
-    /root/.sp1/bin/sp1up && \
-    echo 'export PATH="/root/.sp1/bin:$PATH"' >> /root/.bashrc
-
-ENV PATH="/root/.sp1/bin:${PATH}"
-
 WORKDIR /app
 COPY . .
 RUN cargo build --release -p server
