@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  DOCKER_TAGS: taprootfreak/zkcoins-server:latest
+  DOCKER_TAGS: zkcoin/server:latest
 
 permissions:
   contents: read
