@@ -1,10 +1,14 @@
 FROM rust:1.81-bookworm AS builder
+
+# Install SP1 toolchain (required for program compilation)
+RUN curl -L https://sp1up.succinct.xyz | bash && \
+    /root/.sp1/bin/sp1up && \
+    echo 'export PATH="/root/.sp1/bin:$PATH"' >> /root/.bashrc
+
+ENV PATH="/root/.sp1/bin:${PATH}"
+
 WORKDIR /app
 COPY . .
-
-# Remove script crate (requires SP1 succinct toolchain not available in Docker)
-# The server uses SP1_PROVER=mock which doesn't need the actual prover
-RUN sed -i '/"script",/d' Cargo.toml
 RUN cargo build --release -p server
 
 FROM debian:bookworm-slim
