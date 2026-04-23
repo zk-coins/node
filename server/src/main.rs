@@ -19,7 +19,7 @@ use std::io::{Read, Write};
 const SMT_PATH: &str = "smt.bin";
 const MMR_PATH: &str = "mmr.bin";
 const LATEST_BLOCK_PATH: &str = "latest_block.bin";
-const ACCOUNT_SERVER_ADDR: &str = "127.0.0.1:4242";
+const ACCOUNT_SERVER_ADDR: &str = "0.0.0.0:4242";
 //const START_BLOCK_HASH: &str = "000000f43ca5c99c54c4738878fe1c5cca07691dc614a2734b73aa78ca868fb8";
 
 use esplora_client::{
