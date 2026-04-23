@@ -3,8 +3,12 @@ version = "0.1.0"
 name = "zkcoins-program"
 edition = "2021"
 
+[features]
+default = []
+zkvm = ["sp1-zkvm"]
+
 [dependencies]
-sp1-zkvm = { version="4.0.0", features = ["verify"] }
+sp1-zkvm = { version = "4.0.0", features = ["verify"], optional = true }
 bincode = { workspace = true }
 serde = { workspace = true }
 rand = { workspace = true } 

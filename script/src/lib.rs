@@ -2,12 +2,14 @@
 //! All proof operations return mock data when SP1_PROVER=mock.
 
 use serde::{Deserialize, Serialize};
-use zkcoins_program::ProgramInputsBuilder;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Proof {
     pub public_values: Vec<u8>,
 }
+
+/// Stub replacement for ProgramInputsBuilder from the program crate.
+pub struct ProgramInputsBuilder;
 
 pub struct Prover;
 
