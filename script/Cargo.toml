@@ -6,3 +6,5 @@ publish = false
 
 [dependencies]
 serde = { workspace = true }
+bincode = { workspace = true }
+zkcoins-program = { path = "../program" }

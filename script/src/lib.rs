@@ -1,15 +1,35 @@
 //! Stub prover for Docker builds without SP1 toolchain.
-//! All proof operations return mock data when SP1_PROVER=mock.
+//! Mimics the SP1 API surface used by the server.
 
 use serde::{Deserialize, Serialize};
+pub use zkcoins_program::ProgramInputsBuilder;
 
+/// Mock proof that mimics SP1ProofWithPublicValues.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Proof {
-    pub public_values: Vec<u8>,
+    pub public_values: PublicValues,
 }
 
-/// Stub replacement for ProgramInputsBuilder from the program crate.
-pub struct ProgramInputsBuilder;
+/// Mock public values that mimics SP1PublicValues.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PublicValues {
+    data: Vec<u8>,
+}
+
+impl PublicValues {
+    pub fn new(data: Vec<u8>) -> Self {
+        Self { data }
+    }
+
+    /// Mimics SP1PublicValues::read::<T>() — deserializes from the internal buffer.
+    pub fn read<T: for<'de> Deserialize<'de>>(&self) -> T {
+        bincode::deserialize(&self.data).expect("Failed to deserialize public values")
+    }
+
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.data.clone()
+    }
+}
 
 pub struct Prover;
 
@@ -30,7 +50,7 @@ impl Prover {
         _coin_proofs: Vec<Proof>,
     ) -> Result<Proof, &'static str> {
         Ok(Proof {
-            public_values: vec![0u8; 32],
+            public_values: PublicValues::new(vec![0u8; 256]),
         })
     }
 
@@ -41,7 +61,7 @@ impl Prover {
         _coin_proofs: Vec<Proof>,
     ) -> Result<Proof, &'static str> {
         Ok(Proof {
-            public_values: vec![0u8; 32],
+            public_values: PublicValues::new(vec![0u8; 256]),
         })
     }
 }
