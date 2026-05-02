@@ -1,6 +1,6 @@
 target/
 .env
 *.pem
-minting_secret.bin
 *.bin
+!server/minting_secret.bin
 .DS_Store

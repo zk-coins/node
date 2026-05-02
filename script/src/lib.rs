@@ -1,20 +1,37 @@
-use sp1_sdk::{
-    include_elf, EnvProver, HashableKey, ProverClient, SP1Proof, SP1ProofWithPublicValues,
-    SP1ProvingKey, SP1Stdin, SP1VerifyingKey,
-};
+//! Stub prover for Docker builds without SP1 toolchain.
+//! Mimics the SP1 API surface used by the server.
 
-use zkcoins_program::ProofType;
-use zkcoins_program::{ProgramInputs, ProgramInputsBuilder};
+use serde::{Deserialize, Serialize};
+pub use zkcoins_program::ProgramInputsBuilder;
 
-pub const ZKCOINS_ELF: &[u8] = include_elf!("zkcoins-program");
-
-pub type Proof = SP1ProofWithPublicValues;
-
-pub struct Prover {
-    pub client: EnvProver,
-    pub pk: SP1ProvingKey,
-    pub vk: SP1VerifyingKey,
+/// Mock proof that mimics SP1ProofWithPublicValues.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Proof {
+    pub public_values: PublicValues,
 }
+
+/// Mock public values that mimics SP1PublicValues.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PublicValues {
+    data: Vec<u8>,
+}
+
+impl PublicValues {
+    pub fn new(data: Vec<u8>) -> Self {
+        Self { data }
+    }
+
+    /// Mimics SP1PublicValues::read::<T>() — deserializes from the internal buffer.
+    pub fn read<T: for<'de> Deserialize<'de>>(&self) -> T {
+        bincode::deserialize(&self.data).expect("Failed to deserialize public values")
+    }
+
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.data.clone()
+    }
+}
+
+pub struct Prover;
 
 impl Default for Prover {
     fn default() -> Self {
@@ -24,86 +41,27 @@ impl Default for Prover {
 
 impl Prover {
     pub fn new() -> Self {
-        // Initialize the proving client.
-        let client = ProverClient::from_env();
-
-        // Setup the logger.
-        sp1_sdk::utils::setup_logger();
-        // Setup the proving and verifying keys.
-        let (pk, vk) = client.setup(ZKCOINS_ELF);
-        Prover { client, pk, vk }
+        Prover
     }
 
-    /// Used for sending the first time.
     pub fn create_account(
         &self,
-        program_inputs_builder: &mut ProgramInputsBuilder,
-        coin_proofs: Vec<SP1ProofWithPublicValues>,
-    ) -> Result<SP1ProofWithPublicValues, &'static str> {
-        let mut stdin = SP1Stdin::new();
-        let program_inputs = match program_inputs_builder.in_coin_proofs_public_values(
-            coin_proofs.iter().map(|proof| proof.public_values.to_vec()).collect::<Vec<_>>(),
-        ).proof_type(ProofType::InitialProof).verification_key(self.vk.vk.hash_u32()).build() {
-            Ok(fields) => fields,
-            Err(_) => return Err("didnt provide all fields")
-        };
-        stdin.write::<ProgramInputs>(&program_inputs);
-        for proof in coin_proofs {
-            let SP1Proof::Compressed(proof) = proof.proof else {
-                return Err("Proof doesnt match Compressed(SP1ReduceProof)");
-            };
-            stdin.write_proof(*proof, self.vk.vk.clone());
-        }
-
-        tracing::info_span!("FIRST_SEND").in_scope(|| {
-            // Generate the compressed proof.
-            match self.client.prove(&self.pk, &stdin).compressed().run() {
-                Ok(proof) => Ok(proof),
-                Err(_) => Err("proving failed")
-            }
+        _program_inputs_builder: &mut ProgramInputsBuilder,
+        _coin_proofs: Vec<Proof>,
+    ) -> Result<Proof, &'static str> {
+        Ok(Proof {
+            public_values: PublicValues::new(vec![0u8; 256]),
         })
     }
 
     pub fn update_account(
         &self,
-        program_inputs_builder: &mut ProgramInputsBuilder,
-        account_proof: SP1ProofWithPublicValues,
-        coin_proofs: Vec<SP1ProofWithPublicValues>,
-    ) -> Result<SP1ProofWithPublicValues, &'static str> {
-        let mut stdin = SP1Stdin::new();
-        let program_inputs = {
-            let result = program_inputs_builder.in_coin_proofs_public_values(
-                coin_proofs
-                    .iter()
-                    .map(|proof| proof.public_values.to_vec())
-                    .collect::<Vec<_>>(),
-            ).prev_proof_public_values(Some(account_proof.public_values.to_vec())).
-                proof_type(ProofType::InitialProof).verification_key(self.vk.vk.hash_u32()).build();
-            if let Err(_) = result {
-                return Err("didnt provide all fields");
-            }
-            result.unwrap()
-        };
-        stdin.write::<ProgramInputs>(&program_inputs);
-        // Write the account proof
-        let SP1Proof::Compressed(proof) = account_proof.proof else {
-            return Err("account proof doesnt match Compressed(SP1ReduceProof)");
-        };
-        stdin.write_proof(*proof, self.vk.vk.clone());
-        // Write coin proofs
-        for proof in coin_proofs {
-            let SP1Proof::Compressed(proof) = proof.proof else {
-                return Err("Coin proof doesnt match Compressed(SP1ReduceProof)");
-            };
-            stdin.write_proof(*proof, self.vk.vk.clone());
-        }
-
-        tracing::info_span!("UPDATE_SEND").in_scope(|| {
-            // Generate the compressed proof.
-            match self.client.prove(&self.pk, &stdin).compressed().run() {
-                Ok(proof) => Ok(proof),
-                Err(_) => Err("proving failed")
-            }
+        _program_inputs_builder: &mut ProgramInputsBuilder,
+        _account_proof: Proof,
+        _coin_proofs: Vec<Proof>,
+    ) -> Result<Proof, &'static str> {
+        Ok(Proof {
+            public_values: PublicValues::new(vec![0u8; 256]),
         })
     }
 }

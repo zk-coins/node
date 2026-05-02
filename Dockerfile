@@ -4,7 +4,7 @@ COPY . .
 RUN cargo build --release -p server
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates wget && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/server /usr/local/bin/zkcoins-server
 
 ENV RUST_LOG=info
