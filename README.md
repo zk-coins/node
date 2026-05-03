@@ -85,8 +85,8 @@ The stub prover (`script/src/lib.rs`) removes the SP1 dependency — no succinct
 
 | Workflow | Trigger | Action |
 |---|---|---|
-| `deploy-dev.yaml` | Push develop | Docker (ARM64) → `zkcoin/server:beta` → dfxdev |
-| `deploy-prd.yaml` | Push main | Docker (ARM64) → `zkcoin/server:latest` → dfxprd |
+| `deploy-dev.yaml` | Push develop | Docker (ARM64) → `zkcoin/server:beta` → DEV server |
+| `deploy-prd.yaml` | Push main | Docker (ARM64) → `zkcoin/server:latest` → PRD server |
 | `auto-release-pr.yaml` | Push develop | Creates Release PR (develop → main) |
 
 Build time: ~5 minutes (Rust compilation on ARM64).
