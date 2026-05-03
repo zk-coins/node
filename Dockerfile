@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y ca-certificates wget && rm -rf /var/lib
 COPY --from=builder /app/target/release/server /usr/local/bin/zkcoins-server
 
 ENV RUST_LOG=info
+WORKDIR /data
 EXPOSE 4242
 
 ENTRYPOINT ["zkcoins-server"]

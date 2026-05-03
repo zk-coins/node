@@ -28,6 +28,7 @@ struct AppState {
     account_server: Arc<Mutex<AccountServer>>,
     proof_store: Arc<ProofStore>,
     minting_account: Arc<Mutex<ClientAccount>>,
+    accounts_path: String,
 }
 
 // Response types for our API
@@ -236,12 +237,18 @@ async fn send_coin_handler(
     // Acquire the account_server lock only for the duration of sending coins.
     let send_result = {
         let mut account_server_lock = state.account_server.lock().unwrap();
-        account_server_lock.send_coins(
+        let result = account_server_lock.send_coins(
             vec![Invoice::new(request.amount, to_address)],
             from_address,
             request.public_key,
             request.next_public_key,
-        )
+        );
+        if result.is_ok() {
+            if let Err(e) = account_server_lock.save_to_file(&state.accounts_path) {
+                eprintln!("Failed to persist accounts after send: {}", e);
+            }
+        }
+        result
     };
 
     println!("Generated send_result: {:?}", send_result);
@@ -383,7 +390,10 @@ async fn mint_handler(
             {
                 let mut account_server_guard = state.account_server.lock().unwrap();
                 for coin_proof in &coin_proofs {
-                    account_server_guard.receive_coin(coin_proof.clone());
+                    let _ = account_server_guard.receive_coin(coin_proof.clone());
+                }
+                if let Err(e) = account_server_guard.save_to_file(&state.accounts_path) {
+                    eprintln!("Failed to persist accounts after mint: {}", e);
                 }
             }
 
@@ -444,7 +454,11 @@ async fn info_handler() -> impl IntoResponse {
 }
 
 // Function to start the REST API server
-pub async fn start_rest_server(account_server: AccountServer, addr: &str) -> anyhow::Result<()> {
+pub async fn start_rest_server(
+    account_server: AccountServer,
+    addr: &str,
+    accounts_path: String,
+) -> anyhow::Result<()> {
     // Parse the address string into a SocketAddr
     let socket_addr = addr
         .parse::<SocketAddr>()
@@ -476,14 +490,22 @@ pub async fn start_rest_server(account_server: AccountServer, addr: &str) -> any
         account_server: shared_account_server,
         proof_store,
         minting_account,
+        accounts_path,
     };
     {
-        let mut minting_server_account = crate::account_server::Account::new();
-        minting_server_account.balance = u64::MAX;
-        state.account_server.lock().unwrap().import_account(
-            state.minting_account.lock().unwrap().address,
-            minting_server_account,
-        );
+        let mut account_server_guard = state.account_server.lock().unwrap();
+        if account_server_guard
+            .get_minting_account_address()
+            .is_err()
+        {
+            let mut minting_server_account = crate::account_server::Account::new();
+            minting_server_account.balance = u64::MAX;
+            account_server_guard
+                .import_account(zkcoins_program::MINTING_ADDRESS, minting_server_account);
+            if let Err(e) = account_server_guard.save_to_file(&state.accounts_path) {
+                eprintln!("Failed to save initial accounts file: {}", e);
+            }
+        }
     }
 
     // Create a router for API endpoints

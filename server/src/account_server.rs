@@ -368,6 +368,24 @@ impl AccountServer {
             None => Err("Minting account not created"),
         }
     }
+
+    pub fn save_to_file(&self, path: &str) -> std::io::Result<()> {
+        let bytes = bincode::serialize(&self.accounts)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        std::fs::write(path, bytes)
+    }
+
+    pub fn load_from_file(state: Arc<Mutex<State>>, path: &str) -> std::io::Result<Self> {
+        let bytes = std::fs::read(path)?;
+        let accounts: HashMap<Address, Account> = bincode::deserialize(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let prover = Prover::new();
+        Ok(AccountServer {
+            accounts,
+            prover,
+            state,
+        })
+    }
 }
 
 #[cfg(test)]

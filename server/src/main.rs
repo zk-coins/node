@@ -19,6 +19,7 @@ use std::io::{Read, Write};
 const SMT_PATH: &str = "smt.bin";
 const MMR_PATH: &str = "mmr.bin";
 const LATEST_BLOCK_PATH: &str = "latest_block.bin";
+const ACCOUNTS_PATH: &str = "accounts.bin";
 const ACCOUNT_SERVER_ADDR: &str = "0.0.0.0:4242";
 //const START_BLOCK_HASH: &str = "000000f43ca5c99c54c4738878fe1c5cca07691dc614a2734b73aa78ca868fb8";
 
@@ -72,15 +73,26 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         }
     ));
     
-    // Create a new AccountServer instance with a reference to the state
-    let account_server = account_server::AccountServer::new(Arc::clone(&state));
-    
-    // TODO: Create minting account
-    //wallet.create_account();
+    // Create a new AccountServer instance with a reference to the state.
+    // Try to restore persisted accounts; otherwise start with an empty server
+    // and let start_rest_server seed the minting account.
+    let account_server =
+        match account_server::AccountServer::load_from_file(Arc::clone(&state), ACCOUNTS_PATH) {
+            Ok(server) => {
+                println!("Loaded existing accounts from {}", ACCOUNTS_PATH);
+                server
+            }
+            Err(_) => {
+                println!("No accounts file found, creating new AccountServer");
+                account_server::AccountServer::new(Arc::clone(&state))
+            }
+        };
 
     // Spawn the account_server as a separate task
     tokio::spawn(async move {
-        if let Err(e) = start_rest_server(account_server, ACCOUNT_SERVER_ADDR).await {
+        if let Err(e) =
+            start_rest_server(account_server, ACCOUNT_SERVER_ADDR, ACCOUNTS_PATH.to_string()).await
+        {
             eprintln!("Account server error: {}", e);
         }
     });
