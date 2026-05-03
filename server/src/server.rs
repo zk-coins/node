@@ -95,6 +95,11 @@ pub struct SendCoinResponse {
     proof_id: Option<u64>, // Store a reference ID instead of the proof itself
 }
 
+#[derive(Serialize)]
+pub struct InfoResponse {
+    network: String,
+}
+
 // Handler functions for our REST API
 async fn get_balance_handler(
     State(state): State<AppState>,
@@ -432,6 +437,12 @@ async fn get_proof_handler(
     }
 }
 
+async fn info_handler() -> impl IntoResponse {
+    Json(InfoResponse {
+        network: NETWORK_CONFIG.network_name.clone(),
+    })
+}
+
 // Function to start the REST API server
 pub async fn start_rest_server(account_server: AccountServer, addr: &str) -> anyhow::Result<()> {
     // Parse the address string into a SocketAddr
@@ -477,6 +488,7 @@ pub async fn start_rest_server(account_server: AccountServer, addr: &str) -> any
 
     // Create a router for API endpoints
     let api_routes = Router::new()
+        .route("/info", get(info_handler))
         .route("/balance", get(get_balance_handler))
         .route("/send", post(send_coin_handler))
         // .route("/address", get(get_address_handler))

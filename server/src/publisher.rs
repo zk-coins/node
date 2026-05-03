@@ -22,8 +22,9 @@ use esplora_client::{
 // Define a configuration struct for Esplora
 #[derive(Clone, Debug)]
 pub struct EsploraConfig {
-    pub url: &'static str,
+    pub url: String,
     pub is_mainnet: bool,
+    pub network_name: String,
 }
 
 const PUBLISHER_KEY: &str = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
@@ -238,7 +239,7 @@ pub async fn broadcast_inscription_txs(
     reveal_tx: &Transaction,
 ) -> Result<(Txid, Txid), Box<dyn std::error::Error + Send + Sync>> {
     // Create an Esplora client
-    let builder = EsploraBuilder::new(config.url);
+    let builder = EsploraBuilder::new(&config.url);
     let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(builder)?;
 
     println!("Broadcasting commit transaction...");
@@ -264,7 +265,7 @@ pub async fn get_publisher_utxo(
     config: &EsploraConfig,
     min_amount: Option<u64>,
 ) -> Result<Vec<(OutPoint, u64)>, Box<dyn std::error::Error + Send + Sync>> {
-    let builder = EsploraBuilder::new(config.url);
+    let builder = EsploraBuilder::new(&config.url);
     let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(builder)?;
 
     // Get all UTXOs for the address

@@ -1,5 +1,10 @@
 FROM rust:1.81-bookworm AS builder
 WORKDIR /app
+
+# Install SP1 toolchain (needed by build.rs to compile the program ELF for riscv32)
+RUN curl -L https://sp1up.succinct.xyz | bash && \
+    /root/.sp1/bin/sp1up
+
 COPY . .
 RUN cargo build --release -p server
 
@@ -8,7 +13,6 @@ RUN apt-get update && apt-get install -y ca-certificates wget && rm -rf /var/lib
 COPY --from=builder /app/target/release/server /usr/local/bin/zkcoins-server
 
 ENV RUST_LOG=info
-ENV SP1_PROVER=mock
 EXPOSE 4242
 
 ENTRYPOINT ["zkcoins-server"]

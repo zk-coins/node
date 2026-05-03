@@ -25,20 +25,20 @@ const ACCOUNT_SERVER_ADDR: &str = "0.0.0.0:4242";
 use esplora_client::{
     r#async::DefaultSleeper, AsyncClient as EsploraAsyncClient, Builder as EsploraBuilder,
 };
-// Mainnet configuration
-// const NETWORK_CONFIG: EsploraConfig = EsploraConfig {
-//     url: "https://blockstream.info/api",
-//     is_mainnet: true,
-// };
 
-// Alternative testnet configuration
-const NETWORK_CONFIG: EsploraConfig = EsploraConfig {
-    // url: "https://blockstream.info/testnet/api",
-    // url: "https://mempool.space/signet/api",
-    // url: "https://mempool.space/testnet4/api/",
-    url: "https://mutinynet.com/api",
-    is_mainnet: false,
-};
+lazy_static::lazy_static! {
+    pub static ref NETWORK_CONFIG: EsploraConfig = {
+        let url = std::env::var("ESPLORA_URL")
+            .unwrap_or_else(|_| "https://mutinynet.com/api".to_string());
+        let is_mainnet = std::env::var("IS_MAINNET")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let network_name = std::env::var("NETWORK_NAME")
+            .unwrap_or_else(|_| if is_mainnet { "Mainnet".to_string() } else { "Mutinynet".to_string() });
+        println!("Network config: {} ({})", network_name, url);
+        EsploraConfig { url, is_mainnet, network_name }
+    };
+}
 
 // Helper function to save the latest block hash
 fn save_latest_block(block_hash: &BlockHash, path: &str) -> Result<(), Box<dyn StdError>> {
@@ -93,7 +93,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         }
         Err(_) => {
             println!("No saved block hash found, fetching latest from Esplora...");
-            let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(EsploraBuilder::new(NETWORK_CONFIG.url))?;
+            let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(EsploraBuilder::new(&NETWORK_CONFIG.url))?;
     
             let tip_hash = client.get_tip_hash().await?;
             println!("Fetched latest tip hash from Esplora: {}", tip_hash);
