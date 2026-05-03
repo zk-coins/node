@@ -15,7 +15,7 @@ Rust/Axum backend for [zkcoins.app](https://zkcoins.app) — account management,
 |---|---|---|
 | Language | Rust 1.81 | Same as ZK circuits, memory safety, performance |
 | Web framework | Axum | Built on Tokio, idiomatic async Rust |
-| ZK Proofs | SP1 zkVM (stub) | Write proofs in standard Rust, no DSL |
+| ZK Proofs | SP1 zkVM | Write proofs in standard Rust, no DSL |
 | Data structures | SMT + MMR | Non-inclusion proofs + append-only history |
 | Bitcoin | Taproot Inscriptions | 64-byte nullifiers, Esplora API scanning |
 | Bitcoin node | bitcoind-mainnet | Shared Docker network `bitcoin`, port 8332 |
@@ -55,14 +55,14 @@ server/                # Axum REST API
 shared/                # Shared types (Commitment, Invoice, ClientAccount)
 program/               # SP1 zkVM circuit types (AccountState, Coin, ProofData)
 │   └── src/merkle/    # SMT + MMR implementations
-script/                # Prover (stub — returns mock proofs, no SP1 dependency)
+script/                # Prover (real SP1 zkVM — create_account, update_account)
 ```
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `SP1_PROVER` | `mock` | `mock` (stub) or `local` (real SP1) |
+| `SP1_PROVER` | `mock` | `mock` (no proof), `cpu`, `cuda`, or `network` |
 | `ESPLORA_URL` | `https://mutinynet.com/api` | Bitcoin node API |
 | `BITCOIN_RPC_USER` | — | Bitcoin Core RPC username |
 | `BITCOIN_RPC_PASSWORD` | — | Bitcoin Core RPC password |
@@ -79,7 +79,7 @@ docker run -p 4242:4242 \
   zkcoin/server
 ```
 
-The stub prover (`script/src/lib.rs`) removes the SP1 dependency — no succinct toolchain needed for Docker builds.
+The pre-built ELF (`elf/zkcoins-program`) is committed to the repo, so Docker builds do not require the Succinct toolchain — only standard Rust.
 
 ## CI/CD
 
@@ -94,7 +94,8 @@ Build time: ~5 minutes (Rust compilation on ARM64).
 ## Open Tasks
 
 - [x] CORS headers (allow frontend to call API directly)
-- [ ] Real SP1 proofs (replace stub prover with GPU/Succinct network)
+- [x] Real SP1 proofs (CPU prover live on DEV/PRD)
+- [ ] GPU acceleration (`SP1_PROVER=cuda`) or Succinct Prover Network
 - [ ] Explorer endpoints (`/api/stats`, `/api/nullifiers`)
 - [ ] Publisher key from environment variable (currently hardcoded)
 - [ ] Light client support
