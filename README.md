@@ -105,6 +105,7 @@ Build time: ~5 minutes (Rust compilation on ARM64).
 |---|---|
 | [zk-coins/app](https://github.com/zk-coins/app) | Web application (frontend, PWA) |
 | [zk-coins/docs](https://github.com/zk-coins/docs) | Documentation ([docs.zkcoins.app](https://docs.zkcoins.app)) |
+| [zk-coins/research](https://github.com/zk-coins/research) | Protocol research, upstream repos, paper PDF |
 
 ## Protocol
 
