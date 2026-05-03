@@ -1,7 +1,7 @@
 use axum::{
     body::Bytes,
     extract::{Json, Path, State},
-    http::{header, StatusCode},
+    http::{header, HeaderValue, Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Router,
@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
+use tower_http::cors::CorsLayer;
 use zkcoins_program::hash;
 use zkcoins_prover::Proof;
 
@@ -349,11 +350,15 @@ async fn mint_handler(
                     // Handle appropriately, maybe log an error or return a specific response.
                     eprintln!("WARNING: num_pubkeys changed unexpectedly during mint operation.");
                 }
-                let proof_data = bincode::deserialize::<ProofData>(&coin_proofs[0].proof.public_values.to_vec()).unwrap();
-                coin_proofs[0].commitment = Some(minting_account_guard.create_commitment(&proof_data.account_state_hash, &proof_data.output_coins_root));
+                let proof_data =
+                    bincode::deserialize::<ProofData>(&coin_proofs[0].proof.public_values.to_vec())
+                        .unwrap();
+                coin_proofs[0].commitment = Some(minting_account_guard.create_commitment(
+                    &proof_data.account_state_hash,
+                    &proof_data.output_coins_root,
+                ));
                 // minting_account_guard is dropped here
             }
-
 
             let commitment_data = bincode::serialize(&coin_proofs[0].commitment)
                 .expect("Failed to serialize commitment");
@@ -480,11 +485,22 @@ pub async fn start_rest_server(account_server: AccountServer, addr: &str) -> any
         .route("/mint", post(mint_handler))
         .with_state(state);
 
+    // CORS: allow frontend origins
+    let cors = CorsLayer::new()
+        .allow_origin([
+            "https://zkcoins.app".parse::<HeaderValue>().unwrap(),
+            "https://dev.zkcoins.app".parse::<HeaderValue>().unwrap(),
+            "http://localhost:3000".parse::<HeaderValue>().unwrap(),
+        ])
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([header::CONTENT_TYPE]);
+
     // Build our application with routes
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .nest("/api", api_routes)
-        .fallback(|| async { StatusCode::NOT_FOUND });
+        .fallback(|| async { StatusCode::NOT_FOUND })
+        .layer(cors);
 
     // Run the server
     println!("REST server started at {}", socket_addr);
