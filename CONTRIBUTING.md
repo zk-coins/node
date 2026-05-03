@@ -55,7 +55,7 @@ server/
 | `develop` | Default branch, active development | dfxdev (DEV) |
 | `main` | Production releases | dfxprd (PRD) |
 
-- **Push directly to `develop`**
+- **Push to `develop` via feature branch + PR** (branch ruleset active)
 - **`main` is protected** — changes only via PR
 - Never force-push, never amend
 
