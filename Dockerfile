@@ -3,7 +3,9 @@ WORKDIR /app
 
 # Install SP1 toolchain (needed by build.rs to compile the program ELF for riscv32)
 RUN curl -L https://sp1up.succinct.xyz | bash && \
-    /root/.sp1/bin/sp1up
+    /root/.sp1/bin/sp1up && \
+    TOOLCHAIN_BIN=$(dirname $(rustup +succinct which rustc)) && \
+    ln -sf $(which cargo) "$TOOLCHAIN_BIN/cargo"
 
 COPY . .
 RUN cargo build --release -p server
