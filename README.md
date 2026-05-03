@@ -91,6 +91,18 @@ The pre-built ELF (`elf/zkcoins-program`) is committed to the repo, so Docker bu
 
 Build time: ~5 minutes (Rust compilation on ARM64).
 
+## Proving Strategy
+
+Staged scaling for the SP1 prover:
+
+| Stage | When to move | Configuration |
+|---|---|---|
+| **1. CPU (current)** | Baseline | `SP1_PROVER=cpu` running on Mac Studio M3 Ultra, 96 GB unified memory. Measure `update_account` / `create_account` latency under real load before scaling further. |
+| **2. Succinct Prover Network** | CPU latency becomes a bottleneck | `SP1_PROVER=network` — no hardware commitment, requires PROVE token deposit and accepts token-price exposure. See [docs.succinct.xyz](https://docs.succinct.xyz/docs/sp1/prover-network/quickstart). |
+| **3. Self-hosted CUDA** | Network volume too costly or PROVE exposure undesirable | `SP1_PROVER=cuda` on x86 Linux with NVIDIA GPU (Compute Capability ≥ 8.6, ≥ 24 GB VRAM — RTX 4090 / 5090 / RTX 6000 Ada). Apple Silicon is not supported. |
+
+Skip stages only with concrete latency or cost data, not assumptions.
+
 ## Open Tasks
 
 - [x] CORS headers (allow frontend to call API directly)
