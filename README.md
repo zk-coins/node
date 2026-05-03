@@ -93,7 +93,7 @@ Build time: ~5 minutes (Rust compilation on ARM64).
 
 ## Open Tasks
 
-- [ ] CORS headers (allow frontend to call API directly)
+- [x] CORS headers (allow frontend to call API directly)
 - [ ] Real SP1 proofs (replace stub prover with GPU/Succinct network)
 - [ ] Explorer endpoints (`/api/stats`, `/api/nullifiers`)
 - [ ] Publisher key from environment variable (currently hardcoded)
