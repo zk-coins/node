@@ -482,9 +482,9 @@ pub async fn start_rest_server(account_server: AccountServer, addr: &str) -> any
 
     // Build our application with routes
     let app = Router::new()
-        .nest("/api", api_routes) // Put all API routes under /api
-        .nest_service("/pkg", tower_http::services::ServeDir::new("../client/pkg")) // Serve static files from www/pkg
-        .fallback(serve_index); // Use our custom serve_index handler as fallback
+        .route("/health", get(|| async { "ok" }))
+        .nest("/api", api_routes)
+        .fallback(|| async { StatusCode::NOT_FOUND });
 
     // Run the server
     println!("REST server started at {}", socket_addr);
