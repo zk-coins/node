@@ -490,7 +490,7 @@ pub async fn start_rest_server(account_server: AccountServer, addr: &str) -> any
         .allow_origin([
             "https://zkcoins.app".parse::<HeaderValue>().unwrap(),
             "https://dev.zkcoins.app".parse::<HeaderValue>().unwrap(),
-            "http://localhost:3000".parse::<HeaderValue>().unwrap(),
+            "http://localhost:3090".parse::<HeaderValue>().unwrap(),
         ])
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([header::CONTENT_TYPE]);
