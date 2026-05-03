@@ -1,14 +1,7 @@
 FROM rust:1.81-bookworm AS builder
 WORKDIR /app
-
-# Install SP1 toolchain (needed by build.rs to compile the program ELF for riscv32)
-RUN curl -L https://sp1up.succinct.xyz | bash && \
-    /root/.sp1/bin/sp1up && \
-    TOOLCHAIN_BIN=$(dirname $(rustup +succinct which rustc)) && \
-    ln -sf $(which cargo) "$TOOLCHAIN_BIN/cargo"
-
 COPY . .
-RUN RUST_MIN_STACK=67108864 cargo build --release -p server
+RUN cargo build --release -p server
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates wget && rm -rf /var/lib/apt/lists/*

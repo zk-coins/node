@@ -6585,7 +6585,6 @@ dependencies = [
 name = "zkcoins-prover"
 version = "1.1.0"
 dependencies = [
- "sp1-build",
  "sp1-sdk",
  "tracing",
  "zkcoins-program",
