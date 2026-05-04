@@ -1199,23 +1199,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f46ad14479a25103f283c0f10005961cf086d8dc42205bb44c46ac563475dca6"
 
 [[package]]
-name = "client"
-version = "1.1.0"
-dependencies = [
- "bincode",
- "bitcoin",
- "getrandom 0.2.15",
- "hex",
- "serde",
- "serde-wasm-bindgen",
- "serde_json",
- "shared",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
 name = "colorchoice"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4572,17 +4555,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde-wasm-bindgen"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8302e169f0eddcc139c70f139d19d6467353af16f9fce27e8c30158036a1e16b"
-dependencies = [
- "js-sys",
- "serde",
- "wasm-bindgen",
-]
-
-[[package]]
 name = "serde_derive"
 version = "1.0.219"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6613,8 +6585,6 @@ dependencies = [
 name = "zkcoins-prover"
 version = "1.1.0"
 dependencies = [
- "bitcoin",
- "sp1-build",
  "sp1-sdk",
  "tracing",
  "zkcoins-program",

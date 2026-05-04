@@ -52,10 +52,10 @@ server/
 
 | Branch | Purpose | Deploy target |
 |---|---|---|
-| `develop` | Default branch, active development | dfxdev (DEV) |
-| `main` | Production releases | dfxprd (PRD) |
+| `develop` | Default branch, active development | DEV server |
+| `main` | Production releases | PRD server |
 
-- **Push directly to `develop`**
+- **Push to `develop` via feature branch + PR** (branch ruleset active)
 - **`main` is protected** — changes only via PR
 - Never force-push, never amend
 
@@ -201,8 +201,8 @@ See [docs.zkcoins.app/infrastructure/backend](https://docs.zkcoins.app/infrastru
 
 | Workflow | Trigger | Action |
 |---|---|---|
-| `deploy-dev.yaml` | Push to develop | Docker build (ARM64) → push `zkcoin/server:beta` → deploy to dfxdev |
-| `deploy-prd.yaml` | Push to main | Docker build (ARM64) → push `zkcoin/server:latest` → deploy to dfxprd |
+| `deploy-dev.yaml` | Push to develop | Docker build (ARM64) → push `zkcoin/server:beta` → deploy to DEV |
+| `deploy-prd.yaml` | Push to main | Docker build (ARM64) → push `zkcoin/server:latest` → deploy to PRD |
 | `auto-release-pr.yaml` | Push to develop | Creates Release PR (develop → main) |
 
 Build time is ~5 minutes (Rust compilation on ARM64).

@@ -269,8 +269,11 @@ impl SparseMerkleTree {
             };
         }
 
-        // Store the leaf to get it with the key
-        debug_assert_eq!(self.leaf_values.insert(key, leaf), None);
+        // Store the leaf to get it with the key.
+        // Bind the insert result first: debug_assert! is a no-op in release
+        // and would otherwise drop the side effect entirely.
+        let prev_leaf = self.leaf_values.insert(key, leaf);
+        debug_assert_eq!(prev_leaf, None);
 
         // Hash leaf with key
         let leaf_hash = hash_concat(&leaf, &key);
@@ -295,8 +298,9 @@ impl SparseMerkleTree {
                 };
             }
         }
-        // Update the merkle root
-        debug_assert_ne!(self.nodes.insert((0, [0; 32]), current_hash), Some(current_hash));
+        // Update the merkle root. Same caveat as above: bind first, assert second.
+        let prev_root = self.nodes.insert((0, [0; 32]), current_hash);
+        debug_assert_ne!(prev_root, Some(current_hash));
 
         Ok(())
     }

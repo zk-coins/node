@@ -173,7 +173,7 @@ pub async fn scan_for_inscriptions(
     start_block_hash: BlockHash,
     callback: &InscriptionCallback,
 ) -> Result<(), Box<dyn StdError>> {
-    let builder = Builder::new(config.url);
+    let builder = Builder::new(&config.url);
     let client = AsyncClient::<DefaultSleeper>::from_builder(builder)?;
     let mut scanner = InscriptionScanner::new(client);
     

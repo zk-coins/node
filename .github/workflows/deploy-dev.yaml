@@ -4,6 +4,12 @@ on:
   push:
     branches: [develop]
   workflow_dispatch:
+    inputs:
+      reset_state:
+        description: 'Reset server state (clear blockchain data)'
+        required: false
+        type: boolean
+        default: false
 
 env:
   DOCKER_TAGS: zkcoin/server:beta
@@ -47,7 +53,13 @@ jobs:
           echo "${{ secrets.DEPLOY_DEV_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           echo "${{ secrets.DEPLOY_DEV_SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+          DEPLOY_CMD="zkcoins-server"
+          if [ "${{ inputs.reset_state }}" == "true" ]; then
+            DEPLOY_CMD="cd ~/zkcoins && docker compose stop zkcoins-server && docker compose rm -f zkcoins-server && docker volume rm zkcoins_server-data 2>/dev/null; zkcoins-server"
+          fi
+
           ssh -i ~/.ssh/deploy_key \
             -o ProxyCommand="cloudflared access ssh --hostname ${{ secrets.DEPLOY_DEV_HOST }}" \
             ${{ secrets.DEPLOY_DEV_USER }}@${{ secrets.DEPLOY_DEV_HOST }} \
-            "zkcoins-server"
+            "$DEPLOY_CMD"

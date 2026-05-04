@@ -1,7 +1,7 @@
 use axum::{
     body::Bytes,
     extract::{Json, Path, State},
-    http::{header, StatusCode},
+    http::{header, HeaderValue, Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Router,
@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
+use tower_http::cors::CorsLayer;
 use zkcoins_program::hash;
 use zkcoins_prover::Proof;
 
@@ -27,6 +28,7 @@ struct AppState {
     account_server: Arc<Mutex<AccountServer>>,
     proof_store: Arc<ProofStore>,
     minting_account: Arc<Mutex<ClientAccount>>,
+    accounts_path: String,
 }
 
 // Response types for our API
@@ -92,6 +94,11 @@ impl ProofStore {
 pub struct SendCoinResponse {
     success: bool,
     proof_id: Option<u64>, // Store a reference ID instead of the proof itself
+}
+
+#[derive(Serialize)]
+pub struct InfoResponse {
+    network: String,
 }
 
 // Handler functions for our REST API
@@ -230,12 +237,18 @@ async fn send_coin_handler(
     // Acquire the account_server lock only for the duration of sending coins.
     let send_result = {
         let mut account_server_lock = state.account_server.lock().unwrap();
-        account_server_lock.send_coins(
+        let result = account_server_lock.send_coins(
             vec![Invoice::new(request.amount, to_address)],
             from_address,
             request.public_key,
             request.next_public_key,
-        )
+        );
+        if result.is_ok() {
+            if let Err(e) = account_server_lock.save_to_file(&state.accounts_path) {
+                eprintln!("Failed to persist accounts after send: {}", e);
+            }
+        }
+        result
     };
 
     println!("Generated send_result: {:?}", send_result);
@@ -349,11 +362,15 @@ async fn mint_handler(
                     // Handle appropriately, maybe log an error or return a specific response.
                     eprintln!("WARNING: num_pubkeys changed unexpectedly during mint operation.");
                 }
-                let proof_data = bincode::deserialize::<ProofData>(&coin_proofs[0].proof.public_values.to_vec()).unwrap();
-                coin_proofs[0].commitment = Some(minting_account_guard.create_commitment(&proof_data.account_state_hash, &proof_data.output_coins_root));
+                let proof_data =
+                    bincode::deserialize::<ProofData>(&coin_proofs[0].proof.public_values.to_vec())
+                        .unwrap();
+                coin_proofs[0].commitment = Some(minting_account_guard.create_commitment(
+                    &proof_data.account_state_hash,
+                    &proof_data.output_coins_root,
+                ));
                 // minting_account_guard is dropped here
             }
-
 
             let commitment_data = bincode::serialize(&coin_proofs[0].commitment)
                 .expect("Failed to serialize commitment");
@@ -373,7 +390,10 @@ async fn mint_handler(
             {
                 let mut account_server_guard = state.account_server.lock().unwrap();
                 for coin_proof in &coin_proofs {
-                    account_server_guard.receive_coin(coin_proof.clone());
+                    let _ = account_server_guard.receive_coin(coin_proof.clone());
+                }
+                if let Err(e) = account_server_guard.save_to_file(&state.accounts_path) {
+                    eprintln!("Failed to persist accounts after mint: {}", e);
                 }
             }
 
@@ -427,8 +447,18 @@ async fn get_proof_handler(
     }
 }
 
+async fn info_handler() -> impl IntoResponse {
+    Json(InfoResponse {
+        network: NETWORK_CONFIG.network_name.clone(),
+    })
+}
+
 // Function to start the REST API server
-pub async fn start_rest_server(account_server: AccountServer, addr: &str) -> anyhow::Result<()> {
+pub async fn start_rest_server(
+    account_server: AccountServer,
+    addr: &str,
+    accounts_path: String,
+) -> anyhow::Result<()> {
     // Parse the address string into a SocketAddr
     let socket_addr = addr
         .parse::<SocketAddr>()
@@ -460,18 +490,27 @@ pub async fn start_rest_server(account_server: AccountServer, addr: &str) -> any
         account_server: shared_account_server,
         proof_store,
         minting_account,
+        accounts_path,
     };
     {
-        let mut minting_server_account = crate::account_server::Account::new();
-        minting_server_account.balance = u64::MAX;
-        state.account_server.lock().unwrap().import_account(
-            state.minting_account.lock().unwrap().address,
-            minting_server_account,
-        );
+        let mut account_server_guard = state.account_server.lock().unwrap();
+        if account_server_guard
+            .get_minting_account_address()
+            .is_err()
+        {
+            let mut minting_server_account = crate::account_server::Account::new();
+            minting_server_account.balance = u64::MAX;
+            account_server_guard
+                .import_account(zkcoins_program::MINTING_ADDRESS, minting_server_account);
+            if let Err(e) = account_server_guard.save_to_file(&state.accounts_path) {
+                eprintln!("Failed to save initial accounts file: {}", e);
+            }
+        }
     }
 
     // Create a router for API endpoints
     let api_routes = Router::new()
+        .route("/info", get(info_handler))
         .route("/balance", get(get_balance_handler))
         .route("/send", post(send_coin_handler))
         // .route("/address", get(get_address_handler))
@@ -480,11 +519,28 @@ pub async fn start_rest_server(account_server: AccountServer, addr: &str) -> any
         .route("/mint", post(mint_handler))
         .with_state(state);
 
+    // CORS: allow frontend origins
+    let cors = CorsLayer::new()
+        .allow_origin([
+            "https://zkcoins.app"
+                .parse::<HeaderValue>()
+                .expect("valid origin"),
+            "https://dev.zkcoins.app"
+                .parse::<HeaderValue>()
+                .expect("valid origin"),
+            "http://localhost:3090"
+                .parse::<HeaderValue>()
+                .expect("valid origin"),
+        ])
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([header::CONTENT_TYPE]);
+
     // Build our application with routes
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .nest("/api", api_routes)
-        .fallback(|| async { StatusCode::NOT_FOUND });
+        .fallback(|| async { StatusCode::NOT_FOUND })
+        .layer(cors);
 
     // Run the server
     println!("REST server started at {}", socket_addr);

@@ -19,26 +19,27 @@ use std::io::{Read, Write};
 const SMT_PATH: &str = "smt.bin";
 const MMR_PATH: &str = "mmr.bin";
 const LATEST_BLOCK_PATH: &str = "latest_block.bin";
+const ACCOUNTS_PATH: &str = "accounts.bin";
 const ACCOUNT_SERVER_ADDR: &str = "0.0.0.0:4242";
 //const START_BLOCK_HASH: &str = "000000f43ca5c99c54c4738878fe1c5cca07691dc614a2734b73aa78ca868fb8";
 
 use esplora_client::{
     r#async::DefaultSleeper, AsyncClient as EsploraAsyncClient, Builder as EsploraBuilder,
 };
-// Mainnet configuration
-// const NETWORK_CONFIG: EsploraConfig = EsploraConfig {
-//     url: "https://blockstream.info/api",
-//     is_mainnet: true,
-// };
 
-// Alternative testnet configuration
-const NETWORK_CONFIG: EsploraConfig = EsploraConfig {
-    // url: "https://blockstream.info/testnet/api",
-    // url: "https://mempool.space/signet/api",
-    // url: "https://mempool.space/testnet4/api/",
-    url: "https://mutinynet.com/api",
-    is_mainnet: false,
-};
+lazy_static::lazy_static! {
+    pub static ref NETWORK_CONFIG: EsploraConfig = {
+        let url = std::env::var("ESPLORA_URL")
+            .unwrap_or_else(|_| "https://mutinynet.com/api".to_string());
+        let is_mainnet = std::env::var("IS_MAINNET")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let network_name = std::env::var("NETWORK_NAME")
+            .unwrap_or_else(|_| if is_mainnet { "Mainnet".to_string() } else { "Mutinynet".to_string() });
+        println!("Network config: {} ({})", network_name, url);
+        EsploraConfig { url, is_mainnet, network_name }
+    };
+}
 
 // Helper function to save the latest block hash
 fn save_latest_block(block_hash: &BlockHash, path: &str) -> Result<(), Box<dyn StdError>> {
@@ -72,15 +73,26 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         }
     ));
     
-    // Create a new AccountServer instance with a reference to the state
-    let account_server = account_server::AccountServer::new(Arc::clone(&state));
-    
-    // TODO: Create minting account
-    //wallet.create_account();
+    // Create a new AccountServer instance with a reference to the state.
+    // Try to restore persisted accounts; otherwise start with an empty server
+    // and let start_rest_server seed the minting account.
+    let account_server =
+        match account_server::AccountServer::load_from_file(Arc::clone(&state), ACCOUNTS_PATH) {
+            Ok(server) => {
+                println!("Loaded existing accounts from {}", ACCOUNTS_PATH);
+                server
+            }
+            Err(_) => {
+                println!("No accounts file found, creating new AccountServer");
+                account_server::AccountServer::new(Arc::clone(&state))
+            }
+        };
 
     // Spawn the account_server as a separate task
     tokio::spawn(async move {
-        if let Err(e) = start_rest_server(account_server, ACCOUNT_SERVER_ADDR).await {
+        if let Err(e) =
+            start_rest_server(account_server, ACCOUNT_SERVER_ADDR, ACCOUNTS_PATH.to_string()).await
+        {
             eprintln!("Account server error: {}", e);
         }
     });
@@ -93,7 +105,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         }
         Err(_) => {
             println!("No saved block hash found, fetching latest from Esplora...");
-            let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(EsploraBuilder::new(NETWORK_CONFIG.url))?;
+            let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(EsploraBuilder::new(&NETWORK_CONFIG.url))?;
     
             let tip_hash = client.get_tip_hash().await?;
             println!("Fetched latest tip hash from Esplora: {}", tip_hash);
