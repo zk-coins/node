@@ -669,4 +669,58 @@ mod tests {
             10_000
         );
     }
+
+    #[test]
+    fn test_mint_single_invoice() {
+        let state_arc = Arc::new(Mutex::new(State::new()));
+        let mut server = AccountServer::new(Arc::clone(&state_arc));
+
+        let mut minting_account_data = TestAccountData::new_minting_account();
+        server.import_account(
+            minting_account_data.address,
+            Account {
+                proof: None,
+                coin_queue: vec![],
+                coin_history: SparseMerkleTree::new(),
+                balance: 10_000,
+            },
+        );
+
+        let account_1_data = TestAccountData::new_generic(&[1u8; 32], Network::Signet);
+        let invoice = Invoice::new(100, account_1_data.address);
+
+        let coin_proofs = minting_account_data
+            .execute_send_coins(&mut server, vec![invoice])
+            .expect("Mint with single invoice failed");
+
+        assert_eq!(coin_proofs.len(), 1);
+    }
+
+    /// Reproduces the exact configuration of /api/mint on the live DEV server:
+    /// balance = u64::MAX, recipient = raw [1u8; 32] bytes, amount = 1.
+    #[test]
+    fn test_mint_repro_live_setup() {
+        let state_arc = Arc::new(Mutex::new(State::new()));
+        let mut server = AccountServer::new(Arc::clone(&state_arc));
+
+        let mut minting_account_data = TestAccountData::new_minting_account();
+        server.import_account(
+            minting_account_data.address,
+            Account {
+                proof: None,
+                coin_queue: vec![],
+                coin_history: SparseMerkleTree::new(),
+                balance: u64::MAX,
+            },
+        );
+
+        let recipient: Address = [1u8; 32];
+        let invoice = Invoice::new(1, recipient);
+
+        let coin_proofs = minting_account_data
+            .execute_send_coins(&mut server, vec![invoice])
+            .expect("Mint repro failed");
+
+        assert_eq!(coin_proofs.len(), 1);
+    }
 }
