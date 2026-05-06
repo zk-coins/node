@@ -208,19 +208,6 @@ See [docs.zkcoins.app/infrastructure/backend](https://docs.zkcoins.app/infrastru
 
 Build time is ~5 minutes (Rust compilation on ARM64).
 
-## API Reference
-
-| Endpoint | Method | Description | Success |
-|---|---|---|---|
-| `/health` | GET | Health check | `ok` (200) |
-| `/api/info` | GET | Network info | `{ network }` |
-| `/api/mint` | POST | Mint coins from minting account | `{ proof_id }` |
-| `/api/send` | POST | Transfer coins between accounts | `{ proof_id }` |
-| `/api/balance?address=<hex>` | GET | Query account balance | `{ balance }` |
-| `/api/address` | GET | Generate receive addresses | `{ addresses }` |
-| `/api/receive` | POST | Receive coins from sender | `{ success }` |
-| `/api/proof/:id` | GET | Download coin proof (binary) | Binary data |
-
 ## Related Repos
 
 - [zk-coins/app](https://github.com/zk-coins/app) — Web application (frontend)

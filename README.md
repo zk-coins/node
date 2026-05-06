@@ -109,11 +109,8 @@ Skip stages only with concrete latency or cost data, not assumptions.
 
 ## Open Tasks
 
-- [x] CORS headers (allow frontend to call API directly)
-- [x] Real SP1 proofs (CPU prover live on DEV/PRD)
 - [ ] GPU acceleration (`SP1_PROVER=cuda`) or Succinct Prover Network
 - [ ] Explorer endpoints (`/api/stats`, `/api/nullifiers`)
-- [x] Publisher key from environment variable
 - [ ] Light client support
 
 ## Related
