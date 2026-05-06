@@ -213,7 +213,7 @@ impl AccountServer {
         public_key: PublicKey,
         next_public_key: PublicKey,
     ) -> Result<Vec<CoinProof>, &'static str> {
-        let state = &self.state.lock().unwrap();
+        let state = &self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // Check if the account balance is enough
         let balance = self.get_account_balance(&account_address)?;
         let invoiced_amount = invoices.iter().fold(0, |acc, x| acc + x.amount);
@@ -339,8 +339,8 @@ impl AccountServer {
 
         // Insert account back into database.
         self.accounts.insert(account_address, account);
-        let public_values =
-            bincode::deserialize::<ProofData>(&proof.public_values.to_vec()).unwrap();
+        let public_values = bincode::deserialize::<ProofData>(&proof.public_values.to_vec())
+            .map_err(|_| "Failed to deserialize proof public values")?;
         if public_values.output_coins_root != out_coins_tree.root() {
             return Err(
                 "The simulated out_coins_tree root does not match the commited output_coins_root",
@@ -372,7 +372,7 @@ impl AccountServer {
     pub fn save_to_file(&self, path: &str) -> std::io::Result<()> {
         let bytes = bincode::serialize(&self.accounts)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        std::fs::write(path, bytes)
+        crate::atomic_write(path, &bytes)
     }
 
     pub fn load_from_file(state: Arc<Mutex<State>>, path: &str) -> std::io::Result<Self> {

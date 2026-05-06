@@ -52,10 +52,20 @@ lazy_static::lazy_static! {
     };
 }
 
+/// Atomic write: write to a temp file, then rename.
+/// This prevents data corruption if the process crashes mid-write.
+pub fn atomic_write(path: &str, data: &[u8]) -> std::io::Result<()> {
+    let tmp_path = format!("{}.tmp", path);
+    let mut file = File::create(&tmp_path)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
 // Helper function to save the latest block hash
 fn save_latest_block(block_hash: &BlockHash, path: &str) -> Result<(), Box<dyn StdError>> {
-    let mut file = File::create(path)?;
-    file.write_all(&block_hash.to_byte_array())?;
+    atomic_write(path, &block_hash.to_byte_array())?;
     Ok(())
 }
 

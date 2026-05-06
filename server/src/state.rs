@@ -144,7 +144,7 @@ impl State {
 
         // Save prev_mmr_root to a separate file
         let prev_root_path = format!("{}.prev_root", mmr_path);
-        std::fs::write(prev_root_path, self.prev_mmr_root)?;
+        crate::atomic_write(&prev_root_path, &self.prev_mmr_root)?;
 
         Ok(())
     }
