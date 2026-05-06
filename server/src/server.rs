@@ -563,11 +563,13 @@ pub async fn start_rest_server(
             "Set MINTING_ADDRESS to {:?}",
             &zkcoins_program::MINTING_ADDRESS
         );
-        Arc::new(Mutex::new(ClientAccount {
-            address: hash(private_key.to_string().as_bytes()),
-            num_pubkeys: 0,
-            private_key,
-        }))
+        let minting_client = ClientAccount::new(private_key);
+        assert_eq!(
+            minting_client.address,
+            zkcoins_program::MINTING_ADDRESS,
+            "Minting account address mismatch — minting_secret.bin or MINTING_ADDRESS constant is wrong"
+        );
+        Arc::new(Mutex::new(minting_client))
     };
 
     // Create the combined state using the AppState struct
