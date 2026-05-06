@@ -63,7 +63,10 @@ script/                # Prover (real SP1 zkVM — create_account, update_accoun
 | Variable | Default | Description |
 |---|---|---|
 | `SP1_PROVER` | `mock` | `mock` (no proof), `cpu`, `cuda`, or `network` |
-| `ESPLORA_URL` | `https://mutinynet.com/api` | Bitcoin node API |
+| `ESPLORA_URL` | `https://mutinynet.com/api` | Esplora API endpoint (electrs or public) |
+| `IS_MAINNET` | `false` | `true` for Bitcoin Mainnet, `false` for Mutinynet/Signet |
+| `NETWORK_NAME` | `Mutinynet` | Human-readable network name (returned by `/api/info`) |
+| `PUBLISHER_KEY` | test key | 32-byte hex private key for inscription publishing. **Required on mainnet** — server panics if default test key is used |
 | `BITCOIN_RPC_USER` | — | Bitcoin Core RPC username |
 | `BITCOIN_RPC_PASSWORD` | — | Bitcoin Core RPC password |
 | `RUST_LOG` | `info` | Log level |

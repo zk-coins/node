@@ -170,7 +170,10 @@ The `zkvm` feature gates the SP1 entrypoint and all `sp1_zkvm::` calls.
 | Variable | Default | Description |
 |---|---|---|
 | `SP1_PROVER` | `mock` | `mock` (stub proofs) or `local` (real SP1) |
-| `ESPLORA_URL` | `https://mutinynet.com/api` | Bitcoin node API |
+| `ESPLORA_URL` | `https://mutinynet.com/api` | Esplora API endpoint (electrs or public) |
+| `IS_MAINNET` | `false` | `true` for Bitcoin Mainnet, `false` for Mutinynet/Signet |
+| `NETWORK_NAME` | `Mutinynet` | Human-readable network name (returned by `/api/info`) |
+| `PUBLISHER_KEY` | test key | 32-byte hex private key for inscription publishing. **Required on mainnet** |
 | `BITCOIN_RPC_USER` | — | Bitcoin Core RPC username |
 | `BITCOIN_RPC_PASSWORD` | — | Bitcoin Core RPC password |
 | `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
