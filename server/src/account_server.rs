@@ -158,7 +158,15 @@ impl AccountServer {
         //    &account.state.public_key,
         //);
 
-        // TODO: Make sure the coin_queue doesn't include this coin already.
+        // Reject duplicate coins (replay protection)
+        let coin_id = coin_proof.coin.identifier;
+        if account.coin_queue.iter().any(|cp| cp.coin.identifier == coin_id) {
+            return Err("Coin already in queue (duplicate)");
+        }
+        if account.coin_history.generate_inclusion_proof(&coin_id).is_ok() {
+            return Err("Coin already spent (replay)");
+        }
+
         let address = coin_proof.coin.recipient;
         account.coin_queue.push(coin_proof);
         self.accounts.insert(address, account);
