@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::{collections::HashMap, mem::take};
+use std::collections::HashMap;
 
 use crate::state::State;
 use bitcoin::bip32::Xpriv;
@@ -173,9 +173,9 @@ impl AccountServer {
         Ok(())
     }
 
-    /// Get all required merkle proofs from the state for the public key and the previous proof
-    pub fn get_merkle_proofs(
-        &self,
+    /// Get all required merkle proofs from the state for the public key and the previous proof.
+    /// Static method: does not access self.accounts, only the state guard.
+    fn get_merkle_proofs(
         mut previous_proof: Proof,
         public_key: PublicKey,
         state: &MutexGuard<'_, State>,
@@ -229,7 +229,7 @@ impl AccountServer {
             return Err("Insufficient funds");
         }
 
-        let mut account = match self.accounts.remove(&account_address) {
+        let account = match self.accounts.get_mut(&account_address) {
             Some(account) => account,
             None => return Err("Unknown account address"),
         };
@@ -249,7 +249,7 @@ impl AccountServer {
         for coin_proof in &account.coin_queue {
             coin_history_proofs.push({
                 match &coin_proof.commitment {
-                    Some(commitment) => self.get_merkle_proofs(
+                    Some(commitment) => Self::get_merkle_proofs(
                         coin_proof.proof.clone(),
                         commitment.public_key,
                         state,
@@ -318,35 +318,35 @@ impl AccountServer {
             .out_coins(out_coins.clone())
             .out_coin_proofs(out_coin_proofs);
 
-        // TODO(Refactor): Don't use take and move this up into the loop
-        let received_proofs = take(&mut account.coin_queue)
-            .into_iter()
-            .map(|x| x.proof)
+        let received_proofs: Vec<_> = account.coin_queue
+            .iter()
+            .map(|x| x.proof.clone())
             .collect();
 
-        let proof = match account.proof.take() {
+        let proof = match &account.proof {
             Some(account_proof) => {
                 let account_commitment_public_key = public_key;
-                proof_hints_builder.prev_proof_history_proofs(Some(self.get_merkle_proofs(
+                let merkle_proofs = Self::get_merkle_proofs(
                     account_proof.clone(),
                     account_commitment_public_key,
                     state,
-                )?));
+                )?;
+                proof_hints_builder.prev_proof_history_proofs(Some(merkle_proofs));
                 proof_hints_builder.proof_type(ProofType::AccountUpdateProof);
                 self.prover
-                    .update_account(proof_hints_builder, account_proof, received_proofs)?
+                    .update_account(proof_hints_builder, account_proof.clone(), received_proofs)?
             }
-            _ => self
+            None => self
                 .prover
                 .create_account(proof_hints_builder, received_proofs)?,
         };
 
-        // Update account.
+        // Proof generation succeeded — now commit the state changes.
+        // coin_queue and proof were read non-destructively above,
+        // so the account is unchanged if we got an error before this point.
+        account.coin_queue.clear();
         account.balance = balance - invoiced_amount;
         account.proof = Some(proof.clone());
-
-        // Insert account back into database.
-        self.accounts.insert(account_address, account);
         let public_values = bincode::deserialize::<ProofData>(&proof.public_values.to_vec())
             .map_err(|_| "Failed to deserialize proof public values")?;
         if public_values.output_coins_root != out_coins_tree.root() {
