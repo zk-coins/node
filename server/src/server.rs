@@ -12,7 +12,7 @@ use shared::{ClientAccount, Invoice, ProofData};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 use zkcoins_program::hash;
@@ -21,6 +21,15 @@ use zkcoins_prover::Proof;
 use crate::account_server::{AccountServer, CoinProof};
 use crate::publisher::create_and_broadcast_inscription;
 use crate::NETWORK_CONFIG;
+
+/// Lock a mutex, recovering from poison if a previous holder panicked.
+/// This prevents cascade failures where one panic takes down all handlers.
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        eprintln!("WARNING: Recovering from poisoned mutex");
+        poisoned.into_inner()
+    })
+}
 
 // Define a struct for our application state
 #[derive(Clone)]
@@ -79,13 +88,13 @@ impl ProofStore {
 
     fn add_proof(&self, proof_with_commitment: CoinProof) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let mut proofs = self.proofs.lock().unwrap();
+        let mut proofs = lock_or_recover(&self.proofs);
         proofs.insert(id, proof_with_commitment);
         id
     }
 
     fn get_proof(&self, id: u64) -> Option<CoinProof> {
-        let proofs = self.proofs.lock().unwrap();
+        let proofs = lock_or_recover(&self.proofs);
         proofs.get(&id).cloned()
     }
 }
@@ -106,7 +115,7 @@ async fn get_balance_handler(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let account_server = state.account_server.lock().unwrap();
+    let account_server = lock_or_recover(&state.account_server);
 
     // Check if an address parameter was provided
     if let Some(address_hex) = params.get("address") {
@@ -143,7 +152,7 @@ async fn get_balance_handler(
 }
 
 async fn get_address_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let account_server = state.account_server.lock().unwrap();
+    let account_server = lock_or_recover(&state.account_server);
 
     // Convert addresses to hex strings
     let hex_addresses: Vec<String> = account_server
@@ -164,7 +173,7 @@ async fn receive_coin_handler(
     // Try to deserialize the binary data as a CoinProof
     match bincode::deserialize::<CoinProof>(&body) {
         Ok(coin_proof) => {
-            let mut account_server = state.account_server.lock().unwrap();
+            let mut account_server = lock_or_recover(&state.account_server);
             match account_server.receive_coin(coin_proof) {
                 Ok(_) => Json(SendCoinResponse {
                     success: true,
@@ -236,7 +245,7 @@ async fn send_coin_handler(
     // TODO: Provide the correct public keys from the client
     // Acquire the account_server lock only for the duration of sending coins.
     let send_result = {
-        let mut account_server_lock = state.account_server.lock().unwrap();
+        let mut account_server_lock = lock_or_recover(&state.account_server);
         let result = account_server_lock.send_coins(
             vec![Invoice::new(request.amount, to_address)],
             from_address,
@@ -324,7 +333,7 @@ async fn mint_handler(
 
     // Generate keys and get necessary info while holding the minting_account lock briefly
     let (minting_pubkey, next_minting_pubkey, num_pubkeys_before_mint) = {
-        let minting_account_guard = state.minting_account.lock().unwrap();
+        let minting_account_guard = lock_or_recover(&state.minting_account);
         let current_num_pubkeys = minting_account_guard.num_pubkeys;
         (
             minting_account_guard.generate_public_key(current_num_pubkeys),
@@ -336,7 +345,7 @@ async fn mint_handler(
 
     // Acquire the account_server lock only for the duration of sending coins.
     let send_result = {
-        let mut account_server_guard = state.account_server.lock().unwrap();
+        let mut account_server_guard = lock_or_recover(&state.account_server);
         let minting_address = account_server_guard.get_minting_account_address().unwrap();
         account_server_guard.send_coins(
             vec![Invoice::new(request.amount, account_address)],
@@ -353,7 +362,7 @@ async fn mint_handler(
         Ok(mut coin_proofs) => {
             // Increment num_pubkeys *after* successful send and before await
             {
-                let mut minting_account_guard = state.minting_account.lock().unwrap();
+                let mut minting_account_guard = lock_or_recover(&state.minting_account);
                 // Ensure we only increment if the send was successful and based on the state *before* the send
                 if minting_account_guard.num_pubkeys == num_pubkeys_before_mint {
                     minting_account_guard.num_pubkeys += 1;
@@ -388,7 +397,7 @@ async fn mint_handler(
                 eprintln!("Error broadcasting inscription: {}", err);
             }
             {
-                let mut account_server_guard = state.account_server.lock().unwrap();
+                let mut account_server_guard = lock_or_recover(&state.account_server);
                 for coin_proof in &coin_proofs {
                     let _ = account_server_guard.receive_coin(coin_proof.clone());
                 }
