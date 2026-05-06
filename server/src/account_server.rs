@@ -220,6 +220,7 @@ impl AccountServer {
         account_address: Address,
         public_key: PublicKey,
         next_public_key: PublicKey,
+        prev_commitment_pubkey: Option<PublicKey>,
     ) -> Result<Vec<CoinProof>, &'static str> {
         let state = &self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // Check if the account balance is enough
@@ -325,7 +326,8 @@ impl AccountServer {
 
         let proof = match &account.proof {
             Some(account_proof) => {
-                let account_commitment_public_key = public_key;
+                let account_commitment_public_key = prev_commitment_pubkey
+                    .ok_or("prev_commitment_pubkey required for account update")?;
                 let merkle_proofs = Self::get_merkle_proofs(
                     account_proof.clone(),
                     account_commitment_public_key,
@@ -474,8 +476,13 @@ mod tests {
         ) -> Result<Vec<CoinProof>, String> {
             let current_pk = generate_test_public_key(&self.xpriv, self.num_pubkeys);
             let next_pk = generate_test_public_key(&self.xpriv, self.num_pubkeys + 1);
+            let prev_pk = if self.num_pubkeys > 0 {
+                Some(generate_test_public_key(&self.xpriv, self.num_pubkeys - 1))
+            } else {
+                None
+            };
 
-            let mut coin_proofs = server.send_coins(invoices, self.address, current_pk, next_pk)?;
+            let mut coin_proofs = server.send_coins(invoices, self.address, current_pk, next_pk, prev_pk)?;
 
             // The key used for the commitment corresponds to current_pk
             let signing_secret_key = derive_test_secret_key(&self.xpriv, self.num_pubkeys);

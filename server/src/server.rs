@@ -100,6 +100,7 @@ pub struct SendCoinRequest {
     amount: u64,
     public_key: bitcoin::secp256k1::PublicKey,
     next_public_key: bitcoin::secp256k1::PublicKey,
+    prev_commitment_pubkey: Option<bitcoin::secp256k1::PublicKey>,
     signature: Option<String>,
     timestamp: Option<u64>,
 }
@@ -309,6 +310,7 @@ async fn send_coin_handler(
             from_address,
             request.public_key,
             request.next_public_key,
+            request.prev_commitment_pubkey,
         );
         if result.is_ok() {
             if let Err(e) = account_server_lock.save_to_file(&state.accounts_path) {
@@ -392,15 +394,20 @@ async fn mint_handler(
     }
 
     // Generate keys and get necessary info while holding the minting_account lock briefly
-    let (minting_pubkey, next_minting_pubkey, num_pubkeys_before_mint) = {
+    let (minting_pubkey, next_minting_pubkey, prev_commitment_pubkey, num_pubkeys_before_mint) = {
         let minting_account_guard = lock_or_recover(&state.minting_account);
         let current_num_pubkeys = minting_account_guard.num_pubkeys;
+        let prev_pk = if current_num_pubkeys > 0 {
+            Some(minting_account_guard.generate_public_key(current_num_pubkeys - 1))
+        } else {
+            None
+        };
         (
             minting_account_guard.generate_public_key(current_num_pubkeys),
             minting_account_guard.generate_public_key(current_num_pubkeys + 1),
+            prev_pk,
             current_num_pubkeys,
         )
-        // minting_account_guard is dropped here, releasing the lock before any .await
     };
 
     // Acquire the account_server lock only for the duration of sending coins.
@@ -419,10 +426,10 @@ async fn mint_handler(
         account_server_guard.send_coins(
             vec![Invoice::new(request.amount, account_address)],
             minting_address,
-            minting_pubkey,      // Use the generated keys
-            next_minting_pubkey, // Use the generated keys
+            minting_pubkey,
+            next_minting_pubkey,
+            prev_commitment_pubkey,
         )
-        // account_server_guard is dropped here
     };
 
     println!("Minting result: {:?}", send_result);
