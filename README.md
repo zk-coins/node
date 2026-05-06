@@ -40,7 +40,8 @@ SP1_PROVER=mock cargo run -p server
 | `/api/mint` | POST | Mint coins (faucet) | `{ proof_id }` |
 | `/api/send` | POST | Transfer coins | `{ proof_id }` |
 | `/api/balance?address=<hex>` | GET | Query balance | `{ balance }` |
-| `/api/address` | GET | Generate receive address | `{ address, public_key }` |
+| `/api/address` | GET | Generate receive addresses | `{ addresses }` |
+| `/api/receive` | POST | Receive coins from sender | `{ success }` |
 | `/api/proof/:id` | GET | Download coin proof | Binary |
 
 ## Project Structure
@@ -69,8 +70,6 @@ script/                # Prover (real SP1 zkVM — create_account, update_accoun
 | `IS_MAINNET` | `false` | `true` for Bitcoin Mainnet, `false` for Mutinynet/Signet |
 | `NETWORK_NAME` | `Mutinynet` | Human-readable network name (returned by `/api/info`) |
 | `PUBLISHER_KEY` | test key | 32-byte hex private key for inscription publishing. **Required on mainnet** — server panics if default test key is used |
-| `BITCOIN_RPC_USER` | — | Bitcoin Core RPC username |
-| `BITCOIN_RPC_PASSWORD` | — | Bitcoin Core RPC password |
 | `RUST_LOG` | `info` | Log level |
 
 ## Docker

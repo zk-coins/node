@@ -169,13 +169,11 @@ The `zkvm` feature gates the SP1 entrypoint and all `sp1_zkvm::` calls.
 
 | Variable | Default | Description |
 |---|---|---|
-| `SP1_PROVER` | `mock` | `mock` (stub proofs) or `local` (real SP1) |
+| `SP1_PROVER` | `mock` | `mock` (no proof), `cpu`, `cuda`, or `network` |
 | `ESPLORA_URL` | `https://mutinynet.com/api` | Esplora API endpoint (electrs or public) |
 | `IS_MAINNET` | `false` | `true` for Bitcoin Mainnet, `false` for Mutinynet/Signet |
 | `NETWORK_NAME` | `Mutinynet` | Human-readable network name (returned by `/api/info`) |
 | `PUBLISHER_KEY` | test key | 32-byte hex private key for inscription publishing. **Required on mainnet** |
-| `BITCOIN_RPC_USER` | — | Bitcoin Core RPC username |
-| `BITCOIN_RPC_PASSWORD` | — | Bitcoin Core RPC password |
 | `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
 
 ## Docker
@@ -189,7 +187,7 @@ docker run -p 4242:4242 \
   zkcoin/server
 ```
 
-The Dockerfile removes the `script` crate from the workspace (via `sed`) to avoid requiring the SP1 toolchain. The stub prover in `script/src/lib.rs` provides the same API surface with mock proofs.
+The pre-built ELF (`elf/zkcoins-program`) is committed to the repo, so Docker builds do not require the Succinct toolchain — only standard Rust.
 
 ### Bitcoin Node
 
