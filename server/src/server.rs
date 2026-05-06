@@ -346,7 +346,16 @@ async fn mint_handler(
     // Acquire the account_server lock only for the duration of sending coins.
     let send_result = {
         let mut account_server_guard = lock_or_recover(&state.account_server);
-        let minting_address = account_server_guard.get_minting_account_address().unwrap();
+        let minting_address = match account_server_guard.get_minting_account_address() {
+            Ok(addr) => addr,
+            Err(e) => {
+                eprintln!("Minting account not found: {:?}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(SendCoinResponse { success: false, proof_id: None }),
+                );
+            }
+        };
         account_server_guard.send_coins(
             vec![Invoice::new(request.amount, account_address)],
             minting_address,
@@ -371,9 +380,18 @@ async fn mint_handler(
                     // Handle appropriately, maybe log an error or return a specific response.
                     eprintln!("WARNING: num_pubkeys changed unexpectedly during mint operation.");
                 }
-                let proof_data =
-                    bincode::deserialize::<ProofData>(&coin_proofs[0].proof.public_values.to_vec())
-                        .unwrap();
+                let proof_data = match bincode::deserialize::<ProofData>(
+                    &coin_proofs[0].proof.public_values.to_vec(),
+                ) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        eprintln!("Failed to deserialize proof data: {}", e);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(SendCoinResponse { success: false, proof_id: None }),
+                        );
+                    }
+                };
                 coin_proofs[0].commitment = Some(minting_account_guard.create_commitment(
                     &proof_data.account_state_hash,
                     &proof_data.output_coins_root,
@@ -482,7 +500,7 @@ pub async fn start_rest_server(
     let minting_account = {
         let secret = include_bytes!("../minting_secret.bin");
         let private_key =
-            Xpriv::new_master(Network::Bitcoin, secret).expect("Failed to create private key.");
+            Xpriv::new_master(NETWORK_CONFIG.network(), secret).expect("Failed to create private key.");
         println!(
             "Set MINTING_ADDRESS to {:?}",
             &zkcoins_program::MINTING_ADDRESS
