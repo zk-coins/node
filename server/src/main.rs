@@ -27,6 +27,8 @@ use esplora_client::{
     r#async::DefaultSleeper, AsyncClient as EsploraAsyncClient, Builder as EsploraBuilder,
 };
 
+const DEFAULT_PUBLISHER_KEY: &str = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
 lazy_static::lazy_static! {
     pub static ref NETWORK_CONFIG: EsploraConfig = {
         let url = std::env::var("ESPLORA_URL")
@@ -38,6 +40,15 @@ lazy_static::lazy_static! {
             .unwrap_or_else(|_| if is_mainnet { "Mainnet".to_string() } else { "Mutinynet".to_string() });
         println!("Network config: {} ({})", network_name, url);
         EsploraConfig { url, is_mainnet, network_name }
+    };
+
+    pub static ref PUBLISHER_KEY: String = {
+        let key = std::env::var("PUBLISHER_KEY")
+            .unwrap_or_else(|_| DEFAULT_PUBLISHER_KEY.to_string());
+        if NETWORK_CONFIG.is_mainnet && key == DEFAULT_PUBLISHER_KEY {
+            panic!("PUBLISHER_KEY env var must be set for mainnet");
+        }
+        key
     };
 }
 

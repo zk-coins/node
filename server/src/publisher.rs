@@ -27,7 +27,11 @@ pub struct EsploraConfig {
     pub network_name: String,
 }
 
-const PUBLISHER_KEY: &str = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+impl EsploraConfig {
+    pub fn network(&self) -> Network {
+        if self.is_mainnet { Network::Bitcoin } else { Network::Signet }
+    }
+}
 
 // Define constants for transaction identification
 pub const INSCRIPTION_MARKER_PREFIX: &str = "4242";
@@ -65,12 +69,7 @@ pub fn inscription_txs(
     let key_pair = secp256k1::Keypair::from_secret_key(&secp256k1, &sk);
     let (public_key, _parity) = XOnlyPublicKey::from_keypair(&key_pair);
 
-    // Use the network from the config
-    let network = if config.is_mainnet {
-        Network::Bitcoin
-    } else {
-        Network::Testnet
-    };
+    let network = config.network();
 
     println!("Publisher address: {}", publisher_address);
 
@@ -296,16 +295,12 @@ pub async fn create_and_broadcast_inscription(
     config: &EsploraConfig,
 ) -> Result<Option<(Txid, Txid)>, Box<dyn std::error::Error + Send + Sync>> {
     // Generate publisher address
-    let publisher_key = PUBLISHER_KEY;
+    let publisher_key = &*crate::PUBLISHER_KEY;
     let secp256k1 = Secp256k1::new();
     let sk = SecretKey::from_str(publisher_key)?;
     let key_pair = secp256k1::Keypair::from_secret_key(&secp256k1, &sk);
     let (public_key, _parity) = XOnlyPublicKey::from_keypair(&key_pair);
-    let network = if config.is_mainnet {
-        Network::Bitcoin
-    } else {
-        Network::Testnet
-    };
+    let network = config.network();
     let publisher_address = Address::p2tr(&secp256k1, public_key, None, network);
     println!("Publisher address: {}", publisher_address);
 

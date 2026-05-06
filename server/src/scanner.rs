@@ -5,6 +5,7 @@ use esplora_client::r#async::DefaultSleeper;
 use esplora_client::{AsyncClient, Builder, Error as EsploraError, Sleeper};
 use std::collections::HashSet;
 use std::time::Duration;
+use bitcoin::blockdata::opcodes;
 use bitcoin::script::Instruction;
 use bitcoin::script::ScriptBuf;
 use std::error::Error as StdError;
@@ -146,16 +147,13 @@ impl<S: Sleeper> InscriptionScanner<S> {
         callback: &InscriptionCallback,
     ) -> Result<(), EsploraError> {
         // We already know it's an inscription tx based on the txid prefix
-        // Extract inscription content from inputs
+        // In a Taproot script-spend, the witness is: [signature, script, control_block]
+        // The script is the second-to-last witness item.
         for input in tx.input.iter() {
-            // Look for the witness item that contains the inscription
-            if let Some(witness_item) = input.witness.iter().find(|item| {
-                let hex_str = hex::encode(item);
-                hex_str.contains("0063") // Look for the inscription marker
-            }) {
-                // Extract the inscription content
-                if let Some(content_bytes) = extract_inscription_content(witness_item) {
-                    // Call the handler with the content
+            let witness_items: Vec<&[u8]> = input.witness.iter().collect();
+            if witness_items.len() >= 3 {
+                let script_bytes = witness_items[witness_items.len() - 2];
+                if let Some(content_bytes) = extract_inscription_content(script_bytes) {
                     if let Some(current_hash) = self.current_block_hash {
                         callback(content_bytes, current_hash);
                     }
@@ -182,36 +180,48 @@ pub async fn scan_for_inscriptions(
     Ok(())
 }
 
-/// Helper function to extract inscription content from witness data
-pub fn extract_inscription_content(witness_data: &[u8]) -> Option<Vec<u8>> {
-    // Look for the inscription marker in the witness data
-    // The marker is "0063" (OP_FALSE OP_IF)
-    let marker = [0x00, 0x63];
+/// Extract inscription content from a Taproot reveal script.
+///
+/// The script structure is:
+///   <pubkey> OP_CHECKSIG OP_FALSE OP_IF <push data>... OP_ENDIF
+///
+/// We parse the script opcodes properly (not raw bytes) to find the
+/// OP_FALSE OP_IF boundary, then concatenate all push data chunks
+/// until OP_ENDIF.
+pub fn extract_inscription_content(script_bytes: &[u8]) -> Option<Vec<u8>> {
+    let script = ScriptBuf::from_bytes(script_bytes.to_vec());
+    let mut instructions = script.instructions();
 
-    if let Some(pos) = find_subsequence(witness_data, &marker) {
-        // Skip the marker bytes
-        let start_pos = pos + marker.len();
-        
-        // Create a script from the remaining data
-        let script = ScriptBuf::from_bytes(witness_data[start_pos..].to_vec());
-        
-        // Parse the script instructions
-        let instructions = script.instructions();
-        
-        // The first instruction after the marker should contain our data
-        for instruction in instructions {
-            if let Ok(Instruction::PushBytes(bytes)) = instruction {
-                return Some(bytes.as_bytes().to_vec());
+    // Walk opcodes until we find OP_FALSE followed by OP_IF
+    let mut prev_was_op_false = false;
+    let mut inside_envelope = false;
+    let mut content = Vec::new();
+
+    while let Some(Ok(instruction)) = instructions.next() {
+        if inside_envelope {
+            match instruction {
+                Instruction::PushBytes(bytes) => {
+                    content.extend_from_slice(bytes.as_bytes());
+                }
+                Instruction::Op(op) if op == opcodes::all::OP_ENDIF => {
+                    break;
+                }
+                _ => {}
+            }
+        } else {
+            match instruction {
+                Instruction::Op(op) if op == opcodes::OP_FALSE => {
+                    prev_was_op_false = true;
+                }
+                Instruction::Op(op) if op == opcodes::all::OP_IF && prev_was_op_false => {
+                    inside_envelope = true;
+                }
+                _ => {
+                    prev_was_op_false = false;
+                }
             }
         }
     }
 
-    None
-}
-
-/// Helper function to find a subsequence in a byte array
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    if content.is_empty() { None } else { Some(content) }
 }
