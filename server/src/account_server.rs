@@ -458,14 +458,7 @@ mod tests {
                 .expect("Failed to create private key for generic account.");
 
             let initial_pk_bytes = generate_test_public_key(&xpriv, 0).serialize().to_vec();
-            // Deterministic address generation for tests, mimicking AccountState::new but with fixed randomness
-            let address = zkcoins_program::hash(
-                &[
-                    initial_pk_bytes,
-                    TEST_ACCOUNT_RANDOM_SEED_FOR_ADDRESS.to_vec(),
-                ]
-                .concat(),
-            );
+            let address = zkcoins_program::hash(&initial_pk_bytes);
 
             TestAccountData {
                 xpriv,
