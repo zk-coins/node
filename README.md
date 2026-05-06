@@ -57,7 +57,7 @@ server/                # Axum REST API
 │   └── publisher.rs   # Taproot Inscription broadcaster (commit/reveal)
 shared/                # Shared types (Commitment, Invoice, ClientAccount)
 program/               # SP1 zkVM circuit types (AccountState, Coin, ProofData)
-│   └── src/merkle/    # SMT + MMR implementations
+├── src/merkle/        # SMT + MMR implementations
 script/                # Prover (real SP1 zkVM — create_account, update_account)
 ```
 
