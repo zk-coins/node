@@ -210,7 +210,8 @@ pub fn extract_inscription_content(script_bytes: &[u8]) -> Option<Vec<u8>> {
             }
         } else {
             match instruction {
-                Instruction::Op(op) if op == opcodes::OP_FALSE => {
+                // OP_FALSE (0x00) is parsed as PushBytes of empty data by the bitcoin crate
+                Instruction::PushBytes(bytes) if bytes.is_empty() => {
                     prev_was_op_false = true;
                 }
                 Instruction::Op(op) if op == opcodes::all::OP_IF && prev_was_op_false => {
