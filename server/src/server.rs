@@ -323,7 +323,9 @@ async fn send_coin_handler(
     // Now that the account_server lock is dropped, we can await safely.
     match send_result {
         Ok(mut coin_proofs) => {
-            let commitment_data = bincode::serialize(&coin_proofs[0].commitment)
+            let commitment = coin_proofs[0].commitment.as_ref()
+                .expect("Commitment must be set after send_coins");
+            let commitment_data = bincode::serialize(commitment)
                 .expect("Failed to serialize commitment");
 
             println!(
@@ -457,7 +459,9 @@ async fn mint_handler(
                 // minting_account_guard is dropped here
             }
 
-            let commitment_data = bincode::serialize(&coin_proofs[0].commitment)
+            let commitment = coin_proofs[0].commitment.as_ref()
+                .expect("Commitment must be set after mint");
+            let commitment_data = bincode::serialize(commitment)
                 .expect("Failed to serialize commitment");
 
             println!(
