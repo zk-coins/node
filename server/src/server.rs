@@ -7,7 +7,9 @@ use axum::{
     Router,
 };
 use bitcoin::{bip32::Xpriv, Network};
+use bitcoin::secp256k1::{self as secp, schnorr::Signature as SchnorrSignature, Message, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use shared::{ClientAccount, Invoice, ProofData};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -21,6 +23,46 @@ use zkcoins_prover::Proof;
 use crate::account_server::{AccountServer, CoinProof};
 use crate::publisher::create_and_broadcast_inscription;
 use crate::NETWORK_CONFIG;
+
+/// Verify a Schnorr signature over send request fields.
+/// Message = SHA256(account_address || recipient || amount || timestamp)
+fn verify_send_signature(
+    request: &SendCoinRequest,
+) -> Result<(), &'static str> {
+    let signature_hex = request.signature.as_deref()
+        .ok_or("Missing signature")?;
+    let timestamp = request.timestamp
+        .ok_or("Missing timestamp")?;
+
+    // Reject requests older than 5 minutes
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now.abs_diff(timestamp) > 300 {
+        return Err("Request timestamp too old or in the future");
+    }
+
+    // Build the message: SHA256(account_address || recipient || amount || timestamp)
+    let mut hasher = Sha256::new();
+    hasher.update(request.account_address.as_bytes());
+    hasher.update(request.recipient.as_bytes());
+    hasher.update(request.amount.to_le_bytes());
+    hasher.update(timestamp.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+
+    let msg = Message::from_digest(hash);
+    let sig_bytes = hex::decode(signature_hex)
+        .map_err(|_| "Invalid signature hex")?;
+    let sig = SchnorrSignature::from_slice(&sig_bytes)
+        .map_err(|_| "Invalid Schnorr signature format")?;
+
+    let (xonly, _parity) = request.public_key.x_only_public_key();
+    let secp = secp::Secp256k1::verification_only();
+
+    secp.verify_schnorr(&sig, &msg, &xonly)
+        .map_err(|_| "Signature verification failed")
+}
 
 /// Lock a mutex, recovering from poison if a previous holder panicked.
 /// This prevents cascade failures where one panic takes down all handlers.
@@ -51,7 +93,6 @@ pub struct AddressesResponse {
     addresses: Vec<String>,
 }
 
-// TODO: Send multiple coins at once.
 #[derive(Deserialize)]
 pub struct SendCoinRequest {
     account_address: String,
@@ -59,6 +100,8 @@ pub struct SendCoinRequest {
     amount: u64,
     public_key: bitcoin::secp256k1::PublicKey,
     next_public_key: bitcoin::secp256k1::PublicKey,
+    signature: Option<String>,
+    timestamp: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -200,6 +243,21 @@ async fn send_coin_handler(
     Json(request): Json<SendCoinRequest>,
 ) -> impl IntoResponse {
     println!("Received send post request...");
+
+    // Verify sender signature if provided (graceful: skip if not present for backwards compat)
+    if request.signature.is_some() {
+        if let Err(e) = verify_send_signature(&request) {
+            eprintln!("Signature verification failed: {}", e);
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(SendCoinResponse {
+                    success: false,
+                    proof_id: None,
+                }),
+            );
+        }
+    }
+
     // Create converted addresses (from_address and to_address)
     let from_address_vec = match hex::decode(request.account_address.trim_start_matches("0x")) {
         Ok(addr) => addr,
