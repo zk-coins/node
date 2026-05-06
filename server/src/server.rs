@@ -540,9 +540,9 @@ pub async fn start_rest_server(
         .route("/info", get(info_handler))
         .route("/balance", get(get_balance_handler))
         .route("/send", post(send_coin_handler))
-        // .route("/address", get(get_address_handler))
-        // .route("/receive", post(receive_coin_handler))
-        // .route("/proof/:id", get(get_proof_handler))
+        .route("/address", get(get_address_handler))
+        .route("/receive", post(receive_coin_handler))
+        .route("/proof/{id}", get(get_proof_handler))
         .route("/mint", post(mint_handler))
         .with_state(state);
 
