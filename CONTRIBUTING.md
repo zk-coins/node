@@ -8,7 +8,7 @@ This guide covers everything you need to develop, test, and deploy the zkCoins b
 git clone https://github.com/zk-coins/server.git
 cd server
 SP1_PROVER=mock cargo run -p server
-# Server starts on http://127.0.0.1:4242
+# Server starts on http://0.0.0.0:4242
 ```
 
 ## Prerequisites
@@ -185,7 +185,7 @@ docker build -t zkcoin/server .
 docker run -p 4242:4242 \
   --network bitcoin \
   -e SP1_PROVER=mock \
-  -e ESPLORA_URL=http://bitcoind-mainnet:8332 \
+  -e ESPLORA_URL=http://electrs-mainnet:3000 \
   zkcoin/server
 ```
 
@@ -193,7 +193,7 @@ The Dockerfile removes the `script` crate from the workspace (via `sed`) to avoi
 
 ### Bitcoin Node
 
-The server needs a Bitcoin node. In production, it connects via the shared Docker network `bitcoin` to `bitcoind-mainnet:8332`. Requirements:
+The server needs a Bitcoin node with an Esplora-compatible indexer (electrs). In production, it connects via the shared Docker network `bitcoin` to `electrs-mainnet:3000` (DEV: `electrs-mutinynet:3000`). The underlying bitcoind requires:
 - `txindex=1`
 - `rest=1`
 - `server=1`

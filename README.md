@@ -18,7 +18,7 @@ Rust/Axum backend for [zkcoins.app](https://zkcoins.app) — account management,
 | ZK Proofs | SP1 zkVM | Write proofs in standard Rust, no DSL |
 | Data structures | SMT + MMR | Non-inclusion proofs + append-only history |
 | Bitcoin | Taproot Inscriptions | 64-byte nullifiers, Esplora API scanning |
-| Bitcoin node | bitcoind-mainnet | Shared Docker network `bitcoin`, port 8332 |
+| Bitcoin index | electrs (Esplora) | Esplora REST API via shared Docker network `bitcoin` |
 
 Full rationale: [docs.zkcoins.app/tech-decisions](https://docs.zkcoins.app/tech-decisions)
 
@@ -36,9 +36,11 @@ SP1_PROVER=mock cargo run -p server
 | Endpoint | Method | Description | Response |
 |---|---|---|---|
 | `/health` | GET | Health check | `ok` (200) |
+| `/api/info` | GET | Network info | `{ network }` |
 | `/api/mint` | POST | Mint coins (faucet) | `{ proof_id }` |
 | `/api/send` | POST | Transfer coins | `{ proof_id }` |
 | `/api/balance?address=<hex>` | GET | Query balance | `{ balance }` |
+| `/api/address` | GET | Generate receive address | `{ address, public_key }` |
 | `/api/proof/:id` | GET | Download coin proof | Binary |
 
 ## Project Structure
@@ -78,7 +80,7 @@ docker build -t zkcoin/server .
 docker run -p 4242:4242 \
   --network bitcoin \
   -e SP1_PROVER=mock \
-  -e ESPLORA_URL=http://bitcoind-mainnet:8332 \
+  -e ESPLORA_URL=http://electrs-mainnet:3000 \
   zkcoin/server
 ```
 
@@ -112,7 +114,7 @@ Skip stages only with concrete latency or cost data, not assumptions.
 - [x] Real SP1 proofs (CPU prover live on DEV/PRD)
 - [ ] GPU acceleration (`SP1_PROVER=cuda`) or Succinct Prover Network
 - [ ] Explorer endpoints (`/api/stats`, `/api/nullifiers`)
-- [ ] Publisher key from environment variable (currently hardcoded)
+- [x] Publisher key from environment variable
 - [ ] Light client support
 
 ## Related
