@@ -109,4 +109,22 @@ mod tests {
         store.claim("carol_x", [3u8; 32]).unwrap();
         store.claim("dave.btc", [4u8; 32]).unwrap();
     }
+
+    #[test]
+    fn save_and_load_roundtrip() {
+        let path = "/tmp/zkcoins-test-usernames.bin";
+        let mut store = UsernameStore::new();
+        store.claim("alice", [1u8; 32]).unwrap();
+        store.claim("bob", [2u8; 32]).unwrap();
+
+        store.save_to_file(path).unwrap();
+        let loaded = UsernameStore::load_from_file(path).unwrap();
+
+        assert_eq!(loaded.resolve("alice"), Some([1u8; 32]));
+        assert_eq!(loaded.resolve("bob"), Some([2u8; 32]));
+        assert_eq!(loaded.get_username(&[1u8; 32]), Some("alice"));
+        assert_eq!(loaded.resolve("nonexistent"), None);
+
+        std::fs::remove_file(path).ok();
+    }
 }

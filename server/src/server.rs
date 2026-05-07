@@ -1706,4 +1706,181 @@ mod tests {
             "commit with non-existent proof_id must return 404"
         );
     }
+
+    // --- verify_send_signature tests ---
+
+    #[test]
+    fn send_signature_rejects_missing_signature() {
+        let request = SendCoinRequest {
+            account_address: "0x".to_string() + &hex::encode([1u8; 32]),
+            recipient: "0x".to_string() + &hex::encode([2u8; 32]),
+            amount: 100,
+            public_key: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                .parse()
+                .unwrap(),
+            next_public_key: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                .parse()
+                .unwrap(),
+            prev_commitment_pubkey: None,
+            signature: None,
+            timestamp: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            ),
+        };
+        let result = verify_send_signature(&request);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Missing signature"));
+    }
+
+    #[test]
+    fn send_signature_rejects_missing_timestamp() {
+        let request = SendCoinRequest {
+            account_address: "0x".to_string() + &hex::encode([1u8; 32]),
+            recipient: "0x".to_string() + &hex::encode([2u8; 32]),
+            amount: 100,
+            public_key: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                .parse()
+                .unwrap(),
+            next_public_key: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                .parse()
+                .unwrap(),
+            prev_commitment_pubkey: None,
+            signature: Some("ab".repeat(64)),
+            timestamp: None,
+        };
+        let result = verify_send_signature(&request);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Missing timestamp"));
+    }
+
+    #[test]
+    fn send_signature_rejects_expired_timestamp() {
+        let old_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 600; // 10 minutes ago
+        let request = SendCoinRequest {
+            account_address: "0x".to_string() + &hex::encode([1u8; 32]),
+            recipient: "0x".to_string() + &hex::encode([2u8; 32]),
+            amount: 100,
+            public_key: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                .parse()
+                .unwrap(),
+            next_public_key: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                .parse()
+                .unwrap(),
+            prev_commitment_pubkey: None,
+            signature: Some("ab".repeat(64)),
+            timestamp: Some(old_timestamp),
+        };
+        let result = verify_send_signature(&request);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("timestamp"));
+    }
+
+    #[test]
+    fn send_signature_rejects_invalid_hex() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let request = SendCoinRequest {
+            account_address: "0x".to_string() + &hex::encode([1u8; 32]),
+            recipient: "0x".to_string() + &hex::encode([2u8; 32]),
+            amount: 100,
+            public_key: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                .parse()
+                .unwrap(),
+            next_public_key: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                .parse()
+                .unwrap(),
+            prev_commitment_pubkey: None,
+            signature: Some("not_valid_hex".to_string()),
+            timestamp: Some(now),
+        };
+        let result = verify_send_signature(&request);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid signature hex"));
+    }
+
+    #[test]
+    fn send_signature_rejects_wrong_signature() {
+        use bitcoin::secp256k1::SecretKey;
+
+        let secp = secp::Secp256k1::new();
+        let secret = SecretKey::from_slice(&[1u8; 32]).unwrap();
+        let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Sign a DIFFERENT message than what verify_send_signature expects
+        let wrong_msg = Message::from_digest([0u8; 32]);
+        let (xonly, _) = public_key.x_only_public_key();
+        let keypair = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &secret);
+        let sig = secp.sign_schnorr(&wrong_msg, &keypair);
+
+        let request = SendCoinRequest {
+            account_address: "0x".to_string() + &hex::encode([1u8; 32]),
+            recipient: "0x".to_string() + &hex::encode([2u8; 32]),
+            amount: 100,
+            public_key,
+            next_public_key: public_key,
+            prev_commitment_pubkey: None,
+            signature: Some(hex::encode(sig.serialize())),
+            timestamp: Some(now),
+        };
+        let result = verify_send_signature(&request);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Signature verification failed"));
+    }
+
+    #[test]
+    fn send_signature_accepts_valid_signature() {
+        use bitcoin::secp256k1::SecretKey;
+
+        let secp = secp::Secp256k1::new();
+        let secret = SecretKey::from_slice(&[1u8; 32]).unwrap();
+        let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+
+        let account_address = "0x".to_string() + &hex::encode([1u8; 32]);
+        let recipient = "0x".to_string() + &hex::encode([2u8; 32]);
+        let amount: u64 = 100;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Build the exact same message as verify_send_signature
+        let mut hasher = Sha256::new();
+        hasher.update(account_address.as_bytes());
+        hasher.update(recipient.as_bytes());
+        hasher.update(amount.to_le_bytes());
+        hasher.update(now.to_le_bytes());
+        let hash: [u8; 32] = hasher.finalize().into();
+
+        let msg = Message::from_digest(hash);
+        let keypair = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &secret);
+        let sig = secp.sign_schnorr(&msg, &keypair);
+
+        let request = SendCoinRequest {
+            account_address,
+            recipient,
+            amount,
+            public_key,
+            next_public_key: public_key,
+            prev_commitment_pubkey: None,
+            signature: Some(hex::encode(sig.serialize())),
+            timestamp: Some(now),
+        };
+        assert!(verify_send_signature(&request).is_ok());
+    }
 }
