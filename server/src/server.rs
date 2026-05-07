@@ -341,7 +341,15 @@ async fn send_coin_handler(
                 println!("No commitment on coin proof — client must submit commitment separately");
             }
 
-            let proof_id = state.proof_store.add_proof(coin_proofs.pop().unwrap());
+            let proof_id = match coin_proofs.pop() {
+                Some(proof) => state.proof_store.add_proof(proof),
+                None => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(SendCoinResponse { success: false, proof_id: None }),
+                    );
+                }
+            };
             (
                 StatusCode::OK,
                 Json(SendCoinResponse {
@@ -484,14 +492,24 @@ async fn mint_handler(
             {
                 let mut account_server_guard = lock_or_recover(&state.account_server);
                 for coin_proof in &coin_proofs {
-                    let _ = account_server_guard.receive_coin(coin_proof.clone());
+                    if let Err(e) = account_server_guard.receive_coin(coin_proof.clone()) {
+                        eprintln!("Failed to receive minted coin: {}", e);
+                    }
                 }
                 if let Err(e) = account_server_guard.save_to_file(&state.accounts_path) {
                     eprintln!("Failed to persist accounts after mint: {}", e);
                 }
             }
 
-            let proof_id = state.proof_store.add_proof(coin_proofs.pop().unwrap());
+            let proof_id = match coin_proofs.pop() {
+                Some(proof) => state.proof_store.add_proof(proof),
+                None => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(SendCoinResponse { success: false, proof_id: None }),
+                    );
+                }
+            };
             (
                 StatusCode::OK,
                 Json(SendCoinResponse {

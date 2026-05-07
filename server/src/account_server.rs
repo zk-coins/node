@@ -131,12 +131,12 @@ impl AccountServer {
         let proof_data = coin_proof.proof.public_values.clone().read::<ProofData>();
 
         // Verify the inclusion of the coin in the proof.
-        // TODO: Return an err and also verify the proof verification itself. (Dry-run the
-        // aggregation)
-        // TODO: Verify that the commitment was not included in our state.
-        coin_proof
+        if !coin_proof
             .inclusion_proof
-            .verify(coin_proof.coin.identifier, proof_data.output_coins_root);
+            .verify(coin_proof.coin.identifier, proof_data.output_coins_root)
+        {
+            return Err("Coin inclusion proof verification failed");
+        }
 
         println!("Receiving coin for address: {:?}", coin_proof.coin.recipient);
         // Get the recipient account
