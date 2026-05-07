@@ -926,16 +926,36 @@ async fn claim_username_handler(
         .into_response()
 }
 
+/// Resolve an identifier to an address. Checks the username store first,
+/// then falls back to hex-prefix matching against known account addresses.
+fn resolve_identifier(state: &AppState, identifier: &str) -> Option<([u8; 32], String)> {
+    let normalized = identifier.to_lowercase();
+
+    // 1. Check custom username
+    let username_store = lock_or_recover(&state.username_store);
+    if let Some(address) = username_store.resolve(&normalized) {
+        return Some((address, normalized));
+    }
+    drop(username_store);
+
+    // 2. Check hex prefix against known addresses
+    let account_server = lock_or_recover(&state.account_server);
+    account_server
+        .get_addresses()
+        .into_iter()
+        .find(|addr| hex::encode(addr).starts_with(&normalized))
+        .map(|addr| (addr, normalized))
+}
+
 async fn resolve_username_handler(
     State(state): State<AppState>,
     Path(username): Path<String>,
 ) -> impl IntoResponse {
-    let username_store = lock_or_recover(&state.username_store);
-    match username_store.resolve(&username) {
-        Some(address) => (
+    match resolve_identifier(&state, &username) {
+        Some((address, resolved_name)) => (
             StatusCode::OK,
             Json(UsernameResponse {
-                username: username.to_lowercase(),
+                username: resolved_name,
                 address: format!("0x{}", hex::encode(address)),
             }),
         )
@@ -956,8 +976,7 @@ async fn lnurlp_handler(
     Path(username): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let username_store = lock_or_recover(&state.username_store);
-    if username_store.resolve(&username).is_none() {
+    if resolve_identifier(&state, &username).is_none() {
         return (
             StatusCode::NOT_FOUND,
             Json(LnurlErrorResponse {
