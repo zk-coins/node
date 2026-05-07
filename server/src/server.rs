@@ -6,10 +6,13 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use bitcoin::secp256k1::{
+    self as secp, schnorr::Signature as SchnorrSignature, Message, XOnlyPublicKey,
+};
 use bitcoin::{bip32::Xpriv, Network};
-use bitcoin::secp256k1::{self as secp, schnorr::Signature as SchnorrSignature, Message, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use shared::commitment::Commitment;
 use shared::{ClientAccount, Invoice, ProofData};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -26,13 +29,9 @@ use crate::NETWORK_CONFIG;
 
 /// Verify a Schnorr signature over send request fields.
 /// Message = SHA256(account_address || recipient || amount || timestamp)
-fn verify_send_signature(
-    request: &SendCoinRequest,
-) -> Result<(), &'static str> {
-    let signature_hex = request.signature.as_deref()
-        .ok_or("Missing signature")?;
-    let timestamp = request.timestamp
-        .ok_or("Missing timestamp")?;
+fn verify_send_signature(request: &SendCoinRequest) -> Result<(), &'static str> {
+    let signature_hex = request.signature.as_deref().ok_or("Missing signature")?;
+    let timestamp = request.timestamp.ok_or("Missing timestamp")?;
 
     // Reject requests older than 5 minutes
     let now = std::time::SystemTime::now()
@@ -52,10 +51,9 @@ fn verify_send_signature(
     let hash: [u8; 32] = hasher.finalize().into();
 
     let msg = Message::from_digest(hash);
-    let sig_bytes = hex::decode(signature_hex)
-        .map_err(|_| "Invalid signature hex")?;
-    let sig = SchnorrSignature::from_slice(&sig_bytes)
-        .map_err(|_| "Invalid Schnorr signature format")?;
+    let sig_bytes = hex::decode(signature_hex).map_err(|_| "Invalid signature hex")?;
+    let sig =
+        SchnorrSignature::from_slice(&sig_bytes).map_err(|_| "Invalid Schnorr signature format")?;
 
     let (xonly, _parity) = request.public_key.x_only_public_key();
     let secp = secp::Secp256k1::verification_only();
@@ -143,10 +141,27 @@ impl ProofStore {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct SendCoinResponse {
     success: bool,
-    proof_id: Option<u64>, // Store a reference ID instead of the proof itself
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proof_id: Option<u64>,
+    /// Hex-encoded hash fields the client needs to create a commitment (only set for user sends).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_state_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_coins_root: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct CommitRequest {
+    proof_id: u64,
+    /// Hex-encoded compressed public key (33 bytes) that signed the commitment.
+    public_key: bitcoin::secp256k1::PublicKey,
+    /// Hex-encoded Schnorr signature (64 bytes).
+    signature: String,
+    /// Hex-encoded message that was signed (the concatenation of account_state_hash + output_coins_root).
+    message: String,
 }
 
 #[derive(Serialize)]
@@ -221,20 +236,14 @@ async fn receive_coin_handler(
             match account_server.receive_coin(coin_proof) {
                 Ok(_) => Json(SendCoinResponse {
                     success: true,
-                    proof_id: None,
+                    ..Default::default()
                 }),
-                Err(_) => Json(SendCoinResponse {
-                    success: false,
-                    proof_id: None,
-                }),
+                Err(_) => Json(SendCoinResponse::default()),
             }
         }
         Err(e) => {
             eprintln!("Failed to deserialize proof with commitment: {}", e);
-            Json(SendCoinResponse {
-                success: false,
-                proof_id: None,
-            })
+            Json(SendCoinResponse::default())
         }
     }
 }
@@ -249,13 +258,7 @@ async fn send_coin_handler(
     if request.signature.is_some() {
         if let Err(e) = verify_send_signature(&request) {
             eprintln!("Signature verification failed: {}", e);
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(SendCoinResponse {
-                    success: false,
-                    proof_id: None,
-                }),
-            );
+            return (StatusCode::UNAUTHORIZED, Json(SendCoinResponse::default()));
         }
     }
 
@@ -265,10 +268,7 @@ async fn send_coin_handler(
         Err(_) => {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(SendCoinResponse {
-                    success: false,
-                    proof_id: None,
-                }),
+                Json(SendCoinResponse::default()),
             )
         }
     };
@@ -277,10 +277,7 @@ async fn send_coin_handler(
         Err(_) => {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(SendCoinResponse {
-                    success: false,
-                    proof_id: None,
-                }),
+                Json(SendCoinResponse::default()),
             )
         }
     };
@@ -294,10 +291,7 @@ async fn send_coin_handler(
     } else {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(SendCoinResponse {
-                success: false,
-                proof_id: None,
-            }),
+            Json(SendCoinResponse::default()),
         );
     }
 
@@ -325,20 +319,32 @@ async fn send_coin_handler(
     // Now that the account_server lock is dropped, we can await safely.
     match send_result {
         Ok(mut coin_proofs) => {
-            // For user sends, the commitment must be signed by the sender's private key.
-            // The server doesn't have it, so commitment broadcasting is deferred:
-            // the client will submit the signed commitment via a separate request.
+            // Extract proof data so the client can create a commitment
+            let (ash_hex, ocr_hex) = {
+                let proof_data =
+                    bincode::deserialize::<ProofData>(&coin_proofs[0].proof.public_values.to_vec());
+                match proof_data {
+                    Ok(pd) => (
+                        Some(hex::encode(pd.account_state_hash)),
+                        Some(hex::encode(pd.output_coins_root)),
+                    ),
+                    Err(e) => {
+                        eprintln!("Failed to deserialize proof data: {}", e);
+                        (None, None)
+                    }
+                }
+            };
+
+            // If commitment is already set (e.g. mint flow), broadcast immediately
             if let Some(commitment) = coin_proofs[0].commitment.as_ref() {
-                let commitment_data = bincode::serialize(commitment)
-                    .expect("Failed to serialize commitment");
-                println!("Sending commitment data with size: {} bytes", commitment_data.len());
+                let commitment_data =
+                    bincode::serialize(commitment).expect("Failed to serialize commitment");
+                println!("Broadcasting commitment ({} bytes)", commitment_data.len());
                 if let Err(err) =
                     create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG).await
                 {
                     eprintln!("Error broadcasting inscription: {}", err);
                 }
-            } else {
-                println!("No commitment on coin proof — client must submit commitment separately");
             }
 
             let proof_id = match coin_proofs.pop() {
@@ -346,7 +352,12 @@ async fn send_coin_handler(
                 None => {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(SendCoinResponse { success: false, proof_id: None }),
+                        Json(SendCoinResponse {
+                            success: false,
+                            proof_id: None,
+                            account_state_hash: None,
+                            output_coins_root: None,
+                        }),
                     );
                 }
             };
@@ -355,6 +366,8 @@ async fn send_coin_handler(
                 Json(SendCoinResponse {
                     success: true,
                     proof_id: Some(proof_id),
+                    account_state_hash: ash_hex,
+                    output_coins_root: ocr_hex,
                 }),
             )
         }
@@ -363,6 +376,8 @@ async fn send_coin_handler(
             Json(SendCoinResponse {
                 success: false,
                 proof_id: None,
+                account_state_hash: None,
+                output_coins_root: None,
             }),
         ),
     }
@@ -378,10 +393,7 @@ async fn mint_handler(
         Err(_) => {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(SendCoinResponse {
-                    success: false,
-                    proof_id: None,
-                }),
+                Json(SendCoinResponse::default()),
             )
         }
     };
@@ -392,10 +404,7 @@ async fn mint_handler(
     } else {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(SendCoinResponse {
-                success: false,
-                proof_id: None,
-            }),
+            Json(SendCoinResponse::default()),
         );
     }
 
@@ -425,7 +434,7 @@ async fn mint_handler(
                 eprintln!("Minting account not found: {:?}", e);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(SendCoinResponse { success: false, proof_id: None }),
+                    Json(SendCoinResponse::default()),
                 );
             }
         };
@@ -461,7 +470,7 @@ async fn mint_handler(
                         eprintln!("Failed to deserialize proof data: {}", e);
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(SendCoinResponse { success: false, proof_id: None }),
+                            Json(SendCoinResponse::default()),
                         );
                     }
                 };
@@ -472,10 +481,12 @@ async fn mint_handler(
                 // minting_account_guard is dropped here
             }
 
-            let commitment = coin_proofs[0].commitment.as_ref()
+            let commitment = coin_proofs[0]
+                .commitment
+                .as_ref()
                 .expect("Commitment must be set after mint");
-            let commitment_data = bincode::serialize(commitment)
-                .expect("Failed to serialize commitment");
+            let commitment_data =
+                bincode::serialize(commitment).expect("Failed to serialize commitment");
 
             println!(
                 "Sending commitment data with size: {} bytes",
@@ -506,7 +517,7 @@ async fn mint_handler(
                 None => {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(SendCoinResponse { success: false, proof_id: None }),
+                        Json(SendCoinResponse::default()),
                     );
                 }
             };
@@ -515,16 +526,12 @@ async fn mint_handler(
                 Json(SendCoinResponse {
                     success: true,
                     proof_id: Some(proof_id),
+                    account_state_hash: None,
+                    output_coins_root: None,
                 }),
             )
         }
-        Err(_) => (
-            StatusCode::OK,
-            Json(SendCoinResponse {
-                success: false,
-                proof_id: None,
-            }),
-        ),
+        Err(_) => (StatusCode::OK, Json(SendCoinResponse::default())),
     }
 }
 
@@ -559,6 +566,125 @@ async fn get_proof_handler(
     }
 }
 
+/// Accepts a client-signed commitment for a previously generated proof.
+/// Broadcasts the commitment as a Taproot inscription and delivers the coin to the recipient.
+async fn commit_handler(
+    State(state): State<AppState>,
+    Json(request): Json<CommitRequest>,
+) -> impl IntoResponse {
+    // Retrieve the stored coin proof
+    let coin_proof = match state.proof_store.get_proof(request.proof_id) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(SendCoinResponse {
+                    success: false,
+                    proof_id: None,
+                    account_state_hash: None,
+                    output_coins_root: None,
+                }),
+            );
+        }
+    };
+
+    // Reconstruct the Commitment from the client-provided fields
+    let message_bytes = match hex::decode(&request.message) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(SendCoinResponse {
+                    success: false,
+                    proof_id: None,
+                    account_state_hash: None,
+                    output_coins_root: None,
+                }),
+            );
+        }
+    };
+    let sig_bytes = match hex::decode(&request.signature) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(SendCoinResponse {
+                    success: false,
+                    proof_id: None,
+                    account_state_hash: None,
+                    output_coins_root: None,
+                }),
+            );
+        }
+    };
+    let signature = match bitcoin::secp256k1::schnorr::Signature::from_slice(&sig_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(SendCoinResponse {
+                    success: false,
+                    proof_id: None,
+                    account_state_hash: None,
+                    output_coins_root: None,
+                }),
+            );
+        }
+    };
+
+    let commitment = Commitment {
+        public_key: request.public_key,
+        signature,
+        message: message_bytes,
+    };
+
+    // Verify the commitment
+    if !commitment.verify() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(SendCoinResponse {
+                success: false,
+                proof_id: None,
+                account_state_hash: None,
+                output_coins_root: None,
+            }),
+        );
+    }
+
+    // Broadcast the inscription
+    let commitment_data = bincode::serialize(&commitment).expect("Failed to serialize commitment");
+    println!(
+        "Broadcasting user commitment ({} bytes)",
+        commitment_data.len()
+    );
+    if let Err(err) = create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG).await {
+        eprintln!("Error broadcasting inscription: {}", err);
+    }
+
+    // Deliver the coin to the recipient
+    let mut updated_proof = coin_proof;
+    updated_proof.commitment = Some(commitment);
+    {
+        let mut account_server_guard = lock_or_recover(&state.account_server);
+        if let Err(e) = account_server_guard.receive_coin(updated_proof) {
+            eprintln!("Failed to receive coin after commit: {}", e);
+        }
+        if let Err(e) = account_server_guard.save_to_file(&state.accounts_path) {
+            eprintln!("Failed to persist accounts after commit: {}", e);
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(SendCoinResponse {
+            success: true,
+            proof_id: Some(request.proof_id),
+            account_state_hash: None,
+            output_coins_root: None,
+        }),
+    )
+}
+
 async fn info_handler() -> impl IntoResponse {
     Json(InfoResponse {
         network: NETWORK_CONFIG.network_name.clone(),
@@ -584,8 +710,8 @@ pub async fn start_rest_server(
 
     let minting_account = {
         let secret = include_bytes!("../minting_secret.bin");
-        let private_key =
-            Xpriv::new_master(NETWORK_CONFIG.network(), secret).expect("Failed to create private key.");
+        let private_key = Xpriv::new_master(NETWORK_CONFIG.network(), secret)
+            .expect("Failed to create private key.");
         println!(
             "Set MINTING_ADDRESS to {:?}",
             &zkcoins_program::MINTING_ADDRESS
@@ -608,10 +734,7 @@ pub async fn start_rest_server(
     };
     {
         let mut account_server_guard = state.account_server.lock().unwrap();
-        if account_server_guard
-            .get_minting_account_address()
-            .is_err()
-        {
+        if account_server_guard.get_minting_account_address().is_err() {
             let mut minting_server_account = crate::account_server::Account::new();
             minting_server_account.balance = u64::MAX;
             account_server_guard
@@ -631,6 +754,7 @@ pub async fn start_rest_server(
         .route("/receive", post(receive_coin_handler))
         .route("/proof/{id}", get(get_proof_handler))
         .route("/mint", post(mint_handler))
+        .route("/commit", post(commit_handler))
         .with_state(state);
 
     // CORS: allow frontend origins

@@ -1,10 +1,10 @@
 use bitcoin::secp256k1::{
-    self, schnorr::Signature, Keypair, Message, PublicKey, Secp256k1, SecretKey
+    self, schnorr::Signature, Keypair, Message, PublicKey, Secp256k1, SecretKey,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use zkcoins_program::merkle::HashDigest;
 use std::fmt;
+use zkcoins_program::merkle::HashDigest;
 
 use crate::SECP256K1;
 

@@ -29,7 +29,11 @@ pub struct EsploraConfig {
 
 impl EsploraConfig {
     pub fn network(&self) -> Network {
-        if self.is_mainnet { Network::Bitcoin } else { Network::Signet }
+        if self.is_mainnet {
+            Network::Bitcoin
+        } else {
+            Network::Signet
+        }
     }
 }
 

@@ -1,8 +1,19 @@
-use bitcoin::{bip32::{ChildNumber, Xpriv, Xpub}, key::{rand::{rngs::OsRng, RngCore}, Secp256k1}, secp256k1::{All, PublicKey, SecretKey}, Network};
+use bitcoin::{
+    bip32::{ChildNumber, Xpriv, Xpub},
+    key::{
+        rand::{rngs::OsRng, RngCore},
+        Secp256k1,
+    },
+    secp256k1::{All, PublicKey, SecretKey},
+    Network,
+};
 use commitment::Commitment;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
-use zkcoins_program::{merkle::{hash_concat, HashDigest}, AccountState, Amount};
+use zkcoins_program::{
+    merkle::{hash_concat, HashDigest},
+    AccountState, Amount,
+};
 
 pub mod commitment;
 pub use zkcoins_program::ProofData;
@@ -55,18 +66,18 @@ impl ClientAccount {
             .private_key
     }
 
-    pub fn create_commitment(&self, account_state_hash: &HashDigest, output_coins_root: &HashDigest) -> Commitment {
+    pub fn create_commitment(
+        &self,
+        account_state_hash: &HashDigest,
+        output_coins_root: &HashDigest,
+    ) -> Commitment {
         Commitment::new(
             &self.current_private_key(),
-            hash_concat(
-                account_state_hash,
-                output_coins_root,
-            )
-            .to_vec(),
+            hash_concat(account_state_hash, output_coins_root).to_vec(),
         )
         .expect("Should be able to create commitment")
     }
-    
+
     pub fn generate_public_key(&self, index: u32) -> PublicKey {
         // WARNING: LEAKING THE MASTER PUBLIC KEY IS EQUIVALENT TO LEAKING THE PRIVATE KEY!
         Xpub::from_priv(&SECP256K1, &self.private_key)
@@ -81,11 +92,7 @@ impl ClientAccount {
             num_pubkeys: 0,
             private_key,
         };
-        let account = AccountState::new(
-            client_account.generate_public_key(0)
-                .serialize()
-                .to_vec(),
-        );
+        let account = AccountState::new(client_account.generate_public_key(0).serialize().to_vec());
         client_account.address = account.owner;
         client_account
     }

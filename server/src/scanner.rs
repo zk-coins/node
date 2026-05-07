@@ -1,14 +1,14 @@
 use crate::publisher::{EsploraConfig, INSCRIPTION_MARKER_PREFIX};
+use bitcoin::blockdata::opcodes;
 use bitcoin::hashes::Hash;
+use bitcoin::script::Instruction;
+use bitcoin::script::ScriptBuf;
 use bitcoin::{BlockHash, Transaction, Txid};
 use esplora_client::r#async::DefaultSleeper;
 use esplora_client::{AsyncClient, Builder, Error as EsploraError, Sleeper};
 use std::collections::HashSet;
-use std::time::Duration;
-use bitcoin::blockdata::opcodes;
-use bitcoin::script::Instruction;
-use bitcoin::script::ScriptBuf;
 use std::error::Error as StdError;
+use std::time::Duration;
 
 /// Type alias for the inscription callback function
 type InscriptionCallback = dyn Fn(Vec<u8>, BlockHash) + Send + Sync + 'static;
@@ -40,7 +40,7 @@ impl<S: Sleeper> InscriptionScanner<S> {
         loop {
             // Update the current block hash
             self.current_block_hash = Some(current_hash);
-            
+
             // Skip if we've already processed this block
             if self.processed_blocks.contains(&current_hash) {
                 // We've reached a block we've already processed
@@ -174,7 +174,7 @@ pub async fn scan_for_inscriptions(
     let builder = Builder::new(&config.url);
     let client = AsyncClient::<DefaultSleeper>::from_builder(builder)?;
     let mut scanner = InscriptionScanner::new(client);
-    
+
     scanner.scan_from_block(start_block_hash, callback).await?;
 
     Ok(())
@@ -224,5 +224,9 @@ pub fn extract_inscription_content(script_bytes: &[u8]) -> Option<Vec<u8>> {
         }
     }
 
-    if content.is_empty() { None } else { Some(content) }
+    if content.is_empty() {
+        None
+    } else {
+        Some(content)
+    }
 }

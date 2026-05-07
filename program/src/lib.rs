@@ -5,7 +5,8 @@ use sha2::{Digest, Sha256};
 
 use derive_builder::Builder;
 use merkle::{
-    sparse_merkle_tree::{InclusionProof, NonInclusionProof, DEFAULT_HASHES}, HashDigest
+    sparse_merkle_tree::{InclusionProof, NonInclusionProof, DEFAULT_HASHES},
+    HashDigest,
 };
 
 pub type Amount = u64;
@@ -67,7 +68,10 @@ impl CommitmentMerkleProofs {
     }
 }
 
-pub const MINTING_ADDRESS: HashDigest = [175, 83, 161, 5, 16, 78, 44, 44, 237, 20, 140, 19, 48, 116, 86, 210, 247, 116, 223, 190, 106, 191, 59, 198, 226, 248, 55, 102, 143, 24, 155, 216];
+pub const MINTING_ADDRESS: HashDigest = [
+    175, 83, 161, 5, 16, 78, 44, 44, 237, 20, 140, 19, 48, 116, 86, 210, 247, 116, 223, 190, 106,
+    191, 59, 198, 226, 248, 55, 102, 143, 24, 155, 216,
+];
 
 pub fn hash(data: &[u8]) -> HashDigest {
     Sha256::digest(data).into()
@@ -154,7 +158,7 @@ impl AccountState {
 
         self.balance = match self.balance.checked_add(coin.amount) {
             Some(balance) => balance,
-            None => return Err("Receiving coin causes an overflow")
+            None => return Err("Receiving coin causes an overflow"),
         };
         Ok(self)
     }
@@ -181,7 +185,7 @@ impl AccountState {
             // Apply coin.
             self.balance = match self.balance.checked_sub(coin.amount) {
                 Some(balance) => balance,
-                None => return Err("Balance too small to create Coin.")
+                None => return Err("Balance too small to create Coin."),
             };
         }
 

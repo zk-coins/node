@@ -1,5 +1,5 @@
-use std::sync::{Arc, Mutex, MutexGuard};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::state::State;
 use bitcoin::bip32::Xpriv;
@@ -138,7 +138,10 @@ impl AccountServer {
             return Err("Coin inclusion proof verification failed");
         }
 
-        println!("Receiving coin for address: {:?}", coin_proof.coin.recipient);
+        println!(
+            "Receiving coin for address: {:?}",
+            coin_proof.coin.recipient
+        );
         // Get the recipient account
         let mut account = self
             .accounts
@@ -160,10 +163,18 @@ impl AccountServer {
 
         // Reject duplicate coins (replay protection)
         let coin_id = coin_proof.coin.identifier;
-        if account.coin_queue.iter().any(|cp| cp.coin.identifier == coin_id) {
+        if account
+            .coin_queue
+            .iter()
+            .any(|cp| cp.coin.identifier == coin_id)
+        {
             return Err("Coin already in queue (duplicate)");
         }
-        if account.coin_history.generate_inclusion_proof(&coin_id).is_ok() {
+        if account
+            .coin_history
+            .generate_inclusion_proof(&coin_id)
+            .is_ok()
+        {
             return Err("Coin already spent (replay)");
         }
 
@@ -222,7 +233,10 @@ impl AccountServer {
         next_public_key: PublicKey,
         prev_commitment_pubkey: Option<PublicKey>,
     ) -> Result<Vec<CoinProof>, &'static str> {
-        let state = &self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = &self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Check if the account balance is enough
         let balance = self.get_account_balance(&account_address)?;
         let invoiced_amount = invoices.iter().fold(0, |acc, x| acc + x.amount);
@@ -319,10 +333,7 @@ impl AccountServer {
             .out_coins(out_coins.clone())
             .out_coin_proofs(out_coin_proofs);
 
-        let received_proofs: Vec<_> = account.coin_queue
-            .iter()
-            .map(|x| x.proof.clone())
-            .collect();
+        let received_proofs: Vec<_> = account.coin_queue.iter().map(|x| x.proof.clone()).collect();
 
         let proof = match &account.proof {
             Some(account_proof) => {
@@ -335,8 +346,11 @@ impl AccountServer {
                 )?;
                 proof_hints_builder.prev_proof_history_proofs(Some(merkle_proofs));
                 proof_hints_builder.proof_type(ProofType::AccountUpdateProof);
-                self.prover
-                    .update_account(proof_hints_builder, account_proof.clone(), received_proofs)?
+                self.prover.update_account(
+                    proof_hints_builder,
+                    account_proof.clone(),
+                    received_proofs,
+                )?
             }
             None => self
                 .prover
@@ -482,7 +496,8 @@ mod tests {
                 None
             };
 
-            let mut coin_proofs = server.send_coins(invoices, self.address, current_pk, next_pk, prev_pk)?;
+            let mut coin_proofs =
+                server.send_coins(invoices, self.address, current_pk, next_pk, prev_pk)?;
 
             // The key used for the commitment corresponds to current_pk
             let signing_secret_key = derive_test_secret_key(&self.xpriv, self.num_pubkeys);
