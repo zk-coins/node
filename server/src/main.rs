@@ -3,6 +3,7 @@ mod publisher;
 mod scanner;
 mod server;
 mod state;
+mod username;
 
 use crate::publisher::EsploraConfig;
 use crate::scanner::scan_for_inscriptions;
@@ -20,6 +21,7 @@ const SMT_PATH: &str = "smt.bin";
 const MMR_PATH: &str = "mmr.bin";
 const LATEST_BLOCK_PATH: &str = "latest_block.bin";
 const ACCOUNTS_PATH: &str = "accounts.bin";
+const USERNAMES_PATH: &str = "usernames.bin";
 const ACCOUNT_SERVER_ADDR: &str = "0.0.0.0:4242";
 //const START_BLOCK_HASH: &str = "000000f43ca5c99c54c4738878fe1c5cca07691dc614a2734b73aa78ca868fb8";
 
@@ -110,12 +112,26 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             }
         };
 
+    // Load or create UsernameStore
+    let username_store = match username::UsernameStore::load_from_file(USERNAMES_PATH) {
+        Ok(store) => {
+            println!("Loaded existing usernames from {}", USERNAMES_PATH);
+            store
+        }
+        Err(_) => {
+            println!("No usernames file found, creating new UsernameStore");
+            username::UsernameStore::new()
+        }
+    };
+
     // Spawn the account_server as a separate task
     tokio::spawn(async move {
         if let Err(e) = start_rest_server(
             account_server,
+            username_store,
             ACCOUNT_SERVER_ADDR,
             ACCOUNTS_PATH.to_string(),
+            USERNAMES_PATH.to_string(),
         )
         .await
         {

@@ -22,6 +22,7 @@ use zkcoins_prover::Proof;
 
 use crate::account_server::{AccountServer, CoinProof};
 use crate::publisher::create_and_broadcast_inscription;
+use crate::username::UsernameStore;
 use crate::NETWORK_CONFIG;
 
 /// Verify a Schnorr signature over send request fields.
@@ -74,13 +75,17 @@ struct AppState {
     account_server: Arc<Mutex<AccountServer>>,
     proof_store: Arc<ProofStore>,
     minting_account: Arc<Mutex<ClientAccount>>,
+    username_store: Arc<Mutex<UsernameStore>>,
     accounts_path: String,
+    usernames_path: String,
 }
 
 // Response types for our API
 #[derive(Serialize, Deserialize)]
 pub struct BalanceResponse {
     balance: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -195,6 +200,40 @@ pub struct InfoResponse {
     network: String,
 }
 
+// --- Username & LNURL types ---
+
+#[derive(Deserialize)]
+pub struct ClaimUsernameRequest {
+    username: String,
+    address: String,
+    public_key: bitcoin::secp256k1::PublicKey,
+    signature: String,
+    timestamp: u64,
+}
+
+#[derive(Serialize)]
+pub struct UsernameResponse {
+    username: String,
+    address: String,
+}
+
+#[derive(Serialize)]
+pub struct LnurlpResponse {
+    tag: String,
+    callback: String,
+    #[serde(rename = "minSendable")]
+    min_sendable: u64,
+    #[serde(rename = "maxSendable")]
+    max_sendable: u64,
+    metadata: String,
+}
+
+#[derive(Serialize)]
+pub struct LnurlErrorResponse {
+    status: String,
+    reason: String,
+}
+
 // Handler functions for our REST API
 async fn get_balance_handler(
     State(state): State<AppState>,
@@ -210,7 +249,10 @@ async fn get_balance_handler(
             Err(_) => {
                 return (
                     StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(BalanceResponse { balance: 0 }),
+                    Json(BalanceResponse {
+                        balance: 0,
+                        username: None,
+                    }),
                 )
             }
         };
@@ -222,17 +264,36 @@ async fn get_balance_handler(
         } else {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(BalanceResponse { balance: 0 }),
+                Json(BalanceResponse {
+                    balance: 0,
+                    username: None,
+                }),
             );
         }
 
         // Get balance for the specific account
+        let username = {
+            let username_store = lock_or_recover(&state.username_store);
+            username_store.get_username(&address).map(String::from)
+        };
         match account_server.get_account_balance(&address) {
-            Ok(balance) => (StatusCode::OK, Json(BalanceResponse { balance })),
-            Err(_) => (StatusCode::NOT_FOUND, Json(BalanceResponse { balance: 0 })),
+            Ok(balance) => (StatusCode::OK, Json(BalanceResponse { balance, username })),
+            Err(_) => (
+                StatusCode::NOT_FOUND,
+                Json(BalanceResponse {
+                    balance: 0,
+                    username: None,
+                }),
+            ),
         }
     } else {
-        (StatusCode::NOT_FOUND, Json(BalanceResponse { balance: 0 }))
+        (
+            StatusCode::NOT_FOUND,
+            Json(BalanceResponse {
+                balance: 0,
+                username: None,
+            }),
+        )
     }
 }
 
@@ -528,7 +589,10 @@ async fn mint_handler(
                 create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG).await
             {
                 eprintln!("Error broadcasting mint inscription: {}", err);
-                return (StatusCode::SERVICE_UNAVAILABLE, Json(SendCoinResponse::default()));
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(SendCoinResponse::default()),
+                );
             }
             {
                 let mut account_server_guard = lock_or_recover(&state.account_server);
@@ -689,7 +753,10 @@ async fn commit_handler(
     );
     if let Err(err) = create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG).await {
         eprintln!("Error broadcasting commit inscription: {}", err);
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(SendCoinResponse::default()));
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(SendCoinResponse::default()),
+        );
     }
 
     // Deliver the coin to the recipient
@@ -722,21 +789,225 @@ async fn info_handler() -> impl IntoResponse {
     })
 }
 
+// --- Username & LNURL handlers ---
+
+async fn claim_username_handler(
+    State(state): State<AppState>,
+    Json(request): Json<ClaimUsernameRequest>,
+) -> impl IntoResponse {
+    // Decode address
+    let address_vec = match hex::decode(request.address.trim_start_matches("0x")) {
+        Ok(a) => a,
+        Err(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(LnurlErrorResponse {
+                    status: "ERROR".into(),
+                    reason: "Invalid address hex".into(),
+                }),
+            )
+                .into_response()
+        }
+    };
+    let mut address = [0u8; 32];
+    if address_vec.len() != 32 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(LnurlErrorResponse {
+                status: "ERROR".into(),
+                reason: "Address must be 32 bytes".into(),
+            }),
+        )
+            .into_response();
+    }
+    address.copy_from_slice(&address_vec);
+
+    // Verify public key matches address: sha256(compressed_pubkey) == address
+    let pk_hash: [u8; 32] = Sha256::digest(request.public_key.serialize()).into();
+    if pk_hash != address {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(LnurlErrorResponse {
+                status: "ERROR".into(),
+                reason: "Public key does not match address".into(),
+            }),
+        )
+            .into_response();
+    }
+
+    // Verify timestamp freshness (5 min window)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now.abs_diff(request.timestamp) > 300 {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(LnurlErrorResponse {
+                status: "ERROR".into(),
+                reason: "Timestamp too old or in the future".into(),
+            }),
+        )
+            .into_response();
+    }
+
+    // Verify Schnorr signature over sha256("zkcoins:claim_username" || address_hex || username || timestamp_le)
+    let mut hasher = Sha256::new();
+    hasher.update(b"zkcoins:claim_username");
+    hasher.update(request.address.as_bytes());
+    hasher.update(request.username.as_bytes());
+    hasher.update(request.timestamp.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+
+    let msg = Message::from_digest(hash);
+    let sig_bytes = match hex::decode(&request.signature) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(LnurlErrorResponse {
+                    status: "ERROR".into(),
+                    reason: "Invalid signature hex".into(),
+                }),
+            )
+                .into_response()
+        }
+    };
+    let sig = match SchnorrSignature::from_slice(&sig_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(LnurlErrorResponse {
+                    status: "ERROR".into(),
+                    reason: "Invalid signature format".into(),
+                }),
+            )
+                .into_response()
+        }
+    };
+    let (xonly, _) = request.public_key.x_only_public_key();
+    let secp = secp::Secp256k1::verification_only();
+    if secp.verify_schnorr(&sig, &msg, &xonly).is_err() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(LnurlErrorResponse {
+                status: "ERROR".into(),
+                reason: "Signature verification failed".into(),
+            }),
+        )
+            .into_response();
+    }
+
+    // Claim the username
+    let mut username_store = lock_or_recover(&state.username_store);
+    if let Err(e) = username_store.claim(&request.username, address) {
+        return (
+            StatusCode::CONFLICT,
+            Json(LnurlErrorResponse {
+                status: "ERROR".into(),
+                reason: e.into(),
+            }),
+        )
+            .into_response();
+    }
+    if let Err(e) = username_store.save_to_file(&state.usernames_path) {
+        eprintln!("Failed to persist usernames: {}", e);
+    }
+
+    let normalized = request.username.to_lowercase();
+    (
+        StatusCode::OK,
+        Json(UsernameResponse {
+            username: normalized,
+            address: format!("0x{}", hex::encode(address)),
+        }),
+    )
+        .into_response()
+}
+
+async fn resolve_username_handler(
+    State(state): State<AppState>,
+    Path(username): Path<String>,
+) -> impl IntoResponse {
+    let username_store = lock_or_recover(&state.username_store);
+    match username_store.resolve(&username) {
+        Some(address) => (
+            StatusCode::OK,
+            Json(UsernameResponse {
+                username: username.to_lowercase(),
+                address: format!("0x{}", hex::encode(address)),
+            }),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(LnurlErrorResponse {
+                status: "ERROR".into(),
+                reason: "Username not found".into(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn lnurlp_handler(
+    State(state): State<AppState>,
+    Path(username): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let username_store = lock_or_recover(&state.username_store);
+    if username_store.resolve(&username).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(LnurlErrorResponse {
+                status: "ERROR".into(),
+                reason: "User not found".into(),
+            }),
+        )
+            .into_response();
+    }
+
+    let host = headers
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("api.zkcoins.app");
+    let scheme = if host.contains("localhost") {
+        "http"
+    } else {
+        "https"
+    };
+    let normalized = username.to_lowercase();
+    let callback = format!("{}://{}/lnurl/pay/{}", scheme, host, normalized);
+    let metadata = format!(
+        "[[\"text/plain\",\"Pay {} on zkCoins\"],[\"text/identifier\",\"{}@zkcoins.app\"]]",
+        normalized, normalized
+    );
+
+    (
+        StatusCode::OK,
+        Json(LnurlpResponse {
+            tag: "payRequest".into(),
+            callback,
+            min_sendable: 1_000,
+            max_sendable: 1_000_000_000_000,
+            metadata,
+        }),
+    )
+        .into_response()
+}
+
+async fn lnurl_callback_handler(Path(_username): Path<String>) -> impl IntoResponse {
+    Json(LnurlErrorResponse {
+        status: "ERROR".into(),
+        reason: "Lightning payments coming soon (Phase 2)".into(),
+    })
+}
+
 /// Build the full application router with all API routes, CORS, health check, and fallback.
 /// Extracted so it can be reused in integration tests via `oneshot()`.
 fn create_router(state: AppState) -> Router {
-    let api_routes = Router::new()
-        .route("/info", get(info_handler))
-        .route("/balance", get(get_balance_handler))
-        .route("/send", post(send_coin_handler))
-        .route("/address", get(get_address_handler))
-        .route("/receive", post(receive_coin_handler))
-        .route("/proof/{id}", get(get_proof_handler))
-        .route("/mint", post(mint_handler))
-        .route("/commit", post(commit_handler))
-        .with_state(state);
-
-    let cors = CorsLayer::new()
+    let app_cors = CorsLayer::new()
         .allow_origin([
             "https://zkcoins.app"
                 .parse::<HeaderValue>()
@@ -751,18 +1022,46 @@ fn create_router(state: AppState) -> Router {
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([header::CONTENT_TYPE]);
 
+    let lnurl_cors = CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods([Method::GET])
+        .allow_headers([header::CONTENT_TYPE]);
+
+    let api_routes = Router::new()
+        .route("/info", get(info_handler))
+        .route("/balance", get(get_balance_handler))
+        .route("/send", post(send_coin_handler))
+        .route("/address", get(get_address_handler))
+        .route("/receive", post(receive_coin_handler))
+        .route("/proof/{id}", get(get_proof_handler))
+        .route("/mint", post(mint_handler))
+        .route("/commit", post(commit_handler))
+        .route("/username", post(claim_username_handler))
+        .route("/username/{username}", get(resolve_username_handler))
+        .with_state(state.clone())
+        .layer(app_cors);
+
+    // LNURL endpoints need open CORS (any wallet can call these)
+    let lnurl_routes = Router::new()
+        .route("/.well-known/lnurlp/{username}", get(lnurlp_handler))
+        .route("/lnurl/pay/{username}", get(lnurl_callback_handler))
+        .with_state(state)
+        .layer(lnurl_cors);
+
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .nest("/api", api_routes)
+        .merge(lnurl_routes)
         .fallback(|| async { StatusCode::NOT_FOUND })
-        .layer(cors)
 }
 
 // Function to start the REST API server
 pub async fn start_rest_server(
     account_server: AccountServer,
+    username_store: UsernameStore,
     addr: &str,
     accounts_path: String,
+    usernames_path: String,
 ) -> anyhow::Result<()> {
     // Parse the address string into a SocketAddr
     let socket_addr = addr
@@ -773,7 +1072,13 @@ pub async fn start_rest_server(
     let shared_account_server = Arc::new(Mutex::new(account_server));
 
     // Create a persistent proof store
-    let proofs_dir = format!("{}/proofs", std::path::Path::new(&accounts_path).parent().unwrap_or(std::path::Path::new(".")).display());
+    let proofs_dir = format!(
+        "{}/proofs",
+        std::path::Path::new(&accounts_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .display()
+    );
     let proof_store = Arc::new(ProofStore::new(&proofs_dir));
 
     let minting_account = {
@@ -793,12 +1098,16 @@ pub async fn start_rest_server(
         Arc::new(Mutex::new(minting_client))
     };
 
+    let shared_username_store = Arc::new(Mutex::new(username_store));
+
     // Create the combined state using the AppState struct
     let state = AppState {
         account_server: shared_account_server,
         proof_store,
         minting_account,
+        username_store: shared_username_store,
         accounts_path,
+        usernames_path,
     };
     {
         let mut account_server_guard = state.account_server.lock().unwrap();
@@ -886,7 +1195,9 @@ mod tests {
             account_server: Arc::new(Mutex::new(account_server)),
             proof_store: Arc::new(ProofStore::new("/tmp/zkcoins-test-proofs")),
             minting_account: Arc::new(Mutex::new(minting_client)),
+            username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
             accounts_path: String::new(),
+            usernames_path: String::new(),
         }
     }
 
@@ -939,6 +1250,7 @@ mod tests {
 
         let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
         assert_eq!(resp.balance, 0);
+        assert!(resp.username.is_none());
     }
 
     #[tokio::test]
@@ -963,6 +1275,7 @@ mod tests {
 
         let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
         assert_eq!(resp.balance, 0);
+        assert!(resp.username.is_none());
     }
 
     #[tokio::test]
