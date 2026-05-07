@@ -325,24 +325,22 @@ async fn send_coin_handler(
     // Now that the account_server lock is dropped, we can await safely.
     match send_result {
         Ok(mut coin_proofs) => {
-            let commitment = coin_proofs[0].commitment.as_ref()
-                .expect("Commitment must be set after send_coins");
-            let commitment_data = bincode::serialize(commitment)
-                .expect("Failed to serialize commitment");
-
-            println!(
-                "Sending commitment data with size: {} bytes",
-                commitment_data.len()
-            );
-            println!("Commitment data hex: {}", hex::encode(&commitment_data));
-
-            if let Err(err) =
-                create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG).await
-            {
-                eprintln!("Error broadcasting inscription: {}", err);
+            // For user sends, the commitment must be signed by the sender's private key.
+            // The server doesn't have it, so commitment broadcasting is deferred:
+            // the client will submit the signed commitment via a separate request.
+            if let Some(commitment) = coin_proofs[0].commitment.as_ref() {
+                let commitment_data = bincode::serialize(commitment)
+                    .expect("Failed to serialize commitment");
+                println!("Sending commitment data with size: {} bytes", commitment_data.len());
+                if let Err(err) =
+                    create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG).await
+                {
+                    eprintln!("Error broadcasting inscription: {}", err);
+                }
+            } else {
+                println!("No commitment on coin proof — client must submit commitment separately");
             }
 
-            // TODO: Handle all the coins_proofs
             let proof_id = state.proof_store.add_proof(coin_proofs.pop().unwrap());
             (
                 StatusCode::OK,
