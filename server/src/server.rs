@@ -112,30 +112,58 @@ pub struct ReceiveCoinRequest {
     coin_proof: Proof,
 }
 
-// Add a struct to store proofs temporarily
+/// Persistent proof store — survives server restarts.
+/// Each proof is stored as an individual file: /data/proofs/{id}.bin
 struct ProofStore {
-    proofs: Mutex<HashMap<u64, CoinProof>>,
+    dir: String,
     next_id: AtomicU64,
 }
 
 impl ProofStore {
-    fn new() -> Self {
+    fn new(dir: &str) -> Self {
+        std::fs::create_dir_all(dir).ok();
+        // Scan existing files to find the highest ID
+        let max_id = std::fs::read_dir(dir)
+            .ok()
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| {
+                        e.file_name()
+                            .to_str()?
+                            .strip_suffix(".bin")?
+                            .parse::<u64>()
+                            .ok()
+                    })
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+
         ProofStore {
-            proofs: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
+            dir: dir.to_string(),
+            next_id: AtomicU64::new(max_id + 1),
         }
     }
 
     fn add_proof(&self, proof_with_commitment: CoinProof) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let mut proofs = lock_or_recover(&self.proofs);
-        proofs.insert(id, proof_with_commitment);
+        let path = format!("{}/{}.bin", self.dir, id);
+        match bincode::serialize(&proof_with_commitment) {
+            Ok(bytes) => {
+                if let Err(e) = crate::atomic_write(&path, &bytes) {
+                    eprintln!("Failed to persist proof {}: {}", id, e);
+                }
+            }
+            Err(e) => eprintln!("Failed to serialize proof {}: {}", id, e),
+        }
         id
     }
 
     fn get_proof(&self, id: u64) -> Option<CoinProof> {
-        let proofs = lock_or_recover(&self.proofs);
-        proofs.get(&id).cloned()
+        let path = format!("{}/{}.bin", self.dir, id);
+        let bytes = std::fs::read(&path).ok()?;
+        bincode::deserialize(&bytes).ok()
     }
 }
 
@@ -741,8 +769,9 @@ pub async fn start_rest_server(
     // Wrap the account_server in an Arc<Mutex> for thread-safe sharing
     let shared_account_server = Arc::new(Mutex::new(account_server));
 
-    // Create a proof store
-    let proof_store = Arc::new(ProofStore::new());
+    // Create a persistent proof store
+    let proofs_dir = format!("{}/proofs", std::path::Path::new(&accounts_path).parent().unwrap_or(std::path::Path::new(".")).display());
+    let proof_store = Arc::new(ProofStore::new(&proofs_dir));
 
     let minting_account = {
         let secret = include_bytes!("../minting_secret.bin");
@@ -852,7 +881,7 @@ mod tests {
 
         AppState {
             account_server: Arc::new(Mutex::new(account_server)),
-            proof_store: Arc::new(ProofStore::new()),
+            proof_store: Arc::new(ProofStore::new("/tmp/zkcoins-test-proofs")),
             minting_account: Arc::new(Mutex::new(minting_client)),
             accounts_path: String::new(),
         }
