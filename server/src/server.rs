@@ -496,7 +496,8 @@ async fn mint_handler(
             if let Err(err) =
                 create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG).await
             {
-                eprintln!("Error broadcasting inscription: {}", err);
+                eprintln!("Error broadcasting mint inscription: {}", err);
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(SendCoinResponse::default()));
             }
             {
                 let mut account_server_guard = lock_or_recover(&state.account_server);
@@ -656,7 +657,8 @@ async fn commit_handler(
         commitment_data.len()
     );
     if let Err(err) = create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG).await {
-        eprintln!("Error broadcasting inscription: {}", err);
+        eprintln!("Error broadcasting commit inscription: {}", err);
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(SendCoinResponse::default()));
     }
 
     // Deliver the coin to the recipient

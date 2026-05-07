@@ -314,8 +314,8 @@ pub async fn create_and_broadcast_inscription(
         get_publisher_utxo(&publisher_address, config, Some(MIN_INSCRIPTION_AMOUNT)).await?;
 
     if outpoints_with_sats.is_empty() {
-        println!("No UTXOs found for the publisher address. Please fund the address first.");
-        return Ok(None);
+        eprintln!("ERROR: No UTXOs found for publisher address {}. Fund it to continue.", publisher_address);
+        return Err("No UTXOs available for inscription broadcast — publisher wallet is empty".into());
     }
 
     // Log found UTXOs
