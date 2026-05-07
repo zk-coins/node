@@ -78,12 +78,12 @@ struct AppState {
 }
 
 // Response types for our API
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct BalanceResponse {
     balance: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct AddressesResponse {
     addresses: Vec<String>,
 }
@@ -162,7 +162,7 @@ pub struct CommitRequest {
     message: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct InfoResponse {
     network: String,
 }
@@ -689,6 +689,42 @@ async fn info_handler() -> impl IntoResponse {
     })
 }
 
+/// Build the full application router with all API routes, CORS, health check, and fallback.
+/// Extracted so it can be reused in integration tests via `oneshot()`.
+fn create_router(state: AppState) -> Router {
+    let api_routes = Router::new()
+        .route("/info", get(info_handler))
+        .route("/balance", get(get_balance_handler))
+        .route("/send", post(send_coin_handler))
+        .route("/address", get(get_address_handler))
+        .route("/receive", post(receive_coin_handler))
+        .route("/proof/{id}", get(get_proof_handler))
+        .route("/mint", post(mint_handler))
+        .route("/commit", post(commit_handler))
+        .with_state(state);
+
+    let cors = CorsLayer::new()
+        .allow_origin([
+            "https://zkcoins.app"
+                .parse::<HeaderValue>()
+                .expect("valid origin"),
+            "https://dev.zkcoins.app"
+                .parse::<HeaderValue>()
+                .expect("valid origin"),
+            "http://localhost:3090"
+                .parse::<HeaderValue>()
+                .expect("valid origin"),
+        ])
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([header::CONTENT_TYPE]);
+
+    Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .nest("/api", api_routes)
+        .fallback(|| async { StatusCode::NOT_FOUND })
+        .layer(cors)
+}
+
 // Function to start the REST API server
 pub async fn start_rest_server(
     account_server: AccountServer,
@@ -743,40 +779,7 @@ pub async fn start_rest_server(
         }
     }
 
-    // Create a router for API endpoints
-    let api_routes = Router::new()
-        .route("/info", get(info_handler))
-        .route("/balance", get(get_balance_handler))
-        .route("/send", post(send_coin_handler))
-        .route("/address", get(get_address_handler))
-        .route("/receive", post(receive_coin_handler))
-        .route("/proof/{id}", get(get_proof_handler))
-        .route("/mint", post(mint_handler))
-        .route("/commit", post(commit_handler))
-        .with_state(state);
-
-    // CORS: allow frontend origins
-    let cors = CorsLayer::new()
-        .allow_origin([
-            "https://zkcoins.app"
-                .parse::<HeaderValue>()
-                .expect("valid origin"),
-            "https://dev.zkcoins.app"
-                .parse::<HeaderValue>()
-                .expect("valid origin"),
-            "http://localhost:3090"
-                .parse::<HeaderValue>()
-                .expect("valid origin"),
-        ])
-        .allow_methods([Method::GET, Method::POST])
-        .allow_headers([header::CONTENT_TYPE]);
-
-    // Build our application with routes
-    let app = Router::new()
-        .route("/health", get(|| async { "ok" }))
-        .nest("/api", api_routes)
-        .fallback(|| async { StatusCode::NOT_FOUND })
-        .layer(cors);
+    let app = create_router(state);
 
     // Run the server
     println!("REST server started at {}", socket_addr);
@@ -813,3 +816,241 @@ async fn serve_index() -> impl IntoResponse {
 // http://myserver.com/<my_address>/balance
 // http://myserver.com/<my_address>/send
 // http://myserver.com/<my_address>/sign)
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    use crate::account_server::{Account, AccountServer};
+    use crate::state::State;
+
+    /// Create a minimal AppState for testing.
+    /// The AccountServer is constructed with a real (mock) prover so that the
+    /// type system is satisfied, but we seed it with a minting account so that
+    /// balance / address queries work without needing the minting_secret.bin
+    /// flow.
+    fn test_state() -> AppState {
+        let state = Arc::new(Mutex::new(State::new()));
+        let mut account_server = AccountServer::new(Arc::clone(&state));
+
+        // Seed a minting account with max balance (mirrors production setup)
+        let mut minting_account = Account::new();
+        minting_account.balance = u64::MAX;
+        account_server.import_account(zkcoins_program::MINTING_ADDRESS, minting_account);
+
+        // Create a dummy minting ClientAccount from a deterministic key
+        let secret = include_bytes!("../minting_secret.bin");
+        let private_key = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Signet, secret)
+            .expect("Failed to create test private key");
+        let minting_client = shared::ClientAccount::new(private_key);
+
+        AppState {
+            account_server: Arc::new(Mutex::new(account_server)),
+            proof_store: Arc::new(ProofStore::new()),
+            minting_account: Arc::new(Mutex::new(minting_client)),
+            accounts_path: String::new(),
+        }
+    }
+
+    /// Helper: send a request through the router and return (status, body string).
+    async fn send_request(request: Request<Body>) -> (StatusCode, String) {
+        let app = create_router(test_state());
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        (status, body)
+    }
+
+    // --- GET /health ---
+
+    #[tokio::test]
+    async fn health_returns_ok() {
+        let req = Request::get("/health").body(Body::empty()).unwrap();
+        let (status, body) = send_request(req).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "ok");
+    }
+
+    // --- GET /api/info ---
+
+    #[tokio::test]
+    async fn info_returns_network_name() {
+        let req = Request::get("/api/info").body(Body::empty()).unwrap();
+        let (status, body) = send_request(req).await;
+
+        assert_eq!(status, StatusCode::OK);
+
+        let info: InfoResponse = serde_json::from_str(&body).expect("valid JSON");
+        // The lazy_static defaults to "Mutinynet" when IS_MAINNET is unset
+        assert!(!info.network.is_empty(), "network name must not be empty");
+    }
+
+    // --- GET /api/balance ---
+
+    #[tokio::test]
+    async fn balance_unknown_address_returns_not_found() {
+        // 32 zero bytes in hex = 64 hex chars
+        let address_hex = "00".repeat(32);
+        let uri = format!("/api/balance?address={}", address_hex);
+        let req = Request::get(&uri).body(Body::empty()).unwrap();
+        let (status, body) = send_request(req).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(resp.balance, 0);
+    }
+
+    #[tokio::test]
+    async fn balance_minting_address_returns_max() {
+        let address_hex = hex::encode(zkcoins_program::MINTING_ADDRESS);
+        let uri = format!("/api/balance?address={}", address_hex);
+        let req = Request::get(&uri).body(Body::empty()).unwrap();
+        let (status, body) = send_request(req).await;
+
+        assert_eq!(status, StatusCode::OK);
+
+        let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(resp.balance, u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn balance_missing_address_param_returns_not_found() {
+        let req = Request::get("/api/balance").body(Body::empty()).unwrap();
+        let (status, body) = send_request(req).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(resp.balance, 0);
+    }
+
+    #[tokio::test]
+    async fn balance_invalid_hex_returns_unprocessable() {
+        let req = Request::get("/api/balance?address=not_valid_hex")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _body) = send_request(req).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn balance_wrong_length_returns_unprocessable() {
+        // 16 bytes = 32 hex chars, but the handler expects exactly 32 bytes
+        let short_hex = "ab".repeat(16);
+        let uri = format!("/api/balance?address={}", short_hex);
+        let req = Request::get(&uri).body(Body::empty()).unwrap();
+        let (status, _body) = send_request(req).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // --- GET /api/address ---
+
+    #[tokio::test]
+    async fn address_returns_list() {
+        let req = Request::get("/api/address").body(Body::empty()).unwrap();
+        let (status, body) = send_request(req).await;
+
+        assert_eq!(status, StatusCode::OK);
+
+        let resp: AddressesResponse = serde_json::from_str(&body).expect("valid JSON");
+        // The test state has the minting address seeded
+        assert!(
+            !resp.addresses.is_empty(),
+            "should contain at least the minting address"
+        );
+        assert!(
+            resp.addresses[0].starts_with("0x"),
+            "addresses should be 0x-prefixed"
+        );
+    }
+
+    // --- POST /api/send with missing fields ---
+
+    #[tokio::test]
+    async fn send_missing_body_returns_error() {
+        let req = Request::post("/api/send")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (status, _body) = send_request(req).await;
+
+        // Axum returns 422 when JSON deserialization fails (missing required fields)
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn send_invalid_json_returns_bad_request() {
+        let req = Request::post("/api/send")
+            .header("content-type", "application/json")
+            .body(Body::from("not json"))
+            .unwrap();
+        let (status, _body) = send_request(req).await;
+
+        // Axum returns 400 Bad Request for syntactically invalid JSON
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn send_no_content_type_returns_error() {
+        let req = Request::post("/api/send").body(Body::from("{}")).unwrap();
+        let (status, _body) = send_request(req).await;
+
+        // Axum returns 415 Unsupported Media Type when content-type is missing for Json extractor
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    // --- POST /api/mint with missing fields ---
+
+    #[tokio::test]
+    async fn mint_missing_body_returns_error() {
+        let req = Request::post("/api/mint")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (status, _body) = send_request(req).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // --- GET /api/proof/{id} for non-existent proof ---
+
+    #[tokio::test]
+    async fn proof_not_found_returns_404() {
+        let req = Request::get("/api/proof/9999").body(Body::empty()).unwrap();
+        let (status, _body) = send_request(req).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // --- POST /api/commit with missing fields ---
+
+    #[tokio::test]
+    async fn commit_missing_body_returns_error() {
+        let req = Request::post("/api/commit")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (status, _body) = send_request(req).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // --- Fallback for unknown routes ---
+
+    #[tokio::test]
+    async fn unknown_route_returns_404() {
+        let req = Request::get("/does-not-exist").body(Body::empty()).unwrap();
+        let (status, _body) = send_request(req).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+}
