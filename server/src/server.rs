@@ -1055,8 +1055,11 @@ fn create_router(state: AppState) -> Router {
         .route("/proof/{id}", get(get_proof_handler))
         .route("/mint", post(mint_handler))
         .route("/commit", post(commit_handler))
-        .route("/username", post(claim_username_handler))
-        .route("/username/{username}", get(resolve_username_handler))
+        .route("/username/claim", post(claim_username_handler))
+        .route(
+            "/username/resolve/{username}",
+            get(resolve_username_handler),
+        )
         .with_state(state.clone())
         .layer(app_cors);
 
