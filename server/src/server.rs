@@ -6,10 +6,8 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use bitcoin::secp256k1::{
-    self as secp, schnorr::Signature as SchnorrSignature, Message, XOnlyPublicKey,
-};
-use bitcoin::{bip32::Xpriv, Network};
+use bitcoin::bip32::Xpriv;
+use bitcoin::secp256k1::{self as secp, schnorr::Signature as SchnorrSignature, Message};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shared::commitment::Commitment;
@@ -20,7 +18,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
-use zkcoins_program::hash;
 use zkcoins_prover::Proof;
 
 use crate::account_server::{AccountServer, CoinProof};
@@ -111,6 +108,7 @@ pub struct MintRequest {
 
 #[derive(Deserialize)]
 pub struct ReceiveCoinRequest {
+    #[allow(dead_code)]
     coin_proof: Proof,
 }
 
@@ -788,7 +786,8 @@ pub async fn start_rest_server(
     Ok(())
 }
 
-// Handler to serve the index.html file
+// Handler to serve the index.html file (currently unused, kept for future use)
+#[allow(dead_code)]
 async fn serve_index() -> impl IntoResponse {
     let current_dir = std::env::current_dir().unwrap_or_default();
     let index_path = current_dir.join("..").join("client").join("index.html");

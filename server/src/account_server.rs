@@ -2,9 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::state::State;
-use bitcoin::bip32::Xpriv;
 use bitcoin::secp256k1::PublicKey;
-use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use shared::commitment::Commitment;
 use shared::{Address, Invoice};

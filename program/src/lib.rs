@@ -1,5 +1,4 @@
 use merkle::{hash_concat, merkle_mountain_range::MMRProof};
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 

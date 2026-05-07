@@ -333,7 +333,7 @@ impl SparseMerkleTree {
 
         let mut sibling_leaf = (key, DEFAULT_HASHES[TREE_DEPTH]);
 
-        if self.nodes.get(&(0, [0; 32])).is_none() {
+        if !self.nodes.contains_key(&(0, [0; 32])) {
             return Ok(NonInclusionProof {
                 key,
                 root: DEFAULT_HASHES[0],
