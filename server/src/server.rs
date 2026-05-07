@@ -325,24 +325,18 @@ async fn send_coin_handler(
     // Acquire the account_server lock only for the duration of sending coins.
     let send_result = {
         let mut account_server_lock = lock_or_recover(&state.account_server);
-        let result = account_server_lock.send_coins(
+        account_server_lock.send_coins(
             vec![Invoice::new(request.amount, to_address)],
             from_address,
             request.public_key,
             request.next_public_key,
             request.prev_commitment_pubkey,
-        );
-        if result.is_ok() {
-            if let Err(e) = account_server_lock.save_to_file(&state.accounts_path) {
-                eprintln!("Failed to persist accounts after send: {}", e);
-            }
-        }
-        result
+        )
+        // NOTE: accounts are NOT saved here — proof must be persisted first
     };
 
     println!("Generated send_result: {:?}", send_result);
 
-    // Now that the account_server lock is dropped, we can await safely.
     match send_result {
         Ok(mut coin_proofs) => {
             // Extract proof data so the client can create a commitment
@@ -373,6 +367,7 @@ async fn send_coin_handler(
                 }
             }
 
+            // Persist proof FIRST (crash-safe: proof exists even if account save fails)
             let proof_id = match coin_proofs.pop() {
                 Some(proof) => state.proof_store.add_proof(proof),
                 None => {
@@ -387,6 +382,14 @@ async fn send_coin_handler(
                     );
                 }
             };
+            // Now persist accounts (proof is already safe on disk)
+            {
+                let account_server_lock = lock_or_recover(&state.account_server);
+                if let Err(e) = account_server_lock.save_to_file(&state.accounts_path) {
+                    eprintln!("Failed to persist accounts after send: {}", e);
+                }
+            }
+
             (
                 StatusCode::OK,
                 Json(SendCoinResponse {
