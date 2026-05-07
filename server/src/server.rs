@@ -1,7 +1,7 @@
 use axum::{
     body::Bytes,
     extract::{Json, Path, State},
-    http::{header, HeaderValue, Method, StatusCode},
+    http::{header, Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Router,
@@ -1660,5 +1660,81 @@ mod tests {
         for handle in handles {
             handle.await.expect("task should not panic");
         }
+    }
+
+    // --- POST /api/commit with non-existent proof_id ---
+
+    #[tokio::test]
+    async fn commit_nonexistent_proof_id_returns_404() {
+        let state = test_state();
+        let body = serde_json::json!({
+            "proof_id": 999999,
+            "public_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+            "signature": "00".repeat(64),
+            "message": "00".repeat(32),
+        });
+        let req = Request::post("/api/commit")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let (status, _body) = send_request_with_state(state, req).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // --- POST /api/commit with valid proof_id but invalid signature ---
+
+    #[tokio::test]
+    async fn commit_invalid_signature_returns_401() {
+        let state = test_state();
+
+        // Mint a coin to populate the proof store with a valid proof_id.
+        let mint_body = serde_json::json!({
+            "address": hex::encode([1u8; 32]),
+            "amount": 1,
+        });
+        let mint_req = Request::post("/api/mint")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&mint_body).unwrap()))
+            .unwrap();
+        let (mint_status, mint_resp) = send_request_with_state(state.clone(), mint_req).await;
+        assert_eq!(mint_status, StatusCode::OK);
+
+        let mint_json: serde_json::Value =
+            serde_json::from_str(&mint_resp).expect("mint response should be valid JSON");
+        assert!(
+            mint_json["success"].as_bool().unwrap_or(false),
+            "mint should succeed"
+        );
+        let proof_id = mint_json["proof_id"]
+            .as_u64()
+            .expect("mint response should contain proof_id");
+
+        // Retrieve the proof to get the real message (account_state_hash || output_coins_root)
+        let proof_req = Request::get(&format!("/api/proof/{}", proof_id))
+            .body(Body::empty())
+            .unwrap();
+        let (proof_status, _) = send_request_with_state(state.clone(), proof_req).await;
+        assert_eq!(proof_status, StatusCode::OK);
+
+        // Submit a commit with the valid proof_id but a fabricated (invalid) signature.
+        // Use a valid public key format but the signature does not match.
+        let commit_body = serde_json::json!({
+            "proof_id": proof_id,
+            "public_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+            "signature": "ab".repeat(64),
+            "message": "cd".repeat(32),
+        });
+        let commit_req = Request::post("/api/commit")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&commit_body).unwrap()))
+            .unwrap();
+        let (commit_status, _body) = send_request_with_state(state, commit_req).await;
+
+        assert_eq!(
+            commit_status,
+            StatusCode::UNAUTHORIZED,
+            "commit with invalid signature must return 401"
+        );
     }
 }
