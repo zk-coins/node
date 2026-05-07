@@ -717,6 +717,107 @@ mod tests {
         assert_eq!(coin_proofs.len(), 1);
     }
 
+    #[test]
+    fn test_receive_duplicate_coin_rejected() {
+        let state_arc = Arc::new(Mutex::new(State::new()));
+        let mut server = AccountServer::new(Arc::clone(&state_arc));
+
+        let mut minting_account_data = TestAccountData::new_minting_account();
+        server.import_account(
+            minting_account_data.address,
+            Account {
+                proof: None,
+                coin_queue: vec![],
+                coin_history: SparseMerkleTree::new(),
+                balance: 10_000,
+            },
+        );
+
+        let account_1_data = TestAccountData::new_generic(&[1u8; 32], Network::Signet);
+        let invoice = Invoice::new(100, account_1_data.address);
+
+        let coin_proofs = minting_account_data
+            .execute_send_coins(&mut server, vec![invoice])
+            .expect("Mint failed");
+
+        state_arc
+            .lock()
+            .unwrap()
+            .update(
+                &coin_proofs
+                    .iter()
+                    .map(|x| x.commitment.clone().unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+
+        let coin_proof = coin_proofs.into_iter().next().unwrap();
+        let duplicate = coin_proof.clone();
+
+        // First receive should succeed
+        server
+            .receive_coin(coin_proof)
+            .expect("First receive should succeed");
+
+        // Second receive of the same coin should be rejected
+        let result = server.receive_coin(duplicate);
+        assert!(result.is_err(), "Duplicate coin receive must be rejected");
+    }
+
+    #[test]
+    fn test_receive_updates_balance() {
+        let state_arc = Arc::new(Mutex::new(State::new()));
+        let mut server = AccountServer::new(Arc::clone(&state_arc));
+
+        let mut minting_account_data = TestAccountData::new_minting_account();
+        server.import_account(
+            minting_account_data.address,
+            Account {
+                proof: None,
+                coin_queue: vec![],
+                coin_history: SparseMerkleTree::new(),
+                balance: 10_000,
+            },
+        );
+
+        let account_1_data = TestAccountData::new_generic(&[1u8; 32], Network::Signet);
+        let invoice = Invoice::new(250, account_1_data.address);
+
+        // Balance should not exist before any receive
+        assert!(
+            server.get_account_balance(&account_1_data.address).is_err(),
+            "Account should not exist before receiving coins"
+        );
+
+        let coin_proofs = minting_account_data
+            .execute_send_coins(&mut server, vec![invoice])
+            .expect("Mint failed");
+
+        state_arc
+            .lock()
+            .unwrap()
+            .update(
+                &coin_proofs
+                    .iter()
+                    .map(|x| x.commitment.clone().unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+
+        for cp in coin_proofs {
+            server.receive_coin(cp).expect("Receive should succeed");
+        }
+
+        // Balance should reflect the received coin amount
+        let balance = server
+            .get_account_balance(&account_1_data.address)
+            .expect("Account should exist after receive");
+        assert_eq!(
+            balance, 250,
+            "Balance should equal the received coin amount"
+        );
+    }
+
     /// Reproduces the exact configuration of /api/mint on the live DEV server:
     /// balance = u64::MAX, recipient = raw [1u8; 32] bytes, amount = 1.
     #[test]

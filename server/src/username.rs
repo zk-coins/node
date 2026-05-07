@@ -127,4 +127,24 @@ mod tests {
 
         std::fs::remove_file(path).ok();
     }
+
+    #[test]
+    fn resolve_is_case_insensitive() {
+        let mut store = UsernameStore::new();
+        let address = [5u8; 32];
+        store.claim("Alice", address).unwrap();
+
+        // Resolve with different casings
+        assert_eq!(store.resolve("alice"), Some(address));
+        assert_eq!(store.resolve("ALICE"), Some(address));
+        assert_eq!(store.resolve("Alice"), Some(address));
+        assert_eq!(store.resolve("aLiCe"), Some(address));
+    }
+
+    #[test]
+    fn get_username_returns_none_for_unknown() {
+        let store = UsernameStore::new();
+        let unknown_address = [99u8; 32];
+        assert_eq!(store.get_username(&unknown_address), None);
+    }
 }

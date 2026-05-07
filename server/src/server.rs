@@ -1843,6 +1843,173 @@ mod tests {
             .contains("Signature verification failed"));
     }
 
+    // --- POST /api/username/claim with valid Schnorr signature ---
+
+    #[tokio::test]
+    async fn claim_username_with_valid_signature() {
+        use bitcoin::secp256k1::{Keypair, SecretKey};
+
+        let secp = secp::Secp256k1::new();
+        let secret = SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+
+        // address = sha256(compressed_pubkey)
+        let address: [u8; 32] = Sha256::digest(public_key.serialize()).into();
+        let address_hex = hex::encode(address);
+
+        let username = "testclaim";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Build claim message: sha256("zkcoins:claim_username" || address_hex || username || timestamp_le)
+        let mut hasher = Sha256::new();
+        hasher.update(b"zkcoins:claim_username");
+        hasher.update(address_hex.as_bytes());
+        hasher.update(username.as_bytes());
+        hasher.update(now.to_le_bytes());
+        let hash: [u8; 32] = hasher.finalize().into();
+
+        let msg = Message::from_digest(hash);
+        let keypair = Keypair::from_secret_key(&secp, &secret);
+        let sig = secp.sign_schnorr(&msg, &keypair);
+
+        // Import the address into the account_server so resolve_identifier can find it
+        let state = test_state();
+        {
+            let mut account_server = state.account_server.lock().unwrap();
+            account_server.import_account(address, Account::new());
+        }
+
+        let body = serde_json::json!({
+            "username": username,
+            "address": address_hex,
+            "public_key": public_key.to_string(),
+            "signature": hex::encode(sig.serialize()),
+            "timestamp": now,
+        });
+
+        let req = Request::post("/api/username/claim")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let (status, resp_body) = send_request_with_state(state, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "Claim should succeed: {}",
+            resp_body
+        );
+
+        let resp: UsernameResponse = serde_json::from_str(&resp_body).expect("valid JSON");
+        assert_eq!(resp.username, username);
+        assert_eq!(resp.address, format!("0x{}", address_hex));
+    }
+
+    #[tokio::test]
+    async fn claim_username_wrong_pubkey() {
+        use bitcoin::secp256k1::{Keypair, SecretKey};
+
+        let secp = secp::Secp256k1::new();
+        let secret = SecretKey::from_slice(&[8u8; 32]).unwrap();
+        let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+
+        // Use a DIFFERENT address that does NOT match sha256(pubkey)
+        let wrong_address: [u8; 32] = [0xAA; 32];
+        let address_hex = hex::encode(wrong_address);
+
+        let username = "wrongpk";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Sign with the correct message format but the address doesn't match the pubkey
+        let mut hasher = Sha256::new();
+        hasher.update(b"zkcoins:claim_username");
+        hasher.update(address_hex.as_bytes());
+        hasher.update(username.as_bytes());
+        hasher.update(now.to_le_bytes());
+        let hash: [u8; 32] = hasher.finalize().into();
+
+        let msg = Message::from_digest(hash);
+        let keypair = Keypair::from_secret_key(&secp, &secret);
+        let sig = secp.sign_schnorr(&msg, &keypair);
+
+        let body = serde_json::json!({
+            "username": username,
+            "address": address_hex,
+            "public_key": public_key.to_string(),
+            "signature": hex::encode(sig.serialize()),
+            "timestamp": now,
+        });
+
+        let req = Request::post("/api/username/claim")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let (status, _) = send_request(req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "Claim with mismatched pubkey/address must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_username_expired_timestamp() {
+        use bitcoin::secp256k1::{Keypair, SecretKey};
+
+        let secp = secp::Secp256k1::new();
+        let secret = SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+
+        let address: [u8; 32] = Sha256::digest(public_key.serialize()).into();
+        let address_hex = hex::encode(address);
+
+        let username = "expiredts";
+        // Timestamp 10 minutes in the past (exceeds 5-min window)
+        let expired_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 600;
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"zkcoins:claim_username");
+        hasher.update(address_hex.as_bytes());
+        hasher.update(username.as_bytes());
+        hasher.update(expired_timestamp.to_le_bytes());
+        let hash: [u8; 32] = hasher.finalize().into();
+
+        let msg = Message::from_digest(hash);
+        let keypair = Keypair::from_secret_key(&secp, &secret);
+        let sig = secp.sign_schnorr(&msg, &keypair);
+
+        let body = serde_json::json!({
+            "username": username,
+            "address": address_hex,
+            "public_key": public_key.to_string(),
+            "signature": hex::encode(sig.serialize()),
+            "timestamp": expired_timestamp,
+        });
+
+        let req = Request::post("/api/username/claim")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let (status, _) = send_request(req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "Claim with expired timestamp must be rejected"
+        );
+    }
+
     #[test]
     fn send_signature_accepts_valid_signature() {
         use bitcoin::secp256k1::SecretKey;
