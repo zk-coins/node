@@ -211,13 +211,13 @@ pub struct ClaimUsernameRequest {
     timestamp: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct UsernameResponse {
     username: String,
     address: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct LnurlpResponse {
     tag: String,
     callback: String,
@@ -228,7 +228,7 @@ pub struct LnurlpResponse {
     metadata: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct LnurlErrorResponse {
     status: String,
     reason: String,
@@ -1016,7 +1016,10 @@ async fn lnurlp_handler(
         .into_response()
 }
 
-async fn lnurl_callback_handler(Path(_username): Path<String>) -> impl IntoResponse {
+async fn lnurl_callback_handler(
+    State(_state): State<AppState>,
+    Path(_username): Path<String>,
+) -> impl IntoResponse {
     Json(LnurlErrorResponse {
         status: "ERROR".into(),
         reason: "Lightning payments coming soon (Phase 2)".into(),
@@ -1026,55 +1029,31 @@ async fn lnurl_callback_handler(Path(_username): Path<String>) -> impl IntoRespo
 /// Build the full application router with all API routes, CORS, health check, and fallback.
 /// Extracted so it can be reused in integration tests via `oneshot()`.
 fn create_router(state: AppState) -> Router {
-    let app_cors = CorsLayer::new()
-        .allow_origin([
-            "https://zkcoins.app"
-                .parse::<HeaderValue>()
-                .expect("valid origin"),
-            "https://dev.zkcoins.app"
-                .parse::<HeaderValue>()
-                .expect("valid origin"),
-            "http://localhost:3090"
-                .parse::<HeaderValue>()
-                .expect("valid origin"),
-        ])
+    let cors = CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([header::CONTENT_TYPE]);
 
-    let lnurl_cors = CorsLayer::new()
-        .allow_origin(tower_http::cors::Any)
-        .allow_methods([Method::GET])
-        .allow_headers([header::CONTENT_TYPE]);
-
-    let api_routes = Router::new()
-        .route("/info", get(info_handler))
-        .route("/balance", get(get_balance_handler))
-        .route("/send", post(send_coin_handler))
-        .route("/address", get(get_address_handler))
-        .route("/receive", post(receive_coin_handler))
-        .route("/proof/{id}", get(get_proof_handler))
-        .route("/mint", post(mint_handler))
-        .route("/commit", post(commit_handler))
-        .route("/username/claim", post(claim_username_handler))
-        .route(
-            "/username/resolve/{username}",
-            get(resolve_username_handler),
-        )
-        .with_state(state.clone())
-        .layer(app_cors);
-
-    // LNURL endpoints need open CORS (any wallet can call these)
-    let lnurl_routes = Router::new()
-        .route("/.well-known/lnurlp/{username}", get(lnurlp_handler))
-        .route("/lnurl/pay/{username}", get(lnurl_callback_handler))
-        .with_state(state)
-        .layer(lnurl_cors);
-
     Router::new()
         .route("/health", get(|| async { "ok" }))
-        .nest("/api", api_routes)
-        .merge(lnurl_routes)
+        .route("/api/info", get(info_handler))
+        .route("/api/balance", get(get_balance_handler))
+        .route("/api/send", post(send_coin_handler))
+        .route("/api/address", get(get_address_handler))
+        .route("/api/receive", post(receive_coin_handler))
+        .route("/api/proof/:id", get(get_proof_handler))
+        .route("/api/mint", post(mint_handler))
+        .route("/api/commit", post(commit_handler))
+        .route("/api/username/claim", post(claim_username_handler))
+        .route(
+            "/api/username/resolve/:username",
+            get(resolve_username_handler),
+        )
+        .route("/.well-known/lnurlp/:username", get(lnurlp_handler))
+        .route("/lnurl/pay/:username", get(lnurl_callback_handler))
+        .with_state(state)
         .fallback(|| async { StatusCode::NOT_FOUND })
+        .layer(cors)
 }
 
 // Function to start the REST API server
@@ -1421,5 +1400,265 @@ mod tests {
         let (status, _body) = send_request(req).await;
 
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // =======================================================================
+    // Helper: send a request through a *shared* router (same AppState across
+    // calls) instead of creating a fresh test_state() for every request.
+    // =======================================================================
+    async fn send_request_with_state(
+        state: AppState,
+        request: Request<Body>,
+    ) -> (StatusCode, String) {
+        let app = create_router(state);
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        (status, body)
+    }
+
+    // --- GET /api/username/resolve/{username} ---
+
+    #[tokio::test]
+    async fn resolve_unknown_username_returns_404() {
+        let req = Request::get("/api/username/resolve/nonexistent")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send_request(req).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let resp: LnurlErrorResponse = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(resp.status, "ERROR");
+        assert!(resp.reason.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn resolve_minting_address_by_hex_prefix() {
+        // The minting address starts with "af53a1" — a short prefix is enough
+        // for resolve_identifier to match via hex-prefix fallback.
+        let full_hex = hex::encode(zkcoins_program::MINTING_ADDRESS);
+        let prefix = &full_hex[..8]; // first 8 hex chars
+
+        let uri = format!("/api/username/resolve/{}", prefix);
+        let req = Request::get(&uri).body(Body::empty()).unwrap();
+        let (status, body) = send_request(req).await;
+
+        assert_eq!(status, StatusCode::OK);
+
+        let resp: UsernameResponse = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(resp.address, format!("0x{}", full_hex));
+        assert_eq!(resp.username, prefix);
+    }
+
+    // --- POST /api/username/claim ---
+
+    #[tokio::test]
+    async fn claim_username_empty_body_returns_422() {
+        let req = Request::post("/api/username/claim")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (status, _body) = send_request(req).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn claim_username_no_content_type_returns_415() {
+        let req = Request::post("/api/username/claim")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (status, _body) = send_request(req).await;
+
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    // --- GET /.well-known/lnurlp/{username} ---
+
+    #[tokio::test]
+    async fn lnurlp_unknown_user_returns_404() {
+        let req = Request::get("/.well-known/lnurlp/nobody")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send_request(req).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let resp: LnurlErrorResponse = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(resp.status, "ERROR");
+        assert!(resp.reason.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn lnurlp_known_address_returns_pay_request() {
+        // The minting address is resolvable by hex prefix through resolve_identifier.
+        let full_hex = hex::encode(zkcoins_program::MINTING_ADDRESS);
+        let prefix = &full_hex[..8];
+
+        let uri = format!("/.well-known/lnurlp/{}", prefix);
+        let req = Request::get(&uri)
+            .header("host", "api.zkcoins.app")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send_request(req).await;
+
+        assert_eq!(status, StatusCode::OK);
+
+        let resp: LnurlpResponse = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(resp.tag, "payRequest");
+        assert!(
+            resp.callback.contains(prefix),
+            "callback should include the identifier"
+        );
+        assert_eq!(resp.min_sendable, 1_000);
+        assert_eq!(resp.max_sendable, 1_000_000_000_000);
+        assert!(resp.metadata.contains("zkCoins"));
+    }
+
+    // --- GET /lnurl/pay/{username} ---
+
+    #[tokio::test]
+    async fn lnurl_pay_callback_returns_phase2_error() {
+        let req = Request::get("/lnurl/pay/someone")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send_request(req).await;
+
+        assert_eq!(status, StatusCode::OK);
+
+        let resp: LnurlErrorResponse = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(resp.status, "ERROR");
+        assert!(
+            resp.reason.contains("Phase 2"),
+            "should mention Phase 2: {}",
+            resp.reason
+        );
+    }
+
+    // --- Balance includes username field ---
+
+    #[tokio::test]
+    async fn balance_minting_address_has_no_username() {
+        let address_hex = hex::encode(zkcoins_program::MINTING_ADDRESS);
+        let uri = format!("/api/balance?address={}", address_hex);
+        let req = Request::get(&uri).body(Body::empty()).unwrap();
+        let (status, body) = send_request(req).await;
+
+        assert_eq!(status, StatusCode::OK);
+
+        // username should be absent (skip_serializing_if = None)
+        let raw: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert!(
+            raw.get("username").is_none() || raw["username"].is_null(),
+            "minting address without a claimed username should have no username field"
+        );
+    }
+
+    #[tokio::test]
+    async fn balance_includes_username_when_claimed() {
+        let state = test_state();
+
+        // Manually claim a username for the minting address
+        {
+            let mut username_store = state.username_store.lock().unwrap();
+            username_store
+                .claim("satoshi", zkcoins_program::MINTING_ADDRESS)
+                .expect("claim should succeed");
+        }
+
+        let address_hex = hex::encode(zkcoins_program::MINTING_ADDRESS);
+        let uri = format!("/api/balance?address={}", address_hex);
+        let req = Request::get(&uri).body(Body::empty()).unwrap();
+        let (status, body) = send_request_with_state(state, req).await;
+
+        assert_eq!(status, StatusCode::OK);
+
+        let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(resp.balance, u64::MAX);
+        assert_eq!(resp.username, Some("satoshi".to_string()));
+    }
+
+    // --- Concurrent balance reads ---
+
+    #[tokio::test]
+    async fn concurrent_balance_reads_are_consistent() {
+        let state = test_state();
+        let address_hex = hex::encode(zkcoins_program::MINTING_ADDRESS);
+        let uri = format!("/api/balance?address={}", address_hex);
+
+        // Spawn many concurrent balance requests against the same shared state.
+        let mut handles = vec![];
+        for _ in 0..20 {
+            let s = state.clone();
+            let u = uri.clone();
+            handles.push(tokio::spawn(async move {
+                let req = Request::get(&u).body(Body::empty()).unwrap();
+                send_request_with_state(s, req).await
+            }));
+        }
+
+        for handle in handles {
+            let (status, body) = handle.await.expect("task should not panic");
+            assert_eq!(status, StatusCode::OK);
+            let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
+            assert_eq!(
+                resp.balance,
+                u64::MAX,
+                "every concurrent read must see the same minting balance"
+            );
+        }
+    }
+
+    // --- Concurrent mixed reads and username operations ---
+
+    #[tokio::test]
+    async fn concurrent_reads_with_username_claim() {
+        let state = test_state();
+        let address_hex = hex::encode(zkcoins_program::MINTING_ADDRESS);
+
+        // Claim a username through the store directly (bypasses signature validation)
+        {
+            let mut store = state.username_store.lock().unwrap();
+            store
+                .claim("testuser", zkcoins_program::MINTING_ADDRESS)
+                .unwrap();
+        }
+
+        // Spawn concurrent balance + resolve requests
+        let mut handles = vec![];
+
+        for i in 0..10 {
+            let s = state.clone();
+            let hex = address_hex.clone();
+            handles.push(tokio::spawn(async move {
+                if i % 2 == 0 {
+                    // Balance request
+                    let req = Request::get(&format!("/api/balance?address={}", hex))
+                        .body(Body::empty())
+                        .unwrap();
+                    let (status, body) = send_request_with_state(s, req).await;
+                    assert_eq!(status, StatusCode::OK);
+                    let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
+                    assert_eq!(resp.balance, u64::MAX);
+                    assert_eq!(resp.username, Some("testuser".to_string()));
+                } else {
+                    // Resolve request
+                    let req = Request::get("/api/username/resolve/testuser")
+                        .body(Body::empty())
+                        .unwrap();
+                    let (status, body) = send_request_with_state(s, req).await;
+                    assert_eq!(status, StatusCode::OK);
+                    let resp: UsernameResponse = serde_json::from_str(&body).expect("valid JSON");
+                    assert_eq!(resp.username, "testuser");
+                    assert_eq!(resp.address, format!("0x{}", hex));
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.await.expect("task should not panic");
+        }
     }
 }
