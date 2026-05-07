@@ -37,12 +37,23 @@ SP1_PROVER=mock cargo run -p server
 |---|---|---|---|
 | `/health` | GET | Health check | `ok` (200) |
 | `/api/info` | GET | Network info | `{ network }` |
-| `/api/mint` | POST | Mint coins (faucet) | `{ proof_id }` |
-| `/api/send` | POST | Transfer coins | `{ proof_id }` |
+| `/api/mint` | POST | Mint coins (faucet) | `{ success, proof_id }` |
+| `/api/send` | POST | Transfer coins (phase 1) | `{ success, proof_id, account_state_hash, output_coins_root }` |
+| `/api/commit` | POST | Submit signed commitment (phase 2) | `{ success, proof_id }` |
 | `/api/balance?address=<hex>` | GET | Query balance | `{ balance }` |
-| `/api/address` | GET | Generate receive addresses | `{ addresses }` |
+| `/api/address` | GET | List all addresses | `{ addresses }` |
 | `/api/receive` | POST | Receive coins from sender | `{ success }` |
 | `/api/proof/:id` | GET | Download coin proof | Binary |
+
+### Two-Phase Send Flow
+
+User sends require a two-phase flow because the server doesn't hold sender private keys:
+
+1. **`POST /api/send`** — server generates ZK proof, returns `proof_id` + `account_state_hash` + `output_coins_root`
+2. **Client signs commitment** — `Schnorr(hash_concat(account_state_hash, output_coins_root))` with BIP-32 key at `numPubkeys`
+3. **`POST /api/commit`** — server verifies commitment, broadcasts Taproot inscription, delivers coin to recipient via `receive_coin`
+
+Mint uses a single-phase flow (server holds the minting account key).
 
 ## Project Structure
 
@@ -101,7 +112,8 @@ Staged scaling for the SP1 prover:
 
 | Stage | When to move | Configuration |
 |---|---|---|
-| **1. CPU (current)** | Baseline | `SP1_PROVER=cpu` running on Mac Studio M3 Ultra, 96 GB unified memory. Measure `update_account` / `create_account` latency under real load before scaling further. |
+| **0. Mock (DEV)** | Development & testing | `SP1_PROVER=mock` — no real proofs, instant responses. Required on DEV because CPU prover causes OOM (SP1 `update_account` exceeds available memory). |
+| **1. CPU (PRD)** | Production baseline | `SP1_PROVER=cpu` running on Mac Studio M3 Ultra, 96 GB unified memory. `create_account` works, `update_account` needs memory tuning. |
 | **2. Succinct Prover Network** | CPU latency becomes a bottleneck | `SP1_PROVER=network` — no hardware commitment, requires PROVE token deposit and accepts token-price exposure. See [docs.succinct.xyz](https://docs.succinct.xyz/docs/sp1/prover-network/quickstart). |
 | **3. Self-hosted CUDA** | Network volume too costly or PROVE exposure undesirable | `SP1_PROVER=cuda` on x86 Linux with NVIDIA GPU (Compute Capability ≥ 8.6, ≥ 24 GB VRAM — RTX 4090 / 5090 / RTX 6000 Ada). Apple Silicon is not supported. |
 
