@@ -151,12 +151,17 @@ impl ProofStore {
         }
     }
 
+    /// Build a safe file path for a proof ID within the store directory.
+    fn proof_path(&self, id: u64) -> std::path::PathBuf {
+        std::path::Path::new(&self.dir).join(format!("{}.bin", id))
+    }
+
     fn add_proof(&self, proof_with_commitment: CoinProof) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let path = format!("{}/{}.bin", self.dir, id);
+        let path = self.proof_path(id);
         match bincode::serialize(&proof_with_commitment) {
             Ok(bytes) => {
-                if let Err(e) = crate::atomic_write(&path, &bytes) {
+                if let Err(e) = crate::atomic_write(path.to_str().unwrap_or(""), &bytes) {
                     eprintln!("Failed to persist proof {}: {}", id, e);
                 }
             }
@@ -166,7 +171,7 @@ impl ProofStore {
     }
 
     fn get_proof(&self, id: u64) -> Option<CoinProof> {
-        let path = format!("{}/{}.bin", self.dir, id);
+        let path = self.proof_path(id);
         let bytes = std::fs::read(&path).ok()?;
         bincode::deserialize(&bytes).ok()
     }
@@ -396,7 +401,10 @@ async fn send_coin_handler(
         // NOTE: accounts are NOT saved here — proof must be persisted first
     };
 
-    println!("Generated send_result: {:?}", send_result);
+    eprintln!(
+        "Send result: {}",
+        if send_result.is_ok() { "ok" } else { "err" }
+    );
 
     match send_result {
         Ok(mut coin_proofs) => {
@@ -537,7 +545,10 @@ async fn mint_handler(
         )
     };
 
-    println!("Minting result: {:?}", send_result);
+    eprintln!(
+        "Mint result: {}",
+        if send_result.is_ok() { "ok" } else { "err" }
+    );
     // Now that the locks are dropped, we can await safely.
     match send_result {
         Ok(mut coin_proofs) => {

@@ -136,9 +136,11 @@ impl AccountServer {
             return Err("Coin inclusion proof verification failed");
         }
 
-        println!(
-            "Receiving coin for address: {:?}",
-            coin_proof.coin.recipient
+        // Log coin receipt without exposing full address (privacy).
+        let addr = &coin_proof.coin.recipient;
+        eprintln!(
+            "Receiving coin for address: {:02x}{:02x}…",
+            addr[0], addr[1]
         );
         // Get the recipient account
         let mut account = self
