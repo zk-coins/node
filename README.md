@@ -18,7 +18,7 @@ Rust/Axum backend for [zkcoins.app](https://zkcoins.app) — account management,
 | ZK Proofs | SP1 zkVM | Write proofs in standard Rust, no DSL |
 | Data structures | SMT + MMR | Non-inclusion proofs + append-only history |
 | Bitcoin | Taproot Inscriptions | 64-byte nullifiers, Esplora API scanning |
-| Bitcoin node | bitcoind-mainnet | Shared Docker network `bitcoin`, port 8332 |
+| Bitcoin index | electrs (Esplora) | Esplora REST API via shared Docker network `bitcoin` |
 
 Full rationale: [docs.zkcoins.app/tech-decisions](https://docs.zkcoins.app/tech-decisions)
 
@@ -36,10 +36,24 @@ SP1_PROVER=mock cargo run -p server
 | Endpoint | Method | Description | Response |
 |---|---|---|---|
 | `/health` | GET | Health check | `ok` (200) |
-| `/api/mint` | POST | Mint coins (faucet) | `{ proof_id }` |
-| `/api/send` | POST | Transfer coins | `{ proof_id }` |
+| `/api/info` | GET | Network info | `{ network }` |
+| `/api/mint` | POST | Mint coins (faucet) | `{ success, proof_id }` |
+| `/api/send` | POST | Transfer coins (phase 1) | `{ success, proof_id, account_state_hash, output_coins_root }` |
+| `/api/commit` | POST | Submit signed commitment (phase 2) | `{ success, proof_id }` |
 | `/api/balance?address=<hex>` | GET | Query balance | `{ balance }` |
+| `/api/address` | GET | List all addresses | `{ addresses }` |
+| `/api/receive` | POST | Receive coins from sender | `{ success }` |
 | `/api/proof/:id` | GET | Download coin proof | Binary |
+
+### Two-Phase Send Flow
+
+User sends require a two-phase flow because the server doesn't hold sender private keys:
+
+1. **`POST /api/send`** — server generates ZK proof, returns `proof_id` + `account_state_hash` + `output_coins_root`
+2. **Client signs commitment** — `Schnorr(hash_concat(account_state_hash, output_coins_root))` with BIP-32 key at `numPubkeys`
+3. **`POST /api/commit`** — server verifies commitment, broadcasts Taproot inscription, delivers coin to recipient via `receive_coin`
+
+Mint uses a single-phase flow (server holds the minting account key).
 
 ## Project Structure
 
@@ -54,7 +68,7 @@ server/                # Axum REST API
 │   └── publisher.rs   # Taproot Inscription broadcaster (commit/reveal)
 shared/                # Shared types (Commitment, Invoice, ClientAccount)
 program/               # SP1 zkVM circuit types (AccountState, Coin, ProofData)
-│   └── src/merkle/    # SMT + MMR implementations
+├── src/merkle/        # SMT + MMR implementations
 script/                # Prover (real SP1 zkVM — create_account, update_account)
 ```
 
@@ -63,9 +77,10 @@ script/                # Prover (real SP1 zkVM — create_account, update_accoun
 | Variable | Default | Description |
 |---|---|---|
 | `SP1_PROVER` | `mock` | `mock` (no proof), `cpu`, `cuda`, or `network` |
-| `ESPLORA_URL` | `https://mutinynet.com/api` | Bitcoin node API |
-| `BITCOIN_RPC_USER` | — | Bitcoin Core RPC username |
-| `BITCOIN_RPC_PASSWORD` | — | Bitcoin Core RPC password |
+| `ESPLORA_URL` | `https://mutinynet.com/api` | Esplora API endpoint (electrs or public) |
+| `IS_MAINNET` | `false` | `true` for Bitcoin Mainnet, `false` for Mutinynet/Signet |
+| `NETWORK_NAME` | `Mutinynet` | Human-readable network name (returned by `/api/info`) |
+| `PUBLISHER_KEY` | test key | 32-byte hex private key for inscription publishing. **Required on mainnet** — server panics if default test key is used |
 | `RUST_LOG` | `info` | Log level |
 
 ## Docker
@@ -75,7 +90,7 @@ docker build -t zkcoin/server .
 docker run -p 4242:4242 \
   --network bitcoin \
   -e SP1_PROVER=mock \
-  -e ESPLORA_URL=http://bitcoind-mainnet:8332 \
+  -e ESPLORA_URL=http://electrs-mainnet:3000 \
   zkcoin/server
 ```
 
@@ -97,7 +112,8 @@ Staged scaling for the SP1 prover:
 
 | Stage | When to move | Configuration |
 |---|---|---|
-| **1. CPU (current)** | Baseline | `SP1_PROVER=cpu` running on Mac Studio M3 Ultra, 96 GB unified memory. Measure `update_account` / `create_account` latency under real load before scaling further. |
+| **0. Mock (DEV)** | Development & testing | `SP1_PROVER=mock` — no real proofs, instant responses. Required on DEV because CPU prover causes OOM (SP1 `update_account` exceeds available memory). |
+| **1. CPU (PRD)** | Production baseline | `SP1_PROVER=cpu` running on Mac Studio M3 Ultra, 96 GB unified memory. `create_account` works, `update_account` needs memory tuning. |
 | **2. Succinct Prover Network** | CPU latency becomes a bottleneck | `SP1_PROVER=network` — no hardware commitment, requires PROVE token deposit and accepts token-price exposure. See [docs.succinct.xyz](https://docs.succinct.xyz/docs/sp1/prover-network/quickstart). |
 | **3. Self-hosted CUDA** | Network volume too costly or PROVE exposure undesirable | `SP1_PROVER=cuda` on x86 Linux with NVIDIA GPU (Compute Capability ≥ 8.6, ≥ 24 GB VRAM — RTX 4090 / 5090 / RTX 6000 Ada). Apple Silicon is not supported. |
 
@@ -105,11 +121,8 @@ Skip stages only with concrete latency or cost data, not assumptions.
 
 ## Open Tasks
 
-- [x] CORS headers (allow frontend to call API directly)
-- [x] Real SP1 proofs (CPU prover live on DEV/PRD)
 - [ ] GPU acceleration (`SP1_PROVER=cuda`) or Succinct Prover Network
 - [ ] Explorer endpoints (`/api/stats`, `/api/nullifiers`)
-- [ ] Publisher key from environment variable (currently hardcoded)
 - [ ] Light client support
 
 ## Related

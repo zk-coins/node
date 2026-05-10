@@ -1,13 +1,15 @@
-use shared::commitment::Commitment;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::PublicKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use zkcoins_program::merkle::merkle_mountain_range::{MMRProof, MerkleMountainRange};
-use zkcoins_program::merkle::sparse_merkle_tree::{load_merkle_tree, save_merkle_tree, InclusionProof, SparseMerkleTree};
-use zkcoins_program::merkle::{HashDigest, ZERO_HASH};
+use shared::commitment::Commitment;
 use std::collections::HashMap;
 use std::io;
+use zkcoins_program::merkle::merkle_mountain_range::{MMRProof, MerkleMountainRange};
+use zkcoins_program::merkle::sparse_merkle_tree::{
+    load_merkle_tree, save_merkle_tree, InclusionProof, SparseMerkleTree,
+};
+use zkcoins_program::merkle::{HashDigest, ZERO_HASH};
 
 /// State stores both a Sparse Merkle Tree (for individual commitments)
 /// and a Merkle Mountain Range (for accumulating SMT roots).
@@ -70,7 +72,8 @@ impl State {
 
         // Store the mapping of previous MMR root to (SMT root, leaf index)
         let leaf_index = self.mmr.leaf_count();
-        self.root_indices.insert(prev_mmr_root, (smt_root, leaf_index));
+        self.root_indices
+            .insert(prev_mmr_root, (smt_root, leaf_index));
 
         // 4. Append the new leaf to the MMR
         self.mmr.append(leaf);
@@ -93,7 +96,7 @@ impl State {
         match self.root_indices.get(&prev_mmr_root) {
             // Get the inclusion proof for this index from the MMR
             Some(&(smt_root, index)) => self.mmr.get_proof(index).map(|proof| (smt_root, proof)),
-            None => Err("Couldn't find MMR inclusion proof")
+            None => Err("Couldn't find MMR inclusion proof"),
         }
     }
 
@@ -144,7 +147,7 @@ impl State {
 
         // Save prev_mmr_root to a separate file
         let prev_root_path = format!("{}.prev_root", mmr_path);
-        std::fs::write(prev_root_path, self.prev_mmr_root)?;
+        crate::atomic_write(&prev_root_path, &self.prev_mmr_root)?;
 
         Ok(())
     }
@@ -186,8 +189,8 @@ mod tests {
     use super::*;
     use bitcoin::hashes::Hash;
     use bitcoin::secp256k1::{Secp256k1, SecretKey};
-    use zkcoins_program::merkle::{hash_concat, HASH_SIZE};
     use std::str::FromStr;
+    use zkcoins_program::merkle::{hash_concat, HASH_SIZE};
 
     // Helper function to create a test commitment with a given message
     fn create_test_commitment(message: &[u8], key_hex: &str) -> Commitment {
@@ -242,7 +245,9 @@ mod tests {
         let root1 = state.update(&[commitments[0].clone()]).unwrap();
 
         // Then update with the other two
-        let root2 = state.update(&[commitments[1].clone(), commitments[2].clone()]).unwrap();
+        let root2 = state
+            .update(&[commitments[1].clone(), commitments[2].clone()])
+            .unwrap();
 
         // The roots should be different after each update
         assert_ne!(root1, root2);
@@ -422,7 +427,10 @@ mod tests {
         );
 
         let result = state.get_commitment_proof(&non_existent.public_key);
-        assert!(result.is_err(), "Should return Err for non-existent commitment");
+        assert!(
+            result.is_err(),
+            "Should return Err for non-existent commitment"
+        );
     }
 
     #[test]

@@ -1,10 +1,8 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::{collections::HashMap, mem::take};
 
 use crate::state::State;
-use bitcoin::bip32::Xpriv;
 use bitcoin::secp256k1::PublicKey;
-use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use shared::commitment::Commitment;
 use shared::{Address, Invoice};
@@ -131,14 +129,19 @@ impl AccountServer {
         let proof_data = coin_proof.proof.public_values.clone().read::<ProofData>();
 
         // Verify the inclusion of the coin in the proof.
-        // TODO: Return an err and also verify the proof verification itself. (Dry-run the
-        // aggregation)
-        // TODO: Verify that the commitment was not included in our state.
-        coin_proof
+        if !coin_proof
             .inclusion_proof
-            .verify(coin_proof.coin.identifier, proof_data.output_coins_root);
+            .verify(coin_proof.coin.identifier, proof_data.output_coins_root)
+        {
+            return Err("Coin inclusion proof verification failed");
+        }
 
-        println!("Receiving coin for address: {:?}", coin_proof.coin.recipient);
+        // Log coin receipt without exposing full address (privacy).
+        let addr = &coin_proof.coin.recipient;
+        eprintln!(
+            "Receiving coin for address: {:02x}{:02x}…",
+            addr[0], addr[1]
+        );
         // Get the recipient account
         let mut account = self
             .accounts
@@ -158,16 +161,32 @@ impl AccountServer {
         //    &account.state.public_key,
         //);
 
-        // TODO: Make sure the coin_queue doesn't include this coin already.
+        // Reject duplicate coins (replay protection)
+        let coin_id = coin_proof.coin.identifier;
+        if account
+            .coin_queue
+            .iter()
+            .any(|cp| cp.coin.identifier == coin_id)
+        {
+            return Err("Coin already in queue (duplicate)");
+        }
+        if account
+            .coin_history
+            .generate_inclusion_proof(&coin_id)
+            .is_ok()
+        {
+            return Err("Coin already spent (replay)");
+        }
+
         let address = coin_proof.coin.recipient;
         account.coin_queue.push(coin_proof);
         self.accounts.insert(address, account);
         Ok(())
     }
 
-    /// Get all required merkle proofs from the state for the public key and the previous proof
-    pub fn get_merkle_proofs(
-        &self,
+    /// Get all required merkle proofs from the state for the public key and the previous proof.
+    /// Static method: does not access self.accounts, only the state guard.
+    fn get_merkle_proofs(
         mut previous_proof: Proof,
         public_key: PublicKey,
         state: &MutexGuard<'_, State>,
@@ -212,8 +231,12 @@ impl AccountServer {
         account_address: Address,
         public_key: PublicKey,
         next_public_key: PublicKey,
+        prev_commitment_pubkey: Option<PublicKey>,
     ) -> Result<Vec<CoinProof>, &'static str> {
-        let state = &self.state.lock().unwrap();
+        let state = &self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Check if the account balance is enough
         let balance = self.get_account_balance(&account_address)?;
         let invoiced_amount = invoices.iter().fold(0, |acc, x| acc + x.amount);
@@ -221,7 +244,7 @@ impl AccountServer {
             return Err("Insufficient funds");
         }
 
-        let mut account = match self.accounts.remove(&account_address) {
+        let account = match self.accounts.get_mut(&account_address) {
             Some(account) => account,
             None => return Err("Unknown account address"),
         };
@@ -241,7 +264,7 @@ impl AccountServer {
         for coin_proof in &account.coin_queue {
             coin_history_proofs.push({
                 match &coin_proof.commitment {
-                    Some(commitment) => self.get_merkle_proofs(
+                    Some(commitment) => Self::get_merkle_proofs(
                         coin_proof.proof.clone(),
                         commitment.public_key,
                         state,
@@ -310,37 +333,38 @@ impl AccountServer {
             .out_coins(out_coins.clone())
             .out_coin_proofs(out_coin_proofs);
 
-        // TODO(Refactor): Don't use take and move this up into the loop
-        let received_proofs = take(&mut account.coin_queue)
-            .into_iter()
-            .map(|x| x.proof)
-            .collect();
+        let received_proofs: Vec<_> = account.coin_queue.iter().map(|x| x.proof.clone()).collect();
 
-        let proof = match account.proof.take() {
+        let proof = match &account.proof {
             Some(account_proof) => {
-                let account_commitment_public_key = public_key;
-                proof_hints_builder.prev_proof_history_proofs(Some(self.get_merkle_proofs(
+                let account_commitment_public_key = prev_commitment_pubkey
+                    .ok_or("prev_commitment_pubkey required for account update")?;
+                let merkle_proofs = Self::get_merkle_proofs(
                     account_proof.clone(),
                     account_commitment_public_key,
                     state,
-                )?));
+                )?;
+                proof_hints_builder.prev_proof_history_proofs(Some(merkle_proofs));
                 proof_hints_builder.proof_type(ProofType::AccountUpdateProof);
-                self.prover
-                    .update_account(proof_hints_builder, account_proof, received_proofs)?
+                self.prover.update_account(
+                    proof_hints_builder,
+                    account_proof.clone(),
+                    received_proofs,
+                )?
             }
-            _ => self
+            None => self
                 .prover
                 .create_account(proof_hints_builder, received_proofs)?,
         };
 
-        // Update account.
+        // Proof generation succeeded — now commit the state changes.
+        // coin_queue and proof were read non-destructively above,
+        // so the account is unchanged if we got an error before this point.
+        account.coin_queue.clear();
         account.balance = balance - invoiced_amount;
         account.proof = Some(proof.clone());
-
-        // Insert account back into database.
-        self.accounts.insert(account_address, account);
-        let public_values =
-            bincode::deserialize::<ProofData>(&proof.public_values.to_vec()).unwrap();
+        let public_values = bincode::deserialize::<ProofData>(&proof.public_values.to_vec())
+            .map_err(|_| "Failed to deserialize proof public values")?;
         if public_values.output_coins_root != out_coins_tree.root() {
             return Err(
                 "The simulated out_coins_tree root does not match the commited output_coins_root",
@@ -372,7 +396,7 @@ impl AccountServer {
     pub fn save_to_file(&self, path: &str) -> std::io::Result<()> {
         let bytes = bincode::serialize(&self.accounts)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        std::fs::write(path, bytes)
+        crate::atomic_write(path, &bytes)
     }
 
     pub fn load_from_file(state: Arc<Mutex<State>>, path: &str) -> std::io::Result<Self> {
@@ -450,14 +474,7 @@ mod tests {
                 .expect("Failed to create private key for generic account.");
 
             let initial_pk_bytes = generate_test_public_key(&xpriv, 0).serialize().to_vec();
-            // Deterministic address generation for tests, mimicking AccountState::new but with fixed randomness
-            let address = zkcoins_program::hash(
-                &[
-                    initial_pk_bytes,
-                    TEST_ACCOUNT_RANDOM_SEED_FOR_ADDRESS.to_vec(),
-                ]
-                .concat(),
-            );
+            let address = zkcoins_program::hash(&initial_pk_bytes);
 
             TestAccountData {
                 xpriv,
@@ -473,8 +490,14 @@ mod tests {
         ) -> Result<Vec<CoinProof>, String> {
             let current_pk = generate_test_public_key(&self.xpriv, self.num_pubkeys);
             let next_pk = generate_test_public_key(&self.xpriv, self.num_pubkeys + 1);
+            let prev_pk = if self.num_pubkeys > 0 {
+                Some(generate_test_public_key(&self.xpriv, self.num_pubkeys - 1))
+            } else {
+                None
+            };
 
-            let mut coin_proofs = server.send_coins(invoices, self.address, current_pk, next_pk)?;
+            let mut coin_proofs =
+                server.send_coins(invoices, self.address, current_pk, next_pk, prev_pk)?;
 
             // The key used for the commitment corresponds to current_pk
             let signing_secret_key = derive_test_secret_key(&self.xpriv, self.num_pubkeys);
@@ -504,10 +527,6 @@ mod tests {
         let mut server = AccountServer::new(Arc::clone(&state_arc));
 
         let mut minting_account_data = TestAccountData::new_minting_account();
-        println!(
-            "minting account address: {:?}",
-            minting_account_data.address
-        );
         server.import_account(
             minting_account_data.address,
             Account {
@@ -645,10 +664,6 @@ mod tests {
         let mut server = AccountServer::new(state_arc);
 
         let minting_account_data = TestAccountData::new_minting_account();
-        println!(
-            "minting account address: {:?}",
-            minting_account_data.address
-        );
 
         server.import_account(
             minting_account_data.address, // This is MINTING_ADDRESS
@@ -694,6 +709,107 @@ mod tests {
             .expect("Mint with single invoice failed");
 
         assert_eq!(coin_proofs.len(), 1);
+    }
+
+    #[test]
+    fn test_receive_duplicate_coin_rejected() {
+        let state_arc = Arc::new(Mutex::new(State::new()));
+        let mut server = AccountServer::new(Arc::clone(&state_arc));
+
+        let mut minting_account_data = TestAccountData::new_minting_account();
+        server.import_account(
+            minting_account_data.address,
+            Account {
+                proof: None,
+                coin_queue: vec![],
+                coin_history: SparseMerkleTree::new(),
+                balance: 10_000,
+            },
+        );
+
+        let account_1_data = TestAccountData::new_generic(&[1u8; 32], Network::Signet);
+        let invoice = Invoice::new(100, account_1_data.address);
+
+        let coin_proofs = minting_account_data
+            .execute_send_coins(&mut server, vec![invoice])
+            .expect("Mint failed");
+
+        state_arc
+            .lock()
+            .unwrap()
+            .update(
+                &coin_proofs
+                    .iter()
+                    .map(|x| x.commitment.clone().unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+
+        let coin_proof = coin_proofs.into_iter().next().unwrap();
+        let duplicate = coin_proof.clone();
+
+        // First receive should succeed
+        server
+            .receive_coin(coin_proof)
+            .expect("First receive should succeed");
+
+        // Second receive of the same coin should be rejected
+        let result = server.receive_coin(duplicate);
+        assert!(result.is_err(), "Duplicate coin receive must be rejected");
+    }
+
+    #[test]
+    fn test_receive_updates_balance() {
+        let state_arc = Arc::new(Mutex::new(State::new()));
+        let mut server = AccountServer::new(Arc::clone(&state_arc));
+
+        let mut minting_account_data = TestAccountData::new_minting_account();
+        server.import_account(
+            minting_account_data.address,
+            Account {
+                proof: None,
+                coin_queue: vec![],
+                coin_history: SparseMerkleTree::new(),
+                balance: 10_000,
+            },
+        );
+
+        let account_1_data = TestAccountData::new_generic(&[1u8; 32], Network::Signet);
+        let invoice = Invoice::new(250, account_1_data.address);
+
+        // Balance should not exist before any receive
+        assert!(
+            server.get_account_balance(&account_1_data.address).is_err(),
+            "Account should not exist before receiving coins"
+        );
+
+        let coin_proofs = minting_account_data
+            .execute_send_coins(&mut server, vec![invoice])
+            .expect("Mint failed");
+
+        state_arc
+            .lock()
+            .unwrap()
+            .update(
+                &coin_proofs
+                    .iter()
+                    .map(|x| x.commitment.clone().unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+
+        for cp in coin_proofs {
+            server.receive_coin(cp).expect("Receive should succeed");
+        }
+
+        // Balance should reflect the received coin amount
+        let balance = server
+            .get_account_balance(&account_1_data.address)
+            .expect("Account should exist after receive");
+        assert_eq!(
+            balance, 250,
+            "Balance should equal the received coin amount"
+        );
     }
 
     /// Reproduces the exact configuration of /api/mint on the live DEV server:

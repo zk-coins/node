@@ -1,11 +1,11 @@
 use merkle::{hash_concat, merkle_mountain_range::MMRProof};
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use derive_builder::Builder;
 use merkle::{
-    sparse_merkle_tree::{InclusionProof, NonInclusionProof, DEFAULT_HASHES}, HashDigest
+    sparse_merkle_tree::{InclusionProof, NonInclusionProof, DEFAULT_HASHES},
+    HashDigest,
 };
 
 pub type Amount = u64;
@@ -67,7 +67,10 @@ impl CommitmentMerkleProofs {
     }
 }
 
-pub const MINTING_ADDRESS: HashDigest = [44, 153, 26, 227, 141, 88, 195, 127, 88, 144, 228, 143, 121, 49, 51, 158, 111, 205, 183, 53, 133, 35, 183, 240, 183, 165, 104, 116, 66, 228, 94, 242];
+pub const MINTING_ADDRESS: HashDigest = [
+    175, 83, 161, 5, 16, 78, 44, 44, 237, 20, 140, 19, 48, 116, 86, 210, 247, 116, 223, 190, 106,
+    191, 59, 198, 226, 248, 55, 102, 143, 24, 155, 216,
+];
 
 pub fn hash(data: &[u8]) -> HashDigest {
     Sha256::digest(data).into()
@@ -139,13 +142,7 @@ pub struct AccountState {
 
 impl AccountState {
     pub fn new(initial_public_key: PublicKey) -> Self {
-        // TODO: The randomness here is annoying why do we not hash the public key directly and
-        // skip the first one in the commitments?
-        // We add random bytes to the public key as a blinding factor for the address.
-        // This ensures that the on-chain commited public keys can not be linked to the address.
-        let mut rng = rand::thread_rng();
-        let random_bytes: [u8; 32] = rng.gen();
-        let address = hash(&[initial_public_key.clone(), random_bytes.to_vec()].concat());
+        let address = hash(&initial_public_key);
         AccountState {
             owner: address,
             balance: 0,
@@ -160,7 +157,7 @@ impl AccountState {
 
         self.balance = match self.balance.checked_add(coin.amount) {
             Some(balance) => balance,
-            None => return Err("Receiving coin causes an overflow")
+            None => return Err("Receiving coin causes an overflow"),
         };
         Ok(self)
     }
@@ -187,7 +184,7 @@ impl AccountState {
             // Apply coin.
             self.balance = match self.balance.checked_sub(coin.amount) {
                 Some(balance) => balance,
-                None => return Err("Balance too small to create Coin.")
+                None => return Err("Balance too small to create Coin."),
             };
         }
 

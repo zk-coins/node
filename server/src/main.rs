@@ -1,25 +1,27 @@
+mod account_server;
 mod publisher;
 mod scanner;
 mod server;
-mod account_server;
 mod state;
+mod username;
 
-use shared::commitment::Commitment;
 use crate::publisher::EsploraConfig;
 use crate::scanner::scan_for_inscriptions;
 use crate::server::start_rest_server;
 use crate::state::State;
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
+use shared::commitment::Commitment;
 use std::error::Error as StdError;
-use std::sync::{Arc, Mutex};
 use std::fs::File;
 use std::io::{Read, Write};
+use std::sync::{Arc, Mutex};
 
 const SMT_PATH: &str = "smt.bin";
 const MMR_PATH: &str = "mmr.bin";
 const LATEST_BLOCK_PATH: &str = "latest_block.bin";
 const ACCOUNTS_PATH: &str = "accounts.bin";
+const USERNAMES_PATH: &str = "usernames.bin";
 const ACCOUNT_SERVER_ADDR: &str = "0.0.0.0:4242";
 //const START_BLOCK_HASH: &str = "000000f43ca5c99c54c4738878fe1c5cca07691dc614a2734b73aa78ca868fb8";
 
@@ -27,7 +29,8 @@ use esplora_client::{
     r#async::DefaultSleeper, AsyncClient as EsploraAsyncClient, Builder as EsploraBuilder,
 };
 
-const DEFAULT_PUBLISHER_KEY: &str = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+const DEFAULT_PUBLISHER_KEY: &str =
+    "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 
 lazy_static::lazy_static! {
     pub static ref NETWORK_CONFIG: EsploraConfig = {
@@ -52,10 +55,20 @@ lazy_static::lazy_static! {
     };
 }
 
+/// Atomic write: write to a temp file, then rename.
+/// This prevents data corruption if the process crashes mid-write.
+pub fn atomic_write(path: &str, data: &[u8]) -> std::io::Result<()> {
+    let tmp_path = format!("{}.tmp", path);
+    let mut file = File::create(&tmp_path)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
 // Helper function to save the latest block hash
 fn save_latest_block(block_hash: &BlockHash, path: &str) -> Result<(), Box<dyn StdError>> {
-    let mut file = File::create(path)?;
-    file.write_all(&block_hash.to_byte_array())?;
+    atomic_write(path, &block_hash.to_byte_array())?;
     Ok(())
 }
 
@@ -81,9 +94,9 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                 println!("Creating new State");
                 State::new()
             }
-        }
+        },
     ));
-    
+
     // Create a new AccountServer instance with a reference to the state.
     // Try to restore persisted accounts; otherwise start with an empty server
     // and let start_rest_server seed the minting account.
@@ -99,15 +112,33 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             }
         };
 
+    // Load or create UsernameStore
+    let username_store = match username::UsernameStore::load_from_file(USERNAMES_PATH) {
+        Ok(store) => {
+            println!("Loaded existing usernames from {}", USERNAMES_PATH);
+            store
+        }
+        Err(_) => {
+            println!("No usernames file found, creating new UsernameStore");
+            username::UsernameStore::new()
+        }
+    };
+
     // Spawn the account_server as a separate task
     tokio::spawn(async move {
-        if let Err(e) =
-            start_rest_server(account_server, ACCOUNT_SERVER_ADDR, ACCOUNTS_PATH.to_string()).await
+        if let Err(e) = start_rest_server(
+            account_server,
+            username_store,
+            ACCOUNT_SERVER_ADDR,
+            ACCOUNTS_PATH.to_string(),
+            USERNAMES_PATH.to_string(),
+        )
+        .await
         {
             eprintln!("Account server error: {}", e);
         }
     });
-    
+
     // Try to load the latest block hash or use the default starting point
     let start_block_hash = match load_latest_block(LATEST_BLOCK_PATH) {
         Ok(hash) => {
@@ -116,8 +147,10 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         }
         Err(_) => {
             println!("No saved block hash found, fetching latest from Esplora...");
-            let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(EsploraBuilder::new(&NETWORK_CONFIG.url))?;
-    
+            let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(EsploraBuilder::new(
+                &NETWORK_CONFIG.url,
+            ))?;
+
             let tip_hash = client.get_tip_hash().await?;
             println!("Fetched latest tip hash from Esplora: {}", tip_hash);
             tip_hash
@@ -126,37 +159,37 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 
     // Clone the State's Arc for the closure
     let state_clone = Arc::clone(&state);
-    
+
     scan_for_inscriptions(&NETWORK_CONFIG, start_block_hash, &move |content_bytes: Vec<u8>, current_block_hash| {
         println!("Received content size: {} bytes", content_bytes.len());
-        
+
         // Try to deserialize the content as a Commitment
         match bincode::deserialize::<Commitment>(&content_bytes) {
             Ok(commitment) => {
                 println!("Successfully deserialized as commitment");
                 println!("Public key: {}", commitment.public_key);
-                
+
                 // Verify the commitment
                 if commitment.verify() {
                     println!("Commitment signature verified successfully");
-                    
+
                     // Lock the mutex to modify the state
                     let mut state = state_clone.lock().unwrap();
                     // Update the state with this commitment
                     let new_root = state.update(&[commitment]).unwrap();
-                    
+
                     println!("Added to State. New MMR root: {}", hex::encode(new_root));
-                    
+
                     // Save the state after each update
                     if let Err(e) = state.save_to_files(SMT_PATH, MMR_PATH) {
                         eprintln!("Failed to save state after update: {}", e);
                     }
-                        
+
                     // Save the latest block hash after each update
                     if let Err(e) = save_latest_block(&current_block_hash, LATEST_BLOCK_PATH) {
                         eprintln!("Failed to save latest block hash: {}", e);
                     }
-                
+
                 } else {
                     println!("Commitment verification failed, not adding to state");
                 }

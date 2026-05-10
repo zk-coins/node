@@ -26,9 +26,15 @@ fn verify_account_state_proof(
     let previous_proof_data = verify_proof(public_values, vkey);
     let account_state_hash = account_state.hash();
     assert_eq!(account_state_hash, previous_proof_data.account_state_hash);
-    assert_eq!(account_state_hash, merkle_proofs.commitment_account_state_hash);
+    assert_eq!(
+        account_state_hash,
+        merkle_proofs.commitment_account_state_hash
+    );
     assert!(merkle_proofs.verify_commitment(commitment_history_root));
-    assert!(merkle_proofs.verify_previous_root(previous_proof_data.commitment_history_root, commitment_history_root));
+    assert!(merkle_proofs.verify_previous_root(
+        previous_proof_data.commitment_history_root,
+        commitment_history_root
+    ));
     previous_proof_data.coin_history_root
 }
 
@@ -45,7 +51,10 @@ fn verify_coin_proof(
     assert!(coin_proof.verify(coin.identifier, out_coin_root));
     assert_eq!(out_coin_root, merkle_proofs.commitment_out_coins_root);
     assert!(merkle_proofs.verify_commitment(commitment_history_root));
-    assert!(merkle_proofs.verify_previous_root(coin_proof_data.commitment_history_root, commitment_history_root));
+    assert!(merkle_proofs.verify_previous_root(
+        coin_proof_data.commitment_history_root,
+        commitment_history_root
+    ));
 }
 
 pub fn main() {
@@ -57,9 +66,13 @@ pub fn main() {
     let mut coin_history_root = match hidden_inputs.proof_type {
         ProofType::AccountUpdateProof => verify_account_state_proof(
             &account_state,
-            hidden_inputs.prev_proof_public_values.expect("Missing previous proofs public values"),
+            hidden_inputs
+                .prev_proof_public_values
+                .expect("Missing previous proofs public values"),
             vkey,
-            hidden_inputs.prev_proof_history_proofs.expect("Missing previous proof's history proofs"),
+            hidden_inputs
+                .prev_proof_history_proofs
+                .expect("Missing previous proof's history proofs"),
             commitment_history_root,
         ),
         ProofType::InitialProof => {
@@ -71,36 +84,50 @@ pub fn main() {
     };
 
     let mut coin_history_proofs = hidden_inputs.in_coin_proofs_history_proofs.into_iter();
-    let mut non_inclusion_proofs = hidden_inputs.in_coin_proofs_non_inclusion_proofs.into_iter();
+    let mut non_inclusion_proofs = hidden_inputs
+        .in_coin_proofs_non_inclusion_proofs
+        .into_iter();
     let mut public_values = hidden_inputs.in_coin_proofs_public_values.into_iter();
     let mut inclusion_proofs = hidden_inputs.in_coins_inclusion_proofs.into_iter();
     for coin in &hidden_inputs.in_coins {
         verify_coin_proof(
-            public_values.next().expect("Missing coin proof public values"),
+            public_values
+                .next()
+                .expect("Missing coin proof public values"),
             vkey,
-            coin_history_proofs.next().expect("Missing coin proof history proofs"),
+            coin_history_proofs
+                .next()
+                .expect("Missing coin proof history proofs"),
             commitment_history_root,
             coin,
-            inclusion_proofs.next().expect("Missing coin inclusion proof"),
+            inclusion_proofs
+                .next()
+                .expect("Missing coin inclusion proof"),
         );
-        let coin_non_inclusion_proof = non_inclusion_proofs.next().expect("Missing non_inclusion_proofs");
+        let coin_non_inclusion_proof = non_inclusion_proofs
+            .next()
+            .expect("Missing non_inclusion_proofs");
         assert_eq!(coin_history_root, coin_non_inclusion_proof.root);
-        coin_history_root = coin_non_inclusion_proof.verify_and_insert(coin.identifier).expect("Coin was already integrated");
+        coin_history_root = coin_non_inclusion_proof
+            .verify_and_insert(coin.identifier)
+            .expect("Coin was already integrated");
         account_state = account_state.apply_coin(coin).unwrap();
     }
 
-    let output_coins_root = account_state.send_coins(
-        hidden_inputs.out_coins,
-        hidden_inputs.out_coin_proofs,
-        hidden_inputs.next_public_key
-    ).unwrap();
+    let output_coins_root = account_state
+        .send_coins(
+            hidden_inputs.out_coins,
+            hidden_inputs.out_coin_proofs,
+            hidden_inputs.next_public_key,
+        )
+        .unwrap();
 
     let commitment = ProofData {
         vk: vkey,
         account_state_hash: account_state.hash(),
         output_coins_root,
         commitment_history_root,
-        coin_history_root
+        coin_history_root,
     };
     sp1_zkvm::io::commit::<ProofData>(&commitment);
 }
