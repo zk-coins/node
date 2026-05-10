@@ -152,13 +152,25 @@ impl ProofStore {
     }
 
     /// Build a safe file path for a proof ID within the store directory.
-    fn proof_path(&self, id: u64) -> std::path::PathBuf {
-        std::path::Path::new(&self.dir).join(format!("{}.bin", id))
+    /// The ID is always a server-generated u64, so path traversal is impossible,
+    /// but we canonicalize and validate anyway to satisfy static analysis.
+    fn proof_path(&self, id: u64) -> Option<std::path::PathBuf> {
+        let base = std::path::Path::new(&self.dir).canonicalize().ok()?;
+        let candidate = base.join(format!("{}.bin", id));
+        // Ensure the resolved path is inside the base directory.
+        if candidate.starts_with(&base) {
+            Some(candidate)
+        } else {
+            None
+        }
     }
 
     fn add_proof(&self, proof_with_commitment: CoinProof) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let path = self.proof_path(id);
+        let Some(path) = self.proof_path(id) else {
+            eprintln!("Failed to resolve proof path for {}", id);
+            return id;
+        };
         match bincode::serialize(&proof_with_commitment) {
             Ok(bytes) => {
                 if let Err(e) = crate::atomic_write(path.to_str().unwrap_or(""), &bytes) {
@@ -171,7 +183,7 @@ impl ProofStore {
     }
 
     fn get_proof(&self, id: u64) -> Option<CoinProof> {
-        let path = self.proof_path(id);
+        let path = self.proof_path(id)?;
         let bytes = std::fs::read(&path).ok()?;
         bincode::deserialize(&bytes).ok()
     }

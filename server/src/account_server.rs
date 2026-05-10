@@ -527,10 +527,6 @@ mod tests {
         let mut server = AccountServer::new(Arc::clone(&state_arc));
 
         let mut minting_account_data = TestAccountData::new_minting_account();
-        println!(
-            "minting account address: {:?}",
-            minting_account_data.address
-        );
         server.import_account(
             minting_account_data.address,
             Account {
@@ -668,10 +664,6 @@ mod tests {
         let mut server = AccountServer::new(state_arc);
 
         let minting_account_data = TestAccountData::new_minting_account();
-        println!(
-            "minting account address: {:?}",
-            minting_account_data.address
-        );
 
         server.import_account(
             minting_account_data.address, // This is MINTING_ADDRESS
