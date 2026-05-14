@@ -144,7 +144,7 @@ jobs:
       # under SP1=mock but exercise large parts of the file.
       - name: Run cargo-llvm-cov (MVP scope, regression guard)
         run: |
-          SP1_PROVER=mock cargo llvm-cov -p server --summary-only \
+          SP1_PROVER=mock cargo llvm-cov -p server --show-missing-lines \
             --ignore-filename-regex 'main\.rs|publisher\.rs|server_runtime\.rs|scanner_runtime\.rs|_tests\.rs$' \
             --fail-under-lines 100 \
             --fail-under-functions 100
