@@ -1960,3 +1960,38 @@ async fn receive_coin_duplicate_returns_success_false() {
     let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(resp["success"], false);
 }
+
+#[tokio::test]
+async fn send_without_signature_skips_verification_and_proceeds() {
+    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
+    use bitcoin::secp256k1::PublicKey;
+    let secret_bytes = include_bytes!("../minting_secret.bin");
+    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
+    let secp = secp::Secp256k1::new();
+    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .public_key;
+    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
+        .unwrap()
+        .public_key;
+
+    // signature field omitted entirely -> request.signature is None ->
+    // the verify_send_signature block is skipped (legacy/back-compat path).
+    let body = serde_json::json!({
+        "account_address": "0x".to_string() + &hex::encode(zkcoins_program::MINTING_ADDRESS),
+        "recipient": "0x".to_string() + &hex::encode([1u8; 32]),
+        "amount": 1,
+        "public_key": hex::encode(pk_0.serialize()),
+        "next_public_key": hex::encode(pk_1.serialize()),
+    });
+    let req = Request::post("/api/send")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, _) = send_request(req).await;
+    // Without signature, the handler proceeds to send_coins on the
+    // minting account (which has u64::MAX balance) and returns OK.
+    assert_eq!(status, StatusCode::OK);
+}

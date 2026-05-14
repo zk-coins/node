@@ -19,6 +19,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Force Esplora broadcasts to fail fast in CI. Some unit tests
+  # exercise the commit pipeline that ends in a real HTTP broadcast;
+  # without this, the runs against the public Mutinynet API can take
+  # >60 s per test and tip the job over the timeout.
+  ESPLORA_URL: "http://127.0.0.1:1/api"
 
 jobs:
   lint-and-build:

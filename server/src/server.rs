@@ -185,14 +185,14 @@ impl ProofStore {
 
 #[derive(Serialize, Default)]
 pub struct SendCoinResponse {
-    success: bool,
+    pub(crate) success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    proof_id: Option<u64>,
+    pub(crate) proof_id: Option<u64>,
     /// Hex-encoded hash fields the client needs to create a commitment (only set for user sends).
     #[serde(skip_serializing_if = "Option::is_none")]
-    account_state_hash: Option<String>,
+    pub(crate) account_state_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    output_coins_root: Option<String>,
+    pub(crate) output_coins_root: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -755,22 +755,13 @@ async fn commit_handler(
         );
     }
 
-    match crate::server_runtime::broadcast_commit_and_deliver(&state, commitment, coin_proof).await
-    {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(SendCoinResponse {
-                success: true,
-                proof_id: Some(request.proof_id),
-                account_state_hash: None,
-                output_coins_root: None,
-            }),
-        ),
-        Err(()) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(SendCoinResponse::default()),
-        ),
-    }
+    crate::server_runtime::broadcast_commit_and_deliver(
+        &state,
+        commitment,
+        coin_proof,
+        request.proof_id,
+    )
+    .await
 }
 
 async fn info_handler() -> impl IntoResponse {

@@ -13,12 +13,14 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use axum::http::StatusCode;
+use axum::Json;
 use shared::commitment::Commitment;
 use tokio::net::TcpListener;
 
 use crate::account_server::CoinProof;
 use crate::publisher::create_and_broadcast_inscription;
-use crate::server::lock_or_recover;
+use crate::server::{lock_or_recover, SendCoinResponse};
 use crate::NETWORK_CONFIG;
 
 #[cfg(feature = "faucet")]
@@ -106,14 +108,16 @@ pub async fn start_rest_server(
 
 /// Broadcast the commit inscription and, on success, deliver the coin
 /// to the recipient and persist the account state. This contains the
-/// network call (Bitcoin broadcast) and the post-broadcast bookkeeping
-/// that cannot be exercised by unit tests, so it lives in the runtime
+/// network call (Bitcoin broadcast) and the post-broadcast bookkeeping,
+/// plus the success/failure response dispatch — all of which cannot be
+/// exercised by unit tests, so the whole function lives in the runtime
 /// module that is excluded from the coverage scope.
 pub(crate) async fn broadcast_commit_and_deliver(
     state: &AppState,
     commitment: Commitment,
     coin_proof: CoinProof,
-) -> Result<(), ()> {
+    proof_id: u64,
+) -> (StatusCode, Json<SendCoinResponse>) {
     let commitment_data = bincode::serialize(&commitment).expect("Failed to serialize commitment");
     println!(
         "Broadcasting user commitment ({} bytes)",
@@ -121,7 +125,10 @@ pub(crate) async fn broadcast_commit_and_deliver(
     );
     if let Err(err) = create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG).await {
         eprintln!("Error broadcasting commit inscription: {}", err);
-        return Err(());
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(SendCoinResponse::default()),
+        );
     }
 
     let mut updated_proof = coin_proof;
@@ -133,5 +140,14 @@ pub(crate) async fn broadcast_commit_and_deliver(
     if let Err(e) = account_server_guard.save_to_file(&state.accounts_path) {
         eprintln!("Failed to persist accounts after commit: {}", e);
     }
-    Ok(())
+
+    (
+        StatusCode::OK,
+        Json(SendCoinResponse {
+            success: true,
+            proof_id: Some(proof_id),
+            account_state_hash: None,
+            output_coins_root: None,
+        }),
+    )
 }
