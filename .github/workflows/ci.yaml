@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [develop, main]
 
+# When the auto-release-pr workflow updates the develop -> main PR
+# right after a push to develop, two CI runs fire on the same commit:
+# one from `push`, one from `pull_request`. Cancel the older one so we
+# do not see a spurious "CI failed (canceled)" status on the branch.
+concurrency:
+  group: ci-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 

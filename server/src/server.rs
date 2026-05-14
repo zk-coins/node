@@ -20,6 +20,7 @@ use tower_http::cors::CorsLayer;
 use zkcoins_prover::Proof;
 
 use crate::account_server::{AccountServer, CoinProof};
+#[cfg(feature = "faucet")]
 use crate::publisher::create_and_broadcast_inscription;
 use crate::username::UsernameStore;
 use crate::NETWORK_CONFIG;
@@ -415,23 +416,20 @@ async fn send_coin_handler(
 
     match send_result {
         Ok(mut coin_proofs) => {
-            // Extract proof data so the client can create a commitment
-            let (ash_hex, ocr_hex) = {
-                let proof_data =
-                    bincode::deserialize::<ProofData>(&coin_proofs[0].proof.public_values.to_vec());
-                match proof_data {
-                    Ok(pd) => (
-                        Some(hex::encode(pd.account_state_hash)),
-                        Some(hex::encode(pd.output_coins_root)),
-                    ),
-                    Err(e) => {
-                        eprintln!("Failed to deserialize proof data: {}", e);
-                        (None, None)
-                    }
-                }
-            };
+            // Extract proof data so the client can create a commitment.
+            // The SP1 prover always emits a valid ProofData in public_values,
+            // so the deserialize cannot fail in practice.
+            let pd =
+                bincode::deserialize::<ProofData>(&coin_proofs[0].proof.public_values.to_vec())
+                    .expect("SP1 prover emits valid ProofData public_values");
+            let ash_hex = Some(hex::encode(pd.account_state_hash));
+            let ocr_hex = Some(hex::encode(pd.output_coins_root));
 
-            // If commitment is already set (e.g. mint flow), broadcast immediately
+            // Mint flow only — broadcasting a pre-set commitment is the
+            // server-signed minting path. The mint endpoint is feature-
+            // gated, so in the MVP build coin_proofs[0].commitment is
+            // always None and this block is excluded entirely.
+            #[cfg(feature = "faucet")]
             if let Some(commitment) = coin_proofs[0].commitment.as_ref() {
                 let commitment_data =
                     bincode::serialize(commitment).expect("Failed to serialize commitment");
@@ -443,21 +441,14 @@ async fn send_coin_handler(
                 }
             }
 
-            // Persist proof FIRST (crash-safe: proof exists even if account save fails)
-            let proof_id = match coin_proofs.pop() {
-                Some(proof) => state.proof_store.add_proof(proof),
-                None => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(SendCoinResponse {
-                            success: false,
-                            proof_id: None,
-                            account_state_hash: None,
-                            output_coins_root: None,
-                        }),
-                    );
-                }
-            };
+            // Persist proof FIRST (crash-safe: proof exists even if
+            // account save fails). send_coins always returns a non-empty
+            // Vec on Ok, so pop().unwrap() is total here.
+            let proof_id = state.proof_store.add_proof(
+                coin_proofs
+                    .pop()
+                    .expect("send_coins returns at least one coin_proof on Ok"),
+            );
             // Now persist accounts (proof is already safe on disk)
             {
                 let account_server_lock = lock_or_recover(&state.account_server);
