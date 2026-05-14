@@ -1,5 +1,6 @@
 use super::*;
 use bitcoin::blockdata::{opcodes, script};
+use bitcoin::hashes::Hash;
 use bitcoin::script::PushBytesBuf;
 use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
 use bitcoin::XOnlyPublicKey;

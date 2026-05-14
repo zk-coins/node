@@ -1,156 +1,22 @@
-use crate::publisher::{EsploraConfig, INSCRIPTION_MARKER_PREFIX};
+//! Pure inscription-parsing logic for the block scanner.
+//!
+//! The network-driven scan loop and the Esplora client wiring live in
+//! `scanner_runtime.rs` and are excluded from the coverage scope.
+//! Everything here is testable in isolation without a Bitcoin node.
+
 use bitcoin::blockdata::opcodes;
-use bitcoin::hashes::Hash;
 use bitcoin::script::Instruction;
 use bitcoin::script::ScriptBuf;
 use bitcoin::{BlockHash, Transaction, Txid};
-use esplora_client::r#async::DefaultSleeper;
-use esplora_client::{AsyncClient, Builder, Error as EsploraError, Sleeper};
-use std::collections::HashSet;
-use std::error::Error as StdError;
-use std::time::Duration;
 
 /// Type alias for the inscription callback function
-type InscriptionCallback = dyn Fn(Vec<u8>, BlockHash) + Send + Sync + 'static;
-
-struct InscriptionScanner<S = DefaultSleeper> {
-    client: AsyncClient<S>,
-    processed_blocks: HashSet<BlockHash>,
-    current_block_hash: Option<BlockHash>,
-}
-
-impl<S: Sleeper> InscriptionScanner<S> {
-    pub fn new(client: AsyncClient<S>) -> Self {
-        Self {
-            client,
-            processed_blocks: HashSet::new(),
-            current_block_hash: None,
-        }
-    }
-
-    /// Scans the blockchain starting from the given block hash
-    pub async fn scan_from_block(
-        &mut self,
-        start_block_hash: BlockHash,
-        callback: &InscriptionCallback,
-    ) -> Result<(), EsploraError> {
-        let mut current_hash = start_block_hash;
-        let poll_interval = Duration::from_secs(30);
-
-        loop {
-            // Update the current block hash
-            self.current_block_hash = Some(current_hash);
-
-            // Skip if we've already processed this block
-            if self.processed_blocks.contains(&current_hash) {
-                // We've reached a block we've already processed
-                // Wait for poll_interval before checking for new blocks
-                println!(
-                    "Reached previously processed block or chain tip. Waiting for new blocks..."
-                );
-                tokio::time::sleep(poll_interval).await;
-
-                // Get the latest block hash
-                let tip_hash = match self.client.get_tip_hash().await {
-                    Ok(hash) => hash,
-                    Err(e) => {
-                        println!("Error getting tip hash: {}", e);
-                        tokio::time::sleep(poll_interval).await;
-                        continue;
-                    }
-                };
-
-                // If we've already processed the tip, wait and try again
-                if self.processed_blocks.contains(&tip_hash) {
-                    continue;
-                }
-
-                // Otherwise, continue from the tip
-                current_hash = tip_hash;
-                continue;
-            }
-
-            println!("Processing block: {}", current_hash);
-
-            // Get the transaction IDs in the block
-            let txids = match self.client.get_block_txids(current_hash).await {
-                Ok(txids) => txids,
-                Err(e) => {
-                    println!("Error fetching block txids {}: {}", current_hash, e);
-                    tokio::time::sleep(poll_interval).await;
-                    continue;
-                }
-            };
-
-            // Filter txids that match our marker prefix.
-            let marker_bytes = hex::decode(INSCRIPTION_MARKER_PREFIX).unwrap_or_default();
-            let matching_txids = filter_marker_txids(txids, &marker_bytes);
-
-            // Process only the matching transactions
-            for txid in matching_txids {
-                println!("Found transaction with marker prefix: {}", txid);
-                match self.client.get_tx(&txid).await {
-                    Ok(Some(tx)) => {
-                        self.process_transaction(&tx, callback).await?;
-                    }
-                    Ok(None) => {
-                        println!("Transaction {} not found", txid);
-                    }
-                    Err(e) => {
-                        println!("Error fetching transaction {}: {}", txid, e);
-                    }
-                }
-            }
-
-            // Mark this block as processed
-            self.processed_blocks.insert(current_hash);
-
-            // Get the next block
-            let block_status = self.client.get_block_status(&current_hash).await?;
-            match block_status.next_best {
-                Some(next_hash) => current_hash = next_hash,
-                None => {
-                    // No more blocks in the chain, wait and check for new ones
-                    println!("Reached chain tip. Waiting for new blocks...");
-                    tokio::time::sleep(poll_interval).await;
-
-                    // Get the latest block hash
-                    match self.client.get_tip_hash().await {
-                        Ok(tip_hash) => {
-                            // If we've already processed the tip, wait and try again
-                            if self.processed_blocks.contains(&tip_hash) {
-                                continue;
-                            }
-                            current_hash = tip_hash;
-                        }
-                        Err(e) => {
-                            println!("Error getting tip hash: {}", e);
-                            tokio::time::sleep(poll_interval).await;
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Process a single transaction, checking if it's an inscription transaction
-    async fn process_transaction(
-        &self,
-        tx: &Transaction,
-        callback: &InscriptionCallback,
-    ) -> Result<(), EsploraError> {
-        if let Some(current_hash) = self.current_block_hash {
-            process_transaction_inscriptions(tx, current_hash, callback);
-        }
-        Ok(())
-    }
-}
+pub(crate) type InscriptionCallback = dyn Fn(Vec<u8>, BlockHash) + Send + Sync + 'static;
 
 /// Pure logic: filter a list of txids down to those starting with the
-/// marker prefix. Extracted from `scan_from_block` so it can be unit
-/// tested without an Esplora client.
+/// marker prefix. Extracted from the scan loop so it can be unit-tested
+/// without an Esplora client.
 pub(crate) fn filter_marker_txids(txids: Vec<Txid>, marker_bytes: &[u8]) -> Vec<Txid> {
+    use bitcoin::hashes::Hash;
     txids
         .into_iter()
         .filter(|txid| txid.as_byte_array().starts_with(marker_bytes))
@@ -176,21 +42,6 @@ pub(crate) fn process_transaction_inscriptions(
             }
         }
     }
-}
-
-/// Scans for inscriptions transactions in the blockchain
-pub async fn scan_for_inscriptions(
-    config: &EsploraConfig,
-    start_block_hash: BlockHash,
-    callback: &InscriptionCallback,
-) -> Result<(), Box<dyn StdError>> {
-    let builder = Builder::new(&config.url);
-    let client = AsyncClient::<DefaultSleeper>::from_builder(builder)?;
-    let mut scanner = InscriptionScanner::new(client);
-
-    scanner.scan_from_block(start_block_hash, callback).await?;
-
-    Ok(())
 }
 
 /// Extract inscription content from a Taproot reveal script.
