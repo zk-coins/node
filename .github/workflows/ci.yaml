@@ -83,3 +83,43 @@ jobs:
 
       - name: Run tests (program lib)
         run: cargo test -p zkcoins-program --lib
+
+  coverage:
+    name: Coverage (MVP scope)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.81.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.81.0"
+          components: llvm-tools-preview
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-llvm-cov-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-llvm-cov-
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      # Coverage is measured on the MVP build only: no Cargo features
+      # enabled. Code behind a Cargo feature (address-list / faucet /
+      # usernames / lnurl) is excluded from the binary at compile time
+      # and is therefore not part of the measured surface.
+      #
+      # Threshold is the current MVP baseline. New PRs must not regress
+      # below it. The long-term goal is 100% on this scope — see the
+      # Contributing section in README.md.
+      - name: Run cargo-llvm-cov (MVP scope, regression guard)
+        run: SP1_PROVER=mock cargo llvm-cov -p server --summary-only --fail-under-lines 65 -- --skip account_server::tests

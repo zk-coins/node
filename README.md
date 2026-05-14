@@ -22,6 +22,16 @@ Rust/Axum backend for [zkcoins.app](https://zkcoins.app) — account management,
 
 Full rationale: [docs.zkcoins.app/tech-decisions](https://docs.zkcoins.app/tech-decisions)
 
+## Contributing
+
+**New PRs may only merge into `develop` if test coverage is 100% on the activated surface.** Code behind a Cargo feature (`address-list`, `faucet`, `usernames`, `lnurl`) is excluded from the MVP measurement — feature-gated routes do not need to be tested as long as the feature stays off in the PRD build. Concretely:
+
+- `cargo llvm-cov -p server` (no `--all-features`) must report 100% lines, statements, branches, and functions on the MVP build. CI enforces this with `--fail-under-lines 100`. The current baseline is below 100% — the regression-block threshold is set to the current measured value and the goal is to lift it to 100% via follow-up PRs.
+- Defensive code that genuinely cannot be reached in unit tests (e.g. the publisher's Bitcoin-broadcast path that requires a signet/regtest node, the `main.rs` runtime bootstrap) is excluded from the measured scope at the file level rather than tested.
+- The branch is protected on GitHub: a PR cannot be merged while CI is red.
+
+The same rule applies to `zk-coins/app` (gated `NEXT_PUBLIC_ENABLE_*` flags are excluded from the measured scope).
+
 ## Features
 
 API endpoints, background services, their activation status, and the tests that cover them.
