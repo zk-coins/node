@@ -556,3 +556,45 @@ fn test_receive_coin_rejects_invalid_inclusion_proof() {
         "Coin inclusion proof verification failed"
     );
 }
+
+#[test]
+fn test_send_coins_twice_from_same_account_uses_update_account() {
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    let mut server = AccountServer::new(Arc::clone(&state_arc));
+
+    let mut minting = TestAccountData::new_minting_account();
+    server.import_account(
+        minting.address,
+        Account {
+            proof: None,
+            coin_queue: vec![],
+            coin_history: SparseMerkleTree::new(),
+            balance: 10_000,
+        },
+    );
+
+    let recipient: Address = [42u8; 32];
+
+    // First send: account.proof is None -> create_account branch.
+    let coin_proofs_1 = minting
+        .execute_send_coins(&mut server, vec![Invoice::new(100, recipient)])
+        .expect("first send should succeed");
+    state_arc
+        .lock()
+        .unwrap()
+        .update(
+            &coin_proofs_1
+                .iter()
+                .map(|cp| cp.commitment.clone().unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+    // After the first send, account.proof = Some. A second send from the
+    // same account must therefore take the AccountUpdateProof branch
+    // (update_account, not create_account).
+    let coin_proofs_2 = minting
+        .execute_send_coins(&mut server, vec![Invoice::new(50, recipient)])
+        .expect("second send should succeed (update_account path)");
+    assert_eq!(coin_proofs_2.len(), 1);
+}
