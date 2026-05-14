@@ -82,15 +82,9 @@ impl<S: Sleeper> InscriptionScanner<S> {
                 }
             };
 
-            // Filter txids that match our marker prefix
+            // Filter txids that match our marker prefix.
             let marker_bytes = hex::decode(INSCRIPTION_MARKER_PREFIX).unwrap_or_default();
-            let matching_txids: Vec<Txid> = txids
-                .into_iter()
-                .filter(|txid| {
-                    let txid_bytes = txid.as_byte_array();
-                    txid_bytes.starts_with(&marker_bytes)
-                })
-                .collect();
+            let matching_txids = filter_marker_txids(txids, &marker_bytes);
 
             // Process only the matching transactions
             for txid in matching_txids {
@@ -146,22 +140,41 @@ impl<S: Sleeper> InscriptionScanner<S> {
         tx: &Transaction,
         callback: &InscriptionCallback,
     ) -> Result<(), EsploraError> {
-        // We already know it's an inscription tx based on the txid prefix
-        // In a Taproot script-spend, the witness is: [signature, script, control_block]
-        // The script is the second-to-last witness item.
-        for input in tx.input.iter() {
-            let witness_items: Vec<&[u8]> = input.witness.iter().collect();
-            if witness_items.len() >= 3 {
-                let script_bytes = witness_items[witness_items.len() - 2];
-                if let Some(content_bytes) = extract_inscription_content(script_bytes) {
-                    if let Some(current_hash) = self.current_block_hash {
-                        callback(content_bytes, current_hash);
-                    }
-                }
+        if let Some(current_hash) = self.current_block_hash {
+            process_transaction_inscriptions(tx, current_hash, callback);
+        }
+        Ok(())
+    }
+}
+
+/// Pure logic: filter a list of txids down to those starting with the
+/// marker prefix. Extracted from `scan_from_block` so it can be unit
+/// tested without an Esplora client.
+pub(crate) fn filter_marker_txids(txids: Vec<Txid>, marker_bytes: &[u8]) -> Vec<Txid> {
+    txids
+        .into_iter()
+        .filter(|txid| txid.as_byte_array().starts_with(marker_bytes))
+        .collect()
+}
+
+/// Pure logic: walk every input of the transaction, look for a Taproot
+/// script-spend witness whose script encodes an inscription envelope,
+/// extract the content bytes, and invoke the callback with them.
+/// In a Taproot script-spend the witness is `[signature, script, control_block]`
+/// so the script is always the second-to-last witness item.
+pub(crate) fn process_transaction_inscriptions(
+    tx: &Transaction,
+    current_block_hash: BlockHash,
+    callback: &InscriptionCallback,
+) {
+    for input in tx.input.iter() {
+        let witness_items: Vec<&[u8]> = input.witness.iter().collect();
+        if witness_items.len() >= 3 {
+            let script_bytes = witness_items[witness_items.len() - 2];
+            if let Some(content_bytes) = extract_inscription_content(script_bytes) {
+                callback(content_bytes, current_block_hash);
             }
         }
-
-        Ok(())
     }
 }
 
@@ -232,161 +245,5 @@ pub fn extract_inscription_content(script_bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use bitcoin::blockdata::{opcodes, script};
-    use bitcoin::script::PushBytesBuf;
-    use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
-    use bitcoin::XOnlyPublicKey;
-    use shared::commitment::Commitment;
-    use std::str::FromStr;
-
-    /// Build a reveal script in the same format as the publisher:
-    ///   <pubkey> OP_CHECKSIG OP_FALSE OP_IF <push data chunks...> OP_ENDIF
-    fn build_inscription_script(pubkey: XOnlyPublicKey, data: &[u8]) -> ScriptBuf {
-        let mut builder = script::Builder::new()
-            .push_slice(pubkey.serialize())
-            .push_opcode(opcodes::all::OP_CHECKSIG)
-            .push_opcode(opcodes::OP_FALSE)
-            .push_opcode(opcodes::all::OP_IF);
-
-        for chunk in data.chunks(520) {
-            let buffer = PushBytesBuf::try_from(chunk.to_vec()).unwrap();
-            builder = builder.push_slice(buffer);
-        }
-
-        builder.push_opcode(opcodes::all::OP_ENDIF).into_script()
-    }
-
-    /// Helper: create a deterministic x-only public key for tests.
-    fn test_xonly_pubkey() -> XOnlyPublicKey {
-        let secp = Secp256k1::new();
-        let sk =
-            SecretKey::from_str("0000000000000000000000000000000000000000000000000000000000000001")
-                .unwrap();
-        let kp = Keypair::from_secret_key(&secp, &sk);
-        XOnlyPublicKey::from_keypair(&kp).0
-    }
-
-    // --- extract_inscription_content ---
-
-    #[test]
-    fn parse_valid_inscription_into_commitment() {
-        let sk =
-            SecretKey::from_str("0000000000000000000000000000000000000000000000000000000000000001")
-                .unwrap();
-        let message = b"test commitment data".to_vec();
-        let commitment = Commitment::new(&sk, message.clone()).expect("should create commitment");
-        let commitment_bytes =
-            bincode::serialize(&commitment).expect("should serialize commitment");
-
-        let pubkey = test_xonly_pubkey();
-        let script = build_inscription_script(pubkey, &commitment_bytes);
-
-        let extracted = extract_inscription_content(script.as_bytes());
-        assert!(
-            extracted.is_some(),
-            "should extract content from valid script"
-        );
-
-        let extracted_bytes = extracted.unwrap();
-        assert_eq!(
-            extracted_bytes, commitment_bytes,
-            "extracted bytes must match the serialized commitment"
-        );
-
-        // Deserialize back into a Commitment and verify fields
-        let deserialized: Commitment =
-            bincode::deserialize(&extracted_bytes).expect("should deserialize commitment");
-        assert_eq!(deserialized.message, message);
-        assert_eq!(deserialized.public_key, commitment.public_key);
-    }
-
-    #[test]
-    fn reject_invalid_inscription_data() {
-        // Empty script has no envelope
-        assert_eq!(extract_inscription_content(&[]), None);
-
-        // Random bytes without OP_FALSE OP_IF envelope
-        assert_eq!(extract_inscription_content(&[0xab, 0xcd, 0xef]), None);
-
-        // Script with OP_IF but missing OP_FALSE before it (just OP_1 OP_IF OP_ENDIF)
-        let script = script::Builder::new()
-            .push_opcode(opcodes::all::OP_PUSHNUM_1)
-            .push_opcode(opcodes::all::OP_IF)
-            .push_opcode(opcodes::all::OP_ENDIF)
-            .into_script();
-        assert_eq!(
-            extract_inscription_content(script.as_bytes()),
-            None,
-            "OP_IF without OP_FALSE should not open an envelope"
-        );
-
-        // Script with OP_FALSE OP_IF but no push data (only OP_ENDIF)
-        let script = script::Builder::new()
-            .push_opcode(opcodes::OP_FALSE)
-            .push_opcode(opcodes::all::OP_IF)
-            .push_opcode(opcodes::all::OP_ENDIF)
-            .into_script();
-        assert_eq!(
-            extract_inscription_content(script.as_bytes()),
-            None,
-            "envelope with no push data should return None"
-        );
-    }
-
-    #[test]
-    fn verify_commitment_signature_after_deserialization() {
-        let sk =
-            SecretKey::from_str("0000000000000000000000000000000000000000000000000000000000000002")
-                .unwrap();
-        let message = vec![42u8; 32]; // 32-byte message (treated as raw digest)
-        let commitment = Commitment::new(&sk, message.clone()).expect("should create commitment");
-        let commitment_bytes = bincode::serialize(&commitment).unwrap();
-
-        let pubkey = test_xonly_pubkey();
-        let script = build_inscription_script(pubkey, &commitment_bytes);
-        let extracted = extract_inscription_content(script.as_bytes()).unwrap();
-
-        let deserialized: Commitment = bincode::deserialize(&extracted).unwrap();
-        assert!(
-            deserialized.verify(),
-            "commitment signature must be valid after round-trip through inscription script"
-        );
-
-        // Tamper with the message and verify that verification fails
-        let mut tampered = deserialized.clone();
-        tampered.message = vec![0u8; 32];
-        assert!(
-            !tampered.verify(),
-            "tampered commitment must fail signature verification"
-        );
-    }
-
-    #[test]
-    fn parse_multi_chunk_inscription() {
-        let sk =
-            SecretKey::from_str("0000000000000000000000000000000000000000000000000000000000000003")
-                .unwrap();
-        // Create a large message that will be split into multiple chunks (>520 bytes)
-        let large_message = vec![0xAB; 1200];
-        let commitment = Commitment::new(&sk, large_message).expect("should create commitment");
-        let commitment_bytes = bincode::serialize(&commitment).unwrap();
-        assert!(
-            commitment_bytes.len() > 520,
-            "test data should span multiple chunks"
-        );
-
-        let pubkey = test_xonly_pubkey();
-        let script = build_inscription_script(pubkey, &commitment_bytes);
-        let extracted = extract_inscription_content(script.as_bytes()).unwrap();
-
-        assert_eq!(
-            extracted, commitment_bytes,
-            "multi-chunk inscription must reassemble correctly"
-        );
-
-        let deserialized: Commitment = bincode::deserialize(&extracted).unwrap();
-        assert!(deserialized.verify(), "multi-chunk commitment must verify");
-    }
-}
+#[path = "scanner_tests.rs"]
+mod tests;
