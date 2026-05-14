@@ -91,11 +91,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # `--test-threads=1` is mandatory: multiple test binaries each load the
+      # SP1 mock prover ELF (~1.5 GB resident) and running them in parallel
+      # on a 7 GB GitHub-hosted runner OOM-kills the job (exit 143). The
+      # account_server::tests group runs the real SP1 prover and is skipped
+      # here — it is only exercised in the coverage job, which is also
+      # single-threaded.
       - name: Run tests (server + shared, all features, skip slow SP1 prover tests)
-        run: cargo test -p server -p shared --all-features -- --skip account_server::tests
+        run: cargo test -p server -p shared --all-features -- --test-threads=1 --skip account_server::tests
 
       - name: Run tests (program lib)
-        run: cargo test -p zkcoins-program --lib
+        run: cargo test -p zkcoins-program --lib -- --test-threads=1
 
   coverage:
     name: Coverage (MVP scope)
@@ -147,4 +153,5 @@ jobs:
           SP1_PROVER=mock cargo llvm-cov -p server --show-missing-lines \
             --ignore-filename-regex 'main\.rs|publisher\.rs|server_runtime\.rs|scanner_runtime\.rs|_tests\.rs$' \
             --fail-under-lines 100 \
-            --fail-under-functions 100
+            --fail-under-functions 100 \
+            -- --test-threads=1
