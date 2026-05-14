@@ -26,36 +26,57 @@ Full rationale: [docs.zkcoins.app/tech-decisions](https://docs.zkcoins.app/tech-
 
 API endpoints, background services, their activation status, and the tests that cover them.
 
-**Status legend:** `always` = endpoint/service always available · `env` = behavior controlled by an env var · `planned` = listed in Open Tasks, not yet implemented.
+**Status legend** (current behaviour): `always` = endpoint/service always available · `env` = behavior controlled by an env var · `planned` = listed in Open Tasks, not yet implemented.
+
+**Triage legend** (target state for MVP): `mvp` = in scope, must reach full test coverage before launch · `gate (VAR)` = to be hidden behind the named env var (default off) until tests exist · `planned` = not in scope for MVP.
 
 **Coverage legend:** unit % refers to `cargo-llvm-cov` line coverage of the module that implements the function (latest run, `SP1_PROVER=mock`). `—` means no test exists.
 
-| Function                             | Trigger                               | Status  | Tests                         |
-| ------------------------------------ | ------------------------------------- | ------- | ----------------------------- |
-| Health check                         | `GET /health`                         | always  | 75% (server)                  |
-| Network info                         | `GET /api/info`                       | env¹    | 75% (server)                  |
-| Get balance                          | `GET /api/balance?address=<hex>`      | always  | 75% (server)                  |
-| List all addresses                   | `GET /api/address`                    | always  | 75% (server)                  |
-| Mint coins (faucet, single-phase)    | `POST /api/mint`                      | env²    | 91% (account)                 |
-| Send — phase 1 (generate proof)      | `POST /api/send`                      | env²    | 75% (server)                  |
-| Send — phase 2 (commit + broadcast)  | `POST /api/commit`                    | env³    | 75% (server) · 0% (publisher) |
-| Receive coin                         | `POST /api/receive`                   | always  | 91% (account)                 |
-| Download coin proof                  | `GET /api/proof/:id`                  | always  | 75% (server)                  |
-| Claim username                       | `POST /api/username/claim`            | always  | 98% (username)                |
-| Resolve username                     | `GET /api/username/resolve/:username` | always  | 98% (username)                |
-| LNURL-Pay metadata                   | `GET /.well-known/lnurlp/:username`   | always  | 75% (server)                  |
-| LNURL-Pay callback                   | `GET /lnurl/pay/:username`            | always  | 75% (server)                  |
-| Bitcoin block scanner (background)   | Loop in `main.rs`, 30 s poll          | env⁴    | 51% (scanner) · 4% (main)     |
-| State persistence (SMT/MMR write)    | Scanner callback on commitment match  | always  | 97% (state)                   |
-| Taproot inscription broadcast        | Called by `/api/commit`               | env³    | 0% (publisher)                |
-| Publisher UTXO lookup                | Internal, before broadcast            | env³    | 0% (publisher)                |
-| Explorer endpoints (`/api/stats`, …) | n/a                                   | planned | —                             |
-| Light client support                 | n/a                                   | planned | —                             |
+| Function                             | Trigger                               | Status  | Triage                       | Tests                         |
+| ------------------------------------ | ------------------------------------- | ------- | ---------------------------- | ----------------------------- |
+| Health check                         | `GET /health`                         | always  | mvp                          | 75% (server)                  |
+| Network info                         | `GET /api/info`                       | env¹    | mvp                          | 75% (server)                  |
+| Get balance                          | `GET /api/balance?address=<hex>`      | always  | mvp                          | 75% (server)                  |
+| List all addresses                   | `GET /api/address`                    | always  | gate (`ENABLE_ADDRESS_LIST`) | 75% (server)                  |
+| Mint coins (faucet, single-phase)    | `POST /api/mint`                      | env²    | gate (`ENABLE_FAUCET`)       | 91% (account)                 |
+| Send — phase 1 (generate proof)      | `POST /api/send`                      | env²    | mvp                          | 75% (server)                  |
+| Send — phase 2 (commit + broadcast)  | `POST /api/commit`                    | env³    | mvp                          | 75% (server) · 0% (publisher) |
+| Receive coin                         | `POST /api/receive`                   | always  | mvp                          | 91% (account)                 |
+| Download coin proof                  | `GET /api/proof/:id`                  | always  | mvp                          | 75% (server)                  |
+| Claim username                       | `POST /api/username/claim`            | always  | gate (`ENABLE_USERNAMES`)    | 98% (username)                |
+| Resolve username                     | `GET /api/username/resolve/:username` | always  | gate (`ENABLE_USERNAMES`)    | 98% (username)                |
+| LNURL-Pay metadata                   | `GET /.well-known/lnurlp/:username`   | always  | gate (`ENABLE_LNURL`)        | 75% (server)                  |
+| LNURL-Pay callback                   | `GET /lnurl/pay/:username`            | always  | gate (`ENABLE_LNURL`)        | 75% (server)                  |
+| Bitcoin block scanner (background)   | Loop in `main.rs`, 30 s poll          | env⁴    | mvp                          | 51% (scanner) · 4% (main)     |
+| State persistence (SMT/MMR write)    | Scanner callback on commitment match  | always  | mvp                          | 97% (state)                   |
+| Taproot inscription broadcast        | Called by `/api/commit`               | env³    | mvp                          | 0% (publisher)                |
+| Publisher UTXO lookup                | Internal, before broadcast            | env³    | mvp                          | 0% (publisher)                |
+| Explorer endpoints (`/api/stats`, …) | n/a                                   | planned | planned                      | —                             |
+| Light client support                 | n/a                                   | planned | planned                      | —                             |
 
 ¹ `NETWORK_NAME` env var controls the string returned. `IS_MAINNET=true` flips the default to `"Mainnet"`.
 ² Proof generation routes through SP1. `SP1_PROVER=mock` skips real proving; `cpu`/`cuda`/`network` perform actual proving (latency and resource cost vary by stage — see [Proving Strategy](#proving-strategy)).
 ³ Requires `PUBLISHER_KEY` set to a real funded key and `ESPLORA_URL` reachable. With the default test key the server panics on `IS_MAINNET=true` startup; on testnet it accepts the call but broadcast will fail without funded UTXOs.
 ⁴ Scanner depends on `ESPLORA_URL` being reachable; on connection failure it backs off and retries.
+
+### Triage gaps
+
+Features tagged `mvp` whose current test coverage is insufficient — these block "100% on activated features":
+
+- **Send — phase 2 (commit + broadcast)** — only error-path tests (`commit_missing_body`, `commit_nonexistent_proof_id`); no happy-path test that exercises the publisher
+- **Download coin proof** — only 404 path tested; no test for the happy-path binary stream
+- **Bitcoin block scanner** — parsing helpers covered (`scanner.rs` 51%); no integration test against a real Bitcoin block
+- **Taproot inscription broadcast** — `publisher.rs` 0%, no tests at all (would need signet/regtest + funded publisher key)
+- **Publisher UTXO lookup** — `publisher.rs` 0%, no tests
+
+Env vars that need to be implemented to honour the `gate (…)` decisions above:
+
+- `ENABLE_ADDRESS_LIST` — gates `GET /api/address`. Default off (debug/admin only)
+- `ENABLE_FAUCET` — gates `POST /api/mint` (replaces the implicit mainnet check via `IS_MAINNET`). Default off
+- `ENABLE_USERNAMES` — gates the two username endpoints (`/api/username/claim`, `/api/username/resolve/:username`). Default off
+- `ENABLE_LNURL` — gates the two LNURL-Pay endpoints. Default off (stub implementation, not wired to a real invoice generator)
+
+Until the gates are wired, the listed `gate (…)` endpoints still respond unconditionally; the Triage column is the agreed target, not the current code state.
 
 ### Details
 
