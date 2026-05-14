@@ -1668,6 +1668,34 @@ fn proof_store_new_picks_up_max_id_from_existing_files() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn persist_proof_bytes_logs_error_when_write_fails() {
+    // Pointing at a file inside a directory that does not exist guarantees
+    // `File::create` inside `atomic_write` returns an `Err` on both Linux
+    // and macOS. The function is best-effort: it logs and returns ().
+    // Exercising it covers the `if let Err(e) = ...` arm in server.rs
+    // that was reported uncovered on the Linux runner only.
+    let bad = std::path::Path::new("/this/path/does/not/exist/zkcoins/0.bin");
+    ProofStore::persist_proof_bytes(bad, b"payload", 42);
+}
+
+#[test]
+fn persist_proof_bytes_succeeds_when_write_succeeds() {
+    // Mirror test for the Ok arm so the helper is fully exercised.
+    let dir = std::env::temp_dir().join(format!(
+        "zkcoins-persist-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("99.bin");
+    ProofStore::persist_proof_bytes(&path, b"payload", 99);
+    assert_eq!(std::fs::read(&path).unwrap(), b"payload");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[tokio::test]
 async fn commit_with_wrong_length_signature_returns_422() {
     let state = test_state();

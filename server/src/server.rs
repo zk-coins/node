@@ -170,10 +170,18 @@ impl ProofStore {
             .expect("proof store directory exists (created in ProofStore::new)");
         let bytes =
             bincode::serialize(&proof_with_commitment).expect("CoinProof is always serializable");
-        if let Err(e) = crate::atomic_write(path.to_str().unwrap_or(""), &bytes) {
+        Self::persist_proof_bytes(&path, &bytes, id);
+        id
+    }
+
+    /// Best-effort persist: write `bytes` to `path` atomically, log the
+    /// I/O error if the write fails. Extracted so the error arm can be
+    /// exercised directly without having to construct a real `CoinProof`
+    /// (which requires the SP1 prover to run).
+    fn persist_proof_bytes(path: &std::path::Path, bytes: &[u8], id: u64) {
+        if let Err(e) = crate::atomic_write(path.to_str().unwrap_or(""), bytes) {
             eprintln!("Failed to persist proof {}: {}", id, e);
         }
-        id
     }
 
     fn get_proof(&self, id: u64) -> Option<CoinProof> {
