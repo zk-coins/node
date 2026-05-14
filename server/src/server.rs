@@ -49,15 +49,15 @@ fn verify_send_signature(request: &SendCoinRequest) -> Result<(), &'static str> 
     let hash: [u8; 32] = hasher.finalize().into();
 
     let msg = Message::from_digest(hash);
-    let sig_bytes = hex::decode(signature_hex).map_err(|_| "Invalid signature hex")?;
+    let sig_bytes = hex::decode(signature_hex).or(Err("Invalid signature hex"))?;
     let sig =
-        SchnorrSignature::from_slice(&sig_bytes).map_err(|_| "Invalid Schnorr signature format")?;
+        SchnorrSignature::from_slice(&sig_bytes).or(Err("Invalid Schnorr signature format"))?;
 
     let (xonly, _parity) = request.public_key.x_only_public_key();
     let secp = secp::Secp256k1::verification_only();
 
     secp.verify_schnorr(&sig, &msg, &xonly)
-        .map_err(|_| "Signature verification failed")
+        .or(Err("Signature verification failed"))
 }
 
 /// Lock a mutex, recovering from poison if a previous holder panicked.

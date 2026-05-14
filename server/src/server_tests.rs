@@ -1995,3 +1995,38 @@ async fn send_without_signature_skips_verification_and_proceeds() {
     // minting account (which has u64::MAX balance) and returns OK.
     assert_eq!(status, StatusCode::OK);
 }
+
+#[test]
+fn lock_or_recover_account_server_poisoned() {
+    // Generic instantiation: cover the AccountServer-specific monomorphic
+    // copy of lock_or_recover's poison-recovery closure.
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    let server = Arc::new(Mutex::new(AccountServer::new(Arc::clone(&state_arc))));
+    let server_clone = Arc::clone(&server);
+
+    let _ = std::thread::spawn(move || {
+        let _guard = server_clone.lock().unwrap();
+        panic!("intentional poison");
+    })
+    .join();
+
+    assert!(server.is_poisoned());
+    let _guard = lock_or_recover(&server);
+}
+
+#[test]
+fn lock_or_recover_username_store_poisoned() {
+    // Generic instantiation: cover the UsernameStore-specific monomorphic
+    // copy of lock_or_recover's poison-recovery closure.
+    let store = Arc::new(Mutex::new(crate::username::UsernameStore::new()));
+    let store_clone = Arc::clone(&store);
+
+    let _ = std::thread::spawn(move || {
+        let _guard = store_clone.lock().unwrap();
+        panic!("intentional poison");
+    })
+    .join();
+
+    assert!(store.is_poisoned());
+    let _guard = lock_or_recover(&store);
+}

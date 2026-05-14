@@ -598,3 +598,89 @@ fn test_send_coins_twice_from_same_account_uses_update_account() {
         .expect("second send should succeed (update_account path)");
     assert_eq!(coin_proofs_2.len(), 1);
 }
+
+#[test]
+fn test_receive_coin_rejects_replay_via_coin_history() {
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    let mut server = AccountServer::new(Arc::clone(&state_arc));
+
+    let mut minting = TestAccountData::new_minting_account();
+    server.import_account(
+        minting.address,
+        Account {
+            proof: None,
+            coin_queue: vec![],
+            coin_history: SparseMerkleTree::new(),
+            balance: 10_000,
+        },
+    );
+    let recipient: Address = [9u8; 32];
+    let coin_proofs = minting
+        .execute_send_coins(&mut server, vec![Invoice::new(50, recipient)])
+        .unwrap();
+    let coin_proof = coin_proofs[0].clone();
+    let coin_id = coin_proof.coin.identifier;
+
+    // First receive — succeeds, coin lands in the recipient's coin_queue.
+    server.receive_coin(coin_proof.clone()).unwrap();
+
+    // Simulate the recipient having spent the coin: identifier goes
+    // from coin_queue into coin_history.
+    {
+        let recipient_account = server.accounts.get_mut(&recipient).unwrap();
+        recipient_account
+            .coin_history
+            .insert(coin_id, coin_id)
+            .unwrap();
+        recipient_account
+            .coin_queue
+            .retain(|cp| cp.coin.identifier != coin_id);
+    }
+
+    // Replay: receiving the same coin again must be rejected via the
+    // coin_history check rather than the coin_queue check.
+    let result = server.receive_coin(coin_proof);
+    assert_eq!(result.unwrap_err(), "Coin already spent (replay)");
+}
+
+#[test]
+fn test_send_coins_rejects_coin_queue_entry_without_commitment() {
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    let mut server = AccountServer::new(Arc::clone(&state_arc));
+
+    let mut minting = TestAccountData::new_minting_account();
+    server.import_account(
+        minting.address,
+        Account {
+            proof: None,
+            coin_queue: vec![],
+            coin_history: SparseMerkleTree::new(),
+            balance: 10_000,
+        },
+    );
+    let recipient: Address = [10u8; 32];
+    let coin_proofs = minting
+        .execute_send_coins(&mut server, vec![Invoice::new(50, recipient)])
+        .unwrap();
+    let mut coin_proof = coin_proofs[0].clone();
+    // Strip the commitment so the next send attempt from the recipient
+    // hits the "Coin is missing commitment" branch.
+    coin_proof.commitment = None;
+
+    server.receive_coin(coin_proof).unwrap();
+
+    let mut recipient_data = TestAccountData::new_generic(&[10u8; 32], bitcoin::Network::Signet);
+    // Force the test data to use the same address as the recipient.
+    recipient_data.address = recipient;
+
+    let current_pk = generate_test_public_key(&recipient_data.xpriv, 0);
+    let next_pk = generate_test_public_key(&recipient_data.xpriv, 1);
+    let result = server.send_coins(
+        vec![Invoice::new(1, [11u8; 32])],
+        recipient_data.address,
+        current_pk,
+        next_pk,
+        None,
+    );
+    assert_eq!(result.unwrap_err(), "Coin is missing commitment");
+}
