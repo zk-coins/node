@@ -299,3 +299,18 @@ fn process_transaction_inscriptions_ignores_witness_without_envelope() {
     process_transaction_inscriptions(&tx, hash, callback.as_ref());
     assert!(received.lock().unwrap().is_empty());
 }
+
+#[test]
+fn extract_inscription_skips_non_push_opcodes_inside_envelope() {
+    // Inside the OP_FALSE OP_IF envelope, anything that is not a push or
+    // OP_ENDIF should be silently ignored — exercise the wildcard arm.
+    let script = script::Builder::new()
+        .push_opcode(opcodes::OP_FALSE)
+        .push_opcode(opcodes::all::OP_IF)
+        .push_opcode(opcodes::all::OP_PUSHNUM_1) // non-push, non-endif
+        .push_slice([1u8, 2u8, 3u8])
+        .push_opcode(opcodes::all::OP_ENDIF)
+        .into_script();
+    let extracted = extract_inscription_content(script.as_bytes()).unwrap();
+    assert_eq!(extracted, vec![1u8, 2u8, 3u8]);
+}

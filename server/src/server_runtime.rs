@@ -13,7 +13,13 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use shared::commitment::Commitment;
 use tokio::net::TcpListener;
+
+use crate::account_server::CoinProof;
+use crate::publisher::create_and_broadcast_inscription;
+use crate::server::lock_or_recover;
+use crate::NETWORK_CONFIG;
 
 #[cfg(feature = "faucet")]
 use bitcoin::bip32::Xpriv;
@@ -23,8 +29,6 @@ use shared::ClientAccount;
 use crate::account_server::AccountServer;
 use crate::server::{create_router, AppState, ProofStore};
 use crate::username::UsernameStore;
-#[cfg(feature = "faucet")]
-use crate::NETWORK_CONFIG;
 
 pub async fn start_rest_server(
     account_server: AccountServer,
@@ -97,5 +101,37 @@ pub async fn start_rest_server(
     let listener = TcpListener::bind(socket_addr).await?;
     axum::serve(listener, app).await?;
 
+    Ok(())
+}
+
+/// Broadcast the commit inscription and, on success, deliver the coin
+/// to the recipient and persist the account state. This contains the
+/// network call (Bitcoin broadcast) and the post-broadcast bookkeeping
+/// that cannot be exercised by unit tests, so it lives in the runtime
+/// module that is excluded from the coverage scope.
+pub(crate) async fn broadcast_commit_and_deliver(
+    state: &AppState,
+    commitment: Commitment,
+    coin_proof: CoinProof,
+) -> Result<(), ()> {
+    let commitment_data = bincode::serialize(&commitment).expect("Failed to serialize commitment");
+    println!(
+        "Broadcasting user commitment ({} bytes)",
+        commitment_data.len()
+    );
+    if let Err(err) = create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG).await {
+        eprintln!("Error broadcasting commit inscription: {}", err);
+        return Err(());
+    }
+
+    let mut updated_proof = coin_proof;
+    updated_proof.commitment = Some(commitment);
+    let mut account_server_guard = lock_or_recover(&state.account_server);
+    if let Err(e) = account_server_guard.receive_coin(updated_proof) {
+        eprintln!("Failed to receive coin after commit: {}", e);
+    }
+    if let Err(e) = account_server_guard.save_to_file(&state.accounts_path) {
+        eprintln!("Failed to persist accounts after commit: {}", e);
+    }
     Ok(())
 }

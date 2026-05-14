@@ -63,7 +63,7 @@ fn verify_send_signature(request: &SendCoinRequest) -> Result<(), &'static str> 
 
 /// Lock a mutex, recovering from poison if a previous holder panicked.
 /// This prevents cascade failures where one panic takes down all handlers.
-fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| {
         eprintln!("WARNING: Recovering from poisoned mutex");
         poisoned.into_inner()
@@ -775,42 +775,22 @@ async fn commit_handler(
         );
     }
 
-    // Broadcast the inscription
-    let commitment_data = bincode::serialize(&commitment).expect("Failed to serialize commitment");
-    println!(
-        "Broadcasting user commitment ({} bytes)",
-        commitment_data.len()
-    );
-    if let Err(err) = create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG).await {
-        eprintln!("Error broadcasting commit inscription: {}", err);
-        return (
+    match crate::server_runtime::broadcast_commit_and_deliver(&state, commitment, coin_proof).await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(SendCoinResponse {
+                success: true,
+                proof_id: Some(request.proof_id),
+                account_state_hash: None,
+                output_coins_root: None,
+            }),
+        ),
+        Err(()) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(SendCoinResponse::default()),
-        );
+        ),
     }
-
-    // Deliver the coin to the recipient
-    let mut updated_proof = coin_proof;
-    updated_proof.commitment = Some(commitment);
-    {
-        let mut account_server_guard = lock_or_recover(&state.account_server);
-        if let Err(e) = account_server_guard.receive_coin(updated_proof) {
-            eprintln!("Failed to receive coin after commit: {}", e);
-        }
-        if let Err(e) = account_server_guard.save_to_file(&state.accounts_path) {
-            eprintln!("Failed to persist accounts after commit: {}", e);
-        }
-    }
-
-    (
-        StatusCode::OK,
-        Json(SendCoinResponse {
-            success: true,
-            proof_id: Some(request.proof_id),
-            account_state_hash: None,
-            output_coins_root: None,
-        }),
-    )
 }
 
 async fn info_handler() -> impl IntoResponse {
