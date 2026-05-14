@@ -6,12 +6,15 @@ use axum::{
     routing::{get, post},
     Router,
 };
+#[cfg(feature = "faucet")]
 use bitcoin::bip32::Xpriv;
 use bitcoin::secp256k1::{self as secp, schnorr::Signature as SchnorrSignature, Message};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shared::commitment::Commitment;
-use shared::{ClientAccount, Invoice, ProofData};
+#[cfg(feature = "faucet")]
+use shared::ClientAccount;
+use shared::{Invoice, ProofData};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -74,9 +77,11 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 struct AppState {
     account_server: Arc<Mutex<AccountServer>>,
     proof_store: Arc<ProofStore>,
+    #[cfg(feature = "faucet")]
     minting_account: Arc<Mutex<ClientAccount>>,
     username_store: Arc<Mutex<UsernameStore>>,
     accounts_path: String,
+    #[cfg(feature = "usernames")]
     usernames_path: String,
 }
 
@@ -105,6 +110,7 @@ pub struct SendCoinRequest {
     timestamp: Option<u64>,
 }
 
+#[cfg(feature = "faucet")]
 #[derive(Deserialize)]
 pub struct MintRequest {
     account_address: String,
@@ -219,6 +225,7 @@ pub struct InfoResponse {
 
 // --- Username & LNURL types ---
 
+#[cfg(feature = "usernames")]
 #[derive(Deserialize)]
 pub struct ClaimUsernameRequest {
     username: String,
@@ -314,6 +321,7 @@ async fn get_balance_handler(
     }
 }
 
+#[cfg(feature = "address-list")]
 async fn get_address_handler(State(state): State<AppState>) -> impl IntoResponse {
     let account_server = lock_or_recover(&state.account_server);
 
@@ -493,6 +501,7 @@ async fn send_coin_handler(
     }
 }
 
+#[cfg(feature = "faucet")]
 async fn mint_handler(
     State(state): State<AppState>,
     Json(request): Json<MintRequest>,
@@ -814,6 +823,7 @@ async fn info_handler() -> impl IntoResponse {
 
 // --- Username & LNURL handlers ---
 
+#[cfg(feature = "usernames")]
 async fn claim_username_handler(
     State(state): State<AppState>,
     Json(request): Json<ClaimUsernameRequest>,
@@ -951,6 +961,8 @@ async fn claim_username_handler(
 
 /// Resolve an identifier to an address. Checks the username store first,
 /// then falls back to hex-prefix matching against known account addresses.
+/// Only used by the gated username and LNURL handlers.
+#[cfg(any(feature = "usernames", feature = "lnurl"))]
 fn resolve_identifier(state: &AppState, identifier: &str) -> Option<([u8; 32], String)> {
     let normalized = identifier.to_lowercase();
 
@@ -970,6 +982,7 @@ fn resolve_identifier(state: &AppState, identifier: &str) -> Option<([u8; 32], S
         .map(|addr| (addr, normalized))
 }
 
+#[cfg(feature = "usernames")]
 async fn resolve_username_handler(
     State(state): State<AppState>,
     Path(username): Path<String>,
@@ -994,6 +1007,7 @@ async fn resolve_username_handler(
     }
 }
 
+#[cfg(feature = "lnurl")]
 async fn lnurlp_handler(
     State(state): State<AppState>,
     Path(username): Path<String>,
@@ -1039,6 +1053,7 @@ async fn lnurlp_handler(
         .into_response()
 }
 
+#[cfg(feature = "lnurl")]
 async fn lnurl_callback_handler(
     State(_state): State<AppState>,
     Path(_username): Path<String>,
@@ -1057,24 +1072,40 @@ fn create_router(state: AppState) -> Router {
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([header::CONTENT_TYPE]);
 
-    Router::new()
+    // MVP routes — always compiled in.
+    let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/api/info", get(info_handler))
         .route("/api/balance", get(get_balance_handler))
         .route("/api/send", post(send_coin_handler))
-        .route("/api/address", get(get_address_handler))
         .route("/api/receive", post(receive_coin_handler))
         .route("/api/proof/:id", get(get_proof_handler))
-        .route("/api/mint", post(mint_handler))
-        .route("/api/commit", post(commit_handler))
+        .route("/api/commit", post(commit_handler));
+
+    // Gated routes — only compiled in when their Cargo feature is enabled.
+    // With a feature off, the handler does not exist in the binary and the
+    // route is not registered, so the endpoint returns 404 via the fallback
+    // and there is no code path to execute.
+    #[cfg(feature = "address-list")]
+    let app = app.route("/api/address", get(get_address_handler));
+
+    #[cfg(feature = "faucet")]
+    let app = app.route("/api/mint", post(mint_handler));
+
+    #[cfg(feature = "usernames")]
+    let app = app
         .route("/api/username/claim", post(claim_username_handler))
         .route(
             "/api/username/resolve/:username",
             get(resolve_username_handler),
-        )
+        );
+
+    #[cfg(feature = "lnurl")]
+    let app = app
         .route("/.well-known/lnurlp/:username", get(lnurlp_handler))
-        .route("/lnurl/pay/:username", get(lnurl_callback_handler))
-        .with_state(state)
+        .route("/lnurl/pay/:username", get(lnurl_callback_handler));
+
+    app.with_state(state)
         .fallback(|| async { StatusCode::NOT_FOUND })
         .layer(cors)
 }
@@ -1085,7 +1116,7 @@ pub async fn start_rest_server(
     username_store: UsernameStore,
     addr: &str,
     accounts_path: String,
-    usernames_path: String,
+    #[cfg_attr(not(feature = "usernames"), allow(unused_variables))] usernames_path: String,
 ) -> anyhow::Result<()> {
     // Parse the address string into a SocketAddr
     let socket_addr = addr
@@ -1105,6 +1136,7 @@ pub async fn start_rest_server(
     );
     let proof_store = Arc::new(ProofStore::new(&proofs_dir));
 
+    #[cfg(feature = "faucet")]
     let minting_account = {
         let secret = include_bytes!("../minting_secret.bin");
         let private_key = Xpriv::new_master(NETWORK_CONFIG.network(), secret)
@@ -1128,9 +1160,11 @@ pub async fn start_rest_server(
     let state = AppState {
         account_server: shared_account_server,
         proof_store,
+        #[cfg(feature = "faucet")]
         minting_account,
         username_store: shared_username_store,
         accounts_path,
+        #[cfg(feature = "usernames")]
         usernames_path,
     };
     {
@@ -1210,17 +1244,22 @@ mod tests {
         account_server.import_account(zkcoins_program::MINTING_ADDRESS, minting_account);
 
         // Create a dummy minting ClientAccount from a deterministic key
-        let secret = include_bytes!("../minting_secret.bin");
-        let private_key = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Signet, secret)
-            .expect("Failed to create test private key");
-        let minting_client = shared::ClientAccount::new(private_key);
+        #[cfg(feature = "faucet")]
+        let minting_client = {
+            let secret = include_bytes!("../minting_secret.bin");
+            let private_key = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Signet, secret)
+                .expect("Failed to create test private key");
+            shared::ClientAccount::new(private_key)
+        };
 
         AppState {
             account_server: Arc::new(Mutex::new(account_server)),
             proof_store: Arc::new(ProofStore::new("/tmp/zkcoins-test-proofs")),
+            #[cfg(feature = "faucet")]
             minting_account: Arc::new(Mutex::new(minting_client)),
             username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
             accounts_path: String::new(),
+            #[cfg(feature = "usernames")]
             usernames_path: String::new(),
         }
     }
@@ -1325,6 +1364,7 @@ mod tests {
 
     // --- GET /api/address ---
 
+    #[cfg(feature = "address-list")]
     #[tokio::test]
     async fn address_returns_list() {
         let req = Request::get("/api/address").body(Body::empty()).unwrap();
@@ -1381,6 +1421,7 @@ mod tests {
 
     // --- POST /api/mint with missing fields ---
 
+    #[cfg(feature = "faucet")]
     #[tokio::test]
     async fn mint_missing_body_returns_error() {
         let req = Request::post("/api/mint")
@@ -1443,6 +1484,7 @@ mod tests {
 
     // --- GET /api/username/resolve/{username} ---
 
+    #[cfg(feature = "usernames")]
     #[tokio::test]
     async fn resolve_unknown_username_returns_404() {
         let req = Request::get("/api/username/resolve/nonexistent")
@@ -1457,6 +1499,7 @@ mod tests {
         assert!(resp.reason.contains("not found"));
     }
 
+    #[cfg(feature = "usernames")]
     #[tokio::test]
     async fn resolve_minting_address_by_hex_prefix() {
         // The minting address starts with "af53a1" — a short prefix is enough
@@ -1477,6 +1520,7 @@ mod tests {
 
     // --- POST /api/username/claim ---
 
+    #[cfg(feature = "usernames")]
     #[tokio::test]
     async fn claim_username_empty_body_returns_422() {
         let req = Request::post("/api/username/claim")
@@ -1488,6 +1532,7 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
+    #[cfg(feature = "usernames")]
     #[tokio::test]
     async fn claim_username_no_content_type_returns_415() {
         let req = Request::post("/api/username/claim")
@@ -1500,6 +1545,7 @@ mod tests {
 
     // --- GET /.well-known/lnurlp/{username} ---
 
+    #[cfg(feature = "lnurl")]
     #[tokio::test]
     async fn lnurlp_unknown_user_returns_404() {
         let req = Request::get("/.well-known/lnurlp/nobody")
@@ -1514,6 +1560,7 @@ mod tests {
         assert!(resp.reason.contains("not found"));
     }
 
+    #[cfg(feature = "lnurl")]
     #[tokio::test]
     async fn lnurlp_known_address_returns_pay_request() {
         // The minting address is resolvable by hex prefix through resolve_identifier.
@@ -1542,6 +1589,7 @@ mod tests {
 
     // --- GET /lnurl/pay/{username} ---
 
+    #[cfg(feature = "lnurl")]
     #[tokio::test]
     async fn lnurl_pay_callback_returns_phase2_error() {
         let req = Request::get("/lnurl/pay/someone")
@@ -1636,6 +1684,7 @@ mod tests {
 
     // --- Concurrent mixed reads and username operations ---
 
+    #[cfg(feature = "usernames")]
     #[tokio::test]
     async fn concurrent_reads_with_username_claim() {
         let state = test_state();
@@ -1868,6 +1917,7 @@ mod tests {
 
     // --- POST /api/username/claim with valid Schnorr signature ---
 
+    #[cfg(feature = "usernames")]
     #[tokio::test]
     async fn claim_username_with_valid_signature() {
         use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -1931,6 +1981,7 @@ mod tests {
         assert_eq!(resp.address, format!("0x{}", address_hex));
     }
 
+    #[cfg(feature = "usernames")]
     #[tokio::test]
     async fn claim_username_wrong_pubkey() {
         use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -1982,6 +2033,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "usernames")]
     #[tokio::test]
     async fn claim_username_expired_timestamp() {
         use bitcoin::secp256k1::{Keypair, SecretKey};

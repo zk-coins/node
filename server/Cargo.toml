@@ -28,4 +28,12 @@ http-body-util = "0.1"
 serde_json = "1.0"
 
 [features]
+# All non-MVP features are off by default. When a feature is not enabled, the
+# corresponding routes, handlers, and supporting modules are excluded from the
+# binary at compile time via `#[cfg(feature = "…")]`, so the disabled code
+# cannot run, crash, or be exploited at runtime.
 default = []
+address-list = []
+faucet = []
+usernames = []
+lnurl = ["usernames"]

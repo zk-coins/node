@@ -12,6 +12,7 @@ impl UsernameStore {
         Self::default()
     }
 
+    #[cfg(any(feature = "usernames", test))]
     pub fn claim(&mut self, username: &str, address: Address) -> Result<(), &'static str> {
         let normalized = username.to_lowercase();
 
@@ -37,6 +38,7 @@ impl UsernameStore {
         Ok(())
     }
 
+    #[cfg(any(feature = "usernames", feature = "lnurl", test))]
     pub fn resolve(&self, username: &str) -> Option<Address> {
         self.usernames.get(&username.to_lowercase()).copied()
     }
@@ -48,6 +50,7 @@ impl UsernameStore {
             .map(|(name, _)| name.as_str())
     }
 
+    #[cfg(any(feature = "usernames", test))]
     pub fn save_to_file(&self, path: &str) -> std::io::Result<()> {
         let bytes = bincode::serialize(&self.usernames)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;

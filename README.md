@@ -26,38 +26,51 @@ Full rationale: [docs.zkcoins.app/tech-decisions](https://docs.zkcoins.app/tech-
 
 API endpoints, background services, their activation status, and the tests that cover them.
 
-**Status legend** (current behaviour): `always` = endpoint/service always available · `env` = behavior controlled by an env var · `planned` = listed in Open Tasks, not yet implemented.
+**Status legend** (current behaviour): `always` = endpoint/service always compiled in · `env` = behavior controlled by a runtime env var · `feature` = compiled in only when the named Cargo feature is enabled at build time, otherwise excluded from the binary · `planned` = listed in Open Tasks, not yet implemented.
 
-**Triage legend** (target state for MVP): `mvp` = in scope, must reach full test coverage before launch · `gate (VAR)` = to be hidden behind the named env var (default off) until tests exist · `planned` = not in scope for MVP.
+**Triage legend** (MVP testing decision): `mvp` = in MVP scope, must reach full test coverage before launch · `gate` = not in MVP scope; hidden behind a Cargo feature, default off, no test coverage required · `planned` = not in scope for MVP.
 
-**Coverage legend:** unit % refers to `cargo-llvm-cov` line coverage of the module that implements the function (latest run, `SP1_PROVER=mock`). `—` means no test exists.
+**Coverage legend:** unit % refers to `cargo-llvm-cov` line coverage of the module that implements the function (latest run, `SP1_PROVER=mock` with `--all-features`). `—` means no test exists.
 
-| Function                             | Trigger                               | Status  | Triage                       | Tests                         |
-| ------------------------------------ | ------------------------------------- | ------- | ---------------------------- | ----------------------------- |
-| Health check                         | `GET /health`                         | always  | mvp                          | 75% (server)                  |
-| Network info                         | `GET /api/info`                       | env¹    | mvp                          | 75% (server)                  |
-| Get balance                          | `GET /api/balance?address=<hex>`      | always  | mvp                          | 75% (server)                  |
-| List all addresses                   | `GET /api/address`                    | always  | gate (`ENABLE_ADDRESS_LIST`) | 75% (server)                  |
-| Mint coins (faucet, single-phase)    | `POST /api/mint`                      | env²    | gate (`ENABLE_FAUCET`)       | 91% (account)                 |
-| Send — phase 1 (generate proof)      | `POST /api/send`                      | env²    | mvp                          | 75% (server)                  |
-| Send — phase 2 (commit + broadcast)  | `POST /api/commit`                    | env³    | mvp                          | 75% (server) · 0% (publisher) |
-| Receive coin                         | `POST /api/receive`                   | always  | mvp                          | 91% (account)                 |
-| Download coin proof                  | `GET /api/proof/:id`                  | always  | mvp                          | 75% (server)                  |
-| Claim username                       | `POST /api/username/claim`            | always  | gate (`ENABLE_USERNAMES`)    | 98% (username)                |
-| Resolve username                     | `GET /api/username/resolve/:username` | always  | gate (`ENABLE_USERNAMES`)    | 98% (username)                |
-| LNURL-Pay metadata                   | `GET /.well-known/lnurlp/:username`   | always  | gate (`ENABLE_LNURL`)        | 75% (server)                  |
-| LNURL-Pay callback                   | `GET /lnurl/pay/:username`            | always  | gate (`ENABLE_LNURL`)        | 75% (server)                  |
-| Bitcoin block scanner (background)   | Loop in `main.rs`, 30 s poll          | env⁴    | mvp                          | 51% (scanner) · 4% (main)     |
-| State persistence (SMT/MMR write)    | Scanner callback on commitment match  | always  | mvp                          | 97% (state)                   |
-| Taproot inscription broadcast        | Called by `/api/commit`               | env³    | mvp                          | 0% (publisher)                |
-| Publisher UTXO lookup                | Internal, before broadcast            | env³    | mvp                          | 0% (publisher)                |
-| Explorer endpoints (`/api/stats`, …) | n/a                                   | planned | planned                      | —                             |
-| Light client support                 | n/a                                   | planned | planned                      | —                             |
+| Function                             | Trigger                               | Status                   | Triage  | Tests                         |
+| ------------------------------------ | ------------------------------------- | ------------------------ | ------- | ----------------------------- |
+| Health check                         | `GET /health`                         | always                   | mvp     | 75% (server)                  |
+| Network info                         | `GET /api/info`                       | env¹                     | mvp     | 75% (server)                  |
+| Get balance                          | `GET /api/balance?address=<hex>`      | always                   | mvp     | 75% (server)                  |
+| List all addresses                   | `GET /api/address`                    | feature (`address-list`) | gate    | 75% (server)                  |
+| Mint coins (faucet, single-phase)    | `POST /api/mint`                      | feature (`faucet`)²      | gate    | 91% (account)                 |
+| Send — phase 1 (generate proof)      | `POST /api/send`                      | env²                     | mvp     | 75% (server)                  |
+| Send — phase 2 (commit + broadcast)  | `POST /api/commit`                    | env³                     | mvp     | 75% (server) · 0% (publisher) |
+| Receive coin                         | `POST /api/receive`                   | always                   | mvp     | 91% (account)                 |
+| Download coin proof                  | `GET /api/proof/:id`                  | always                   | mvp     | 75% (server)                  |
+| Claim username                       | `POST /api/username/claim`            | feature (`usernames`)    | gate    | 98% (username)                |
+| Resolve username                     | `GET /api/username/resolve/:username` | feature (`usernames`)    | gate    | 98% (username)                |
+| LNURL-Pay metadata                   | `GET /.well-known/lnurlp/:username`   | feature (`lnurl`)        | gate    | 75% (server)                  |
+| LNURL-Pay callback                   | `GET /lnurl/pay/:username`            | feature (`lnurl`)        | gate    | 75% (server)                  |
+| Bitcoin block scanner (background)   | Loop in `main.rs`, 30 s poll          | env⁴                     | mvp     | 51% (scanner) · 4% (main)     |
+| State persistence (SMT/MMR write)    | Scanner callback on commitment match  | always                   | mvp     | 97% (state)                   |
+| Taproot inscription broadcast        | Called by `/api/commit`               | env³                     | mvp     | 0% (publisher)                |
+| Publisher UTXO lookup                | Internal, before broadcast            | env³                     | mvp     | 0% (publisher)                |
+| Explorer endpoints (`/api/stats`, …) | n/a                                   | planned                  | planned | —                             |
+| Light client support                 | n/a                                   | planned                  | planned | —                             |
 
 ¹ `NETWORK_NAME` env var controls the string returned. `IS_MAINNET=true` flips the default to `"Mainnet"`.
 ² Proof generation routes through SP1. `SP1_PROVER=mock` skips real proving; `cpu`/`cuda`/`network` perform actual proving (latency and resource cost vary by stage — see [Proving Strategy](#proving-strategy)).
 ³ Requires `PUBLISHER_KEY` set to a real funded key and `ESPLORA_URL` reachable. With the default test key the server panics on `IS_MAINNET=true` startup; on testnet it accepts the call but broadcast will fail without funded UTXOs.
 ⁴ Scanner depends on `ESPLORA_URL` being reachable; on connection failure it backs off and retries.
+
+### Cargo features
+
+All non-MVP routes are gated by Cargo features so the disabled handler functions, helper structs, and `AppState` fields are excluded from the binary at compile time. With a feature off, the route is never registered and the fallback responds with `404`. There is no runtime path that can reach a disabled handler. Defaults are empty (fail-closed): the PRD image build passes no features, the DEV image build passes all four.
+
+| Feature        | Gates                                                                                                                                                 |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `address-list` | `GET /api/address`                                                                                                                                    |
+| `faucet`       | `POST /api/mint`, `MintRequest`, `AppState::minting_account`                                                                                          |
+| `usernames`    | `POST /api/username/claim`, `GET /api/username/resolve/:u`, `ClaimUsernameRequest`, `UsernameStore::{claim,save_to_file}`, `AppState::usernames_path` |
+| `lnurl`        | `GET /.well-known/lnurlp/:u`, `GET /lnurl/pay/:u` (depends on `usernames`)                                                                            |
+
+Build the MVP-only binary (PRD): `cargo build --release -p server`. Build with everything enabled (DEV / tests): `cargo build --release -p server --all-features`. The Docker `FEATURES` build arg accepts a comma-separated list and is forwarded to `cargo build --features`.
 
 ### Triage gaps
 
@@ -68,15 +81,6 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 - **Bitcoin block scanner** — parsing helpers covered (`scanner.rs` 51%); no integration test against a real Bitcoin block
 - **Taproot inscription broadcast** — `publisher.rs` 0%, no tests at all (would need signet/regtest + funded publisher key)
 - **Publisher UTXO lookup** — `publisher.rs` 0%, no tests
-
-Env vars that need to be implemented to honour the `gate (…)` decisions above:
-
-- `ENABLE_ADDRESS_LIST` — gates `GET /api/address`. Default off (debug/admin only)
-- `ENABLE_FAUCET` — gates `POST /api/mint` (replaces the implicit mainnet check via `IS_MAINNET`). Default off
-- `ENABLE_USERNAMES` — gates the two username endpoints (`/api/username/claim`, `/api/username/resolve/:username`). Default off
-- `ENABLE_LNURL` — gates the two LNURL-Pay endpoints. Default off (stub implementation, not wired to a real invoice generator)
-
-Until the gates are wired, the listed `gate (…)` endpoints still respond unconditionally; the Triage column is the agreed target, not the current code state.
 
 ### Details
 
@@ -187,7 +191,7 @@ Until the gates are wired, the listed `gate (…)` endpoints still respond uncon
 | `PUBLISHER_KEY` | test key                    | 32-byte hex private key for inscription publishing. **Required on mainnet** — server panics on startup if default test key is detected with `IS_MAINNET=true` |
 | `RUST_LOG`      | `info`                      | Log level                                                                                                                                                     |
 
-No Cargo features are wired up — `default = []` in all `Cargo.toml` files. All gating is runtime via the env vars above.
+Runtime config above shapes _behaviour_ of compiled-in routes. _Which_ routes are compiled in is decided at build time by Cargo features — see [Cargo features](#cargo-features).
 
 ### Background services
 
@@ -198,12 +202,13 @@ Spawned from `main.rs::main`:
 
 ### Tests
 
-| Stack            | Command                                    | What it covers                                                                     |
-| ---------------- | ------------------------------------------ | ---------------------------------------------------------------------------------- |
-| `cargo test`     | `SP1_PROVER=mock cargo test -p server`     | 64 tests across `server`, `state`, `scanner`, `username`, `account_server` modules |
-| `cargo-llvm-cov` | `SP1_PROVER=mock cargo llvm-cov -p server` | Line coverage (latest run: **69.0% lines · 55.0% regions · 76.4% functions**)      |
+| Stack            | Command                                                   | What it covers                                                                                             |
+| ---------------- | --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `cargo test`     | `SP1_PROVER=mock cargo test -p server`                    | 45 tests covering only MVP code paths — what the PRD binary actually contains                              |
+| `cargo test`     | `SP1_PROVER=mock cargo test -p server --all-features`     | 58 tests including the gated `address-list`, `faucet`, `usernames`, and `lnurl` routes                     |
+| `cargo-llvm-cov` | `SP1_PROVER=mock cargo llvm-cov -p server --all-features` | Line coverage (latest run: **69.0% lines · 55.0% regions · 76.4% functions**) — measured with all gates on |
 
-Per-module line coverage (latest run):
+Per-module line coverage (latest run, all features):
 
 | Module              | Tests | Line % |
 | ------------------- | ----- | ------ |
@@ -215,7 +220,7 @@ Per-module line coverage (latest run):
 | `publisher.rs`      | 0     | 0.00%  |
 | `main.rs`           | 0     | 4.33%  |
 
-`publisher.rs` and `main.rs` are untested by design — they require a live Bitcoin node and a funded publisher key. CI runs `cargo test`; coverage is collected ad-hoc, not in CI.
+`publisher.rs` and `main.rs` are untested by design — they require a live Bitcoin node and a funded publisher key. CI runs both the MVP build (`cargo build/clippy`) and the all-features build, plus `cargo test --all-features`. Coverage is collected ad-hoc, not in CI.
 
 ## Running
 

@@ -40,14 +40,20 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: Run clippy (server + shared)
+      - name: Run clippy (server + shared, MVP feature set)
         run: cargo clippy -p server -p shared -- -D warnings
+
+      - name: Run clippy (server, all features)
+        run: cargo clippy -p server --all-features -- -D warnings
 
       - name: Run clippy (program lib)
         run: cargo clippy -p zkcoins-program --lib -- -D warnings
 
-      - name: Build server
+      - name: Build server (MVP feature set — the PRD image)
         run: cargo build -p server
+
+      - name: Build server (all features — the DEV image)
+        run: cargo build -p server --all-features
 
   tests:
     name: Tests
@@ -72,8 +78,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Run tests (server + shared, skip slow SP1 prover tests)
-        run: cargo test -p server -p shared -- --skip account_server::tests
+      - name: Run tests (server + shared, all features, skip slow SP1 prover tests)
+        run: cargo test -p server -p shared --all-features -- --skip account_server::tests
 
       - name: Run tests (program lib)
         run: cargo test -p zkcoins-program --lib

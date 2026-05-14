@@ -120,6 +120,7 @@ impl AccountServer {
         }
     }
 
+    #[cfg(any(feature = "address-list", feature = "usernames", feature = "lnurl"))]
     pub fn get_addresses(&self) -> Vec<Address> {
         self.accounts.keys().cloned().collect::<Vec<Address>>()
     }
