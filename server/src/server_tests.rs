@@ -1373,11 +1373,22 @@ async fn send_with_insufficient_funds_returns_ok_with_success_false() {
     let mut empty_minting = Account::new();
     empty_minting.balance = 0;
     account_server.import_account(zkcoins_program::MINTING_ADDRESS, empty_minting);
+    #[cfg(feature = "faucet")]
+    let minting_client = {
+        let secret = include_bytes!("../minting_secret.bin");
+        let private_key = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Signet, secret)
+            .expect("test minting xpriv");
+        shared::ClientAccount::new(private_key)
+    };
     let state = AppState {
         account_server: Arc::new(Mutex::new(account_server)),
         proof_store: Arc::new(ProofStore::new("/tmp/zkcoins-test-proofs-empty")),
+        #[cfg(feature = "faucet")]
+        minting_account: Arc::new(Mutex::new(minting_client)),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
         accounts_path: String::new(),
+        #[cfg(feature = "usernames")]
+        usernames_path: String::new(),
     };
 
     let secret_bytes = include_bytes!("../minting_secret.bin");

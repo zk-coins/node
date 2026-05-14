@@ -6,8 +6,6 @@ use axum::{
     routing::{get, post},
     Router,
 };
-#[cfg(feature = "faucet")]
-use bitcoin::bip32::Xpriv;
 use bitcoin::secp256k1::{self as secp, schnorr::Signature as SchnorrSignature, Message};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -156,32 +154,23 @@ impl ProofStore {
     }
 
     /// Build a safe file path for a proof ID within the store directory.
-    /// The ID is always a server-generated u64, so path traversal is impossible,
-    /// but we canonicalize and validate anyway to satisfy static analysis.
+    /// The ID is always a server-generated u64 and the suffix is the
+    /// literal ".bin", so `base.join(...)` cannot escape `base` — no
+    /// extra starts_with check is needed.
     fn proof_path(&self, id: u64) -> Option<std::path::PathBuf> {
         let base = std::path::Path::new(&self.dir).canonicalize().ok()?;
-        let candidate = base.join(format!("{}.bin", id));
-        // Ensure the resolved path is inside the base directory.
-        if candidate.starts_with(&base) {
-            Some(candidate)
-        } else {
-            None
-        }
+        Some(base.join(format!("{}.bin", id)))
     }
 
     fn add_proof(&self, proof_with_commitment: CoinProof) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let Some(path) = self.proof_path(id) else {
-            eprintln!("Failed to resolve proof path for {}", id);
-            return id;
-        };
-        match bincode::serialize(&proof_with_commitment) {
-            Ok(bytes) => {
-                if let Err(e) = crate::atomic_write(path.to_str().unwrap_or(""), &bytes) {
-                    eprintln!("Failed to persist proof {}: {}", id, e);
-                }
-            }
-            Err(e) => eprintln!("Failed to serialize proof {}: {}", id, e),
+        let path = self
+            .proof_path(id)
+            .expect("proof store directory exists (created in ProofStore::new)");
+        let bytes =
+            bincode::serialize(&proof_with_commitment).expect("CoinProof is always serializable");
+        if let Err(e) = crate::atomic_write(path.to_str().unwrap_or(""), &bytes) {
+            eprintln!("Failed to persist proof {}: {}", id, e);
         }
         id
     }

@@ -56,11 +56,13 @@ impl Account {
             public_key,
         };
         for coin_template in &coin_templates {
-            // Apply all coins.
-            next_account_state.balance = match next_account_state.balance.checked_sub(coin_template.amount) {
-                Some(balance) => balance,
-                None => return Err("Balance too small to create Coin. This should have been checked beforehand and is a bug :(")
-            };
+            // Caller (send_coins) already validated balance >= total
+            // invoiced amount before reaching this function. The expect
+            // here is documentation of that invariant.
+            next_account_state.balance = next_account_state
+                .balance
+                .checked_sub(coin_template.amount)
+                .expect("balance was validated by send_coins");
         }
 
         let next_account_state_hash = next_account_state.hash();
