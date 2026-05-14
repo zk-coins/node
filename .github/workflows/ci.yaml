@@ -129,7 +129,7 @@ jobs:
       - name: Run cargo-llvm-cov (MVP scope, regression guard)
         run: |
           SP1_PROVER=mock cargo llvm-cov -p server --summary-only \
-            --ignore-filename-regex 'main\.rs|publisher\.rs' \
+            --ignore-filename-regex 'main\.rs|publisher\.rs|_tests\.rs$' \
             --fail-under-lines 78 \
             --fail-under-functions 80 \
             -- --skip account_server::tests
