@@ -1190,34 +1190,6 @@ pub async fn start_rest_server(
     Ok(())
 }
 
-// Handler to serve the index.html file (currently unused, kept for future use)
-#[allow(dead_code)]
-async fn serve_index() -> impl IntoResponse {
-    let current_dir = std::env::current_dir().unwrap_or_default();
-    let index_path = current_dir.join("..").join("client").join("index.html");
-
-    match tokio::fs::read_to_string(&index_path).await {
-        Ok(content) => {
-            println!("Successfully read index.html, length: {}", content.len());
-            let headers = [(header::CONTENT_TYPE, "text/html; charset=utf-8")];
-            (StatusCode::OK, headers, content)
-        }
-        Err(e) => {
-            eprintln!("Error reading index.html: {}", e);
-            let error_message = format!("Index file not found: {}", e);
-            (
-                StatusCode::NOT_FOUND,
-                [(header::CONTENT_TYPE, "text/plain")],
-                error_message,
-            )
-        }
-    }
-}
-
-// http://myserver.com/<my_address>/balance
-// http://myserver.com/<my_address>/send
-// http://myserver.com/<my_address>/sign)
-
 #[cfg(test)]
 #[path = "server_tests.rs"]
 mod tests;
