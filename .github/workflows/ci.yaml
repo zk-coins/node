@@ -133,5 +133,5 @@ jobs:
         run: |
           SP1_PROVER=mock cargo llvm-cov -p server --summary-only \
             --ignore-filename-regex 'main\.rs|publisher\.rs|server_runtime\.rs|_tests\.rs$' \
-            --fail-under-lines 78 \
-            --fail-under-functions 80
+            --fail-under-lines 82 \
+            --fail-under-functions 83

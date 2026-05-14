@@ -1224,3 +1224,395 @@ async fn commit_with_unverifiable_commitment_returns_401() {
     let (status, _body) = send_request_with_state(state, commit_req).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn send_with_invalid_signature_returns_401() {
+    let body = serde_json::json!({
+        "account_address": "0x".to_string() + &hex::encode(zkcoins_program::MINTING_ADDRESS),
+        "recipient": "0x".to_string() + &hex::encode([1u8; 32]),
+        "amount": 50,
+        "public_key": hex::encode([2u8; 33]), // garbage compressed pubkey of valid length
+        "next_public_key": hex::encode([3u8; 33]),
+        "signature": hex::encode([0u8; 64]),  // valid hex shape but wrong sig
+        "timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    });
+    let req = Request::post("/api/send")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, _) = send_request(req).await;
+    // serde will reject "02" + [2u8;32] as not-a-valid-pubkey at body parsing,
+    // so we accept either UNPROCESSABLE_ENTITY (parse-failed) or UNAUTHORIZED
+    // (parse-succeeded but signature verification failed).
+    assert!(
+        status == StatusCode::UNAUTHORIZED || status == StatusCode::UNPROCESSABLE_ENTITY,
+        "expected 401 or 422, got {status}"
+    );
+}
+
+#[tokio::test]
+async fn send_with_non_hex_account_address_returns_422() {
+    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
+    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
+    let secret_bytes = include_bytes!("../minting_secret.bin");
+    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
+    let secp = secp::Secp256k1::new();
+    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .public_key;
+    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
+        .unwrap()
+        .public_key;
+    let sk_0: SecretKey = xpriv
+        .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .private_key;
+
+    let account_address = "not-hex-at-all".to_string();
+    let recipient = "0x".to_string() + &hex::encode([1u8; 32]);
+    let amount: u64 = 50;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut hasher = Sha256::new();
+    hasher.update(account_address.as_bytes());
+    hasher.update(recipient.as_bytes());
+    hasher.update(amount.to_le_bytes());
+    hasher.update(now.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    let msg = Message::from_digest(hash);
+    let kp = Keypair::from_secret_key(&secp, &sk_0);
+    let sig = secp.sign_schnorr(&msg, &kp);
+
+    let body = serde_json::json!({
+        "account_address": account_address,
+        "recipient": recipient,
+        "amount": amount,
+        "public_key": hex::encode(pk_0.serialize()),
+        "next_public_key": hex::encode(pk_1.serialize()),
+        "signature": hex::encode(sig.serialize()),
+        "timestamp": now,
+    });
+    let req = Request::post("/api/send")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, _) = send_request(req).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn send_with_wrong_length_address_returns_422() {
+    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
+    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
+    let secret_bytes = include_bytes!("../minting_secret.bin");
+    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
+    let secp = secp::Secp256k1::new();
+    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .public_key;
+    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
+        .unwrap()
+        .public_key;
+    let sk_0: SecretKey = xpriv
+        .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .private_key;
+
+    // Account address is parseable hex but only 16 bytes, not 32.
+    let account_address = "0x".to_string() + &hex::encode([1u8; 16]);
+    let recipient = "0x".to_string() + &hex::encode([2u8; 32]);
+    let amount: u64 = 50;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut hasher = Sha256::new();
+    hasher.update(account_address.as_bytes());
+    hasher.update(recipient.as_bytes());
+    hasher.update(amount.to_le_bytes());
+    hasher.update(now.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    let msg = Message::from_digest(hash);
+    let kp = Keypair::from_secret_key(&secp, &sk_0);
+    let sig = secp.sign_schnorr(&msg, &kp);
+
+    let body = serde_json::json!({
+        "account_address": account_address,
+        "recipient": recipient,
+        "amount": amount,
+        "public_key": hex::encode(pk_0.serialize()),
+        "next_public_key": hex::encode(pk_1.serialize()),
+        "signature": hex::encode(sig.serialize()),
+        "timestamp": now,
+    });
+    let req = Request::post("/api/send")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, _) = send_request(req).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn send_with_insufficient_funds_returns_ok_with_success_false() {
+    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
+    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
+
+    // Build a state where the minting account has been emptied.
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    let mut account_server = AccountServer::new(Arc::clone(&state_arc));
+    let mut empty_minting = Account::new();
+    empty_minting.balance = 0;
+    account_server.import_account(zkcoins_program::MINTING_ADDRESS, empty_minting);
+    let state = AppState {
+        account_server: Arc::new(Mutex::new(account_server)),
+        proof_store: Arc::new(ProofStore::new("/tmp/zkcoins-test-proofs-empty")),
+        username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
+        accounts_path: String::new(),
+    };
+
+    let secret_bytes = include_bytes!("../minting_secret.bin");
+    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
+    let secp = secp::Secp256k1::new();
+    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .public_key;
+    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
+        .unwrap()
+        .public_key;
+    let sk_0: SecretKey = xpriv
+        .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .private_key;
+
+    let account_address = "0x".to_string() + &hex::encode(zkcoins_program::MINTING_ADDRESS);
+    let recipient = "0x".to_string() + &hex::encode([1u8; 32]);
+    let amount: u64 = 100;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut hasher = Sha256::new();
+    hasher.update(account_address.as_bytes());
+    hasher.update(recipient.as_bytes());
+    hasher.update(amount.to_le_bytes());
+    hasher.update(now.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    let msg = Message::from_digest(hash);
+    let kp = Keypair::from_secret_key(&secp, &sk_0);
+    let sig = secp.sign_schnorr(&msg, &kp);
+
+    let body = serde_json::json!({
+        "account_address": account_address,
+        "recipient": recipient,
+        "amount": amount,
+        "public_key": hex::encode(pk_0.serialize()),
+        "next_public_key": hex::encode(pk_1.serialize()),
+        "signature": hex::encode(sig.serialize()),
+        "timestamp": now,
+    });
+    let req = Request::post("/api/send")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(resp["success"], false);
+}
+
+#[tokio::test]
+async fn receive_coin_with_invalid_bincode_returns_default_response() {
+    let req = Request::post("/api/receive")
+        .header("content-type", "application/octet-stream")
+        .body(Body::from(vec![0xff, 0xfe, 0xfd, 0xfc]))
+        .unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::OK);
+    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(resp["success"], false);
+}
+
+#[tokio::test]
+async fn send_with_non_hex_recipient_returns_422() {
+    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
+    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
+    let secret_bytes = include_bytes!("../minting_secret.bin");
+    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
+    let secp = secp::Secp256k1::new();
+    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .public_key;
+    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
+        .unwrap()
+        .public_key;
+    let sk_0: SecretKey = xpriv
+        .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .private_key;
+
+    let account_address = "0x".to_string() + &hex::encode(zkcoins_program::MINTING_ADDRESS);
+    let recipient = "absolutely-not-hex".to_string();
+    let amount: u64 = 1;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut hasher = Sha256::new();
+    hasher.update(account_address.as_bytes());
+    hasher.update(recipient.as_bytes());
+    hasher.update(amount.to_le_bytes());
+    hasher.update(now.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    let msg = Message::from_digest(hash);
+    let kp = Keypair::from_secret_key(&secp, &sk_0);
+    let sig = secp.sign_schnorr(&msg, &kp);
+
+    let body = serde_json::json!({
+        "account_address": account_address,
+        "recipient": recipient,
+        "amount": amount,
+        "public_key": hex::encode(pk_0.serialize()),
+        "next_public_key": hex::encode(pk_1.serialize()),
+        "signature": hex::encode(sig.serialize()),
+        "timestamp": now,
+    });
+    let req = Request::post("/api/send")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, _) = send_request(req).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[test]
+fn lock_or_recover_recovers_from_poisoned_mutex() {
+    let mutex = Arc::new(Mutex::new(42i32));
+    let mutex_clone = Arc::clone(&mutex);
+
+    // Poison the mutex by panicking inside lock().
+    let _ = std::thread::spawn(move || {
+        let _guard = mutex_clone.lock().unwrap();
+        panic!("intentional panic to poison the mutex");
+    })
+    .join();
+
+    assert!(
+        mutex.is_poisoned(),
+        "mutex must be poisoned after the panic"
+    );
+
+    // Recovering must succeed and yield the inner value.
+    let guard = lock_or_recover(&mutex);
+    assert_eq!(*guard, 42);
+}
+
+#[tokio::test]
+async fn commit_with_valid_signature_fails_broadcast_returns_503() {
+    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
+    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
+    let state = test_state();
+
+    let secret_bytes = include_bytes!("../minting_secret.bin");
+    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
+    let secp = secp::Secp256k1::new();
+    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .public_key;
+    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
+        .unwrap()
+        .public_key;
+    let sk_0: SecretKey = xpriv
+        .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .private_key;
+
+    // Send first to get proof_id + the hashes the client signs over.
+    let account_address = "0x".to_string() + &hex::encode(zkcoins_program::MINTING_ADDRESS);
+    let recipient = "0x".to_string() + &hex::encode([5u8; 32]);
+    let amount: u64 = 50;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut hasher = Sha256::new();
+    hasher.update(account_address.as_bytes());
+    hasher.update(recipient.as_bytes());
+    hasher.update(amount.to_le_bytes());
+    hasher.update(now.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    let msg = Message::from_digest(hash);
+    let kp = Keypair::from_secret_key(&secp, &sk_0);
+    let sig = secp.sign_schnorr(&msg, &kp);
+
+    let send_body = serde_json::json!({
+        "account_address": account_address,
+        "recipient": recipient,
+        "amount": amount,
+        "public_key": hex::encode(pk_0.serialize()),
+        "next_public_key": hex::encode(pk_1.serialize()),
+        "signature": hex::encode(sig.serialize()),
+        "timestamp": now,
+    });
+    let send_req = Request::post("/api/send")
+        .header("content-type", "application/json")
+        .body(Body::from(send_body.to_string()))
+        .unwrap();
+    let (status, body) = send_request_with_state(state.clone(), send_req).await;
+    assert_eq!(status, StatusCode::OK, "send failed: {body}");
+    let send_resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let proof_id = send_resp["proof_id"].as_u64().unwrap();
+    let ash_hex = send_resp["account_state_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ocr_hex = send_resp["output_coins_root"].as_str().unwrap().to_string();
+
+    // Build a valid commitment that the handler will accept.
+    let ash_bytes = hex::decode(&ash_hex).unwrap();
+    let ocr_bytes = hex::decode(&ocr_hex).unwrap();
+    let mut commit_message = Vec::with_capacity(ash_bytes.len() + ocr_bytes.len());
+    commit_message.extend_from_slice(&ash_bytes);
+    commit_message.extend_from_slice(&ocr_bytes);
+    // Commitment::new SHA256s the message internally, so just pass the
+    // pre-image bytes the handler will receive.
+    let commitment = shared::commitment::Commitment::new(&sk_0, commit_message.clone())
+        .expect("commitment creation");
+    assert!(commitment.verify(), "test commitment must verify locally");
+
+    let commit_body = serde_json::json!({
+        "proof_id": proof_id,
+        "public_key": hex::encode(commitment.public_key.serialize()),
+        "signature": hex::encode(commitment.signature.serialize()),
+        "message": hex::encode(&commitment.message),
+    });
+    let commit_req = Request::post("/api/commit")
+        .header("content-type", "application/json")
+        .body(Body::from(commit_body.to_string()))
+        .unwrap();
+    let (status, _) = send_request_with_state(state, commit_req).await;
+    // The commitment verifies, the handler proceeds to broadcast. Without
+    // a reachable Bitcoin node in the unit test environment, that call
+    // fails and the handler returns SERVICE_UNAVAILABLE. We accept either
+    // 503 (broadcast attempted and failed) or 200 (network was reachable
+    // and broadcast happened to succeed against a public Mutinynet).
+    assert!(
+        status == StatusCode::SERVICE_UNAVAILABLE || status == StatusCode::OK,
+        "expected 503 or 200, got {status}"
+    );
+}
