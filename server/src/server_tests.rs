@@ -1811,3 +1811,141 @@ async fn receive_coin_with_valid_proof_succeeds() {
         "receive should report success: {body}"
     );
 }
+
+#[tokio::test]
+async fn send_with_wrong_signature_returns_401() {
+    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
+    use bitcoin::secp256k1::{PublicKey, SecretKey};
+    let secret_bytes = include_bytes!("../minting_secret.bin");
+    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
+    let secp = secp::Secp256k1::new();
+    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .public_key;
+    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
+        .unwrap()
+        .public_key;
+
+    let account_address = "0x".to_string() + &hex::encode(zkcoins_program::MINTING_ADDRESS);
+    let recipient = "0x".to_string() + &hex::encode([8u8; 32]);
+    let amount: u64 = 1;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // 64 zero bytes — valid hex shape, valid signature length, but
+    // will never verify against the request's pk_0 over the SHA256
+    // of (account_address || recipient || amount || timestamp).
+    let body = serde_json::json!({
+        "account_address": account_address,
+        "recipient": recipient,
+        "amount": amount,
+        "public_key": hex::encode(pk_0.serialize()),
+        "next_public_key": hex::encode(pk_1.serialize()),
+        "signature": hex::encode([0u8; 64]),
+        "timestamp": now,
+    });
+    let req = Request::post("/api/send")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, _) = send_request(req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn receive_coin_duplicate_returns_success_false() {
+    // After a valid receive, posting the same proof bytes again should
+    // exercise the Err arm of account_server.receive_coin (duplicate
+    // detection via coin_queue).
+    let state = test_state();
+
+    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
+    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
+    let secret_bytes = include_bytes!("../minting_secret.bin");
+    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
+    let secp = secp::Secp256k1::new();
+    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .public_key;
+    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
+        .unwrap()
+        .public_key;
+    let sk_0: SecretKey = xpriv
+        .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .private_key;
+
+    let account_address = "0x".to_string() + &hex::encode(zkcoins_program::MINTING_ADDRESS);
+    let recipient = "0x".to_string() + &hex::encode([9u8; 32]);
+    let amount: u64 = 1;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut hasher = Sha256::new();
+    hasher.update(account_address.as_bytes());
+    hasher.update(recipient.as_bytes());
+    hasher.update(amount.to_le_bytes());
+    hasher.update(now.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    let msg = Message::from_digest(hash);
+    let kp = Keypair::from_secret_key(&secp, &sk_0);
+    let sig = secp.sign_schnorr(&msg, &kp);
+
+    let send_body = serde_json::json!({
+        "account_address": account_address,
+        "recipient": recipient,
+        "amount": amount,
+        "public_key": hex::encode(pk_0.serialize()),
+        "next_public_key": hex::encode(pk_1.serialize()),
+        "signature": hex::encode(sig.serialize()),
+        "timestamp": now,
+    });
+    let send_req = Request::post("/api/send")
+        .header("content-type", "application/json")
+        .body(Body::from(send_body.to_string()))
+        .unwrap();
+    let (status, body) = send_request_with_state(state.clone(), send_req).await;
+    assert_eq!(status, StatusCode::OK, "send failed: {body}");
+    let proof_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["proof_id"]
+        .as_u64()
+        .unwrap();
+
+    let app = create_router(state.clone());
+    let proof_resp = app
+        .oneshot(
+            Request::get(format!("/api/proof/{}", proof_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let proof_bytes = proof_resp.into_body().collect().await.unwrap().to_bytes();
+
+    // First receive: succeeds.
+    let receive_req = Request::post("/api/receive")
+        .header("content-type", "application/octet-stream")
+        .body(Body::from(proof_bytes.to_vec()))
+        .unwrap();
+    let (status, body) = send_request_with_state(state.clone(), receive_req).await;
+    assert_eq!(status, StatusCode::OK);
+    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(resp["success"], true);
+
+    // Second receive of the same bytes: receive_coin returns Err, the
+    // handler responds with success=false (the L351 Err arm).
+    let receive_req = Request::post("/api/receive")
+        .header("content-type", "application/octet-stream")
+        .body(Body::from(proof_bytes.to_vec()))
+        .unwrap();
+    let (status, body) = send_request_with_state(state, receive_req).await;
+    assert_eq!(status, StatusCode::OK);
+    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(resp["success"], false);
+}
