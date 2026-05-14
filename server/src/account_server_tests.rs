@@ -476,3 +476,83 @@ fn test_load_from_file_rejects_corrupted_bytes() {
     assert!(result.is_err());
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn test_send_coins_returns_err_for_unknown_account() {
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    let mut server = AccountServer::new(state_arc);
+    let account_data = TestAccountData::new_generic(&[1u8; 32], Network::Bitcoin);
+
+    let recipient: Address = [2u8; 32];
+    let invoice = Invoice::new(1, recipient);
+
+    let current_pk = generate_test_public_key(&account_data.xpriv, 0);
+    let next_pk = generate_test_public_key(&account_data.xpriv, 1);
+
+    let result = server.send_coins(
+        vec![invoice],
+        account_data.address,
+        current_pk,
+        next_pk,
+        None,
+    );
+    assert_eq!(result.unwrap_err(), "Unknown account address");
+}
+
+#[test]
+fn test_send_coins_returns_err_insufficient_funds() {
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    let mut server = AccountServer::new(state_arc);
+    let account_data = TestAccountData::new_generic(&[1u8; 32], Network::Bitcoin);
+    server.import_account(account_data.address, Account::new());
+
+    let recipient: Address = [2u8; 32];
+    let invoice = Invoice::new(100, recipient);
+
+    let current_pk = generate_test_public_key(&account_data.xpriv, 0);
+    let next_pk = generate_test_public_key(&account_data.xpriv, 1);
+
+    let result = server.send_coins(
+        vec![invoice],
+        account_data.address,
+        current_pk,
+        next_pk,
+        None,
+    );
+    assert_eq!(result.unwrap_err(), "Insufficient funds");
+}
+
+#[test]
+fn test_receive_coin_rejects_invalid_inclusion_proof() {
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    let mut server = AccountServer::new(Arc::clone(&state_arc));
+
+    let mut minting_account_data = TestAccountData::new_minting_account();
+    server.import_account(
+        minting_account_data.address,
+        Account {
+            proof: None,
+            coin_queue: vec![],
+            coin_history: SparseMerkleTree::new(),
+            balance: 10_000,
+        },
+    );
+
+    let recipient: Address = [1u8; 32];
+    let invoice = Invoice::new(100, recipient);
+
+    let mut coin_proofs = minting_account_data
+        .execute_send_coins(&mut server, vec![invoice])
+        .expect("send_coins should succeed");
+
+    // Tamper with the coin identifier so the existing inclusion proof
+    // no longer verifies against it. receive_coin must reject.
+    let mut coin_proof = coin_proofs.pop().unwrap();
+    coin_proof.coin.identifier = [99u8; 32];
+
+    let result = server.receive_coin(coin_proof);
+    assert_eq!(
+        result.unwrap_err(),
+        "Coin inclusion proof verification failed"
+    );
+}

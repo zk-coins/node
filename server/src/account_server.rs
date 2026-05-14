@@ -238,17 +238,19 @@ impl AccountServer {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let account = self
+            .accounts
+            .get_mut(&account_address)
+            .ok_or("Unknown account address")?;
         // Check if the account balance is enough
-        let balance = self.get_account_balance(&account_address)?;
+        let balance = account
+            .coin_queue
+            .iter()
+            .fold(account.balance, |acc, x| acc + x.coin.amount);
         let invoiced_amount = invoices.iter().fold(0, |acc, x| acc + x.amount);
         if balance < invoiced_amount {
             return Err("Insufficient funds");
         }
-
-        let account = match self.accounts.get_mut(&account_address) {
-            Some(account) => account,
-            None => return Err("Unknown account address"),
-        };
 
         // TODO: Copy this over to the client because they too have to check that the
         // out_coins_tree is correct and only contains the coins from the invoices.
