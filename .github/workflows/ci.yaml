@@ -118,8 +118,18 @@ jobs:
       # usernames / lnurl) is excluded from the binary at compile time
       # and is therefore not part of the measured surface.
       #
-      # Threshold is the current MVP baseline. New PRs must not regress
-      # below it. The long-term goal is 100% on this scope — see the
-      # Contributing section in README.md.
+      # main.rs (runtime bootstrap) and publisher.rs (Bitcoin commit /
+      # reveal broadcasting that needs a signet/regtest node) are
+      # genuinely not exercisable in unit tests and are excluded at the
+      # file level via --ignore-filename-regex.
+      # Threshold is the current MVP baseline with main.rs (bootstrap)
+      # and publisher.rs (Bitcoin commit/reveal broadcasting that needs a
+      # signet/regtest node) excluded. The goal is 100% on this scope;
+      # each lifting PR ratchets the threshold upward.
       - name: Run cargo-llvm-cov (MVP scope, regression guard)
-        run: SP1_PROVER=mock cargo llvm-cov -p server --summary-only --fail-under-lines 65 -- --skip account_server::tests
+        run: |
+          SP1_PROVER=mock cargo llvm-cov -p server --summary-only \
+            --ignore-filename-regex 'main\.rs|publisher\.rs' \
+            --fail-under-lines 78 \
+            --fail-under-functions 80 \
+            -- --skip account_server::tests
