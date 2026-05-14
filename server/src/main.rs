@@ -2,12 +2,13 @@ mod account_server;
 mod publisher;
 mod scanner;
 mod server;
+mod server_runtime;
 mod state;
 mod username;
 
 use crate::publisher::EsploraConfig;
 use crate::scanner::scan_for_inscriptions;
-use crate::server::start_rest_server;
+use crate::server_runtime::start_rest_server;
 use crate::state::State;
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;

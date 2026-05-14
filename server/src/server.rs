@@ -16,10 +16,8 @@ use shared::commitment::Commitment;
 use shared::ClientAccount;
 use shared::{Invoice, ProofData};
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 use zkcoins_prover::Proof;
 
@@ -74,15 +72,15 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 // Define a struct for our application state
 #[derive(Clone)]
-struct AppState {
-    account_server: Arc<Mutex<AccountServer>>,
-    proof_store: Arc<ProofStore>,
+pub(crate) struct AppState {
+    pub(crate) account_server: Arc<Mutex<AccountServer>>,
+    pub(crate) proof_store: Arc<ProofStore>,
     #[cfg(feature = "faucet")]
-    minting_account: Arc<Mutex<ClientAccount>>,
-    username_store: Arc<Mutex<UsernameStore>>,
-    accounts_path: String,
+    pub(crate) minting_account: Arc<Mutex<ClientAccount>>,
+    pub(crate) username_store: Arc<Mutex<UsernameStore>>,
+    pub(crate) accounts_path: String,
     #[cfg(feature = "usernames")]
-    usernames_path: String,
+    pub(crate) usernames_path: String,
 }
 
 // Response types for our API
@@ -125,13 +123,13 @@ pub struct ReceiveCoinRequest {
 
 /// Persistent proof store — survives server restarts.
 /// Each proof is stored as an individual file: /data/proofs/{id}.bin
-struct ProofStore {
+pub(crate) struct ProofStore {
     dir: String,
     next_id: AtomicU64,
 }
 
 impl ProofStore {
-    fn new(dir: &str) -> Self {
+    pub(crate) fn new(dir: &str) -> Self {
         std::fs::create_dir_all(dir).ok();
         // Scan existing files to find the highest ID
         let max_id = std::fs::read_dir(dir)
@@ -1066,7 +1064,7 @@ async fn lnurl_callback_handler(
 
 /// Build the full application router with all API routes, CORS, health check, and fallback.
 /// Extracted so it can be reused in integration tests via `oneshot()`.
-fn create_router(state: AppState) -> Router {
+pub(crate) fn create_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods([Method::GET, Method::POST])
@@ -1108,86 +1106,6 @@ fn create_router(state: AppState) -> Router {
     app.with_state(state)
         .fallback(|| async { StatusCode::NOT_FOUND })
         .layer(cors)
-}
-
-// Function to start the REST API server
-pub async fn start_rest_server(
-    account_server: AccountServer,
-    username_store: UsernameStore,
-    addr: &str,
-    accounts_path: String,
-    #[cfg_attr(not(feature = "usernames"), allow(unused_variables))] usernames_path: String,
-) -> anyhow::Result<()> {
-    // Parse the address string into a SocketAddr
-    let socket_addr = addr
-        .parse::<SocketAddr>()
-        .map_err(|e| anyhow::anyhow!("Failed to parse address: {}", e))?;
-
-    // Wrap the account_server in an Arc<Mutex> for thread-safe sharing
-    let shared_account_server = Arc::new(Mutex::new(account_server));
-
-    // Create a persistent proof store
-    let proofs_dir = format!(
-        "{}/proofs",
-        std::path::Path::new(&accounts_path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .display()
-    );
-    let proof_store = Arc::new(ProofStore::new(&proofs_dir));
-
-    #[cfg(feature = "faucet")]
-    let minting_account = {
-        let secret = include_bytes!("../minting_secret.bin");
-        let private_key = Xpriv::new_master(NETWORK_CONFIG.network(), secret)
-            .expect("Failed to create private key.");
-        println!(
-            "Set MINTING_ADDRESS to {:?}",
-            &zkcoins_program::MINTING_ADDRESS
-        );
-        let minting_client = ClientAccount::new(private_key);
-        assert_eq!(
-            minting_client.address,
-            zkcoins_program::MINTING_ADDRESS,
-            "Minting account address mismatch — minting_secret.bin or MINTING_ADDRESS constant is wrong"
-        );
-        Arc::new(Mutex::new(minting_client))
-    };
-
-    let shared_username_store = Arc::new(Mutex::new(username_store));
-
-    // Create the combined state using the AppState struct
-    let state = AppState {
-        account_server: shared_account_server,
-        proof_store,
-        #[cfg(feature = "faucet")]
-        minting_account,
-        username_store: shared_username_store,
-        accounts_path,
-        #[cfg(feature = "usernames")]
-        usernames_path,
-    };
-    {
-        let mut account_server_guard = state.account_server.lock().unwrap();
-        if account_server_guard.get_minting_account_address().is_err() {
-            let mut minting_server_account = crate::account_server::Account::new();
-            minting_server_account.balance = u64::MAX;
-            account_server_guard
-                .import_account(zkcoins_program::MINTING_ADDRESS, minting_server_account);
-            if let Err(e) = account_server_guard.save_to_file(&state.accounts_path) {
-                eprintln!("Failed to save initial accounts file: {}", e);
-            }
-        }
-    }
-
-    let app = create_router(state);
-
-    // Run the server
-    println!("REST server started at {}", socket_addr);
-    let listener = TcpListener::bind(socket_addr).await?;
-    axum::serve(listener, app).await?;
-
-    Ok(())
 }
 
 #[cfg(test)]
