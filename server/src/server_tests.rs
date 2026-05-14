@@ -1616,3 +1616,43 @@ async fn commit_with_valid_signature_fails_broadcast_returns_503() {
         "expected 503 or 200, got {status}"
     );
 }
+
+#[test]
+fn proof_store_proof_path_returns_none_for_nonexistent_directory() {
+    // proof_path canonicalizes the configured directory. If the directory
+    // does not exist, canonicalize fails and proof_path returns None.
+    let store = ProofStore::new("/nonexistent/zkcoins/proof/dir");
+    // The directory was created by ProofStore::new, but to test the
+    // None branch we point at one that does not exist.
+    let truly_missing = ProofStore {
+        dir: "/this/path/genuinely/does/not/exist/zkcoins".to_string(),
+        next_id: std::sync::atomic::AtomicU64::new(0),
+    };
+    assert!(truly_missing.proof_path(7).is_none());
+    // The real store was created and resolves fine for arbitrary ids.
+    drop(store);
+}
+
+#[test]
+fn proof_store_new_picks_up_max_id_from_existing_files() {
+    let dir = std::env::temp_dir().join(format!(
+        "zkcoins-proof-store-max-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Drop a few well-formed and one malformed filename.
+    std::fs::write(dir.join("3.bin"), b"placeholder").unwrap();
+    std::fs::write(dir.join("17.bin"), b"placeholder").unwrap();
+    std::fs::write(dir.join("garbage.bin"), b"placeholder").unwrap();
+    std::fs::write(dir.join("notbin.txt"), b"placeholder").unwrap();
+
+    let store = ProofStore::new(dir.to_str().unwrap());
+    // next_id starts at max(3, 17) + 1 = 18; the malformed names are skipped.
+    let id = store.next_id.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(id, 18);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
