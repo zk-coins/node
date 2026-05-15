@@ -552,10 +552,10 @@ async fn mint_handler(
         )
     };
 
-    eprintln!(
-        "Mint result: {}",
-        if send_result.is_ok() { "ok" } else { "err" }
-    );
+    match &send_result {
+        Ok(_) => eprintln!("Mint result: ok"),
+        Err(e) => eprintln!("Mint result: err — {}", e),
+    }
     // Now that the locks are dropped, we can await safely.
     match send_result {
         Ok(mut coin_proofs) => {
