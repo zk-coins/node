@@ -63,6 +63,24 @@ async fn health_returns_ok() {
     assert_eq!(body, "ok");
 }
 
+// --- GET / (root) ---
+
+#[tokio::test]
+async fn root_returns_service_metadata() {
+    let req = Request::get("/").body(Body::empty()).unwrap();
+    let (status, body) = send_request(req).await;
+
+    assert_eq!(status, StatusCode::OK);
+    // Verify the response is JSON and contains the service identifier plus
+    // a pointer to /api/info — those two are enough to prove the handler
+    // ran and serialized correctly.
+    let json: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(json["service"], "zkcoins-server");
+    assert_eq!(json["endpoints"]["info"], "GET  /api/info");
+    assert!(json["version"].as_str().is_some_and(|v| !v.is_empty()));
+    assert!(json["network"].as_str().is_some_and(|v| !v.is_empty()));
+}
+
 // --- GET /api/info ---
 
 #[tokio::test]

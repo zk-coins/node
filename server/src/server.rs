@@ -778,6 +778,49 @@ async fn info_handler() -> impl IntoResponse {
     })
 }
 
+#[derive(Serialize)]
+struct RootResponse {
+    service: &'static str,
+    version: &'static str,
+    network: String,
+    endpoints: RootEndpoints,
+    docs: &'static str,
+}
+
+#[derive(Serialize)]
+struct RootEndpoints {
+    info: &'static str,
+    balance: &'static str,
+    send: &'static str,
+    receive: &'static str,
+    commit: &'static str,
+    proof: &'static str,
+    health: &'static str,
+}
+
+/// Root handler — anything hitting `https://api.zkcoins.app/` (browser visit,
+/// uptime probe, curious operator) gets a small JSON identifying the service,
+/// the package version, the connected network, and pointers to the real
+/// endpoints. Cheaper than serving a static landing page and still answers the
+/// "is this the right host?" question without surfacing a bare 404.
+async fn root_handler() -> impl IntoResponse {
+    Json(RootResponse {
+        service: "zkcoins-server",
+        version: env!("CARGO_PKG_VERSION"),
+        network: NETWORK_CONFIG.network_name.clone(),
+        endpoints: RootEndpoints {
+            info: "GET  /api/info",
+            balance: "GET  /api/balance?address={hex}",
+            send: "POST /api/send",
+            receive: "POST /api/receive",
+            commit: "POST /api/commit",
+            proof: "GET  /api/proof/{id}",
+            health: "GET  /health",
+        },
+        docs: "https://docs.zkcoins.app",
+    })
+}
+
 // --- Username & LNURL handlers ---
 
 #[cfg(feature = "usernames")]
@@ -1031,6 +1074,7 @@ pub(crate) fn create_router(state: AppState) -> Router {
 
     // MVP routes — always compiled in.
     let app = Router::new()
+        .route("/", get(root_handler))
         .route("/health", get(|| async { "ok" }))
         .route("/api/info", get(info_handler))
         .route("/api/balance", get(get_balance_handler))
