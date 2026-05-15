@@ -3,13 +3,16 @@ name: CI
 on:
   push:
     branches: [develop]
+  # Only trigger on PRs targeting develop (feature → develop). The
+  # release PR (develop → main) is opened automatically and would
+  # otherwise fire a second CI run for every push to develop — those
+  # duplicate runs surfaced as "fail" entries on the release PR's
+  # check list whenever the concurrency block cancelled the older
+  # one. The push event already covers develop, and its run is
+  # associated with the same SHA on the release PR.
   pull_request:
-    branches: [develop, main]
+    branches: [develop]
 
-# When the auto-release-pr workflow updates the develop -> main PR
-# right after a push to develop, two CI runs fire on the same commit:
-# one from `push`, one from `pull_request`. Cancel the older one so we
-# do not see a spurious "CI failed (canceled)" status on the branch.
 concurrency:
   group: ci-${{ github.event.pull_request.head.sha || github.sha }}
   cancel-in-progress: true
