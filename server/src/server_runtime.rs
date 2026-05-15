@@ -63,7 +63,34 @@ pub async fn start_rest_server(
             "Set MINTING_ADDRESS to {:?}",
             &zkcoins_program::MINTING_ADDRESS
         );
-        let minting_client = ClientAccount::new(private_key);
+        let mut minting_client = ClientAccount::new(private_key);
+        // ClientAccount::new starts with num_pubkeys=0, but each successful
+        // mint increments it. The counter MUST survive process restarts;
+        // otherwise we lose alignment with the server-side
+        // minting_account.proof (which IS persisted), the next mint sends
+        // the wrong prev_commitment_pubkey, and send_coins fails with
+        // "prev_commitment_pubkey required for account update".
+        //
+        // Persist it in a tiny sibling file (4 bytes LE u32) next to
+        // accounts.bin. Read here, written in mint_handler after every
+        // successful increment.
+        let minting_pubkeys_path = format!(
+            "{}/minting_num_pubkeys.bin",
+            std::path::Path::new(&accounts_path)
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .display()
+        );
+        if let Ok(bytes) = std::fs::read(&minting_pubkeys_path) {
+            if bytes.len() == 4 {
+                let n = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                println!(
+                    "Loaded minting num_pubkeys={} from {}",
+                    n, minting_pubkeys_path
+                );
+                minting_client.num_pubkeys = n;
+            }
+        }
         assert_eq!(
             minting_client.address,
             zkcoins_program::MINTING_ADDRESS,

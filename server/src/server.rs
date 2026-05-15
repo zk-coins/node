@@ -565,6 +565,22 @@ async fn mint_handler(
                 // Ensure we only increment if the send was successful and based on the state *before* the send
                 if minting_account_guard.num_pubkeys == num_pubkeys_before_mint {
                     minting_account_guard.num_pubkeys += 1;
+                    // Persist the new counter so a server restart keeps the
+                    // ClientAccount aligned with the on-disk server-side
+                    // minting_account.proof. See the corresponding load in
+                    // server_runtime.rs for the matching half.
+                    let path = format!(
+                        "{}/minting_num_pubkeys.bin",
+                        std::path::Path::new(&state.accounts_path)
+                            .parent()
+                            .unwrap_or(std::path::Path::new("."))
+                            .display()
+                    );
+                    if let Err(e) =
+                        crate::atomic_write(&path, &minting_account_guard.num_pubkeys.to_le_bytes())
+                    {
+                        eprintln!("Failed to persist minting num_pubkeys to {}: {}", path, e);
+                    }
                 } else {
                     // This case might indicate a race condition or unexpected state change.
                     // Handle appropriately, maybe log an error or return a specific response.
