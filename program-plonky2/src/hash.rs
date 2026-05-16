@@ -67,6 +67,7 @@ pub fn digest_from_bytes(bytes: &[u8; 32]) -> HashDigest {
     HashOut { elements }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

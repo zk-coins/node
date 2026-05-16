@@ -9,6 +9,8 @@
 //! validated. Circuit gadgets, the monolithic state-transition
 //! circuit, and host-side prover wiring will land in follow-up commits.
 
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::plonk::config::PoseidonGoldilocksConfig;
 
@@ -28,6 +30,7 @@ pub mod inputs;
 pub mod merkle;
 pub mod types;
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

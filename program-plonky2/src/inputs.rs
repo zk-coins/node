@@ -127,6 +127,7 @@ pub struct ProgramInputs {
     pub next_public_key: PublicKey,
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +211,39 @@ mod tests {
         };
 
         assert!(proofs.verify_commitment(history_root));
+    }
+
+    #[test]
+    fn verify_previous_root_holds_for_consistent_history() {
+        // Build a two-leaf MMR; both leaves' parent (the root) is in the MMR.
+        // verify_previous_root should accept the (older_smt_root, older_root_proof)
+        // pair as a prefix of the newer history root.
+        let smt_root_a = hash_bytes(b"smt_a");
+        let smt_root_b = hash_bytes(b"smt_b");
+        let prev_mmr_root = crate::hash::ZERO_HASH;
+
+        let leaf_a = hash_concat(&smt_root_a, &prev_mmr_root);
+        let leaf_b = hash_concat(&smt_root_b, &leaf_a); // older MMR root, after a fold
+        let mut mmr = MerkleMountainRange::new();
+        mmr.append(leaf_a);
+        let after_a_root = mmr.root();
+        mmr.append(leaf_b);
+        let after_b_root = mmr.root();
+        let proof_for_a = mmr.get_proof(0).unwrap();
+
+        let proofs = CommitmentMerkleProofs {
+            commitment_root: smt_root_b,
+            commitment_proof: InclusionProof {
+                key: [0u8; 32],
+                siblings: vec![],
+            },
+            commitment_root_history_proof: MMRProof::new(vec![], 1),
+            commitment_root_mmr_sibling: after_a_root,
+            previous_root_history_proof: (smt_root_a, proof_for_a),
+            commitment_account_state_hash: hash_bytes(b"asth"),
+            commitment_out_coins_root: hash_bytes(b"ocr"),
+        };
+        assert!(proofs.verify_previous_root(prev_mmr_root, after_b_root));
     }
 
     #[test]
