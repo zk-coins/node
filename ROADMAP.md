@@ -137,6 +137,12 @@ These are not MVP scope but block mainnet, per `SPEC.md` §15.
 
 ---
 
+## Long-term positioning
+
+Plonky2 is bridge technology. Post-MVP (after step 9): Plonky3 evaluation. Field/hash choice then via planned migration, not via ad-hoc drift.
+
+---
+
 ## Risk Register
 
 ### R1 — Plonky2 cyclic recursion correctness (high)
@@ -160,6 +166,66 @@ Was: "Wasm Poseidon too slow." No longer applicable — the wallet performs no P
 ### R5 — SP1 stays in the workspace forever (low)
 **What can go wrong:** We don't fully cut over and end up maintaining both backends indefinitely.
 **Mitigation:** Step 7 introduces a Cargo feature flag — but the goal is to delete the SP1 path once Plonky2 is in DEV. Schedule the deletion as a follow-up PR after step 9 succeeds.
+
+### R6 — Plonky2 itself becomes the new dead-end (medium, long horizon)
+**What can go wrong:** Plonky2 is in maintenance mode at 0xPolygonZero. Plonky3 is where active development goes (new gate sets, BabyBear field, Poseidon2 hash, GPU paths). If we ignore Plonky3 indefinitely we end up where SP1 left us — on a stack with no upstream momentum.
+**Mitigation:** Treat Plonky2 as **bridge technology**, not the final destination. See *Post-MVP path: Plonky3* below.
+**Trigger to escalate:** Plonky2 upstream goes 12 months without a release, OR Plonky3 reaches feature parity for our use-case (recursion + BIP-340-Schnorr boundary).
+
+---
+
+## Post-MVP Path: Plonky3
+
+Plonky2 is the **MVP bridge**, not the long-term substrate. After step 9
+succeeds we schedule a Plonky3 evaluation. Concretely:
+
+- **Field:** Plonky3 default is **BabyBear** (`p = 2^31 - 2^27 + 1`).
+  Smaller field, GPU-friendlier, matches SP1's choice (which we are
+  leaving). Plonky2 we use Goldilocks because that's Plonky2's mature
+  default; Plonky3 switches us back to a small-field stack.
+- **Hash:** Plonky3 default is **Poseidon2** (~2× faster than the
+  original Poseidon used in Plonky2).
+- **Gadget reuse:** algorithmic structure (SMT, MMR, ProofData layout,
+  recursion contract) stays. The Plonky3 port is primarily plumbing —
+  re-typing field elements, swapping the hash function, adjusting limb
+  packing for BabyBear's smaller modulus.
+- **Estimated effort for Plonky3 cutover:** 2–4 weeks. Field and hash
+  change cost ~20% of that; the rest is Plonky3's different API
+  (recursion patterns, gate sets, witness generation).
+- **Trigger to start:** Plonky3 reaches feature parity for recursion +
+  our public-input layout. Currently (2026-05) it is close but the
+  recursion ergonomics are still under active iteration.
+
+### Considered alternative — adopt BabyBear + Poseidon2 inside Plonky2 *now*
+
+A reviewer suggested switching to BabyBear field and Poseidon2 hash
+already during this Plonky2 migration so that the Plonky3 cutover later
+becomes "pure glue code". Rejected for v1:
+
+1. **Plonky2 + BabyBear is fork-land.** `plonky2` 1.1.0 on crates.io is
+   Goldilocks-only. BabyBear support exists in community forks
+   (`plonky2-goldibear`-style) but those carry less upstream momentum
+   than the canonical Goldilocks build. We'd trade one upstream-mature
+   stack for one less-mature stack, with no MVP benefit.
+2. **Poseidon2 in Plonky2 needs custom implementation.** The crate's
+   `PoseidonHash` is Poseidon1. Poseidon2 means either hand-rolling the
+   permutation or pulling another community crate. Custom crypto code
+   in the MVP path is exactly what we want to avoid.
+3. **Migration cost now is non-trivial.** Switching to BabyBear means
+   re-doing `hash.rs`, `types.rs`, both Merkle modules (Goldilocks's
+   2-limb u64 → BabyBear's 3-limb u64, 4-element digest → 8-element
+   digest, ProofData re-shape, etc.). Roughly 3–4 days of work that
+   produces no end-user-visible change.
+4. **Plonky3 cutover later is not "glue code" anyway.** Plonky3's API
+   (recursion ergonomics, gate sets, witness generation) is meaningfully
+   different from Plonky2's. The field/hash choice contributes maybe 20%
+   of that work; the rest happens either way. Switching field early
+   shrinks the eventual diff by maybe one day, at the cost of slower MVP
+   delivery.
+
+The decision is reversible: if the Plonky3 evaluation post-step-9 shows
+a clean enough path, we can do the field+hash switch *as part of* that
+migration with no extra structural cost.
 
 ---
 
