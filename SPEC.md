@@ -32,6 +32,32 @@ The proof is then "registered" on-chain by publishing a Schnorr commitment over 
 
 ---
 
+## Glossary
+
+Abbreviations and shorthand used throughout this spec and the surrounding documents (`MIGRATION_RESEARCH.md`, `ROADMAP.md`, `program-plonky2/CONTRIBUTING.md`, source comments).
+
+| Term | Expansion | Meaning |
+| ---- | --------- | ------- |
+| **asth** | account state hash | `H(AccountState)` — the digest committed by a send proof as its post-state. |
+| **ocr** | output coins root | The Merkle root of the SMT containing the send's output coin identifiers. |
+| **vk** | verifying key | The proof system's verifier key. In Plonky2 it's the `circuit_digest`; pinned via `add_verifier_data_public_inputs`. |
+| **pk** | public key | secp256k1 compressed pubkey, 33 bytes. For account commitments, rotates per send. |
+| **SMT** | Sparse Merkle Tree | Binary tree of depth 256 (one level per key bit), used for the per-account coin history, the per-send output coins tree, and the global commitment SMT. |
+| **MMR** | Merkle Mountain Range | (Misnomer in this codebase: actually a capacity-doubling padded Merkle tree.) Append-only structure holding the global commitment history. |
+| **PCD** | Proof-Carrying Data | Recursive-proof composition abstraction used by the Shielded CSV paper; in Plonky2 we instantiate this with cyclic SNARK recursion. |
+| **NIP** | NonInclusionProof | Witness that a key is *not* in an SMT. Two cases off-circuit: case A (empty subtree) and case B (path-compressed sibling leaf). |
+| **IP** | InclusionProof | Witness that a key *is* in an SMT, with its associated value. |
+| **D1–D11** | Divergences | Numbered list of differences between this implementation and Shielded CSV eprint 2025/068 (`MIGRATION_RESEARCH.md` §3, summarised in SPEC §15). |
+| **R1–R6** | Risks | Numbered entries in the ROADMAP risk register. |
+| **MAX_IN_COINS** | — | `= 8`. Fixed bound on input coins per send (Plonky2 circuit is fixed-shape; see decision §5.2 in MIGRATION_RESEARCH). |
+| **TREE_DEPTH** | — | `= 256`. SMT depth (one level per key bit). |
+| **Step N** | — | Refers to the corresponding row in ROADMAP's *Status at a Glance* table. |
+| **BIP-340** | — | Bitcoin Schnorr signature scheme over secp256k1. The wallet uses BIP-340 to sign `SHA256(serialize(asth) ‖ serialize(ocr))`. |
+| **Goldilocks** | — | The 64-bit prime field used by Plonky2 (`p = 2^64 - 2^32 + 1`). |
+| **Poseidon** | — | Algebraic hash function we use for all Merkle node hashing and the field-element commitment of `AccountState`. |
+
+---
+
 ## 2. Conventions and Types
 
 ### 2.1 Hash function
@@ -108,7 +134,7 @@ Coin {
 
 ### 4.1 Sparse Merkle Tree (SMT)
 
-- **Depth:** `TREE_DEPTH = 256` (bit-length of `HashDigest` in the SHA256 reference). For Plonky2/Poseidon the depth SHOULD be set to the bit-length of the chosen `HashDigest` (e.g. 254 if you operate in a 254-bit field).
+- **Depth:** `TREE_DEPTH = 256`. The Poseidon-Goldilocks port keeps this — a `HashDigest` is 4 Goldilocks elements × 64 bits = 256 bits when serialised, so 256 levels exactly cover the key's bit space. Implementations on smaller fields (e.g. BabyBear, 31 bits) would pack the key into more limbs but typically keep the depth at 256 (full-key-bit-tree); see `program-plonky2/src/merkle/sparse_merkle_tree.rs::TREE_DEPTH`.
 - **Key:** a `HashDigest`. Bit `i` is the MSB-first selector at level `i` (level 0 = root, level `TREE_DEPTH` = leaf).
 - **Leaf encoding:** `leaf_hash = H(value || key)`. The `value` is itself a `HashDigest`.
 - **Default leaf** at level `TREE_DEPTH`: `H(0x00 || ε)` (domain-separated empty leaf in the reference; Plonky2 SHOULD pick a fixed sentinel field-element constant).
@@ -305,7 +331,7 @@ fn main(inputs: ProgramInputs):
 
 ### Note on the minting account
 
-`MINTING_ADDRESS` is a hard-coded `HashDigest` (currently the SHA256 of a fixed pubkey, see `program/src/lib.rs`). When porting to a new `H`, this constant MUST be recomputed and the on-chain mint server re-keyed.
+`MINTING_ADDRESS` is a `HashDigest` constant. In the SP1/SHA256 build it is a hard-coded `[u8; 32]` (the SHA256 of a fixed pubkey, see `program/src/lib.rs`). In the Plonky2/Poseidon build it is currently a domain-separated placeholder (`hash_bytes(b"zkcoins:minting-address:placeholder:v1")`, see `program-plonky2/src/types.rs::MINTING_ADDRESS`); the server will replace it with `hash_bytes(serialize(real_minting_pubkey))` when wiring step 7. The minting key itself is generated fresh per backend — the closed test environment means we are not bound to the SP1 minting key.
 
 ---
 
@@ -379,7 +405,7 @@ This list captures the non-trivial decisions a port must make. None of them are 
 
 1. **Pick `H`.** Recommended: Poseidon over Goldilocks (`F = GF(2^64 - 2^32 + 1)`), width 12, full+partial rounds per the standard parameter set. `HashDigest` becomes 4 field elements (≡ 256-bit security with appropriate rate).
 
-2. **Re-derive `MINTING_ADDRESS`.** Currently a hard-coded `[u8; 32]`. After choosing `H` and the mint-account public key encoding, recompute and update the constant in `program/src/lib.rs` (and any client mirror).
+2. **Re-derive `MINTING_ADDRESS`.** Plonky2 port has it as a domain-separated placeholder (`program-plonky2/src/types.rs::MINTING_ADDRESS`). Step 7 of `ROADMAP.md` is when the server generates a fresh minting keypair and replaces the placeholder with `hash_bytes(serialize(real_minting_pubkey))`. Closed test environment — see `MIGRATION_RESEARCH.md` §7 — means no requirement to match the SP1 minting key.
 
 3. **`AccountState` hashing.** Drop `bincode + SHA256`. Define a canonical field-element layout (e.g. `[owner_limbs(4), balance_lo, balance_hi, pubkey_x_limbs(4), pubkey_parity]`) and hash with Poseidon. Both circuit and host MUST agree.
 
