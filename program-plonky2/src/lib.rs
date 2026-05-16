@@ -22,6 +22,8 @@ pub type C = PoseidonGoldilocksConfig;
 /// `standard_recursion_config`.
 pub const D: usize = 2;
 
+pub mod hash;
+
 #[cfg(test)]
 mod tests {
     use super::*;
