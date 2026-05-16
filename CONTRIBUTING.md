@@ -189,6 +189,38 @@ docker run -p 4242:4242 \
 
 The pre-built ELF (`elf/zkcoins-program`) is committed to the repo, so Docker builds do not require the Succinct toolchain — only standard Rust.
 
+## Persistent State
+
+The server writes the following files under its data volume (`/data` in the container, `zkcoins_server-data` Docker volume on dfxdev/dfxprd). Together they define the recoverable state:
+
+| File                       | Format                         | Purpose                                                                                                                                |
+| -------------------------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `smt.bin`                  | bincode `SparseMerkleTree`     | Sparse Merkle Tree of every commitment ever processed (key = sha256(public_key), leaf = account_state_hash).                            |
+| `mmr.bin`                  | bincode `MerkleMountainRange`  | Append-only Merkle Mountain Range of `hash(smt_root ‖ prev_mmr_root)` leaves; one entry per processed commitment.                       |
+| `mmr.bin.prev_root`        | 32 bytes                       | The previous MMR root, kept separately so the SMT/MMR pair stays atomically consistent across restarts.                                 |
+| `latest_block.bin`         | 32 bytes (block hash)          | Last Bitcoin block whose inscriptions were fully processed and persisted. Scanner resumes from `latest_block + 1` after a restart.      |
+| `accounts.bin`             | bincode `HashMap<Address, Account>` | Server-side account ledger — per-address balance, coin_queue, coin_history (SMT), and latest proof. Includes the minting account.        |
+| `usernames.bin`            | bincode `UsernameStore`        | Gated by `usernames` Cargo feature. Bidirectional map of claimed usernames ↔ addresses.                                                |
+| `minting_num_pubkeys.bin`  | 4 bytes LE u32                 | Gated by `faucet`. Counter of how many mint commitments have been issued; **must** survive restart, otherwise the next mint sends a stale `prev_commitment_pubkey` and `send_coins` returns `prev_commitment_pubkey required for account update`. |
+| `proofs/<id>.bin`          | bincode `CoinProof`            | Individual per-send proof + commitment, indexed by `proof_id`. Append-only.                                                            |
+
+`atomic_write` is used for every write (tempfile + rename). A crash between writes can still leave `latest_block.bin` lagging the SMT/MMR pair; the scanner is now tolerant of this — `state.update` errors are logged (see `main.rs::scan_for_inscriptions` callback) rather than propagated as panics.
+
+### DEV state recovery
+
+If the DEV server gets into a bad state (panic loop, mint failures with `prev_commitment_pubkey required`, balance never rising after a successful mint, etc.), the recovery procedure is to wipe the data volume:
+
+```bash
+# On the host running the server (e.g. dfxdev):
+docker stop zkcoins-server
+docker run --rm -v zkcoins_server-data:/data alpine sh -c 'rm -f /data/*.bin /data/*.bin.prev_root'
+docker start zkcoins-server
+```
+
+The server starts from genesis on next boot: `Creating new State / No accounts file found / No saved block hash found / fetching latest from Esplora`. Past test wallets are abandoned on-chain (they're random) but the SMT is re-built from the chain tip onwards. This is **destructive** — never run it on PRD without a known-needed reason.
+
+The E2E regen workflow on the app repo wipes this state before every run as part of the per-PR cadence in `app/e2e/README.md § 11.3`.
+
 ### Bitcoin Node
 
 The server needs a Bitcoin node with an Esplora-compatible indexer (electrs). In production, it connects via the shared Docker network `bitcoin` to `electrs-mainnet:3000` (DEV: `electrs-mutinynet:3000`). The underlying bitcoind requires:

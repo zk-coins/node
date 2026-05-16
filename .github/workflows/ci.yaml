@@ -3,19 +3,41 @@ name: CI
 on:
   push:
     branches: [develop]
+  # Only trigger on PRs targeting develop (feature → develop). The
+  # release PR (develop → main) is opened automatically and would
+  # otherwise fire a second CI run for every push to develop — those
+  # duplicate runs surfaced as "fail" entries on the release PR's
+  # check list whenever the concurrency block cancelled the older
+  # one. The push event already covers develop, and its run is
+  # associated with the same SHA on the release PR.
   pull_request:
-    branches: [develop, main]
+    branches: [develop]
+
+concurrency:
+  group: ci-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  # Force Esplora broadcasts to fail fast in CI. Some unit tests
+  # exercise the commit pipeline that ends in a real HTTP broadcast;
+  # without this, the runs against the public Mutinynet API can take
+  # >60 s per test and tip the job over the timeout.
+  ESPLORA_URL: "http://127.0.0.1:1/api"
+  # Force the SP1 mock prover for every test in this workflow. The
+  # default prover targets real Groth16/Plonk circuits and a single
+  # send_coin/receive_coin test then takes ~20+ minutes on an x86_64
+  # runner. Mock proofs return instantly and exercise the same plumbing.
+  SP1_PROVER: mock
 
 jobs:
   lint-and-build:
     name: Lint & Build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,18 +62,25 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: Run clippy (server + shared)
+      - name: Run clippy (server + shared, MVP feature set)
         run: cargo clippy -p server -p shared -- -D warnings
+
+      - name: Run clippy (server, all features)
+        run: cargo clippy -p server --all-features -- -D warnings
 
       - name: Run clippy (program lib)
         run: cargo clippy -p zkcoins-program --lib -- -D warnings
 
-      - name: Build server
+      - name: Build server (MVP feature set — the PRD image)
         run: cargo build -p server
+
+      - name: Build server (all features — the DEV image)
+        run: cargo build -p server --all-features
 
   tests:
     name: Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -72,8 +101,68 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Run tests (server + shared, skip slow SP1 prover tests)
-        run: cargo test -p server -p shared -- --skip account_server::tests
+      # `--test-threads=1` is mandatory: multiple test binaries each load the
+      # SP1 mock prover ELF (~1.5 GB resident) and running them in parallel
+      # on a 7 GB GitHub-hosted runner OOM-kills the job (exit 143). The
+      # account_server::tests group runs the real SP1 prover and is skipped
+      # here — it is only exercised in the coverage job, which is also
+      # single-threaded.
+      - name: Run tests (server + shared, all features, skip slow SP1 prover tests)
+        run: cargo test -p server -p shared --all-features -- --test-threads=1 --skip account_server::tests
 
       - name: Run tests (program lib)
-        run: cargo test -p zkcoins-program --lib
+        run: cargo test -p zkcoins-program --lib -- --test-threads=1
+
+  coverage:
+    name: Coverage (MVP scope)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.81.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.81.0"
+          components: llvm-tools-preview
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-llvm-cov-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-llvm-cov-
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      # Coverage is measured on the MVP build only: no Cargo features
+      # enabled. Code behind a Cargo feature (address-list / faucet /
+      # usernames / lnurl) is excluded from the binary at compile time
+      # and is therefore not part of the measured surface.
+      #
+      # main.rs (runtime bootstrap) and publisher.rs (Bitcoin commit /
+      # reveal broadcasting that needs a signet/regtest node) are
+      # genuinely not exercisable in unit tests and are excluded at the
+      # file level via --ignore-filename-regex.
+      # Threshold is the current MVP baseline with main.rs (bootstrap)
+      # and publisher.rs (Bitcoin commit/reveal broadcasting that needs a
+      # signet/regtest node) excluded. The goal is 100% on this scope;
+      # each lifting PR ratchets the threshold upward.
+      # All tests must run for the coverage measurement to reflect the
+      # true exercised production surface — account_server tests are slow
+      # under SP1=mock but exercise large parts of the file.
+      - name: Run cargo-llvm-cov (MVP scope, regression guard)
+        run: |
+          cargo llvm-cov -p server --show-missing-lines \
+            --ignore-filename-regex 'main\.rs|publisher\.rs|server_runtime\.rs|scanner_runtime\.rs|_tests\.rs$' \
+            --fail-under-lines 100 \
+            --fail-under-functions 100 \
+            -- --test-threads=1

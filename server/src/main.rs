@@ -1,13 +1,15 @@
 mod account_server;
 mod publisher;
 mod scanner;
+mod scanner_runtime;
 mod server;
+mod server_runtime;
 mod state;
 mod username;
 
 use crate::publisher::EsploraConfig;
-use crate::scanner::scan_for_inscriptions;
-use crate::server::start_rest_server;
+use crate::scanner_runtime::scan_for_inscriptions;
+use crate::server_runtime::start_rest_server;
 use crate::state::State;
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
@@ -173,23 +175,46 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                 if commitment.verify() {
                     println!("Commitment signature verified successfully");
 
+                    // Capture the public_key before moving `commitment` into
+                    // `state.update` so we can reference it in the Err arm.
+                    let pubkey_for_log = commitment.public_key;
+
                     // Lock the mutex to modify the state
                     let mut state = state_clone.lock().unwrap();
-                    // Update the state with this commitment
-                    let new_root = state.update(&[commitment]).unwrap();
+                    // Update the state with this commitment.
+                    //
+                    // Errors are logged but do NOT panic — the scanner is
+                    // best-effort and we never want a single bad commitment
+                    // (replay, client bug, or a re-scan after crash where
+                    // the SMT already has this public_key with a different
+                    // leaf value) to take the whole REST server down. The
+                    // scanner advances to the next block regardless.
+                    match state.update(&[commitment]) {
+                        Ok(new_root) => {
+                            println!(
+                                "Added to State. New MMR root: {}",
+                                hex::encode(new_root)
+                            );
 
-                    println!("Added to State. New MMR root: {}", hex::encode(new_root));
+                            // Save the state after each update
+                            if let Err(e) = state.save_to_files(SMT_PATH, MMR_PATH) {
+                                eprintln!("Failed to save state after update: {}", e);
+                            }
 
-                    // Save the state after each update
-                    if let Err(e) = state.save_to_files(SMT_PATH, MMR_PATH) {
-                        eprintln!("Failed to save state after update: {}", e);
+                            // Save the latest block hash after each update
+                            if let Err(e) =
+                                save_latest_block(&current_block_hash, LATEST_BLOCK_PATH)
+                            {
+                                eprintln!("Failed to save latest block hash: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Skipping commitment for public_key {}: state.update failed: {}",
+                                pubkey_for_log, e
+                            );
+                        }
                     }
-
-                    // Save the latest block hash after each update
-                    if let Err(e) = save_latest_block(&current_block_hash, LATEST_BLOCK_PATH) {
-                        eprintln!("Failed to save latest block hash: {}", e);
-                    }
-
                 } else {
                     println!("Commitment verification failed, not adding to state");
                 }
