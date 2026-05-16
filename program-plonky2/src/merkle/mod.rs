@@ -7,4 +7,5 @@
 //! key indexing (`[u8; 32]`) is preserved so the in-circuit gadget can
 //! use the same MSB-first bit selector path as the off-circuit code.
 
+pub mod merkle_mountain_range;
 pub mod sparse_merkle_tree;
