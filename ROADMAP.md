@@ -24,7 +24,8 @@ Source documents:
 | 3d | Port off-circuit `AccountState`/`Coin`/`ProofData` | ✅ done | — | — |
 | 4a | In-circuit MMR inclusion gadget | ✅ done | — | — |
 | 4b | In-circuit SMT inclusion gadget | ✅ done | — | — |
-| 4c | In-circuit SMT non-inclusion + insert gadget | ⏳ todo | 1–2 d | **medium** (chase-loop complexity in-circuit) |
+| 4c | In-circuit SMT non-inclusion gadget (verify only) | ✅ done | — | — |
+| 4c+ | In-circuit SMT insert gadget (new-root computation) | ⏳ todo | 1 d | medium (fixed-depth padding) |
 | 4d | Port `ProgramInputs` + `CommitmentMerkleProofs` types | ⏳ todo | 1 d | low |
 | 5 | Monolithic state-transition circuit (recursion, padding, vk-pin) | ⏳ todo | **3–5 d** | **high** (vk-pin correctness, first real recursion test) |
 | 6 | `script-plonky2/` host-side prover wrapper | ⏳ todo | 1–2 d | low |
@@ -43,7 +44,8 @@ Pre-mainnet hardening adds another 2–3 weeks on top.
 
 Commit refs (newest first):
 
-- *(next commit)* — feat: SMT inclusion gadget + circuit/util shared helpers (4 tests; bit0/bit7 divergence, 3-leaf, tampered-leaf negative)
+- *(next commit)* — feat: SMT non-inclusion verify gadget (case A empty-subtree, case B path-compressed-neighbour, 3 tests + 1 negative)
+- [`8002ce3`](./../../commit/8002ce3) — feat: SMT inclusion gadget + circuit/util shared helpers (4 tests; bit0/bit7 divergence, 3-leaf, tampered-leaf negative)
 - [`15d45c9`](./../../commit/15d45c9) — feat: MMR inclusion gadget (4 circuit tests, prove+verify pass)
 - [`e1af850`](./../../commit/e1af850) — feat: AccountState/Coin/ProofData/calculate_coin_identifier (field-element layouts)
 - [`c28e279`](./../../commit/c28e279) — feat: MMR to Poseidon (8 tests)
@@ -67,12 +69,12 @@ Commit refs (newest first):
 
 ## Next (in order)
 
-### Step 4c — SMT non-inclusion + insert gadget
-**Effort:** 1–2 days.
-**Files:** `program-plonky2/src/circuit/smt.rs` (extends 4b).
-**Mirror of:** `NonInclusionProof::verify` and `NonInclusionProof::insert`.
-**Test plan:** generate non-inclusion proofs off-circuit, witness + prove + verify. Specifically include the iter=1 zero-state corner case from the SMT regression guard.
-**Risk:** Medium. The "padding with default hashes" loop is data-dependent — needs in-circuit handling that doesn't branch on witness values. Likely solved by fixing `MAX_DEPTH` and conditionally selecting default vs. provided hash per level.
+### Step 4c+ — SMT insert gadget (new-root computation)
+**Effort:** ~1 day.
+**Files:** `program-plonky2/src/circuit/smt.rs` (extends the existing module).
+**Mirror of:** `NonInclusionProof::insert` / `verify_and_insert`.
+**Test plan:** after non-inclusion verify, also assert the computed new-root after inserting a fresh leaf matches the off-circuit `verify_and_insert` result.
+**Risk:** Medium. The off-circuit insert has a variable-length default-hash padding loop driven by where `key` and `other_key` diverge. In-circuit either: (a) compute the divergence depth as a witness and conditionally hash up to `TREE_DEPTH` always, or (b) require the host to pre-pad the path to a fixed depth. Plan: (b), introduced together with the monolithic circuit's fixed-shape padding.
 
 ### Step 4d — Port `ProgramInputs` + `CommitmentMerkleProofs`
 **Effort:** ~1 day.
