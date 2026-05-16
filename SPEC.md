@@ -2,6 +2,8 @@
 
 This document specifies the zkCoins state-transition circuit (currently implemented for SP1 in `program/src/main.rs`) and the surrounding off-circuit responsibilities. It is **implementation-agnostic**: it does not mandate SP1, SHA256, or any particular proof system. It is intended as a starting point for porting the circuit to other proof systems (e.g. Plonky2 with an algebraic hash such as Poseidon) while preserving protocol semantics.
 
+> **Scope note.** This spec describes the **zkCoins MVP variant** of the Shielded CSV protocol, not the paper as published. It deliberately departs from [eprint 2025/068](https://eprint.iacr.org/2025/068) in 11 concrete ways — see §15 "Divergences from Shielded CSV (paper)" below, and [`MIGRATION_RESEARCH.md`](./MIGRATION_RESEARCH.md) for full analysis against the upstream reference implementation at [`ShieldedCSV/ShieldedCSV`](https://github.com/ShieldedCSV/ShieldedCSV).
+
 The reference implementation lives in:
 
 - `program/src/lib.rs` — types and pure helpers (compiled both as host and as zkVM guest)
@@ -426,6 +428,30 @@ A test-suite for the ported circuit MUST cover at minimum:
 
 ## 14. References
 
-- Shielded CSV — Jonas Nick, Liam Eagen, Robin Linus. https://eprint.iacr.org/2025/068
-- Upstream Plonky2 prototype — https://github.com/BitVM/zkCoins
+- Shielded CSV paper — Jonas Nick, Liam Eagen, Robin Linus. https://eprint.iacr.org/2025/068
+- Shielded CSV reference implementation (normative) — https://github.com/ShieldedCSV/ShieldedCSV
+- `BitVM/zkCoins` Plonky2 prototype (IVC scaffold only) — https://github.com/BitVM/zkCoins
 - Current SP1 implementation — this repository, `program/src/main.rs`
+- Migration research and divergence analysis — [`MIGRATION_RESEARCH.md`](./MIGRATION_RESEARCH.md)
+
+---
+
+## 15. Divergences from Shielded CSV (paper)
+
+This implementation differs from the published Shielded CSV protocol in 11 concrete ways. Each is either a deliberate MVP simplification, a deferred feature, or a privacy/soundness gap that must be closed before mainnet. The detailed analysis lives in [`MIGRATION_RESEARCH.md`](./MIGRATION_RESEARCH.md) §3. Summary table:
+
+| #   | This SPEC                                                            | Paper                                                                    | Class            | Status               |
+| --- | -------------------------------------------------------------------- | ------------------------------------------------------------------------ | ---------------- | -------------------- |
+| D1  | `identifier = H(asth ‖ u32_be(idx))` (32 B)                          | `CoinID = tx_hash ‖ idx` (34 B), `CoinIDOnChain = blockchain_loc ‖ idx` (8 B) | Architectural    | Accepted for MVP     |
+| D2  | `Coin.recipient = Address` (plaintext)                              | `coin.essence.address = Commitment::commit(acct_id, rand)` (hiding)      | **Privacy**      | **Must fix pre-mainnet** |
+| D3  | Single Schnorr commitment in Taproot inscription, txid prefix `4242` | Half-aggregate BIP-340 Schnorr `AggregateNullifier` via third-party publishers | Architectural    | Accepted for MVP     |
+| D4  | Global state = SMT(`H(pk)` → `H(asth ‖ ocr)`) + MMR over `H(smt_root ‖ prev_mmr_root)` | `ToSAcc` tuple-of-sets over `(pk, sig_comm, blockchain_loc, fee_acct_comm)` with prefix proofs | Architectural    | Discuss with Robin   |
+| D5  | SMT depth 256, hash-keyed (uniform)                                  | `AccM` lex-ordered by `CoinIDOnChain` for subtree pruning                | Scalability      | Re-evaluate at scale |
+| D6  | No fee field, no fee output                                          | `fee: u64` + `FEE_IDX = 0xffff` reserved coin index for publisher payout | Missing feature  | Deferred             |
+| D7  | No conditional-noop on reorg                                         | `conditional_nav` degrades tx to no-op if claimed nullifier-accum no longer prefix | **Reorg safety** | **Must fix pre-mainnet** |
+| D8  | `Coin` carries no `nullifier_accum` snapshot                         | `Coin` carries snapshot; receiver verifies it's in their local history  | **Soundness**    | **Must fix pre-mainnet** |
+| D9  | No range/uniqueness checks on `coin_index`                           | `idx` strictly increasing within tx; `idx == FEE_IDX` reserved          | Soundness        | Cheap fix            |
+| D10 | `apply_coin` checks `coin.recipient == self.owner` plaintext         | Opens `Commitment::commit(acct_id, rand)` with witnessed `acct_comm_rand` | **Privacy**      | **Tied to D2**       |
+| D11 | `MINTING_ADDRESS` hard-coded                                         | `payment_init_newacct` for fresh accounts; `issuance(IssuanceProof)` branch | Architectural    | Deferred             |
+
+**Bottom line:** D2/D10, D7, D8 are blockers for mainnet (privacy + soundness + reorg safety). D6 is a UX/economics blocker (no fee → no publisher incentive). The rest are documented departures from paper fidelity that the MVP accepts.
