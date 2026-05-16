@@ -30,11 +30,13 @@ Source documents:
 | 5 | Monolithic state-transition circuit (recursion, padding, vk-pin) | ⏳ todo | **3–5 d** | **high** (vk-pin correctness, first real recursion test) |
 | 6 | `script-plonky2/` host-side prover wrapper | ⏳ todo | 1–2 d | low |
 | 7 | Server: rewire `account_server` + `state` + `scanner` to Poseidon | ⏳ todo | **3–5 d** | medium (Schnorr boundary, scanner SMT key) |
-| 8 | App / wallet: wasm Poseidon implementation or bindings | ⏳ todo | **3–5 d** | medium (browser performance) |
+| 8 | App / wallet: Schnorr-signing boundary, server-API integration | ⏳ todo | 1–2 d | low (server-side compute architecture — no wasm-crypto migration) |
 | 9 | DEV deployment + end-to-end roundtrip on signet | ⏳ todo | 3–5 d | medium |
 | — | Pre-mainnet blockers: D2/D10 (recipient hiding), D7 (reorg safety), D8 (per-coin nullifier-accum) | ⏳ todo | **+2–3 weeks** | high (real protocol redesign) |
 
-**MVP total (steps 1–9): ~4–6 weeks full-time** assuming no major surprises in step 5 (Plonky2 recursion vk-pinning).
+**MVP total (steps 1–9): ~3–5 weeks full-time** assuming no major surprises in step 5 (Plonky2 recursion vk-pinning).
+
+The architecture is **server-side compute**: the server generates all ZK proofs; the wallet holds only the private key and signs BIP-340 Schnorr over `SHA256(serialize(asth) ‖ serialize(ocr))`. There is no in-browser Poseidon, no wasm-Plonky2 verifier, no in-app ZK gadget. Performance is sized for server hardware (M3 Ultra baseline; GPU / Succinct Prover Network as upgrade paths), not laptop or mobile.
 
 Pre-mainnet hardening adds another 2–3 weeks on top.
 
@@ -99,11 +101,15 @@ Commit refs (newest first):
 **Key challenge:** the Schnorr commitment message stays `SHA256(serialize(asth) ‖ serialize(ocr))` per §5.4 of `MIGRATION_RESEARCH.md`, so the scanner converts Poseidon outputs to bytes before SHA256 → BIP-340 verify.
 **Risk:** Medium. Many touchpoints, but each one is mechanical.
 
-### Step 8 — App / wallet wasm
-**Effort:** 3–5 days.
-**Files:** `zk-coins/app` repo (separate). Add Poseidon hashing to the wasm crypto module.
-**Key challenge:** Browser performance. Pure-Rust Poseidon via wasm-bindgen is the obvious starting point; benchmark before committing.
-**Risk:** Medium. If browser-side Poseidon is too slow we may need a wasm-optimised variant.
+### Step 8 — App / wallet
+**Effort:** 1–2 days.
+**Files:** `zk-coins/app` repo (separate). Mostly server-API integration.
+**Scope:** The wallet only needs:
+  - BIP-340 Schnorr signing over `SHA256(serialize(asth) ‖ serialize(ocr))` (WebCrypto's SHA256 + a secp256k1 library — no Poseidon).
+  - Display of balance / send-quotes / receive-confirmations from the server API.
+  - No in-app ZK proof generation, verification, or Merkle hashing.
+**Risk:** Low. The wallet trusts the server for ZK correctness — this is the
+explicit zkCoins architectural choice (server-side compute).
 
 ### Step 9 — DEV deployment + e2e
 **Effort:** 3–5 days.
@@ -138,15 +144,13 @@ These are not MVP scope but block mainnet, per `SPEC.md` §15.
 **Mitigation:** Start step 5 with the simplest possible "I verify myself with a trivial payload" circuit before adding the real predicate. Validates the recursion plumbing in isolation.
 **Trigger to escalate:** if 1 day of debugging step 5 doesn't produce a verifying proof, ask Robin / the Plonky2 community.
 
-### R2 — 1-second proof target unreachable (medium)
-**What can go wrong:** Real circuit with 1+8 recursive verifies is too large for sub-second proving on a laptop.
-**Mitigation:** Measure as soon as step 5 has any working proof. Knobs to turn: (a) reduce `MAX_IN_COINS`, (b) drop recursion of in-coin proofs (replace with off-circuit nullifier-set check, requires protocol change), (c) switch to a folding scheme.
-**Trigger to escalate:** measured proof time > 5s on M3 Ultra.
+### R2 — 1-second proof target unreachable on server hardware (medium)
+**What can go wrong:** Real circuit with 1+8 recursive verifies is too large for sub-second proving even on M3 Ultra (or our eventual GPU host).
+**Mitigation:** Measure as soon as step 5 has any working proof. Knobs to turn: (a) reduce `MAX_IN_COINS`, (b) drop recursion of in-coin proofs (replace with off-circuit nullifier-set check, requires protocol change), (c) switch to a folding scheme, (d) move proving to GPU or Succinct Prover Network.
+**Trigger to escalate:** measured proof time > 5s on M3 Ultra. Wallet-side performance is N/A — proving is server-side; the wallet's send-flow latency = proof time + network roundtrip.
 
-### R3 — Wasm Poseidon too slow (medium)
-**What can go wrong:** Browser hashing for SMT path computation makes the wallet feel sluggish.
-**Mitigation:** Profile early in step 8. Consider Poseidon2 (faster) or precompute SMT paths server-side.
-**Trigger to escalate:** wallet send flow > 3s perceived.
+### R3 — (removed)
+Was: "Wasm Poseidon too slow." No longer applicable — the wallet performs no Poseidon hashing (server-side compute architecture). The wallet's only crypto is BIP-340 Schnorr signing of a SHA256 digest, which WebCrypto handles natively.
 
 ### R4 — Pre-mainnet hardening pushes timeline (high)
 **What can go wrong:** D2/D10 hiding recipient is a real protocol change, not a patch. May require re-doing step 5 if it doesn't fit the existing circuit shape.
