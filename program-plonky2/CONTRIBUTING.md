@@ -70,9 +70,10 @@ Acceptable exclusions:
 - Genuinely-unreachable defensive code → `#[cfg(...)]` or
   `#[allow(dead_code)]` with a written reason; auditor must verify the
   exclusion is necessary, not lazy.
-- Code that requires external services (live Bitcoin node, GPU prover)
-  → mark with `#[cfg(feature = "integration-tests")]` and the integration
-  tests run separately in step 9's e2e plan.
+- Code that requires external services (live Bitcoin node) → mark with
+  `#[cfg(feature = "integration-tests")]` and the integration tests run
+  separately in step 9's e2e plan. Note: there is no "GPU prover" path
+  in our architecture — the hardware target is M3 Ultra CPU-only.
 
 NOT acceptable: "I'll add tests later", "this is just MVP scaffolding",
 "the next gadget will cover it". MVP includes coverage; see ROADMAP

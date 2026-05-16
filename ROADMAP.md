@@ -51,7 +51,9 @@ These two requirements are not in tension — the first reduces the surface, the
 
 ### Architecture summary
 
-The architecture is **server-side compute**: the server generates all ZK proofs; the wallet holds only the private key and signs BIP-340 Schnorr over `SHA256(serialize(asth) ‖ serialize(ocr))`. There is no in-browser Poseidon, no wasm-Plonky2 verifier, no in-app ZK gadget. Performance is sized for server hardware (M3 Ultra baseline; GPU / Succinct Prover Network as upgrade paths), not laptop or mobile.
+The architecture is **server-side compute**: the server generates all ZK proofs; the wallet holds only the private key and signs BIP-340 Schnorr over `SHA256(serialize(asth) ‖ serialize(ocr))`. There is no in-browser Poseidon, no wasm-Plonky2 verifier, no in-app ZK gadget.
+
+**Hardware target: Mac Studio M3 Ultra, 96 GB unified RAM, single host, CPU-only.** No discrete GPU, no CUDA, no external cloud proving service (no Succinct Prover Network, no AWS GPU, no Lambda Labs). Performance budget is what M3 Ultra delivers on Apple Silicon Performance cores; if a design overshoots the budget, the design changes — we do not add hardware. Plonky2 has no Apple-Silicon GPU path anyway, so this constraint is structurally compatible with the chosen stack.
 
 zkCoins is in a **closed test environment** (DEV *and* PRD). No external users, no real money, no existing user-base to migrate. Step 7 therefore **replaces** the SP1 path outright rather than running a dual backend: SP1 modules are deleted, server starts with a clean Poseidon SMT/MMR state, no Cargo feature flag, no migration helpers. This is reflected in the lower effort estimates for step 7 (2–3 d instead of 3–5 d) and the dropped risk for R5.
 
@@ -167,8 +169,9 @@ explicit zkCoins architectural choice (server-side compute).
 **Test plan (100% coverage gate applies for code; e2e separately):**
   - Coverage of all server endpoints exercised by the wallet during the e2e roundtrip must already be 100% from step 7's gate; this step verifies the integration, not the unit coverage.
   - e2e success criteria: every endpoint round-trips under realistic conditions (one happy-path traversal per route plus at least one failure path per route).
-  - Performance budget: cold-start proof ≤ 30 s, warm proof ≤ 5 s on M3 Ultra (R2 escalation trigger). Numbers ≤ these unblock the MVP; better numbers postpone GPU/Network considerations.
-**Risk:** Medium. First real exposure to the full stack under realistic load.
+  - Performance budget on the M3 Ultra (96 GB, CPU-only): warm proof ≤ 5 s, ideally ≤ 1 s; cold-start (first-proof after server boot) ≤ 30 s including circuit-data load; memory peak < 64 GB during proving (leaves 32 GB for OS, scanner, REST, OS cache).
+  - If the budget is missed: redesign per R2 (reduce MAX_IN_COINS, drop in-coin recursion, or switch to folding). **NOT** add GPU or move to a cloud prover.
+**Risk:** Medium. First real exposure to the full stack under realistic load on the actual production hardware.
 
 ---
 
@@ -200,10 +203,15 @@ Plonky2 is bridge technology. Post-MVP (after step 9): Plonky3 evaluation. Field
 **Mitigation:** Start step 5 with the simplest possible "I verify myself with a trivial payload" circuit before adding the real predicate. Validates the recursion plumbing in isolation.
 **Trigger to escalate:** if 1 day of debugging step 5 doesn't produce a verifying proof, ask Robin / the Plonky2 community.
 
-### R2 — 1-second proof target unreachable on server hardware (medium)
-**What can go wrong:** Real circuit with 1+8 recursive verifies is too large for sub-second proving even on M3 Ultra (or our eventual GPU host).
-**Mitigation:** Measure as soon as step 5 has any working proof. Knobs to turn: (a) reduce `MAX_IN_COINS`, (b) drop recursion of in-coin proofs (replace with off-circuit nullifier-set check, requires protocol change), (c) switch to a folding scheme, (d) move proving to GPU or Succinct Prover Network.
-**Trigger to escalate:** measured proof time > 5s on M3 Ultra. Wallet-side performance is N/A — proving is server-side; the wallet's send-flow latency = proof time + network roundtrip.
+### R2 — 1-second proof target unreachable on M3 Ultra (medium)
+**What can go wrong:** Real circuit with 1+8 recursive verifies is too large for sub-second proving on the target hardware.
+**Hardware constraint:** Mac Studio M3 Ultra, 96 GB RAM, CPU-only. No GPU fallback. No external cloud prover. If proof time overshoots, the design changes; we do not add hardware.
+**Mitigation knobs (all design-level):**
+  (a) reduce `MAX_IN_COINS`;
+  (b) drop recursion of in-coin proofs (replace with off-circuit nullifier-set check; this is a protocol change);
+  (c) switch to a folding scheme (Nova / HyperNova / similar) that's CPU-native.
+**Explicitly OFF the table:** GPU (no NVIDIA hardware on the M3 Ultra; Plonky2-CUDA needs CUDA anyway), Succinct Prover Network (violates closed-test-env + no-external-services rule), Apple Neural Engine / AMX (Plonky2 doesn't target them and we won't author custom kernels).
+**Trigger to escalate:** measured proof time > 5 s on M3 Ultra. Wallet-side performance is N/A — proving is server-side; the wallet's send-flow latency = proof time + network roundtrip.
 
 ### R3 — (removed)
 Was: "Wasm Poseidon too slow." No longer applicable — the wallet performs no Poseidon hashing (server-side compute architecture). The wallet's only crypto is BIP-340 Schnorr signing of a SHA256 digest, which WebCrypto handles natively.
@@ -230,9 +238,10 @@ Plonky2 is the **MVP bridge**, not the long-term substrate. After step 9
 succeeds we schedule a Plonky3 evaluation. Concretely:
 
 - **Field:** Plonky3 default is **BabyBear** (`p = 2^31 - 2^27 + 1`).
-  Smaller field, GPU-friendlier, matches SP1's choice (which we are
-  leaving). Plonky2 we use Goldilocks because that's Plonky2's mature
-  default; Plonky3 switches us back to a small-field stack.
+  Smaller field, GPU-friendlier in general — but we're on Apple Silicon
+  CPU-only, so the GPU win is *not* a benefit for us. The motivation for
+  BabyBear here reduces to "matches SP1's choice / Plonky3-native";
+  Plonky2 we use Goldilocks because that's Plonky2's mature default.
 - **Hash:** Plonky3 default is **Poseidon2** (~2× faster than the
   original Poseidon used in Plonky2).
 - **Gadget reuse:** algorithmic structure (SMT, MMR, ProofData layout,
