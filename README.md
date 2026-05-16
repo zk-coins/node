@@ -187,7 +187,7 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 
 #### Planned
 
-- **Explorer endpoints (`/api/stats`, `/api/nullifiers`)** — to power an `explorer.zkcoins.app` companion app
+- **Explorer endpoints (`/api/stats`, `/api/nullifiers`)** — to power the `zkcoins.space` companion app
 - **Light client support** — let wallets verify nullifier set membership without scanning the chain themselves
 
 ### Configuration
