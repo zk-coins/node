@@ -26,7 +26,7 @@ Source documents:
 | 4b | In-circuit SMT inclusion gadget | ✅ done | — | — |
 | 4c | In-circuit SMT non-inclusion gadget (verify only) | ✅ done | — | — |
 | 4c+ | In-circuit SMT insert gadget (new-root computation) | ⏳ todo | 1 d | medium (fixed-depth padding) |
-| 4d | Port `ProgramInputs` + `CommitmentMerkleProofs` types | ⏳ todo | 1 d | low |
+| 4d | Port `ProgramInputs` + `CommitmentMerkleProofs` types | ✅ done | — | — |
 | 5 | Monolithic state-transition circuit (recursion, padding, vk-pin) | ⏳ todo | **3–5 d** | **high** (vk-pin correctness, first real recursion test) |
 | 6 | `script-plonky2/` host-side prover wrapper | ⏳ todo | 1–2 d | low |
 | 7 | Server: rewire `account_server` + `state` + `scanner` to Poseidon | ⏳ todo | **3–5 d** | medium (Schnorr boundary, scanner SMT key) |
@@ -44,7 +44,8 @@ Pre-mainnet hardening adds another 2–3 weeks on top.
 
 Commit refs (newest first):
 
-- *(next commit)* — feat: SMT non-inclusion verify gadget (case A empty-subtree, case B path-compressed-neighbour, 3 tests + 1 negative)
+- *(next commit)* — feat: port `ProgramInputs`, `CommitmentMerkleProofs`, `ProofType` off-circuit types with verify_commitment + verify_previous_root (4 tests + e2e SMT+MMR roundtrip)
+- [`9ba03bc`](./../../commit/9ba03bc) — feat: SMT non-inclusion verify gadget (case A empty-subtree, case B path-compressed-neighbour, 3 tests + 1 negative)
 - [`8002ce3`](./../../commit/8002ce3) — feat: SMT inclusion gadget + circuit/util shared helpers (4 tests; bit0/bit7 divergence, 3-leaf, tampered-leaf negative)
 - [`15d45c9`](./../../commit/15d45c9) — feat: MMR inclusion gadget (4 circuit tests, prove+verify pass)
 - [`e1af850`](./../../commit/e1af850) — feat: AccountState/Coin/ProofData/calculate_coin_identifier (field-element layouts)
@@ -75,13 +76,6 @@ Commit refs (newest first):
 **Mirror of:** `NonInclusionProof::insert` / `verify_and_insert`.
 **Test plan:** after non-inclusion verify, also assert the computed new-root after inserting a fresh leaf matches the off-circuit `verify_and_insert` result.
 **Risk:** Medium. The off-circuit insert has a variable-length default-hash padding loop driven by where `key` and `other_key` diverge. In-circuit either: (a) compute the divergence depth as a witness and conditionally hash up to `TREE_DEPTH` always, or (b) require the host to pre-pad the path to a fixed depth. Plan: (b), introduced together with the monolithic circuit's fixed-shape padding.
-
-### Step 4d — Port `ProgramInputs` + `CommitmentMerkleProofs`
-**Effort:** ~1 day.
-**Files:** `program-plonky2/src/types.rs` (extend) + `program-plonky2/src/circuit/inputs.rs` (new for target counterparts).
-**Mirror of:** `program/src/lib.rs::ProgramInputs` + `CommitmentMerkleProofs`.
-**Test plan:** field-element round-trip tests, mirroring the existing `ProofData` round-trip test.
-**Risk:** Low. Pure data types, no circuit logic.
 
 ### Step 5 — Monolithic state-transition circuit
 **Effort:** 3–5 days.
