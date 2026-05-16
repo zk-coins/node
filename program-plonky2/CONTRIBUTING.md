@@ -1,0 +1,152 @@
+# Contributing to `program-plonky2/`
+
+Operational handoff: how to build, test, lint, and not blow up the
+machine. This crate is **excluded from the parent workspace** and
+carries its own toolchain pin.
+
+## Why this crate is standalone
+
+Plonky2 1.1.0 requires nightly Rust because `plonky2_field` uses
+`#![feature(specialization)]`. The rest of the zkCoins workspace is
+pinned to stable 1.81.0 for SP1 compatibility. To avoid forcing nightly
+on the whole workspace during the migration, this crate is excluded
+from `members` in the root `Cargo.toml` (`exclude = ["program-plonky2"]`)
+and has its own `rust-toolchain.toml`.
+
+## First-time setup
+
+```bash
+rustup install nightly-2025-04-15 --profile minimal
+```
+
+The pin is in `program-plonky2/rust-toolchain.toml`. Bumping the
+nightly date is fine but verify Plonky2 still builds and tests pass
+before committing.
+
+## Build / test / lint
+
+All commands run from `program-plonky2/` (NOT from the workspace root):
+
+```bash
+cd program-plonky2
+
+# Build
+cargo build
+
+# Run all tests serially (circuit tests are memory-heavy)
+cargo test -- --test-threads=1
+
+# Run just the off-circuit / non-circuit tests (fast)
+cargo test hash
+cargo test merkle
+cargo test types
+cargo test inputs
+
+# Run just the circuit gadget tests (slow — each ~10 s circuit build)
+cargo test circuit -- --test-threads=1
+
+# Format check (used by CI gate)
+cargo fmt --check
+
+# Lint (used by CI gate). MUST be clean before pushing.
+cargo clippy --all-targets -- -D warnings
+```
+
+## Test runtime characteristics
+
+| Module           | Speed     | Why                                            |
+| ---------------- | --------- | ---------------------------------------------- |
+| `hash::tests`    | <1 s      | Just Poseidon hashes; no circuit.              |
+| `merkle::*`      | <2 s      | Off-circuit SMT/MMR operations.                |
+| `types::tests`   | <1 s      | Pure data shapes; one Poseidon per test.       |
+| `inputs::tests`  | <2 s      | Same plus a small e2e SMT+MMR roundtrip.       |
+| `circuit::*`     | **5–60 s per test** | Each builds a CircuitData under `standard_recursion_config` and runs a real prove + verify. |
+
+A full circuit-test sweep (currently 11 tests) takes ~10 minutes serially.
+With parallel test threads (default), memory peak is much higher because
+each thread holds its own circuit in memory.
+
+**Always use `--test-threads=1` for circuit tests on a memory-constrained
+machine.** See `feedback_cleanup_test_binaries.md` in `~/.claude/.../memory/`
+for the orphan-binary issue: if you abort a circuit test, the prover
+process can leak ~30 GB of swap-resident memory and survive for hours.
+
+```bash
+# After interrupted test runs:
+pgrep -f "target/debug/deps/zkcoins_program_plonky2"
+# If any output: kill -TERM <PID>
+```
+
+## Project layout
+
+```
+program-plonky2/
+├── Cargo.toml            # plonky2 = "1.1.0", anyhow only
+├── Cargo.lock            # commit it — lock transitive deps
+├── rust-toolchain.toml   # nightly-2025-04-15
+└── src/
+    ├── lib.rs            # Prelude: F, C, D type aliases
+    ├── hash.rs           # Poseidon HashDigest + byte conversions
+    ├── types.rs          # AccountState, Coin, ProofData
+    ├── inputs.rs         # ProgramInputs, CommitmentMerkleProofs, ProofType
+    ├── merkle/
+    │   ├── mod.rs
+    │   ├── sparse_merkle_tree.rs    # off-circuit Poseidon SMT
+    │   └── merkle_mountain_range.rs # off-circuit Poseidon MMR
+    └── circuit/
+        ├── mod.rs
+        ├── util.rs       # swap_if shared helper (pub(crate))
+        ├── mmr.rs        # in-circuit MMR inclusion gadget
+        └── smt.rs        # in-circuit SMT inclusion + non-inclusion verify
+```
+
+## Adding a new gadget
+
+The established pattern (see `circuit/mmr.rs` and `circuit/smt.rs`):
+
+1. Mirror an off-circuit verifier method (e.g. `MMRProof::verify`).
+2. Take `&mut CircuitBuilder<F, D>` plus typed targets in, no returns.
+3. Use `builder.connect_hashes(...)` to assert the final equality.
+4. Use `super::util::swap_if` for conditional hash-output swapping.
+5. For bit decomposition, use `key_bits_msb_first` from `smt.rs` (MSB
+   ordering matches `crate::merkle::sparse_merkle_tree::get_bit` on the
+   big-endian byte serialisation — this matters for cross-checking
+   against off-circuit code).
+6. Write at least one positive test (round-trip through prove+verify)
+   and one negative test (assert `data.prove(pw).is_err()` on tampered
+   witness).
+
+## Pinning + version philosophy
+
+- `plonky2 = "1.1.0"` is the latest crates.io release. BitVM's reference
+  was on `0.2.0` which is several majors stale; we tested that 1.1.0
+  still works with the nightly date pinned here.
+- Don't switch to plonky2 from git or a fork without a recorded reason
+  in `MIGRATION_RESEARCH.md`. The crate is intentionally upstream-mature.
+- `anyhow` is the only non-plonky2 runtime dep — keep it that way until
+  there's a concrete need.
+
+## CI integration
+
+The root workspace's CI (`.github/workflows/ci.yaml`) does NOT currently
+build or test this crate, because it requires a different toolchain.
+Adding a parallel job that runs `(cd program-plonky2 && cargo build &&
+cargo clippy && cargo test -- --test-threads=1)` is on the roadmap
+(step 5+) — defer until the circuit lands so CI runtime stays sub-10-min.
+
+## Common pitfalls
+
+See `MIGRATION_RESEARCH.md` § "Lessons Learned" for the gotchas
+discovered during this migration. Most relevant for hacking on this
+crate:
+
+- Don't seed `DEFAULT_HASHES[TREE_DEPTH]` with `ZERO_HASH` — Poseidon's
+  zero-state behaviour causes a structural collision. Use a domain-
+  separated `hash_bytes(b"...")` instead. The SMT module already does
+  this; the regression test `leaf_hash_never_collides_with_defaults`
+  pins the invariant.
+- `pw.set_target(target, value)` returns `Result` in plonky2 1.x. The
+  unwrap-or-handle is required; clippy `unused_must_use` catches it.
+- Field-element packing for byte inputs: pack 7 bytes per Goldilocks
+  element (LE), never 8. 8-byte chunks can exceed the modulus
+  (`from_canonical_u64` will panic in debug).

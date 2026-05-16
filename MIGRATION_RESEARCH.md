@@ -213,14 +213,210 @@ Steps 3-5 are the bulk of the work; everything else is wiring.
 
 ---
 
-## 7. Local Artifacts
+## 7. Lessons Learned (during implementation)
+
+Gotchas, design discoveries, and "would have been nice to know" findings
+that emerged while porting steps 1–4d. Each entry includes what it
+costs (concrete: a regression test, a comment, a constraint) so a later
+contributor can verify the lesson is still load-bearing.
+
+### 7.1 Poseidon zero-state collision in SMT defaults — **HIGH severity**
+
+**Discovered:** SMT port (commit `6215009`), failing test
+`test_verify_non_inclusion_proofs` at iter=1 (2 leaves).
+
+**Symptom:** `debug_assert!(node_1 == *parent || node_0 == *parent)` in
+the chase loop of `generate_non_inclusion_proof` failed. Investigation
+showed the chase had silently diverged from the inserted leaf's path
+because *both* children at some level appeared equal to `parent`.
+
+**Root cause:** Plonky2's Poseidon sponge with state width 12 and zero
+capacity init has the property that
+`PoseidonHash::hash_no_pad(&[F::ZERO])`,
+`PoseidonHash::hash_no_pad(&[F::ZERO, F::ZERO])`,
+`PoseidonHash::two_to_one(ZERO_HASH, ZERO_HASH)`, and any other
+absorption that leaves the state at all-zeros before permutation all
+produce **the same output** — call it `Z = Poseidon(0)`.
+
+If `DEFAULT_HASHES[TREE_DEPTH] = ZERO_HASH`, then `DEFAULT_HASHES[L]`
+for every `L < TREE_DEPTH` is `Z` (after sufficient self-concatenation,
+this stabilises in two steps). Any leaf whose value+key are themselves
+hashes of zero-derived inputs (very common in tests, but also possible
+for real Poseidon-derived keys hitting that exact image) collides with
+`DEFAULT_HASHES[TREE_DEPTH - 1]`. The chase loop then sees both default
+sibling and propagated leaf-hash as equal and picks the wrong path.
+
+**Fix:** seed `DEFAULT_HASHES[TREE_DEPTH]` with a domain-separated
+non-zero value:
+
+```rust
+const EMPTY_LEAF_TAG: &[u8] = b"zkcoins:smt:empty-leaf:v1";
+// ...
+default_hashes[depth] = hash_bytes(EMPTY_LEAF_TAG);
+```
+
+**Regression guard:** `leaf_hash_never_collides_with_defaults` in
+`sparse_merkle_tree.rs` iterates 50 sample keys × values and asserts
+none collides with any `DEFAULT_HASHES[L]`.
+
+**Generalisation for future gadgets:** any time the protocol uses
+"zero" as a sentinel inside a Poseidon hash chain, sanity-check that
+the resulting sentinel isn't also a natural image of zero-derived
+input. Domain separators are cheap insurance.
+
+### 7.2 Variable vs. fixed depth in SMT proofs — **MEDIUM severity, decision pending**
+
+**Discovered:** when porting `verify_smt_non_inclusion` and writing
+`verify_and_insert` plans (steps 4c, 4c+).
+
+**Tension:** the off-circuit SMT uses **path compression**. A single-leaf
+subtree at level L stores `leaf_hash` rather than a real `hash_concat`
+of children, and `generate_inclusion_proof` / `generate_non_inclusion_proof`
+break early when they detect this pattern. The resulting proof has
+variable length `K ≤ TREE_DEPTH`.
+
+Plonky2 circuits are **fixed-shape**: a gadget that processes a path
+must commit to its length at circuit-build time. The current gadgets
+accept any `path.len()` at *test* time, but the monolithic circuit
+(step 5) needs one fixed depth.
+
+**Two options for step 5:**
+
+1. **Remove path compression off-circuit.** Every leaf path is hashed
+   up the full TREE_DEPTH; proofs are uniformly TREE_DEPTH siblings
+   long. Pros: trivial in-circuit logic; uniform. Cons: changes
+   `tree.root()` semantics (root is no longer leaf-hash for single-leaf
+   trees); we'd need to retrofit the test suite and any host code
+   reading the root.
+2. **Keep path compression off-circuit, pre-pad for circuit consumption.**
+   The host produces a "padded" proof of length TREE_DEPTH where
+   levels below path compression are filled with computed
+   `hash_concat(leaf_h, default)` values at each level. Pros: keeps
+   off-circuit `tree.root()` semantics. Cons: host code complexity;
+   the padding must be computed correctly (subtle).
+
+**Status:** unresolved. Decision deferred to step 5 (monolithic circuit).
+The risk register R6 flags this; the ROADMAP's 4c+ entry notes the plan
+is option 2 unless we hit issues.
+
+**Concrete cost so far:** the verify gadget accepts variable depth and
+works for tests, but the insert gadget hasn't been written yet
+precisely because the depth question is unsettled.
+
+### 7.3 `pw.set_target` returns `Result` in plonky2 1.x — **LOW severity**
+
+**Discovered:** smoke test for `program-plonky2/src/lib.rs` (commit
+`984580f`).
+
+**Surprise:** the BitVM reference uses plonky2 0.2.0 where
+`pw.set_target(target, value)` returns `()`. In plonky2 1.x it returns
+`Result<(), anyhow::Error>` and clippy's `unused_must_use` rejects the
+old call shape.
+
+**Fix:** always `.unwrap()` (or properly handle) the result. The error
+case shouldn't fire in correctly-written code; the Result is there for
+target-overwrite detection.
+
+```rust
+// 0.2.0:    pw.set_target(t, v);
+// 1.x:      pw.set_target(t, v).unwrap();
+```
+
+### 7.4 Field-element packing conventions (canonical-reduction safety) — **MEDIUM, codified**
+
+**Discovered:** during `hash.rs` design.
+
+**Constraint:** Goldilocks modulus is `p = 2^64 - 2^32 + 1 ≈ 2^64`. A
+u64 value just below `2^64` exceeds `p` and `F::from_canonical_u64`
+panics in debug builds (release: silent reduction).
+
+**Packing rules** used throughout this crate:
+
+| Operation                          | Bytes per field elt | Why                             |
+| ---------------------------------- | ------------------- | ------------------------------- |
+| `hash_bytes`                       | **7** (LE)          | 7*8 = 56 bits, safe ceiling.    |
+| `digest_to_bytes` / `from_bytes`   | **8** (BE)          | Only works because Poseidon outputs are canonical (< p). Asserted by the protocol invariant; if a user-supplied byte string is fed through `digest_from_bytes`, it MUST come from a prior `digest_to_bytes` of a real digest. |
+| `u64_to_limbs` (balance / amount)  | **4** (2 limbs)     | u32 chunks, never exceeds p.    |
+| `pubkey_to_limbs` (33-byte pubkey) | **7** (5 limbs LE)  | Same as `hash_bytes`.           |
+
+**Invariant to enforce in any future packing function:** input chunks
+that fill a Goldilocks element must be ≤ 56 bits unless the value's
+canonical reduction is independently guaranteed.
+
+### 7.5 The Schnorr / Poseidon boundary lives at byte serialisation — **codified**
+
+**Discovered:** §5.4 decision, then refined while writing
+`CommitmentMerkleProofs::verify_commitment`.
+
+**Rule:** the wallet signs `SHA256(serialize(asth) ‖ serialize(ocr))`
+where `serialize` is `digest_to_bytes` (32 bytes big-endian per field
+element). The scanner verifies the BIP-340 signature and then inserts
+the 32-byte message into the global SMT keyed by `H(serialize(pubkey))`
+(Poseidon hash of compressed pubkey bytes, then taken as a 32-byte
+SMT key).
+
+There is **no in-circuit SHA256**, **no in-circuit Schnorr verify**.
+The boundary is enforced entirely off-circuit, and the proof's public
+output (`ProofData`'s `account_state_hash` + `output_coins_root`)
+provides the values that the wallet signs.
+
+**Consequence for D2/D10 fix (privacy):** if we later add hiding
+recipient commitments, the commitment construction lives off-circuit
+too. The wallet computes `Commitment::commit(acct_id, rand)` and the
+randomness is a regular witness — no in-circuit Pedersen needed unless
+we're verifying commitment openings inside the predicate.
+
+### 7.6 Tests serialised, memory-resident binaries linger — **LOW, but operationally costly**
+
+**Discovered:** orphan `server-f8087395d1b79585` process consuming 35 GB
+of swap reservation hours after `cargo test` finished.
+
+**Cause:** when a background `cargo test` is aborted (or completes but
+its child test binary doesn't terminate cleanly), the test binary
+keeps its allocated arenas in memory and shows up as a giant resident
+process in Activity Monitor.
+
+**Mitigation:** see `program-plonky2/CONTRIBUTING.md` § "Test runtime
+characteristics" and the `feedback_cleanup_test_binaries` memory entry.
+After long test runs:
+
+```bash
+pgrep -f "target/debug/deps/zkcoins_program_plonky2"
+# If any output: kill -TERM <PID>
+```
+
+### 7.7 `gh` needs `--repo` in background tasks — **LOW, operational**
+
+**Discovered:** while running a CI watcher via `Bash` with
+`run_in_background: true`. Background processes lose cwd-read
+permission in this sandbox, so `cd ... && gh ...` fails with "Unable
+to read current working directory: Operation not permitted".
+
+**Mitigation:** always pass `--repo zk-coins/server` explicitly to gh
+commands run in background contexts. Captured in memory as
+`feedback_ci_monitor_after_push`.
+
+### 7.8 Reference repos: BitVM/zkCoins is a 182-LOC toy, ShieldedCSV/ShieldedCSV is the real one — **codified**
+
+**Re-stated for emphasis:** the `BitVM/zkCoins` repo Robin pointed us
+at is a Plonky2 IVC scaffold (182 LOC, no SMT/MMR/AccountState/Coin/
+Schnorr/tests). The actual normative reference implementation is
+`github.com/ShieldedCSV/ShieldedCSV`. Our implementation diverges from
+the paper in 11 ways (see §3 of this doc / SPEC.md §15).
+
+§3 is authoritative for "what does the paper say"; §3's divergence
+table D1–D11 is authoritative for "where do we differ and why".
+
+---
+
+## 8. Local Artifacts
 
 - BitVM/zkCoins reference (cloned): `~/Documents/GitHub/zkcoins/BitVM-zkCoins-reference/`
 - Shielded CSV reference implementation files (downloaded by the research agent): `/tmp/shielded_csv_lib.rs`, `/tmp/shielded_csv_primitives.rs`, `/tmp/shielded_csv_node.rs`. **TODO:** clone the full `ShieldedCSV/ShieldedCSV` repo to `~/Documents/GitHub/zkcoins/ShieldedCSV-reference/` if we decide to make it the normative reference (see §5.1).
 
 ---
 
-## 8. References
+## 9. References
 
 - Shielded CSV paper: https://eprint.iacr.org/2025/068
 - Shielded CSV reference implementation: https://github.com/ShieldedCSV/ShieldedCSV

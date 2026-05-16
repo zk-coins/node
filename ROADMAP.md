@@ -7,8 +7,9 @@ this file is stale relative to recent commits, that is a bug.
 Source documents:
 
 - [`SPEC.md`](./SPEC.md) — protocol specification (the *what*).
-- [`MIGRATION_RESEARCH.md`](./MIGRATION_RESEARCH.md) — analysis of the upstream references + design decisions (the *why*).
-- This file — execution plan, status, estimates (the *when and how*).
+- [`MIGRATION_RESEARCH.md`](./MIGRATION_RESEARCH.md) — analysis of the upstream references + design decisions + **§7 Lessons Learned during implementation** (the *why* + *what bit us*).
+- [`program-plonky2/CONTRIBUTING.md`](./program-plonky2/CONTRIBUTING.md) — operational handoff: toolchain, build/test/lint commands, runtime characteristics, pitfalls (the *how to actually hack on this*).
+- This file — execution plan, status, estimates (the *when and how-overview*).
 
 ---
 
