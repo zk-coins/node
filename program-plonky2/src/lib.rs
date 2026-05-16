@@ -44,8 +44,8 @@ mod tests {
         builder.register_public_input(z);
 
         let mut pw = PartialWitness::new();
-        pw.set_target(x, F::from_canonical_u64(7));
-        pw.set_target(y, F::from_canonical_u64(6));
+        pw.set_target(x, F::from_canonical_u64(7)).unwrap();
+        pw.set_target(y, F::from_canonical_u64(6)).unwrap();
 
         let data = builder.build::<C>();
         let proof = data.prove(pw).expect("prove failed");

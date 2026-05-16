@@ -163,21 +163,35 @@ For a Plonky2 MVP shipping in weeks-not-months:
 
 ---
 
-## 5. Open Decisions for Cyrill / Robin
+## 5. Design Decisions (locked for v1)
 
-These must be resolved before Plonky2 implementation starts; they are not Plonky2-specific but they all affect the circuit's public-input shape, which means relitigating them later costs another full rebuild.
+The following decisions are taken. Each is reversible but reversing them means a full circuit rebuild — they will not be re-litigated within v1.
 
-1. **Paper-fidelity vs. zkCoins variant.** Are we implementing Shielded CSV as published (with `ToSAcc`, fee output, half-aggregate publisher, hiding recipient commitments), or are we shipping a zkCoins MVP that deliberately diverges? Decide explicitly. _If divergent_, our `SPEC.md` must rephrase the §14 reference from "Based on" to "Inspired by" and list the divergences (use D1–D11 above).
+1. **Paper-fidelity vs. zkCoins variant** → **zkCoins MVP variant for v1.** Paper fidelity (`ToSAcc`, half-aggregate publishers, fee economics, hiding recipient commitments) is deferred to v2. SPEC.md §15 documents the divergences D1–D11.
 
-2. **Max input coins per send.** Plonky2 circuits are fixed-shape. Need a hard ceiling. Suggest 8.
+2. **Max input coins per send** → **8.** Plonky2 circuits are fixed-shape; the bound has to be a constant. 8 covers >99% of real wallet sends (most are 1–2 in-coins). Coin slots beyond the actual count are filled with `amount = 0` dummies; the circuit treats those as no-ops.
 
-3. **Hash function final choice.** Poseidon over Goldilocks (D=2) is the assumed default, but Robin may have a preference (Poseidon2? PoseidonBN254 for EVM compatibility?). Pin before writing.
+3. **Hash function** → **Poseidon over Goldilocks (`PoseidonGoldilocksConfig`, `D = 2`)** everywhere in the protocol's Merkle structures — both in-circuit *and* in the scanner state (SMT + MMR). Aligns with the Plonky2 ecosystem default and the BitVM reference config.
 
-4. **Schnorr message hash.** Keep SHA256 (BIP-340-native, secp256k1 wallets compatible) and accept an in-circuit SHA256 gadget? Or move to a Poseidon-friendly signature (EdDSA over Tweedledum etc.)?
+4. **Schnorr message hash** → **BIP-340 secp256k1 stays unchanged.** The wallet signs `SHA256(serialize(asth) ‖ serialize(ocr))` where `asth` and `ocr` are 4-element Poseidon outputs serialised big-endian to 32 bytes each. SHA256 lives only at this boundary; everything inside the circuit is Poseidon. No in-circuit SHA256 gadget is needed because the circuit never verifies the BIP-340 signature itself — that happens off-circuit in the scanner.
 
-5. **Privacy goal**. Are we fixing D2/D10 (hiding recipient commitments) before mainnet, or accepting linkability for v1 and patching later?
+5. **Privacy (D2/D10)** → **deferred to v2.** Plaintext recipient addresses for v1. Linkability across multiple coins to the same recipient is a known limitation, called out as a mainnet blocker in SPEC §15.
 
-6. **Fee model**. Are we shipping without fees (D6) — and if so, how do publishers get paid? Subsidy?
+6. **Fee model (D6)** → **no fee in v1.** We are the publisher (DFX/zkCoins-operated server), so there is no publisher to compensate. Self-funded operation.
+
+Hash-function boundary visualisation:
+
+```
+       in-circuit (Poseidon)          off-circuit (BIP-340 secp256k1)
+       ----------------------          --------------------------------
+           ProofData                   wallet derives x-only privkey
+        ┌──────────┐                   wallet computes
+        │   asth   │ ────────┐         msg = SHA256(asth_bytes || ocr_bytes)
+        │   ocr    │ ────────┼──→      sig = schnorr_sign(privkey, msg)
+        └──────────┘         │         scanner verifies sig
+                             │         scanner inserts (pk, msg) into Poseidon-SMT
+                             └─── serialize each field elt big-endian → 32 B
+```
 
 ---
 
