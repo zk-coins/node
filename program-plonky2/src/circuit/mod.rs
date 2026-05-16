@@ -7,3 +7,5 @@
 //! commit; see `MIGRATION_RESEARCH.md` §6 step 5).
 
 pub mod mmr;
+pub mod smt;
+mod util;

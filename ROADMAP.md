@@ -23,7 +23,7 @@ Source documents:
 | 3c | Port off-circuit MMR to Poseidon | ✅ done | — | — |
 | 3d | Port off-circuit `AccountState`/`Coin`/`ProofData` | ✅ done | — | — |
 | 4a | In-circuit MMR inclusion gadget | ✅ done | — | — |
-| 4b | In-circuit SMT inclusion gadget | ⏳ todo | 0.5 d | low |
+| 4b | In-circuit SMT inclusion gadget | ✅ done | — | — |
 | 4c | In-circuit SMT non-inclusion + insert gadget | ⏳ todo | 1–2 d | **medium** (chase-loop complexity in-circuit) |
 | 4d | Port `ProgramInputs` + `CommitmentMerkleProofs` types | ⏳ todo | 1 d | low |
 | 5 | Monolithic state-transition circuit (recursion, padding, vk-pin) | ⏳ todo | **3–5 d** | **high** (vk-pin correctness, first real recursion test) |
@@ -43,6 +43,7 @@ Pre-mainnet hardening adds another 2–3 weeks on top.
 
 Commit refs (newest first):
 
+- *(next commit)* — feat: SMT inclusion gadget + circuit/util shared helpers (4 tests; bit0/bit7 divergence, 3-leaf, tampered-leaf negative)
 - [`15d45c9`](./../../commit/15d45c9) — feat: MMR inclusion gadget (4 circuit tests, prove+verify pass)
 - [`e1af850`](./../../commit/e1af850) — feat: AccountState/Coin/ProofData/calculate_coin_identifier (field-element layouts)
 - [`c28e279`](./../../commit/c28e279) — feat: MMR to Poseidon (8 tests)
@@ -65,13 +66,6 @@ Commit refs (newest first):
 ---
 
 ## Next (in order)
-
-### Step 4b — SMT inclusion gadget
-**Effort:** ~0.5 day.
-**Files:** `program-plonky2/src/circuit/smt.rs` (new).
-**Mirror of:** `merkle::sparse_merkle_tree::InclusionProof::verify`.
-**Test plan:** off-circuit `SparseMerkleTree::generate_inclusion_proof` → witness in circuit → prove → verify. Tampered-leaf negative case.
-**Risk:** Low. Same structure as `verify_mmr_inclusion`, but key bit selection is MSB-first (already established in `get_bit`).
 
 ### Step 4c — SMT non-inclusion + insert gadget
 **Effort:** 1–2 days.
