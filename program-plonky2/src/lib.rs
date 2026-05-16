@@ -23,6 +23,7 @@ pub type C = PoseidonGoldilocksConfig;
 pub const D: usize = 2;
 
 pub mod hash;
+pub mod merkle;
 
 #[cfg(test)]
 mod tests {
