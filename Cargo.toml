@@ -4,6 +4,12 @@ members = [
     "script",
     "server",
     "shared"]
+# program-plonky2 is intentionally excluded: plonky2 requires nightly Rust
+# (feature(specialization)) while the rest of the workspace is pinned to
+# stable 1.81.0 for SP1. Build it standalone with its own toolchain:
+#   (cd program-plonky2 && cargo build)   # uses program-plonky2/rust-toolchain.toml
+# See MIGRATION_RESEARCH.md §6.
+exclude = ["program-plonky2"]
 resolver = "2"
 
 [workspace.dependencies]
