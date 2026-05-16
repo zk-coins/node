@@ -24,6 +24,7 @@ pub const D: usize = 2;
 
 pub mod circuit;
 pub mod hash;
+pub mod inputs;
 pub mod merkle;
 pub mod types;
 
