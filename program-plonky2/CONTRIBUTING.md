@@ -4,6 +4,11 @@ Operational handoff: how to build, test, lint, and not blow up the
 machine. This crate is **excluded from the parent workspace** and
 carries its own toolchain pin.
 
+> **Fresh contributor?** Read [`../CLAUDE.md`](../CLAUDE.md) first for
+> the project invariants and reading order. This file is the
+> operational *how*, but the rules in CLAUDE constrain what you may
+> change here.
+
 ## Why this crate is standalone
 
 Plonky2 1.1.0 requires nightly Rust because `plonky2_field` uses

@@ -2,6 +2,10 @@
 
 Companion document to [`SPEC.md`](./SPEC.md). Summarises what we can take from the upstream references, and — more importantly — flags where our current implementation has diverged from the published Shielded CSV protocol. Read this before writing any Plonky2 code.
 
+> **Fresh session?** Start with [`CLAUDE.md`](./CLAUDE.md) first for the
+> project invariants and reading order. This file's §7 (Lessons Learned)
+> is the *required reading before touching the affected code areas*.
+
 ---
 
 ## TL;DR
