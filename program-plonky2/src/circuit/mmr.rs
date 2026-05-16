@@ -65,6 +65,7 @@ pub fn verify_mmr_inclusion_with_index<F: RichField + Extendable<D>, const D: us
     verify_mmr_inclusion(builder, leaf, &index_bits, path, expected_root);
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +139,20 @@ mod tests {
                 round_trip(n, i);
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "index_bits and path must have equal length")]
+    fn mismatched_bits_and_path_panics() {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let leaf_t = builder.add_virtual_hash();
+        let root_t = builder.add_virtual_hash();
+        // 3 path entries, 2 bits → mismatch should hit the assertion message.
+        let path_t: Vec<HashOutTarget> = (0..3).map(|_| builder.add_virtual_hash()).collect();
+        let bit0 = builder.add_virtual_bool_target_safe();
+        let bit1 = builder.add_virtual_bool_target_safe();
+        verify_mmr_inclusion(&mut builder, leaf_t, &[bit0, bit1], &path_t, root_t);
     }
 
     #[test]

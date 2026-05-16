@@ -50,7 +50,33 @@ cargo fmt --check
 
 # Lint (used by CI gate). MUST be clean before pushing.
 cargo clippy --all-targets -- -D warnings
+
+# Coverage check (will become a CI gate alongside the existing server gate).
+# Per ROADMAP "Definition of MVP", 100% coverage on the activated surface
+# is non-negotiable. Run this before opening any PR that adds new code:
+cargo +nightly-2025-04-15 install cargo-llvm-cov   # one-time
+cargo llvm-cov --fail-under-lines 100 -- --test-threads=1
 ```
+
+## Coverage gate
+
+Same standard as `program/` and `server/` in the parent workspace:
+**100% line coverage on the activated surface**. The "activated surface"
+is everything compiled in by default features — i.e. the entire crate at
+the moment, since `program-plonky2` has no feature gates yet.
+
+Acceptable exclusions:
+
+- Genuinely-unreachable defensive code → `#[cfg(...)]` or
+  `#[allow(dead_code)]` with a written reason; auditor must verify the
+  exclusion is necessary, not lazy.
+- Code that requires external services (live Bitcoin node, GPU prover)
+  → mark with `#[cfg(feature = "integration-tests")]` and the integration
+  tests run separately in step 9's e2e plan.
+
+NOT acceptable: "I'll add tests later", "this is just MVP scaffolding",
+"the next gadget will cover it". MVP includes coverage; see ROADMAP
+"Definition of MVP".
 
 ## Test runtime characteristics
 

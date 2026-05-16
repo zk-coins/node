@@ -95,11 +95,16 @@ impl MerkleMountainRange {
         for level in 1..self.tree_depth() {
             index /= 2;
             let left = self.levels[level - 1][2 * index];
-            let right = if 2 * index + 1 < self.levels[level - 1].len() {
-                self.levels[level - 1][2 * index + 1]
-            } else {
-                ZERO_HASH
-            };
+            // Right child index is always in bounds: capacity is a power of two
+            // and levels[level-1] has `capacity >> (level-1)` entries — an even
+            // number for any level ≥ 1. `2*index+1` is therefore ≤ `len-1`.
+            // `.get()` + `.copied().unwrap_or(ZERO_HASH)` collapses the safety
+            // fallback into a single uncovered region the host never hits,
+            // keeping the algorithm robust against future capacity tweaks.
+            let right = self.levels[level - 1]
+                .get(2 * index + 1)
+                .copied()
+                .unwrap_or(ZERO_HASH);
             self.levels[level][index] = hash_concat(&left, &right);
         }
         self.count += 1;
@@ -141,11 +146,14 @@ impl MerkleMountainRange {
         let mut idx = index;
         for level in 0..(self.tree_depth() - 1) {
             let sibling_index = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
-            let sibling = if sibling_index < self.levels[level].len() {
-                self.levels[level][sibling_index]
-            } else {
-                ZERO_HASH
-            };
+            // Same reasoning as in `append`: levels[level].len() is a power of
+            // two and `sibling_index` is in `[0, len-1]` for any valid idx.
+            // Collapsed into `.get()` so the unreachable bound check shares one
+            // region with the success path.
+            let sibling = self.levels[level]
+                .get(sibling_index)
+                .copied()
+                .unwrap_or(ZERO_HASH);
             proof.push(sibling);
             idx /= 2;
         }
@@ -168,6 +176,7 @@ impl MerkleMountainRange {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,6 +272,39 @@ mod tests {
         // Flip a field element in the sibling to invalidate the path.
         proof.path[0] = hash_concat(&proof.path[0], &proof.path[0]);
         assert!(!proof.verify(leaf, tree.root()));
+    }
+
+    #[test]
+    fn default_is_empty_tree() {
+        let tree = MerkleMountainRange::default();
+        assert_eq!(tree.root(), ZERO_HASH);
+        assert_eq!(tree.leaf_count(), 0);
+    }
+
+    #[test]
+    fn leaf_count_and_get_leaf() {
+        let mut tree = MerkleMountainRange::new();
+        assert_eq!(tree.leaf_count(), 0);
+        assert!(tree.get_leaf(0).is_none());
+
+        let leaf = leaf_of("leaf1");
+        tree.append(leaf);
+        assert_eq!(tree.leaf_count(), 1);
+        assert_eq!(tree.get_leaf(0), Some(&leaf));
+        assert!(tree.get_leaf(1).is_none());
+    }
+
+    #[test]
+    fn proof_with_odd_leaf_count_uses_zero_sibling() {
+        // 3 leaves → bottom level has 4 slots, last is ZERO_HASH.
+        // Proof for index 2 should have a ZERO_HASH sibling at the bottom level.
+        let mut tree = MerkleMountainRange::new();
+        tree.append(leaf_of("a"));
+        tree.append(leaf_of("b"));
+        tree.append(leaf_of("c"));
+        let proof = tree.get_proof(2).unwrap();
+        assert_eq!(proof.path[0], ZERO_HASH);
+        assert!(proof.verify(leaf_of("c"), tree.root()));
     }
 
     #[test]

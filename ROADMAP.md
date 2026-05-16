@@ -40,6 +40,17 @@ person-days at full focus; multiply for part-time work.
 
 **MVP total (steps 1–9): ~2.5–4 weeks full-time** assuming no major surprises in step 5 (Plonky2 recursion vk-pinning).
 
+### Definition of "MVP"
+
+For this project, an "MVP" is **minimum viable** in two simultaneous senses, both non-negotiable:
+
+1. **Minimal feature surface.** Only what's needed for one complete user loop (create account → mint → send → receive → balance updates). No feature-bloat. If a capability is not on the critical path for that loop, it does not enter the MVP — see SPEC.md §15's deferred items.
+2. **100% test coverage on the activated surface.** Same standard as the SP1/SHA256 codebase (see README.md "Contributing"). Code that is gated OFF in the PRD build (Cargo features like `address-list`, `faucet`, `usernames`, `lnurl`) is excluded; everything else MUST be tested. `cargo llvm-cov --fail-under-lines 100` is the gate.
+
+These two requirements are not in tension — the first reduces the surface, the second keeps what remains clean. "MVP" is never an excuse to skip tests; it's an excuse to skip *features*. Negative tests (asserting that invalid witnesses are rejected) are mandatory for every gadget and every state-transition path.
+
+### Architecture summary
+
 The architecture is **server-side compute**: the server generates all ZK proofs; the wallet holds only the private key and signs BIP-340 Schnorr over `SHA256(serialize(asth) ‖ serialize(ocr))`. There is no in-browser Poseidon, no wasm-Plonky2 verifier, no in-app ZK gadget. Performance is sized for server hardware (M3 Ultra baseline; GPU / Succinct Prover Network as upgrade paths), not laptop or mobile.
 
 zkCoins is in a **closed test environment** (DEV *and* PRD). No external users, no real money, no existing user-base to migrate. Step 7 therefore **replaces** the SP1 path outright rather than running a dual backend: SP1 modules are deleted, server starts with a clean Poseidon SMT/MMR state, no Cargo feature flag, no migration helpers. This is reflected in the lower effort estimates for step 7 (2–3 d instead of 3–5 d) and the dropped risk for R5.
@@ -74,9 +85,18 @@ exhaustive history.
 - [`57cdce4`](./../../commit/57cdce4) — docs: migration research
 - [`496c652`](./../../commit/496c652) — docs: circuit specification
 
-**Test count on this branch:** 48 (all green on nightly-2025-04-15).
-Breakdown: `hash` 5 · `merkle::smt` 12 · `merkle::mmr` 8 · `types` 8 ·
-`inputs` 4 · `circuit::mmr` 4 · `circuit::smt` 7.
+**Test count on this branch:** 64 (all green on nightly-2025-04-15).
+Breakdown: `hash` 5 · `merkle::smt` 19 · `merkle::mmr` 11 · `types` 10 ·
+`inputs` 5 · `circuit::mmr` 5 · `circuit::smt` 9.
+
+**Coverage:** **100% lines, 100% functions, 100% regions** on `program-plonky2/`
+as measured by `cargo llvm-cov --fail-under-lines 100`. Test modules
+are annotated with `#[cfg_attr(coverage_nightly, coverage(off))]` so
+assertion-message-string regions inside tests don't pollute the
+production-surface measurement. Defensive `else ZERO_HASH` branches
+in the MMR were collapsed into `.get().copied().unwrap_or(...)` so the
+unreachable bounds-check shares one region with the success path
+rather than carrying its own perpetually-uncovered branch.
 
 ---
 
@@ -92,23 +112,30 @@ Breakdown: `hash` 5 · `merkle::smt` 12 · `merkle::mmr` 8 · `types` 8 ·
 **Effort:** ~1 day.
 **Files:** `program-plonky2/src/circuit/smt.rs` (extends the existing module).
 **Mirror of:** `NonInclusionProof::insert` / `verify_and_insert`.
-**Test plan:** after non-inclusion verify, also assert the computed new-root after inserting a fresh leaf matches the off-circuit `verify_and_insert` result.
+**Test plan (100% coverage gate applies):**
+  - After non-inclusion verify, also assert the computed new-root matches the off-circuit `verify_and_insert` result. Both case A (empty subtree) and case B (path-compressed neighbour).
+  - Negative: tampered new leaf or wrong padding rejected.
 **Risk:** Medium. The off-circuit insert has a variable-length default-hash padding loop driven by where `key` and `other_key` diverge. In-circuit either: (a) compute the divergence depth as a witness and conditionally hash up to `TREE_DEPTH` always, or (b) require the host to pre-pad the path to a fixed depth. Plan: (b), introduced together with the monolithic circuit's fixed-shape padding.
 
 ### Step 5 — Monolithic state-transition circuit
 **Effort:** 3–5 days.
 **Files:** `program-plonky2/src/circuit/main.rs` (new) — the equivalent of `program/src/main.rs`.
 **Scope:** assemble all gadgets into the full circuit; implement Initial vs. AccountUpdate branch via `conditionally_verify_cyclic_proof_or_dummy`; fix `MAX_IN_COINS = 8`; pin `vk` via `add_verifier_data_public_inputs`; commit `ProofData` as 16-element public output.
-**Test plan:**
+**Test plan (100% coverage gate applies):**
   - Single send (1 in-coin → 1 out-coin) — initial proof path.
   - Two sequential sends — update-proof recursion.
-  - Negative cases from SPEC §13 (overflow, wrong vk, double-spend, wrong identifier).
+  - All 11 negative cases from SPEC §13 (overflow, underflow, wrong vk, double-spend, wrong identifier, mismatched account_state_hash, etc.). Each is a separate `assert!(data.prove(pw).is_err())` test.
+  - `cargo llvm-cov` on the new circuit module must be 100% lines + branches.
 **Risk:** **High.** First real test of Plonky2 cyclic recursion with our public-input shape. The BitVM reference's toy IVC pattern is the only existing example; correctness depends on identical `circuit_digest` between build passes (two-pass `common_data_for_recursion` trick).
 
 ### Step 6 — `script-plonky2/` prover host
 **Effort:** 1–2 days.
 **Files:** new crate `script-plonky2/`.
 **Mirror of:** `script/src/lib.rs::Prover`.
+**Test plan (100% coverage gate applies):**
+  - End-to-end through `create_account` and `update_account` paths.
+  - Error path: malformed inputs rejected.
+  - `cargo llvm-cov` on the prover wrapper must be 100%.
 **Risk:** Low. Plonky2 prover API is simpler than SP1's.
 
 ### Step 7 — Server: replace SP1 with Plonky2 (no dual backend)
@@ -116,6 +143,7 @@ Breakdown: `hash` 5 · `merkle::smt` 12 · `merkle::mmr` 8 · `types` 8 ·
 **Files:** `server/src/account_server.rs`, `server/src/state.rs`, `server/src/scanner.rs`, `server/src/server.rs`. Plus delete the SP1-specific imports and replace the old `program/` and `script/` references with `program-plonky2/` + `script-plonky2/`.
 **Strategy:** closed test environment means no migration. Stop the running DEV/PRD server, delete the existing SMT/MMR data files (`smt.bin`, `mmr.bin`, `accounts.bin`, `latest_block.bin`), start the new Plonky2-based server with a fresh state. No Cargo feature flag, no compatibility shim, no parallel-deploy.
 **Key challenge:** the Schnorr commitment message stays `SHA256(serialize(asth) ‖ serialize(ocr))` per §5.4 of `MIGRATION_RESEARCH.md`, so the scanner converts Poseidon outputs to bytes before SHA256 → BIP-340 verify.
+**Test plan (100% coverage gate applies):** the same `cargo llvm-cov -p server --fail-under-lines 100` gate that already enforces this on the SP1 build carries over. Every handler, every error path, every scanner state transition that lives in the PRD-feature-set must be covered. The current SP1 coverage baseline (see README.md table) is the floor to maintain.
 **Risk:** Low. Mechanical port, no compatibility surface area.
 
 ### Step 8 — App / wallet
@@ -125,6 +153,7 @@ Breakdown: `hash` 5 · `merkle::smt` 12 · `merkle::mmr` 8 · `types` 8 ·
   - BIP-340 Schnorr signing over `SHA256(serialize(asth) ‖ serialize(ocr))` (WebCrypto's SHA256 + a secp256k1 library — no Poseidon).
   - Display of balance / send-quotes / receive-confirmations from the server API.
   - No in-app ZK proof generation, verification, or Merkle hashing.
+**Test plan (100% coverage gate applies):** same Jest/Vitest coverage gate that already applies to `zk-coins/app` (see that repo's README). Signing logic, message serialisation, API client, and error paths all covered. UI integration tests for the user loop (create account → send → receive).
 **Risk:** Low. The wallet trusts the server for ZK correctness — this is the
 explicit zkCoins architectural choice (server-side compute).
 
@@ -135,6 +164,10 @@ explicit zkCoins architectural choice (server-side compute).
   - Wallet at `dev-app.zkcoins.app` points at it.
   - Roundtrip: create account → mint → send → recipient receives.
   - Measure: cold-start proof time, warm proof time, memory usage.
+**Test plan (100% coverage gate applies for code; e2e separately):**
+  - Coverage of all server endpoints exercised by the wallet during the e2e roundtrip must already be 100% from step 7's gate; this step verifies the integration, not the unit coverage.
+  - e2e success criteria: every endpoint round-trips under realistic conditions (one happy-path traversal per route plus at least one failure path per route).
+  - Performance budget: cold-start proof ≤ 30 s, warm proof ≤ 5 s on M3 Ultra (R2 escalation trigger). Numbers ≤ these unblock the MVP; better numbers postpone GPU/Network considerations.
 **Risk:** Medium. First real exposure to the full stack under realistic load.
 
 ---

@@ -186,6 +186,7 @@ pub fn verify_smt_non_inclusion<F: RichField + Extendable<D>, const D: usize>(
     builder.connect_hashes(current, expected_root);
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +435,46 @@ mod tests {
     }
 
     /// Tampered leaf value must not be provable against an honest root.
+    #[test]
+    #[should_panic(expected = "key_bits must cover at least path.len() levels")]
+    fn smt_inclusion_short_key_bits_panics() {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let leaf_t = builder.add_virtual_hash();
+        let key_t = builder.add_virtual_hash();
+        let root_t = builder.add_virtual_hash();
+        let path_t: Vec<HashOutTarget> = (0..3).map(|_| builder.add_virtual_hash()).collect();
+        // Only 2 bits — fewer than the 3-step path.
+        let bit0 = builder.add_virtual_bool_target_safe();
+        let bit1 = builder.add_virtual_bool_target_safe();
+        verify_smt_inclusion(&mut builder, leaf_t, key_t, &[bit0, bit1], &path_t, root_t);
+    }
+
+    #[test]
+    #[should_panic(expected = "other_key_bits must cover at least path.len() levels")]
+    fn smt_non_inclusion_short_key_bits_panics() {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let key_t = builder.add_virtual_hash();
+        let other_key_t = builder.add_virtual_hash();
+        let other_value_t = builder.add_virtual_hash();
+        let root_t = builder.add_virtual_hash();
+        let default_t = builder.add_virtual_hash();
+        let path_t: Vec<HashOutTarget> = (0..3).map(|_| builder.add_virtual_hash()).collect();
+        let bit0 = builder.add_virtual_bool_target_safe();
+        let bit1 = builder.add_virtual_bool_target_safe();
+        verify_smt_non_inclusion(
+            &mut builder,
+            key_t,
+            other_key_t,
+            other_value_t,
+            &[bit0, bit1],
+            &path_t,
+            root_t,
+            default_t,
+        );
+    }
+
     #[test]
     fn smt_inclusion_tampered_leaf_fails() {
         let k0 = [0u8; 32];

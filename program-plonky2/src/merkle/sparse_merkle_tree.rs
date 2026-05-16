@@ -388,6 +388,7 @@ impl SparseMerkleTree {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,6 +549,88 @@ mod tests {
             assert!(proof.verify());
             tree.insert(key, sample_value(i as u64)).unwrap();
         }
+    }
+
+    #[test]
+    fn default_is_empty_tree() {
+        let tree = SparseMerkleTree::default();
+        assert_eq!(tree.root(), DEFAULT_HASHES[0]);
+    }
+
+    #[test]
+    fn insert_same_key_same_value_is_idempotent() {
+        let mut tree = SparseMerkleTree::new();
+        let key = [1u8; 32];
+        let value = sample_value(0);
+        assert!(tree.insert(key, value).is_ok());
+        // Re-inserting the same (key, value) is a no-op success.
+        assert!(tree.insert(key, value).is_ok());
+        assert_eq!(tree.get(&key), Some(value));
+    }
+
+    #[test]
+    fn insert_same_key_different_value_errors() {
+        let mut tree = SparseMerkleTree::new();
+        let key = [1u8; 32];
+        tree.insert(key, sample_value(0)).unwrap();
+        let err = tree.insert(key, sample_value(99));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn generate_non_inclusion_proof_errors_when_key_exists() {
+        let mut tree = SparseMerkleTree::new();
+        let key = [1u8; 32];
+        tree.insert(key, sample_value(0)).unwrap();
+        let err = tree.generate_non_inclusion_proof(key);
+        assert!(err.is_err());
+    }
+
+    /// Build a 2-leaf tree where the lookup-key lands in an empty subtree at
+    /// level 0 (case A non-inclusion). Both inserted keys share bit 0, the
+    /// lookup goes to the opposite bit-0 side which has no node at level 1
+    /// → generate_non_inclusion_proof returns case A with leaf = (lookup, default).
+    fn case_a_tree_and_proof() -> (SparseMerkleTree, NonInclusionProof, [u8; 32]) {
+        let mut tree = SparseMerkleTree::new();
+        let k0 = [0u8; 32];
+        let mut k1 = [0u8; 32];
+        k1[0] = 0x40; // bit 1 = 1, bit 0 = 0
+        tree.insert(k0, sample_value(0)).unwrap();
+        tree.insert(k1, sample_value(1)).unwrap();
+        let lookup = {
+            let mut k = [0u8; 32];
+            k[0] = 0x80; // bit 0 = 1
+            k
+        };
+        let nip = tree.generate_non_inclusion_proof(lookup).unwrap();
+        assert_eq!(nip.key, nip.leaf.0, "must be case A for this fixture");
+        (tree, nip, lookup)
+    }
+
+    #[test]
+    fn non_inclusion_verify_rejects_wrong_default_value_in_case_a() {
+        let (_, mut nip, _) = case_a_tree_and_proof();
+        // Mutate other_value so it no longer matches DEFAULT_HASHES.
+        nip.leaf.1 = sample_value(99);
+        assert!(!nip.verify());
+    }
+
+    #[test]
+    fn verify_and_insert_rejects_invalid_proof() {
+        let (_, mut nip, _) = case_a_tree_and_proof();
+        nip.leaf.1 = sample_value(99);
+        let err = nip.verify_and_insert(sample_value(7));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn non_inclusion_insert_rejects_case_a_with_wrong_default() {
+        // Call insert() directly (without verify) — the case-A branch checks
+        // the default and returns Err if mismatched.
+        let (_, mut nip, _) = case_a_tree_and_proof();
+        nip.leaf.1 = sample_value(99);
+        let err = nip.insert(sample_value(7));
+        assert!(err.is_err());
     }
 
     /// Regression guard against the zero-state Poseidon collision: if

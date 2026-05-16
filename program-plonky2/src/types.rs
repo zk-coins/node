@@ -191,6 +191,7 @@ impl ProofData {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +305,24 @@ mod tests {
             *MINTING_ADDRESS,
             hash_bytes(b"zkcoins:minting-address:placeholder:v1")
         );
+    }
+
+    #[test]
+    fn coin_template_new_carries_fields() {
+        let recipient = hash_bytes(b"r");
+        let template = CoinTemplate::new(recipient, 42);
+        assert_eq!(template.recipient, recipient);
+        assert_eq!(template.amount, 42);
+    }
+
+    #[test]
+    fn coin_new_from_template_preserves_recipient_and_amount() {
+        let recipient = hash_bytes(b"r");
+        let template = CoinTemplate::new(recipient, 17);
+        let id = hash_bytes(b"id");
+        let coin = Coin::new(template, id);
+        assert_eq!(coin.recipient, recipient);
+        assert_eq!(coin.amount, 17);
+        assert_eq!(coin.identifier, id);
     }
 }

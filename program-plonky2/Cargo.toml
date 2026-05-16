@@ -13,3 +13,10 @@ edition = "2021"
 [dependencies]
 plonky2 = "1.1.0"
 anyhow = "1.0"
+
+[lints.rust]
+# Register the cfg key used by `cargo-llvm-cov`'s nightly-only
+# `#[cfg_attr(coverage_nightly, coverage(off))]` annotations on test
+# modules. Suppresses the "unexpected cfg condition" warning when
+# building outside the coverage tool.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
