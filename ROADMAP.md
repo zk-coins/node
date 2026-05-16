@@ -30,14 +30,16 @@ Source documents:
 | 4d | Port `ProgramInputs` + `CommitmentMerkleProofs` types | ✅ done | — | — |
 | 5 | Monolithic state-transition circuit (recursion, padding, vk-pin) | ⏳ todo | **3–5 d** | **high** (vk-pin correctness, first real recursion test) |
 | 6 | `script-plonky2/` host-side prover wrapper | ⏳ todo | 1–2 d | low |
-| 7 | Server: rewire `account_server` + `state` + `scanner` to Poseidon | ⏳ todo | **3–5 d** | medium (Schnorr boundary, scanner SMT key) |
+| 7 | Server: **replace** SP1 path with Plonky2 (no feature flag, no dual backend) | ⏳ todo | 2–3 d | low (closed test env — no migration logic needed) |
 | 8 | App / wallet: Schnorr-signing boundary, server-API integration | ⏳ todo | 1–2 d | low (server-side compute architecture — no wasm-crypto migration) |
 | 9 | DEV deployment + end-to-end roundtrip on signet | ⏳ todo | 3–5 d | medium |
 | — | Pre-mainnet blockers: D2/D10 (recipient hiding), D7 (reorg safety), D8 (per-coin nullifier-accum) | ⏳ todo | **+2–3 weeks** | high (real protocol redesign) |
 
-**MVP total (steps 1–9): ~3–5 weeks full-time** assuming no major surprises in step 5 (Plonky2 recursion vk-pinning).
+**MVP total (steps 1–9): ~2.5–4 weeks full-time** assuming no major surprises in step 5 (Plonky2 recursion vk-pinning).
 
 The architecture is **server-side compute**: the server generates all ZK proofs; the wallet holds only the private key and signs BIP-340 Schnorr over `SHA256(serialize(asth) ‖ serialize(ocr))`. There is no in-browser Poseidon, no wasm-Plonky2 verifier, no in-app ZK gadget. Performance is sized for server hardware (M3 Ultra baseline; GPU / Succinct Prover Network as upgrade paths), not laptop or mobile.
+
+zkCoins is in a **closed test environment** (DEV *and* PRD). No external users, no real money, no existing user-base to migrate. Step 7 therefore **replaces** the SP1 path outright rather than running a dual backend: SP1 modules are deleted, server starts with a clean Poseidon SMT/MMR state, no Cargo feature flag, no migration helpers. This is reflected in the lower effort estimates for step 7 (2–3 d instead of 3–5 d) and the dropped risk for R5.
 
 Pre-mainnet hardening adds another 2–3 weeks on top.
 
@@ -96,11 +98,12 @@ Commit refs (newest first):
 **Mirror of:** `script/src/lib.rs::Prover`.
 **Risk:** Low. Plonky2 prover API is simpler than SP1's.
 
-### Step 7 — Server rewire
-**Effort:** 3–5 days.
-**Files:** `server/src/account_server.rs`, `server/src/state.rs`, `server/src/scanner.rs`, `server/src/server.rs` — all need Poseidon-side variants behind a Cargo feature flag.
+### Step 7 — Server: replace SP1 with Plonky2 (no dual backend)
+**Effort:** 2–3 days.
+**Files:** `server/src/account_server.rs`, `server/src/state.rs`, `server/src/scanner.rs`, `server/src/server.rs`. Plus delete the SP1-specific imports and replace the old `program/` and `script/` references with `program-plonky2/` + `script-plonky2/`.
+**Strategy:** closed test environment means no migration. Stop the running DEV/PRD server, delete the existing SMT/MMR data files (`smt.bin`, `mmr.bin`, `accounts.bin`, `latest_block.bin`), start the new Plonky2-based server with a fresh state. No Cargo feature flag, no compatibility shim, no parallel-deploy.
 **Key challenge:** the Schnorr commitment message stays `SHA256(serialize(asth) ‖ serialize(ocr))` per §5.4 of `MIGRATION_RESEARCH.md`, so the scanner converts Poseidon outputs to bytes before SHA256 → BIP-340 verify.
-**Risk:** Medium. Many touchpoints, but each one is mechanical.
+**Risk:** Low. Mechanical port, no compatibility surface area.
 
 ### Step 8 — App / wallet
 **Effort:** 1–2 days.
@@ -164,9 +167,9 @@ Was: "Wasm Poseidon too slow." No longer applicable — the wallet performs no P
 **Mitigation:** Decide before mainnet whether to ship the MVP variant first (linkable recipients, documented) and harden later, or harden now. Currently planning the former (per §5.5 in MIGRATION_RESEARCH).
 **Trigger to escalate:** if regulatory or PR feedback flags linkability before MVP launch.
 
-### R5 — SP1 stays in the workspace forever (low)
-**What can go wrong:** We don't fully cut over and end up maintaining both backends indefinitely.
-**Mitigation:** Step 7 introduces a Cargo feature flag — but the goal is to delete the SP1 path once Plonky2 is in DEV. Schedule the deletion as a follow-up PR after step 9 succeeds.
+### R5 — SP1 stays in the workspace forever (mitigated by closed-env strategy)
+**What was the worry:** dual-backend Cargo feature flag would let SP1 linger because there's no forcing event to remove it.
+**Mitigation in place:** zkCoins is in a closed test environment (DEV + PRD), so step 7 doesn't introduce a feature flag — it deletes the SP1 path outright as part of the rewire. There is no parallel-backend phase, therefore no "follow-up cleanup PR" needed. Risk reduced from medium to low.
 
 ### R6 — Plonky2 itself becomes the new dead-end (medium, long horizon)
 **What can go wrong:** Plonky2 is in maintenance mode at 0xPolygonZero. Plonky3 is where active development goes (new gate sets, BabyBear field, Poseidon2 hash, GPU paths). If we ignore Plonky3 indefinitely we end up where SP1 left us — on a stack with no upstream momentum.
