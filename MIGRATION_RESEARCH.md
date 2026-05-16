@@ -186,7 +186,7 @@ These must be resolved before Plonky2 implementation starts; they are not Plonky
 Assuming the answer to §5.1 is "zkCoins MVP variant for now, paper-fidelity later":
 
 1. **Reconcile `SPEC.md` with this document.** Add a "Divergences from eprint 2025/068" section listing D1–D11 with rationale for each.
-2. **New crate `program-plonky2/`** parallel to `program/`. Cargo features `sp1-backend` (default for now) and `plonky2-backend` so we can build both during the transition.
+2. **New crate `program-plonky2/`** parallel to `program/`. **Standalone, not a workspace member** — plonky2 requires nightly Rust (`feature(specialization)`) while the rest of the workspace is pinned to stable 1.81.0 for SP1 compatibility. Build with `(cd program-plonky2 && cargo build)`; the crate's own `rust-toolchain.toml` selects nightly automatically. CI integration is deferred until the circuit code actually exists. ✅ scaffolding landed on this branch.
 3. **Port `SparseMerkleTree` and `MerkleMountainRange` to Poseidon.** Keep API; replace `hash_concat` (and rename to `hash_node`). Re-run existing 12 tests.
 4. **Implement the Plonky2 circuit gadgets.** Smallest first: Poseidon-hash gadget (already in plonky2), then SMT non-inclusion-and-insert gadget, then MMR-append gadget, then SHA256 gadget for Schnorr message hashing.
 5. **Build the monolithic `program-plonky2/src/lib.rs` circuit.** Port `program/src/main.rs` assertion-by-assertion. Use `conditionally_verify_cyclic_proof_or_dummy` for the Initial vs. Update branch. Pad `in_coins` to `MAX_IN_COINS`.

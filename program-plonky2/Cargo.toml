@@ -1,0 +1,15 @@
+[package]
+name = "zkcoins-program-plonky2"
+version = "0.0.1"
+edition = "2021"
+
+# Standalone crate, intentionally excluded from the parent workspace.
+# Plonky2 requires nightly Rust (feature(specialization)); the rest of
+# the workspace is pinned to stable 1.81.0 for SP1 compatibility.
+# Build:
+#   (cd program-plonky2 && cargo build)
+# (uses rust-toolchain.toml in this directory)
+
+[dependencies]
+plonky2 = "1.1.0"
+anyhow = "1.0"
