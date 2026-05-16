@@ -24,6 +24,7 @@ pub const D: usize = 2;
 
 pub mod hash;
 pub mod merkle;
+pub mod types;
 
 #[cfg(test)]
 mod tests {
