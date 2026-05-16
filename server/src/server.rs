@@ -625,14 +625,30 @@ async fn mint_handler(
             );
             println!("Commitment data hex: {}", hex::encode(&commitment_data));
 
-            // This await is now safe because no locks are held across it
+            // This await is now safe because no locks are held across it.
+            //
+            // The broadcast can fail for benign reasons in DEV environments
+            // (e.g. the Mutinynet publisher wallet has no UTXOs). When the
+            // operator opts in via `DEV_SKIP_BROADCAST_FAILURE=true`, we
+            // log the error and continue: the recipient still gets the
+            // server-side credit so E2E tests can proceed. The on-chain
+            // commitment is missing — subsequent mints / sends that depend
+            // on the SMT having this entry will fail until state is wiped.
+            //
+            // NEVER set this in PRD. On the default code path (env var
+            // unset / != "true"), the handler returns 503 as before.
             if let Err(err) =
                 create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG).await
             {
                 eprintln!("Error broadcasting mint inscription: {}", err);
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(SendCoinResponse::default()),
+                if std::env::var("DEV_SKIP_BROADCAST_FAILURE").unwrap_or_default() != "true" {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(SendCoinResponse::default()),
+                    );
+                }
+                eprintln!(
+                    "DEV_SKIP_BROADCAST_FAILURE=true — continuing without on-chain commitment"
                 );
             }
             {
