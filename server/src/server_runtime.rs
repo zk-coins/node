@@ -74,13 +74,20 @@ pub async fn start_rest_server(
         // Persist it in a tiny sibling file (4 bytes LE u32) next to
         // accounts.bin. Read here, written in mint_handler after every
         // successful increment.
-        let minting_pubkeys_path = format!(
-            "{}/minting_num_pubkeys.bin",
-            std::path::Path::new(&accounts_path)
-                .parent()
-                .unwrap_or(std::path::Path::new("."))
-                .display()
-        );
+        // accounts_path is typically a relative path like "accounts.bin"
+        // (cwd-relative). Path::parent() returns Some("") for that, and
+        // `format!("{}/minting_num_pubkeys.bin", "")` gives the absolute
+        // path `/minting_num_pubkeys.bin` (filesystem root), not a
+        // sibling of accounts.bin. Resolve to "." in that case so the
+        // counter lands next to accounts.bin inside the data volume.
+        let minting_pubkeys_path = {
+            let parent = std::path::Path::new(&accounts_path).parent();
+            let dir = match parent {
+                Some(p) if !p.as_os_str().is_empty() => p.display().to_string(),
+                _ => ".".to_string(),
+            };
+            format!("{}/minting_num_pubkeys.bin", dir)
+        };
         if let Ok(bytes) = std::fs::read(&minting_pubkeys_path) {
             if bytes.len() == 4 {
                 let n = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);

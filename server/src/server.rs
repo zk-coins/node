@@ -569,13 +569,20 @@ async fn mint_handler(
                     // ClientAccount aligned with the on-disk server-side
                     // minting_account.proof. See the corresponding load in
                     // server_runtime.rs for the matching half.
-                    let path = format!(
-                        "{}/minting_num_pubkeys.bin",
-                        std::path::Path::new(&state.accounts_path)
-                            .parent()
-                            .unwrap_or(std::path::Path::new("."))
-                            .display()
-                    );
+                    //
+                    // Same path-resolution logic as in server_runtime.rs:
+                    // a relative accounts_path like "accounts.bin" has an
+                    // empty parent; in that case fall back to "." so the
+                    // counter lands next to accounts.bin, not at filesystem
+                    // root.
+                    let path = {
+                        let parent = std::path::Path::new(&state.accounts_path).parent();
+                        let dir = match parent {
+                            Some(p) if !p.as_os_str().is_empty() => p.display().to_string(),
+                            _ => ".".to_string(),
+                        };
+                        format!("{}/minting_num_pubkeys.bin", dir)
+                    };
                     if let Err(e) =
                         crate::atomic_write(&path, &minting_account_guard.num_pubkeys.to_le_bytes())
                     {
