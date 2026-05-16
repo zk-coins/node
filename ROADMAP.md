@@ -15,6 +15,9 @@ Source documents:
 
 ## Status at a Glance
 
+Legend: ✅ done · 🟡 in progress · ⏳ todo. Effort estimates are
+person-days at full focus; multiply for part-time work.
+
 | # | Step | Status | Effort | Risk |
 | - | ---- | ------ | ------ | ---- |
 | 1 | Reconcile `SPEC.md` with paper divergences | ✅ done | — | — |
@@ -47,23 +50,33 @@ Pre-mainnet hardening adds another 2–3 weeks on top.
 
 ## Done
 
-Commit refs (newest first):
+Commit refs (newest first). Doc-only commits to ROADMAP / SPEC /
+MIGRATION_RESEARCH / CONTRIBUTING are not individually listed once
+they merely correct or extend this file — see `git log` for the
+exhaustive history.
 
-- *(next commit)* — feat: port `ProgramInputs`, `CommitmentMerkleProofs`, `ProofType` off-circuit types with verify_commitment + verify_previous_root (4 tests + e2e SMT+MMR roundtrip)
-- [`9ba03bc`](./../../commit/9ba03bc) — feat: SMT non-inclusion verify gadget (case A empty-subtree, case B path-compressed-neighbour, 3 tests + 1 negative)
-- [`8002ce3`](./../../commit/8002ce3) — feat: SMT inclusion gadget + circuit/util shared helpers (4 tests; bit0/bit7 divergence, 3-leaf, tampered-leaf negative)
-- [`15d45c9`](./../../commit/15d45c9) — feat: MMR inclusion gadget (4 circuit tests, prove+verify pass)
-- [`e1af850`](./../../commit/e1af850) — feat: AccountState/Coin/ProofData/calculate_coin_identifier (field-element layouts)
+- [`401f813`](./../../commit/401f813) — docs(ROADMAP): closed test env — replace SP1, don't migrate
+- [`cd94f85`](./../../commit/cd94f85) — docs: CONTRIBUTING + §7 Lessons Learned (8 entries)
+- [`4cf98ac`](./../../commit/4cf98ac) — docs(ROADMAP): Plonky3 as post-MVP path; document rejected alternative
+- [`1967087`](./../../commit/1967087) — docs(ROADMAP): server-side compute, drop wasm Poseidon
+- [`2fed8f0`](./../../commit/2fed8f0) — feat: port `ProgramInputs` + `CommitmentMerkleProofs` (4 tests)
+- [`9ba03bc`](./../../commit/9ba03bc) — feat: SMT non-inclusion verify gadget (3 tests + 1 negative)
+- [`8002ce3`](./../../commit/8002ce3) — feat: SMT inclusion gadget + `circuit/util` (4 tests)
+- [`5c92a62`](./../../commit/5c92a62) — docs: initial ROADMAP
+- [`15d45c9`](./../../commit/15d45c9) — feat: MMR inclusion gadget (4 tests)
+- [`e1af850`](./../../commit/e1af850) — feat: AccountState/Coin/ProofData (8 tests)
 - [`c28e279`](./../../commit/c28e279) — feat: MMR to Poseidon (8 tests)
-- [`6215009`](./../../commit/6215009) — feat: SMT to Poseidon + chase-loop zero-state collision fix (11 tests, incl. regression guard)
+- [`6215009`](./../../commit/6215009) — feat: SMT to Poseidon + zero-state collision fix (12 tests)
 - [`984580f`](./../../commit/984580f) — feat: Poseidon hash module (5 tests)
 - [`8fa6a92`](./../../commit/8fa6a92) — chore: toolchain pin + lock §5 decisions
 - [`72c3b78`](./../../commit/72c3b78) — feat: scaffold `program-plonky2/` standalone crate
-- [`049ec3e`](./../../commit/049ec3e) — docs: reconcile SPEC with paper, add §15 divergences
-- [`57cdce4`](./../../commit/57cdce4) — docs: add migration research
-- [`496c652`](./../../commit/496c652) — docs: add circuit specification
+- [`049ec3e`](./../../commit/049ec3e) — docs: SPEC reconciled with paper, §15 divergences
+- [`57cdce4`](./../../commit/57cdce4) — docs: migration research
+- [`496c652`](./../../commit/496c652) — docs: circuit specification
 
-**Test count on this branch:** 37 (all green on nightly-2025-04-15).
+**Test count on this branch:** 48 (all green on nightly-2025-04-15).
+Breakdown: `hash` 5 · `merkle::smt` 12 · `merkle::mmr` 8 · `types` 8 ·
+`inputs` 4 · `circuit::mmr` 4 · `circuit::smt` 7.
 
 ---
 

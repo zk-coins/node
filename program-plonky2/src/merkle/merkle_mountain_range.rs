@@ -16,6 +16,11 @@ use crate::hash::{hash_concat, HashDigest, ZERO_HASH};
 
 pub type MerklePath = Vec<HashDigest>;
 
+/// Inclusion proof for a leaf in an MMR.
+///
+/// `index` is the leaf's position in the bottom level (the order it was
+/// appended). `path` is the sibling hash at each level walking up from the
+/// leaf to the level just below the root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MMRProof {
     pub index: u32,

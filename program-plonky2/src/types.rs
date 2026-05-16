@@ -26,9 +26,9 @@ pub type Address = HashDigest;
 
 /// Minting account address. Currently a placeholder derived from a
 /// domain-separated tag — the server will replace this with the actual
-/// Poseidon hash of the live minting public key when the host wires the
-/// Plonky2 backend in. Tracked under `program-plonky2/TODO.md` (D11 in the
-/// migration research).
+/// Poseidon hash of the live minting public key as part of ROADMAP step 7
+/// ("Server: replace SP1 with Plonky2"). See SPEC.md §12.1 and divergence
+/// D11 in MIGRATION_RESEARCH.md §3.
 pub static MINTING_ADDRESS: std::sync::LazyLock<HashDigest> =
     std::sync::LazyLock::new(|| hash_bytes(b"zkcoins:minting-address:placeholder:v1"));
 

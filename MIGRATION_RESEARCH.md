@@ -195,21 +195,18 @@ Hash-function boundary visualisation:
 
 ---
 
-## 6. Recommended Sequencing
+## 6. Sequencing — moved to ROADMAP.md
 
-Assuming the answer to §5.1 is "zkCoins MVP variant for now, paper-fidelity later":
+The original 9-step strategic outline that lived here was superseded by
+the detailed 16-row breakdown in [`ROADMAP.md`](./ROADMAP.md) once
+implementation started. The ROADMAP is now authoritative for the
+execution plan (status, effort, files, risks).
 
-1. **Reconcile `SPEC.md` with this document.** Add a "Divergences from eprint 2025/068" section listing D1–D11 with rationale for each.
-2. **New crate `program-plonky2/`** parallel to `program/`. **Standalone, not a workspace member** — plonky2 requires nightly Rust (`feature(specialization)`) while the rest of the workspace is pinned to stable 1.81.0 for SP1 compatibility. Build with `(cd program-plonky2 && cargo build)`; the crate's own `rust-toolchain.toml` selects nightly automatically. CI integration is deferred until the circuit code actually exists. ✅ scaffolding landed on this branch.
-3. **Port `SparseMerkleTree` and `MerkleMountainRange` to Poseidon.** Keep API; replace `hash_concat` (and rename to `hash_node`). Re-run existing 12 tests.
-4. **Implement the Plonky2 circuit gadgets.** Smallest first: Poseidon-hash gadget (already in plonky2), then SMT non-inclusion-and-insert gadget, then MMR-append gadget, then SHA256 gadget for Schnorr message hashing.
-5. **Build the monolithic `program-plonky2/src/lib.rs` circuit.** Port `program/src/main.rs` assertion-by-assertion. Use `conditionally_verify_cyclic_proof_or_dummy` for the Initial vs. Update branch. Pad `in_coins` to `MAX_IN_COINS`.
-6. **Wire the new prover into `script/src/lib.rs`.** Behind the cargo feature flag.
-7. **Update `server/src/account_server.rs`** to call the new prover for sends. The on-chain commitment format stays unchanged for v1 (still single Schnorr over `H(asth ‖ ocr)`), so scanner + state don't need to change.
-8. **Run the test suite from §13 of SPEC.md + the paper-derived tests from §3 of this doc.** All must pass before merging into `develop`.
-9. **Deploy `:beta` to DEV** and verify the wallet round-trips a real send within 1 second of click → proof returned.
+Key adjustments made since the original outline:
 
-Steps 3-5 are the bulk of the work; everything else is wiring.
+- **Step ordering of gadgets** (was: hash → SMT non-inclusion+insert → MMR-append → SHA256). Actual: MMR inclusion → SMT inclusion → SMT non-inclusion verify. The original list mentioned an MMR-append and a SHA256 gadget which turned out to not be needed (MMR is built off-circuit by the scanner; SHA256 lives at the Bitcoin-signing boundary, not in-circuit — see §5.4).
+- **No Cargo feature flag for dual backend.** The closed-test-environment decision means step 7 replaces SP1 with Plonky2 outright (see ROADMAP step 7).
+- **Server scanner + state DO change** (Poseidon SMT/MMR, not SHA256). Only the on-chain commitment *format* — a single Schnorr inscription with txid prefix `4242` — stays unchanged.
 
 ---
 
@@ -247,12 +244,20 @@ for real Poseidon-derived keys hitting that exact image) collides with
 sibling and propagated leaf-hash as equal and picks the wrong path.
 
 **Fix:** seed `DEFAULT_HASHES[TREE_DEPTH]` with a domain-separated
-non-zero value:
+non-zero value (verbatim from `program-plonky2/src/merkle/sparse_merkle_tree.rs`):
 
 ```rust
 const EMPTY_LEAF_TAG: &[u8] = b"zkcoins:smt:empty-leaf:v1";
-// ...
-default_hashes[depth] = hash_bytes(EMPTY_LEAF_TAG);
+
+pub static DEFAULT_HASHES: LazyLock<Vec<HashDigest>> = LazyLock::new(|| {
+    let depth = TREE_DEPTH;
+    let empty_leaf = hash_bytes(EMPTY_LEAF_TAG);
+    let mut default_hashes = vec![empty_leaf; depth + 1];
+    for level in (0..depth).rev() {
+        default_hashes[level] = hash_concat(&default_hashes[level + 1], &default_hashes[level + 1]);
+    }
+    default_hashes
+});
 ```
 
 **Regression guard:** `leaf_hash_never_collides_with_defaults` in
