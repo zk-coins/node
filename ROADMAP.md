@@ -45,7 +45,7 @@ person-days at full focus; multiply for part-time work.
 For this project, an "MVP" is **minimum viable** in two simultaneous senses, both non-negotiable:
 
 1. **Minimal feature surface.** Only what's needed for one complete user loop (create account → mint → send → receive → balance updates). No feature-bloat. If a capability is not on the critical path for that loop, it does not enter the MVP — see SPEC.md §15's deferred items.
-2. **100% test coverage on the activated surface.** Same standard as the SP1/SHA256 codebase (see README.md "Contributing"). Code that is gated OFF in the PRD build (Cargo features like `address-list`, `faucet`, `usernames`, `lnurl`) is excluded; everything else MUST be tested. `cargo llvm-cov --fail-under-lines 100` is the gate.
+2. **100% test coverage on the activated surface.** Same standard as the SP1/SHA256 codebase (see README.md "Contributing"). Code that is gated OFF in the PRD build (Cargo features like `address-list`, `faucet`, `usernames`, `lnurl`) is excluded; everything else MUST be tested. `cargo llvm-cov --fail-under-lines 100 -- --test-threads=1` is the gate (run from inside the affected crate; `--test-threads=1` keeps circuit-test memory peaks predictable on the M3 Ultra).
 
 These two requirements are not in tension — the first reduces the surface, the second keeps what remains clean. "MVP" is never an excuse to skip tests; it's an excuse to skip *features*. Negative tests (asserting that invalid witnesses are rejected) are mandatory for every gadget and every state-transition path.
 
@@ -68,6 +68,9 @@ MIGRATION_RESEARCH / CONTRIBUTING are not individually listed once
 they merely correct or extend this file — see `git log` for the
 exhaustive history.
 
+- [`79bd39e`](./../../commit/79bd39e) — docs: hardware target — M3 Ultra CPU-only, no GPU, no cloud prover
+- [`e14d9df`](./../../commit/e14d9df) — feat: 100% test coverage on program-plonky2 (16 new tests + MMR refactor + coverage(off) annotations)
+- [`2b6f2cb`](./../../commit/2b6f2cb) — docs: consistency review pass — fix stale counts, add glossary, reconcile §6
 - [`401f813`](./../../commit/401f813) — docs(ROADMAP): closed test env — replace SP1, don't migrate
 - [`cd94f85`](./../../commit/cd94f85) — docs: CONTRIBUTING + §7 Lessons Learned (8 entries)
 - [`4cf98ac`](./../../commit/4cf98ac) — docs(ROADMAP): Plonky3 as post-MVP path; document rejected alternative
@@ -88,8 +91,8 @@ exhaustive history.
 - [`496c652`](./../../commit/496c652) — docs: circuit specification
 
 **Test count on this branch:** 64 (all green on nightly-2025-04-15).
-Breakdown: `hash` 5 · `merkle::smt` 19 · `merkle::mmr` 11 · `types` 10 ·
-`inputs` 5 · `circuit::mmr` 5 · `circuit::smt` 9.
+Breakdown: `prelude` 1 · `hash` 5 · `merkle::smt` 18 · `merkle::mmr` 11 ·
+`types` 10 · `inputs` 5 · `circuit::mmr` 5 · `circuit::smt` 9.
 
 **Coverage:** **100% lines, 100% functions, 100% regions** on `program-plonky2/`
 as measured by `cargo llvm-cov --fail-under-lines 100`. Test modules
