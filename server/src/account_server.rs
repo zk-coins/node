@@ -334,8 +334,18 @@ impl AccountServer {
 
         let received_proofs: Vec<_> = account.coin_queue.iter().map(|x| x.proof.clone()).collect();
 
+        // When DEV_SKIP_BROADCAST_FAILURE is set, the SMT is missing
+        // entries that should have been written by previous mints (their
+        // on-chain commitment never landed because the publisher wallet
+        // was empty). Drop the existing account.proof on the floor and
+        // take the create_account branch instead — yields a fresh proof
+        // that doesn't depend on get_merkle_proofs ever finding the prev
+        // pubkey. The cost is that the previous commitment history is
+        // discarded; for DEV testing that's an acceptable trade. Same
+        // "NEVER set in PRD" caveat as the broadcast bypass.
+        let dev_skip = std::env::var("DEV_SKIP_BROADCAST_FAILURE").unwrap_or_default() == "true";
         let proof = match &account.proof {
-            Some(account_proof) => {
+            Some(account_proof) if !dev_skip => {
                 let account_commitment_public_key = prev_commitment_pubkey
                     .ok_or("prev_commitment_pubkey required for account update")?;
                 let merkle_proofs = Self::get_merkle_proofs(
@@ -351,7 +361,7 @@ impl AccountServer {
                     received_proofs,
                 )?
             }
-            None => self
+            _ => self
                 .prover
                 .create_account(proof_hints_builder, received_proofs)?,
         };
