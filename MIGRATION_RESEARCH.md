@@ -740,6 +740,43 @@ non-inclusion + insert this is ~512 Poseidon hashes per slot at
 `TREE_DEPTH = 256`. Bumping `MAX_IN_COINS` from 1 to 8 grows the
 circuit by ~3500 hashes — measure before committing to a target.
 
+### 7.18 `add_virtual_target` requires explicit witnessing; prefer `split_le` — **codified**
+
+**Discovered:** stage-5d-next initially implemented the balance
+overflow check by declaring `new_lo`, `new_hi`, `carry`, `overflow`
+as `add_virtual_target()` / `add_virtual_bool_target_safe()`
+targets, range-checking them, and `connect()`ing the recomposed
+value to the precomputed `sum`. The test failed at proof generation
+with `22 generators weren't run` — Plonky2 had no way to fill the
+virtual targets.
+
+**Root cause:** `add_virtual_*` reserves a witness slot but does NOT
+attach a generator. The prover must explicitly populate every
+virtual target via `pw.set_target` / `pw.set_bool_target`. If the
+target's value is determined by other witnesses, the prover would
+have to recompute it off-circuit and supply it manually — fragile
+and error-prone.
+
+**Fix:** use `builder.split_le(t, n_bits)`. It internally adds a
+`BaseSumGate` whose generator decomposes `t` into `n_bits` bits at
+prove time, and constrains each bit to be `{0, 1}` plus the
+recomposition `t == Σ bit[i] * 2^i`. The bits come back as
+`BoolTarget`s the caller can use, but no explicit witnessing is
+needed — given `t`, the bits are uniquely determined.
+
+For the balance check, `sum_lo ∈ [0, 2^33)` decomposes into 33 bits;
+`bits[32]` is the carry; `new_lo = sum_lo - 2^32 * carry` is the
+low 32 bits and stays in range by construction. Same pattern for
+the hi limb with an `assert_zero(overflow)` at the top.
+
+**Rule of thumb:** if a target's value is *uniquely determined* by
+other targets (low/high decomposition, range checks, comparisons),
+look for a Plonky2 gate that ships its own generator
+(`split_le`, `range_check`, `add_many`, `arithmetic` family).
+Reserve `add_virtual_*` for prover-driven witnesses (e.g. real
+secret-key inputs, side channels, off-circuit results that you must
+trust the prover for).
+
 ---
 
 ## 8. Local Artifacts

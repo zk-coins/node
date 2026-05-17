@@ -69,7 +69,8 @@ MIGRATION_RESEARCH / CONTRIBUTING are not individually listed once
 they merely correct or extend this file — see `git log` for the
 exhaustive history.
 
-- (next commit) — feat: stage 5d (minimal) + 5e (partial) — in-coin slot processing for coin_history + four SPEC §13 negative tests. 5d adds `MAX_IN_COINS = 1` const, `InCoinSlotTargets` per slot (`active`, `coin_identifier`, 256-sibling `nip_path`), per-slot SMT non-inclusion + insert into `coin_history_root` masked by `active`, new `prove_initial_with_in_coins` / `prove_account_update_with_in_coins` wrappers, and 5 tests (1 positive + 1 negative + 3 panic guards). 5e adds 4 negative tests against the existing 5c+ predicates: tampered MMR (d) path, tampered MMR (e) path, wrong commitment_root_mmr_sibling, wrong history_root. Source-side checks for in-coins (recursive verify, source.output_coins_root SMT inclusion, source CommitmentMerkleProofs) and `apply_coin` semantics (recipient + balance + overflow) DEFERRED to stage 5d+.
+- (next commit) — feat: stage 5d-next — apply_coin (recipient + balance + overflow). Per-slot witnesses extended with `coin_recipient`, `coin_amount_lo`, `coin_amount_hi`. Active slots assert `coin_recipient == account.owner` and `balance += coin_amount` with overflow check via `split_le(sum, 33)`. Running balance threaded through `MAX_IN_COINS` slots; final balance fed to a second Poseidon hash for the public `ProofData.account_state_hash`. New tests: positive (1 active in-coin, balance increases by 42, final hash matches off-circuit `apply_coin`); negatives (wrong recipient rejected, overflow rejected).
+- [`7db3c29`](./../../commit/7db3c29) — feat: stage 5d (minimal) + 5e (partial) — in-coin slot processing for coin_history + four SPEC §13 negative tests. 5d adds `MAX_IN_COINS = 1` const, `InCoinSlotTargets` per slot (`active`, `coin_identifier`, 256-sibling `nip_path`), per-slot SMT non-inclusion + insert into `coin_history_root` masked by `active`, new `prove_initial_with_in_coins` / `prove_account_update_with_in_coins` wrappers, and 5 tests (1 positive + 1 negative + 3 panic guards). 5e adds 4 negative tests against the existing 5c+ predicates.
 - [`2ce36ce`](./../../commit/2ce36ce) — test: cover assert_eq panic messages in set_cmp_witness (3 should_panic tests restoring 100% line coverage after 5c+)
 - [`4bc5f2f`](./../../commit/4bc5f2f) — feat: stage 5c+ — `CommitmentMerkleProofs` in-circuit (SPEC §8 (c)(d)(e); fixed-shape SMT inclusion at `TREE_DEPTH = 256` + 2× MMR inclusion at `MMR_PROOF_PATH_LEN = 31`; new `MMR_MAX_DEPTH = 32` const + `MMRProof::extend_to(depth)` + `MerkleMountainRange::root_extended(depth)` off-circuit helpers; new `select_hash` masking pattern so every constraint fires only when `condition = true`; `dummy_cmp()` placeholder used by `prove_initial` to populate the unused fields; tests: positive bootstrap chain (Init→Update with full CommitmentMerkleProofs verify) plus negatives for (b), (c), (d).)
 - [`4f317fe`](./../../commit/4f317fe) — refactor: SMT redesign to uncompressed fixed-256 paths (off-circuit `InclusionProof` / `NonInclusionProof` always carry exactly `TREE_DEPTH = 256` siblings; path compression removed from `insert` and proof generation; `NonInclusionProof.leaf` field dropped — non-inclusion now witnesses the empty-leaf default at the depth-256 slot; in-circuit `verify_smt_inclusion` / `verify_smt_non_inclusion` / `verify_smt_insert` reduced to a single `hash_up_full_path` engine; case A/B branch and `extension` parameter gone.)
@@ -99,10 +100,10 @@ exhaustive history.
 - [`57cdce4`](./../../commit/57cdce4) — docs: migration research
 - [`496c652`](./../../commit/496c652) — docs: circuit specification
 
-**Test count on this branch:** 90 (all green on nightly-2025-04-15).
+**Test count on this branch:** 92 (all green on nightly-2025-04-15).
 Breakdown: `prelude` 1 · `hash` 5 · `merkle::smt` 19 · `merkle::mmr` 14 ·
 `types` 10 · `inputs` 5 · `circuit::mmr` 5 · `circuit::smt` 12 ·
-`circuit::main` 19.
+`circuit::main` 21.
 
 **Coverage:** **100% lines, 100% functions, 100% regions** on `program-plonky2/`
 as measured by `cargo llvm-cov --fail-under-lines 100`. Test modules
@@ -177,30 +178,26 @@ stages so each lands as its own reviewable commit on the branch):
   path rejected; 3 panic guards (`nip_path` length, slot count for
   `prove_initial_with_in_coins`, slot count for
   `prove_account_update_with_in_coins`).
-- **5d-next — apply_coin semantics** ⏳. Add per-slot
-  `coin_recipient: HashOutTarget` + `coin_amount_lo` + `coin_amount_hi`
-  witnesses. Per slot, masked by `active`:
-  - **Recipient check:** `condition * (coin_recipient.elements[i] -
-    account.owner.elements[i]) == 0` for each of 4 elements
-    (already-masked form: `active * (recipient[i] - owner[i]) == 0`).
-  - **Balance addition with overflow check:** 32-bit limb add. Let
-    `masked_amount_lo = active * coin_amount_lo`. Compute
-    `sum_lo = balance_lo + masked_amount_lo`, split as
-    `new_lo + 2^32 * carry` with `range_check(new_lo, 32)` and
-    `carry` a `BoolTarget`. Then
-    `sum_hi = balance_hi + active * coin_amount_hi + carry`, split as
-    `new_hi + 2^32 * overflow`. Assert `overflow == 0`. Replaces
-    `(balance_lo, balance_hi)` for the next slot's chain.
-  - Running balance must be threaded through all slots like
-    `running_coin_history`. Final `(balance_lo, balance_hi)` feeds
-    `account_state_hash` at the end.
-
-  Cost estimate: ~80 in-circuit gates per slot (cheap compared to
-  the 512 Poseidon hashes for the SMT walks). Bumping `MAX_IN_COINS`
-  to 8 in parallel adds ~3500 extra Poseidon hashes — feasible if
-  the `common_data_for_recursion_c` padding (currently `1 << 12`
-  gates) accommodates the larger outer circuit. Verify the padding
-  is sufficient before bumping.
+- **5d-next — apply_coin semantics** ✅ done in this revision.
+  Per-slot witnesses extended: `coin_recipient: HashOutTarget`,
+  `coin_amount_lo: Target`, `coin_amount_hi: Target` (both
+  range-checked to 32 bits). Per slot, masked by `active`:
+  - Recipient check `active * (coin_recipient[i] - owner[i]) == 0`
+    for each of 4 hash elements.
+  - Balance add with overflow check via `split_le(sum, 33)`: bits
+    auto-witnessed by Plonky2's `BaseSumGate` generator; bit 32 is
+    the carry / overflow. `new_lo = sum_lo - 2^32 * carry`,
+    `sum_hi = balance_hi + active * coin_amount_hi + carry`,
+    `new_hi = sum_hi - 2^32 * overflow`, `assert overflow == 0`.
+  - Running balance threaded through slots; final balance feeds a
+    second `Poseidon(owner || final_balance_lo || final_balance_hi ||
+    pubkey_limbs)` for the FINAL `account_state_hash` in `ProofData`.
+    The earlier `account_state_hash` (from initial balance) keeps
+    serving SPEC §8 (b) state-continuity and (c) commitment-witness
+    checks. Tests: positive 1-active-in-coin with `coin.amount = 42`
+    increments balance and matches off-circuit `apply_coin` hash;
+    `recipient != owner` rejected; `amount` causing balance overflow
+    rejected.
 
 - **5d-next-2 — bump `MAX_IN_COINS` to 8** ⏳. Mechanical: change the
   constant, extend each `*_with_in_coins` test's slot array with
