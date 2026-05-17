@@ -88,7 +88,6 @@
 //! Total aggregator PIs: `8 * 17 + 4 + 64 = 204`.
 
 use anyhow::Result;
-use plonky2::field::types::Field;
 use plonky2::iop::target::BoolTarget;
 use plonky2::iop::witness::{PartialWitness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
@@ -333,6 +332,7 @@ mod tests {
     use crate::circuit::main::{build_circuit, prove_initial};
     use crate::hash::hash_bytes;
     use crate::types::{AccountState, MINTING_ADDRESS};
+    use plonky2::field::types::Field;
 
     /// Smoke test: build the aggregator against the state-transition
     /// circuit's `common_data`, prove with all slots inactive, verify.
