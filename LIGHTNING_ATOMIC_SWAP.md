@@ -331,7 +331,7 @@ the on-chain side.
   Bitcoin wallet for funding UTXO.
 - **Pre-agreed:** swap amount `A` (in sats), provider fee `F`, swap
   timeout parameters (`T_lock` for on-chain CLTV, `T_ln` for
-  Lightning CLTV-delta — see §10).
+  Lightning CLTV-delta — see §12).
 
 ### 8.2 Protocol steps
 
@@ -407,7 +407,7 @@ Step 6. User pays the Lightning HTLC:
           - User → Provider, hash H, amount A + F, CLTV-delta T_ln
 
 Step 7. User waits for U_lock to reach the agreed confirmation depth
-        (see §10 and §16). Then user broadcasts the commit tx:
+        (see §12 and §16). Then user broadcasts the commit tx:
           - Witness for U_lock spend: <preimage = x> <user_sig>, IF-branch
           - Commit tx now in mempool
 
@@ -438,7 +438,7 @@ Step 11. Provider settles the LN HTLC, capturing A + F. Swap complete.
 | ------- | ------------ | -------- |
 | User aborts at Step 5 | Provider has funded U_lock; nothing else moved | Provider refunds U_lock at T_lock (Step 3 ELSE branch). Cost: on-chain fee for U_lock creation. |
 | User pays LN (Step 6) but never broadcasts commit (Step 7) | Provider has incoming LN HTLC, U_lock still locked | LN HTLC times out at T_ln, user gets LN funds back. Provider refunds U_lock at T_lock. Both whole. |
-| User broadcasts commit but it doesn't confirm before T_lock | User has paid LN, U_lock is being refunded by provider; user's tx might or might not eventually confirm | This is the race condition T_lock is designed to prevent. See §10. With margin, this should not happen; if it does, provider claims U_lock refund and user claims LN refund. Provider has zkCoins still in inventory (no send actually happened since inscription never landed). |
+| User broadcasts commit but it doesn't confirm before T_lock | User has paid LN, U_lock is being refunded by provider; user's tx might or might not eventually confirm | This is the race condition T_lock is designed to prevent. See §12. With margin, this should not happen; if it does, provider claims U_lock refund and user claims LN refund. Provider has zkCoins still in inventory (no send actually happened since inscription never landed). |
 | Provider's server crashes between Step 2 and Step 4 | User has H, has not paid anything | User aborts, no loss. |
 | Provider's Bitcoin wallet runs out of funds for U_lock | Pre-condition failure | Provider rejects swap initiation. No loss. |
 | Provider refuses to settle LN at Step 11 despite preimage visible | Provider has zkCoins inventory still committed, user has zkCoins (Step 9 succeeded), preimage on-chain | LN HTLC will time out and refund to user. User keeps zkCoins **and** gets LN funds back. **Net: provider loses A+F to itself.** This is asymmetric — provider has no incentive to do this. Documented as provider-side discipline. |
@@ -473,202 +473,118 @@ direction matters because the user is the one initiating the
 zkCoins-side send, which means the user controls the inscription
 publication — flipping who broadcasts what.
 
-### 9.1 Asymmetry to address
+### 9.1 The role inversion
 
 In Flow A the user was the inscription broadcaster (Step 7–8). In Flow
 B the user is the inscription *originator* (they own the source coins)
-but the provider is the LN sender. The preimage flow has to invert.
+but the provider is the LN payer. The naïve "provider generates the
+preimage" construction (mirroring Boltz forward submarine swaps)
+introduces a non-trustless gap when applied to inscription publication
+— see §9.3 for why. The recommended construction is a direct mirror
+of Flow A with the swap roles reversed; the preimage generator stays
+on the on-chain-asset-acquirer's side. This is detailed in §9.2.
 
-There are two viable patterns. Pattern 9.2 has the provider as preimage
-generator (matches Boltz forward submarine swaps). Pattern 9.3 has the
-user as preimage generator and uses an "LN hold invoice" — useful if
-the user has stricter privacy needs.
-
-### 9.2 Pattern: provider generates preimage
+### 9.2 Recommended pattern: mirror of Flow A
 
 ```
-Step 1. Provider generates preimage x ←$ {0,1}^256, computes H = SHA256(x).
-        Provider sends to user:
+Step 1. Provider generates preimage x ←$ {0,1}^256. Computes
+        H = SHA256(x). Provider sends to user:
           - H
           - provider_zkcoins_recipient_address
           - amount A
-          - provider_btc_refund_pubkey
-          - provider's LN node identity
+          - provider's LN invoice for amount A − F (standard, not hold)
 
-Step 2. User's zkCoins wallet builds send tx to
-        provider_zkcoins_recipient_address with amount A. User's
-        server prepares send proof, generates asth and ocr, user
-        signs Schnorr σ over H(asth ‖ ocr).
+Step 2. User's zkCoins server prepares the send proof to
+        provider_zkcoins_recipient_address with amount A. User signs
+        Schnorr σ over H(asth ‖ ocr) with their commitment pubkey.
 
-Step 3. User constructs the funding UTXO U_lock' with script:
+Step 3. User funds a Bitcoin UTXO U_lock' from their own wallet with
+        the same Taproot two-leaf construction as Flow A:
 
-          OP_IF
-              OP_SHA256 <H> OP_EQUALVERIFY
-              <provider_btc_recipient_pubkey> OP_CHECKSIG
-          OP_ELSE
-              <T_lock> OP_CHECKLOCKTIMEVERIFY OP_DROP
-              <user_btc_pubkey> OP_CHECKSIG
-          OP_ENDIF
+          IF-branch (claim):  <provider_sig> + <preimage of H>
+          ELSE-branch (refund): <user_sig> after T_lock
 
-        User funds U_lock' from any wallet they control. (For the
-        zkCoins side this isn't directly relevant — U_lock' is being
-        used to gate the inscription publication, not to pay the user.)
+        User constructs the unsigned commit-reveal pair such that
+        the commit tx spends U_lock' via the IF-branch and the
+        reveal tx publishes the inscription containing σ.
 
-        User constructs the commit-reveal pair so that the commit tx
-        spends U_lock' and the reveal tx publishes inscription
-        containing σ + payload. Crucially: the commit tx spend of
-        U_lock' uses the IF-branch (preimage), so the commit cannot
-        be broadcast without x.
+Step 4. User hands provider:
+          - (asth, ocr, σ)
+          - U_lock' outpoint
+          - Unsigned commit-reveal pair
 
-        User sends to provider:
-          - The commit tx (unsigned with respect to U_lock', otherwise
-            complete)
-          - The reveal tx
-          - The (asth, ocr, σ) tuple that the reveal tx will publish
-
-Step 4. Provider verifies:
-          - asth + ocr describe a send to provider_zkcoins_recipient_address
-            of amount A
+Step 5. Provider verifies:
           - σ verifies against user's commitment pubkey
-          - U_lock' is funded and on-chain with the correct script
-          - The commit tx spends U_lock' and has txid prefix 4242
+          - asth + ocr describe a send to provider's address of
+            amount A
+          - U_lock' is on-chain with the correct script
+          - Commit tx spends U_lock' and has txid prefix 4242
 
-Step 5. Provider pays Lightning HTLC to user with hash H, amount A − F.
+Step 6. Provider pays the Lightning HTLC to user with hash H,
+        amount A − F.
 
-Step 6. User claims LN HTLC; settling the claim leaks x to provider via
-        the LN channel mechanics.
+Step 7. User claims the LN HTLC. The settlement reveals x to
+        provider via the LN channel mechanics (preimage-watch
+        pattern, or explicit reveal off-band).
 
-Step 7. Provider broadcasts the commit tx, spending U_lock' via the
-        IF-branch with witness <x> <provider_sig>.
+Step 8. Provider broadcasts the commit tx with witness
+        <x> <provider_sig> (IF-branch satisfied).
 
-Step 8. Commit tx confirms. Provider broadcasts reveal tx. Inscription
-        published; zkCoins scanner picks up; provider's account is
-        credited.
+Step 9. Commit tx confirms. Provider broadcasts reveal tx;
+        inscription publishes on-chain; zkCoins scanner picks up
+        and credits provider's address.
 
-Step 9. Swap complete.
+Step 10. Swap complete.
 ```
 
-Failure modes are the mirror of §8.3 with parties swapped. The key
-recovery path is: if provider claims LN but does not broadcast the
-commit tx, the user can broadcast it themselves (they have the commit
-tx; the preimage is now revealed to them via the LN settlement, so they
-can fill in the witness). Actually — wait. The commit tx in Pattern 9.2
-spends U_lock' via the IF-branch which requires *provider*'s signature
-(not the user's). So if the provider stalls after claiming LN, the user
-cannot broadcast. The user would have to wait for T_lock to time out
-and recover U_lock' via the ELSE branch (user_btc_pubkey). But by then
-the LN payment was settled, so the user is out A − F.
+#### Failure modes for Flow B (Pattern 9.2)
 
-**This is a non-trustless gap in Pattern 9.2.** Fixing it requires
-either:
+| Failure | Who has what | Recovery |
+| ------- | ------------ | -------- |
+| Provider does not pay LN | U_lock' is locked; nothing else moved | User refunds U_lock' at T_lock. Cost: on-chain fee for U_lock' creation. |
+| Provider pays LN, user claims, provider broadcasts | Happy path | Swap completes. |
+| User claims LN but provider does not broadcast commit tx | Provider has x and own signature; they can broadcast any time before T_lock. If they don't, U_lock' refunds to user. User keeps LN funds; provider keeps zkCoins inventory (no inscription landed). | Provider has no incentive to withhold — they would forgo the zkCoins inflow they already paid for in LN. Documented as provider-side discipline. |
+| User funds U_lock' but never sends provider the commit-reveal pair | Pre-condition failure | User can refund U_lock' at T_lock. No LN payment was made. |
+| Commit tx stuck in mempool past T_lock | Race condition | Avoided by the ordering constraint of §12.2; if exhausted, U_lock' refunds to user and provider keeps LN funds. Provider must factor this risk into fee pricing. |
 
-- **Pattern 9.2a:** the IF-branch is `<x> <user_sig>` (user signs),
-  meaning the user can also broadcast. But then the user can broadcast
-  *without* the provider having claimed LN, which means the user can
-  publish their zkCoins-send without ever getting paid. Same gap,
-  flipped.
-- **Pattern 9.2b:** Use 2-of-2 in the IF-branch (`<x> <user_sig>
-  <provider_sig>`). Now both must cooperate to publish, and refund
-  goes 2-of-2 too. The preimage reveal alone is not enough; one party
-  can grief. Not trustless either.
+The last failure mode of the table is worth flagging in code: if the
+inscription never lands, the zkCoins state never updates. The user's
+server-side state shows the send as "prepared" but not "committed",
+because the corresponding `Commitment` was never broadcast. The
+swap-aware server must release the prepared state if it observes that
+the corresponding U_lock' has been refunded, so the user can re-use
+those coins for another swap or send.
 
-The clean fix is **Pattern 9.3** below.
+### 9.3 Why we rejected the "provider generates preimage" pattern
 
-### 9.3 Pattern: user generates preimage, LN hold invoice
+A pattern that more closely mirrors Boltz forward submarine swaps —
+where the provider generates the preimage and the user constructs the
+locked UTXO — does not yield trustlessness for inscription
+publication. The reason is structural:
 
-This pattern flips the preimage generator and uses LN hold invoices to
-restore atomicity.
+- If the commit tx is spendable by `<x> <provider_sig>`, then after
+  provider claims LN (and learns x), the user cannot broadcast the
+  commit tx on the provider's behalf when provider stalls — only
+  provider has the signature. T_lock expires, U_lock' refunds, but
+  the LN payment was already settled, so the user is out A − F.
+- If the commit tx is spendable by `<x> <user_sig>` instead, the user
+  can broadcast at any time after learning x — but x is generated by
+  provider, so the user only learns it after LN settlement. Same
+  asymmetry, flipped: provider could broadcast a fake LN payment
+  flow and steal the zkCoins.
+- A 2-of-2 IF-branch (`<x> <user_sig> <provider_sig>`) lets either
+  party grief: the preimage reveal alone is no longer sufficient to
+  unilaterally publish.
 
-```
-Step 1. User generates preimage x ←$ {0,1}^256, computes H = SHA256(x).
-        User sends to provider:
-          - H
-          - amount A
-          - User's LN invoice for amount A − F using hash H (a hold
-            invoice: provider's LN node will not pay it until user
-            settles; user controls settlement by revealing x).
+A patch using an **LN hold invoice** to make the user the LN
+settlement-controller also fails to close the gap cleanly, because
+the user's reveal of x to settle the hold invoice and the provider's
+broadcast of the commit tx remain two separate events with no
+on-chain coupling between them.
 
-Step 2. User prepares zkCoins send (proof, σ) as in §9.2 Step 2.
-
-Step 3. User funds U_lock' (same script as §9.2 Step 3) and prepares
-        commit-reveal pair, but now the IF-branch is
-          <x> <provider_btc_pubkey>_sig
-        (i.e., provider needs to know x to broadcast the commit tx).
-
-Step 4. User sends provider: (commit tx, reveal tx, U_lock' outpoint).
-
-Step 5. Provider verifies as in §9.2 Step 4.
-
-Step 6. Provider pays LN hold invoice. Provider's LN payment is
-        held in flight; not yet settled because user has not revealed x.
-
-Step 7. Provider broadcasts commit tx — but wait, the commit tx needs
-        x in its witness, which provider does not have.
-
-        Resolution: the user must reveal x to settle the LN hold
-        invoice. The user settles only when satisfied with the
-        on-chain state.
-
-        Hmm: this is still asymmetric — the user has to first reveal x,
-        then the provider broadcasts. What if provider stalls after
-        x reveal?
-
-Step 8. Better resolution: tie the on-chain UTXO and the LN flow
-        differently. The IF-branch should be spendable by user_sig +
-        x. The LN hold invoice settlement reveals x to provider. The
-        user's settlement act IS the broadcast of the commit tx.
-```
-
-The cleanest construction is **Pattern 9.4** below.
-
-### 9.4 Pattern: mirror of Flow A
-
-Restate Flow A with directions flipped:
-
-```
-Step 1. Provider generates preimage x, hash H, gives H to user.
-Step 2. User prepares zkCoins send (proof, σ).
-Step 3. User locks U_lock' such that IF-branch = <provider_sig> + <x>,
-        ELSE = <user_sig> + T_lock. U_lock' has dust amount funded
-        from user's bitcoin wallet.
-Step 4. User hands provider: commit-reveal pair (commit tx spends
-        U_lock' via IF-branch needing provider's sig and x).
-Step 5. User verifies via provider's published LN invoice that LN
-        amount matches.
-Step 6. Provider pays standard LN invoice to user, hash H, settling
-        immediately (not hold). Provider's settle reveals x to user
-        via LN mechanics.
-        
-        Wait — this is backwards. If provider sends with hash H and
-        user claims, user reveals x to provider. That's what we want.
-
-Step 7. User's LN claim reveals x to provider. Provider now has both
-        provider_sig (their own) and x; provider broadcasts commit tx
-        spending U_lock' via IF-branch. Reveal tx publishes inscription.
-
-Step 8. Scanner credits provider. Swap complete.
-
-Failure modes:
-  - Provider doesn't pay LN: user refunds U_lock' at T_lock. No loss.
-  - Provider pays LN, user claims: x revealed; provider broadcasts.
-    User cannot stop this (they don't control U_lock' once IF-branch
-    is satisfiable). Trustless.
-  - User claims LN but provider doesn't broadcast: provider has x,
-    they can broadcast any time before T_lock. If they don't, U_lock'
-    refunds to user. Then user has both: LN payment (claimed) and
-    refund of their bitcoin funding. But: zkCoins send did NOT happen
-    (no inscription). So the operator's account still has its zkCoins
-    inventory; user's zkCoins account is unchanged from the send
-    they initiated locally on the server but never published.
-```
-
-The last failure mode is interesting: if the inscription never lands,
-the zkCoins state never updates. The user's server-side state shows the
-send as "prepared" but not "committed". The next user send would have
-to re-use or override this prepared state — implementation detail for
-the swap-aware server.
-
-Pattern 9.4 is the recommended Flow B design.
+Pattern 9.2 avoids all of this by having the same party (provider)
+control both the LN claim and the on-chain broadcast — the preimage
+reveal through LN settlement directly enables that party to broadcast.
 
 ---
 
@@ -747,8 +663,8 @@ sats at current fee rates.
 ### 10.5 Pubkey choices
 
 - **claim_pubkey:** the user's Bitcoin spending pubkey for Flow A, or
-  the provider's for Flow B Pattern 9.4. Should be a fresh key per
-  swap for unlinkability.
+  the provider's for Flow B. Should be a fresh key per swap for
+  unlinkability.
 - **refund_pubkey:** the counterparty's. Same fresh-key recommendation.
 
 In a Taproot internal-key construction, the cooperative key is a MuSig
@@ -865,10 +781,9 @@ counterparties regardless of direction.
 | LN payment succeeds, user fails to claim on-chain (Flow A) | Provider has LN HTLC pending, user has paid LN | LN HTLC times out at T_ln, user refunded; U_lock refunds at T_lock |
 | User claims on-chain but commit tx stuck in mempool past T_lock | Race condition | Avoided by §12.2 ordering constraint with margin; if margin exhausted, both refund — provider via U_lock refund, user via LN refund (assuming commit tx also evicted from mempool) |
 | Provider's Bitcoin wallet outage between Step 3 and broadcast | Pre-condition failure | Swap not initiated; no loss |
-| Bitcoin reorg removes the confirmed commit tx | See §15 (D7 dependency) | Provider waits ≥6 confirms before claiming LN |
+| Bitcoin reorg removes the confirmed commit tx | See §16 (D7 dependency) | Provider waits ≥6 confirms before claiming LN |
 | zkCoins scanner is offline | Inscription is on-chain but state lags | Scanner catches up on restart; no swap-mechanism impact |
-| Provider claims LN but withholds inscription broadcast (Flow B) | Provider has LN, has not delivered zkCoins | User can broadcast themselves in some patterns (9.4); else U_lock refund. In Pattern 9.4 this is structurally impossible because user is the broadcaster. |
-| User refuses to settle LN hold invoice (Flow B Pattern 9.3) | Provider in-flight LN, U_lock still locked | LN hold invoice eventually times out; no settlement; both whole. (This is why 9.3 needed hold invoices.) |
+| Provider claims LN but withholds inscription broadcast (Flow B) | Provider has LN, has not delivered zkCoins | Provider has no incentive — they would forgo the zkCoins inflow they already paid for in LN. If they do withhold past T_lock, U_lock' refunds to user; user keeps LN funds. See §9.2 failure-mode table. |
 | Provider sets up Sybil swaps to grief | None directly | DoS mitigation: rate-limit, optionally require small upfront fee or deposit |
 
 ---
@@ -1172,8 +1087,8 @@ A draft sequence; not a commitment.
   if conservative confirm-depth gating is used)
 - Operator account funded with sufficient zkCoins inventory
 - Provider Bitcoin wallet with Lightning channel(s)
-- LND or CLN node running with hold-invoice support (for Flow B
-  Pattern 9.3; not required for Pattern 9.4)
+- LND or CLN node running (standard HTLC support sufficient; hold
+  invoices not required by the recommended Pattern 9.2)
 
 ### 19.2 Phase 1: swap engine
 
@@ -1193,9 +1108,8 @@ A draft sequence; not a commitment.
 - `POST /api/swap/initiate` (Flow A) — user submits H + recipient
   address + amount + refund pubkey, gets back commit-reveal pair +
   U_lock funded outpoint
-- `POST /api/swap/lock` (Flow B Pattern 9.4) — provider gives user
-  the H and provider's claim pubkey; user constructs their side and
-  notifies
+- `POST /api/swap/lock` (Flow B) — provider gives user the H and
+  provider's claim pubkey; user constructs their side and notifies
 - `GET /api/swap/{id}` — status (waiting-for-confirms, settled,
   refunded, etc.)
 - WebSocket for live status updates
@@ -1228,43 +1142,38 @@ A draft sequence; not a commitment.
 
 ## 20. Open Questions
 
-1. **Pattern choice for Flow B.** Pattern 9.4 (mirror of Flow A) is
-   the clean trustless construction. Confirm this is the chosen
-   pattern; if there's a reason to prefer Pattern 9.3 (LN hold
-   invoices), document it.
-
-2. **Required confirmation depth for inscription.** Set initially to
+1. **Required confirmation depth for inscription.** Set initially to
    6 confirms (~1 hour wait); re-evaluate after D7 fix lands.
 
-3. **Cooperative key-path for U_lock Taproot internal key.** MuSig of
+2. **Cooperative key-path for U_lock Taproot internal key.** MuSig of
    (claim_pubkey, refund_pubkey) gives best on-chain privacy but adds
    protocol complexity (round of MuSig key aggregation per swap). For
    v1, recommend NUMS internal key (cheaper, less private). Revisit
    for v2 alongside PTLC.
 
-4. **Where does the operator account's privkey live?** The Schnorr
+3. **Where does the operator account's privkey live?** The Schnorr
    signature on H(asth ‖ ocr) (Step 2 of Flow A) needs to happen
    server-side, because the operator is the sender. This means the
    operator account's commitment key is server-resident. Same
    architectural assumption as for any operator-issued zkCoins coin;
    should be documented in ops runbook.
 
-5. **Cross-swap correlation.** If a single operator account is reused
+4. **Cross-swap correlation.** If a single operator account is reused
    for many swaps, all those swaps' inscriptions chain through the
    same account state. A chain analyst can correlate them. Mitigation:
    rotate operator accounts periodically. Not a blocker.
 
-6. **D7 fix interaction.** Once D7 lands with `conditional_nav`-style
+5. **D7 fix interaction.** Once D7 lands with `conditional_nav`-style
    logic, the scanner can roll back. The swap design's confirm-depth
    parameter should drop, and the swap engine should subscribe to
    reorg notifications. Sketch the rollback-aware swap state machine
    when D7 is implemented; not now.
 
-7. **Fee market integration.** Should swap quotes include a
+6. **Fee market integration.** Should swap quotes include a
    user-selected fee tier (fast/slow Bitcoin confirmation, expected
    wait time)? Boltz does this. Adds UI but not protocol complexity.
 
-8. **Maximum swap size.** Bounded by (a) operator zkCoins inventory,
+7. **Maximum swap size.** Bounded by (a) operator zkCoins inventory,
    (b) operator LN inbound liquidity. Define soft and hard limits.
    Boltz publishes these on an info endpoint.
 
@@ -1299,3 +1208,4 @@ A draft sequence; not a commitment.
 | ---------- | ------ |
 | 2026-05-17 | Initial draft. |
 | 2026-05-17 | Consistency audit pass: add branch note at the top explaining that `SPEC.md` / `MIGRATION_RESEARCH.md` / `ROADMAP.md` currently live on `feat/plonky2-migration` only. |
+| 2026-05-17 | Audit round 2: restructure §9 from a stream-of-consciousness exploration of four candidate patterns to a single recommended construction (§9.2 mirror of Flow A) plus a brief §9.3 explaining why the alternatives were rejected. Promote §9.2 to the canonical Flow B; remove §9.3 (LN hold invoice) and §9.4 (renamed to §9.2) as numbered alternatives. Fix four broken internal cross-references (§10/§15 corrected to §12/§16). Renumber open-questions list to drop the gap left after removing the pattern-choice question. |
