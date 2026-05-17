@@ -100,6 +100,19 @@ and one challenger watches for fraud, the bridge holds.
 This section is a precise read of the Citrea Clementine implementation
 as of 2026-05. References at the end.
 
+> **2026 context** (added 2026-05-17): BitVM2 is currently the only
+> trustless-bridge construction with a live mainnet deployment (Citrea
+> launched 2026-01-27). Three credible successors have emerged in
+> 2025–2026 — BitVM3-RSA (withdrawn after security flaw), Glock by
+> Alpen Labs (research/testnet-stage), and Mosaic by Eagen et al.
+> (research-stage, full Rust implementation). All three use garbled
+> circuits + cut-and-choose + adaptor signatures to push BitVM2's
+> on-chain Assert footprint down by 100–1000×. See §12 for a survey
+> of these alternatives and what it means for zkCoins's bridge choice.
+> The fundamentals of §3 (peg-in/peg-out flow, roles, 1-of-N honesty
+> assumption) remain identical across all BitVM-family bridges; the
+> innovations target the fraud-proof step specifically.
+
 ### 3.1 Roles
 
 | Role | Function | Quorum |
@@ -712,19 +725,37 @@ Zcash's t/z address model.
 | Today (D11) | 100% trust DFX as minter | None | None |
 | Liquid-style federation | k-of-n federation honest majority | Off-chain governance | None |
 | Optimistic + governance dispute | 1-of-n + governance recourse | Off-chain | None |
-| BitVM2 / Clementine | 1-of-n setup honesty + 1-of-n watchtower | On-chain via Bitcoin SNARK verifier | Yes (Groth16) |
+| BitVM2 / Clementine | 1-of-n setup honesty + 1-of-n watchtower | On-chain via Bitcoin Groth16 verifier (~2.6 MB Assert) | Yes (Groth16) |
+| BitVM3 (cut-and-choose) | Same as BitVM2 + cut-and-choose security | On-chain via Garbled-Circuit Disprove (~60 kB Assert, ~200 B Disprove) | Yes (DV-SNARK / GC) |
+| Glock (Alpen Labs) | Same as BitVM2 + cut-and-choose | On-chain DV-SNARK based Disprove (~5 kB Assert, 430–550× cheaper than BitVM2) | Yes (DV-SNARK / GC) |
+| Mosaic (Eagen et al.) | Same as BitVM2 + cut-and-choose | On-chain footprint **independent of N** (cut-and-choose copies) via polynomial label correlation + adaptor sigs | Yes (DV-SNARK / GC) |
 | Native Bitcoin (theoretical) | 0 trust | n/a | n/a |
 
-### 11.2 BitVM versions
+### 11.2 BitVM family + competing GC-based verifiers (state as of 2026-05)
 
-| Version | Status | Onchain dispute cost | Bridge production-ready |
-| ------- | ------ | -------------------- | ----------------------- |
-| BitVM1 | Superseded | Very high (interactive multi-round) | No |
-| BitVM2 | Production (Citrea Clementine) | ~2.6 MB Assert tx | Yes |
-| BitVM3 | Research-stage (2026) | ~60 kB Assert, ~200 B Disprove | No (still subject to security review) |
+| Construction | Year | Status | Onchain dispute cost | Bridge deployed where |
+| ------------ | ---- | ------ | -------------------- | --------------------- |
+| BitVM1 | 2023-10 | Superseded | Very high (interactive multi-round) | Theoretical only |
+| BitVM2 | 2024-08 | **Mainnet production** | ~2.6 MB Assert tx | Citrea Clementine (mainnet since 2026-01-27); GOAT (testnet V3 since 2026-01-28); Alpen Strata (signet, 10 BTC fixed denomination) |
+| BitVM3-RSA | 2025-07 | **Withdrawn** — security flaw found by Eagen / Fairgate | ~60 kB Assert, ~200 B Disprove | None |
+| BitVM3-CC (cut-and-choose) | 2026 | Research / early demo | ~$10.91 dispute on mainnet (BOB) | BOB roadmap |
+| Glock (Alpen Labs) | 2025-08 | Research → testnet | 430–550× cheaper than BitVM2 (DV-SNARK based) | Strata bridge transition planned; Starknet partnership announced |
+| Mosaic (Eagen et al.) | 2026-04 | Research, full protocol spec + Rust impl | On-chain footprint **independent of N copies** (polynomial label correlation) | None yet |
 
-A zkCoins bridge built today targets BitVM2. BitVM3 is a future
-upgrade if/when it stabilises.
+**Reading guide:**
+
+- **For a launch today** (zkCoins or any other side-system): BitVM2 is
+  the only choice with a live, production-tested implementation
+  (Clementine). Citrea has been in mainnet since 2026-01-27. Tooling,
+  trusted setup ceremony output, and operational documentation all
+  exist.
+- **For a launch in 6–12 months**: Glock and Mosaic both have credible
+  implementations and academic peer review going. Either could mature
+  to production status by then. Both are 100–1000× cheaper on-chain
+  than BitVM2 and use the same 1-of-N honesty trust model with
+  cut-and-choose security.
+- **Avoid**: BitVM3-RSA (broken). Plain garbled-circuit constructions
+  without cut-and-choose (not malicious-secure).
 
 ### 11.3 Realistic timelines
 
@@ -733,11 +764,235 @@ upgrade if/when it stabilises.
 | Liquid-style federated bridge | 2–3 months | Q3–Q4 2026 |
 | BitVM2 bridge (zkCoins-only federation) | 6–9 months | Q1 2027 |
 | BitVM2 bridge (multi-org federation) | 9–18 months | Late 2027 |
-| BitVM3 bridge | 18+ months | Speculative |
+| Glock-based bridge | depends on Glock production-readiness | Q2–Q4 2027 (if Glock stabilises) |
+| Mosaic-based bridge | depends on Mosaic production-readiness | Q3 2027+ (still in research, full Rust impl exists) |
 
 ---
 
-## 12. Bottom Line
+## 12. Beyond BitVM2 — The 2026 Verification Landscape
+
+This section was added after the initial draft. It documents the
+post-BitVM2 alternatives that emerged in 2025–2026 and explains why
+the strategic recommendation in §13 (Bottom Line) still defaults to
+BitVM2 today despite the alternatives being more efficient.
+
+### 12.1 What changed since BitVM2
+
+BitVM2 (Linus et al., 2024-08) shipped as a Bitcoin-script Groth16
+verifier split into sub-programs small enough to fit individual
+Bitcoin transactions. The Assert transaction — the on-chain message
+where the operator commits to the intermediate computation states —
+is roughly 2.6 MB. At Bitcoin's economic block space cost, this is
+expensive but not prohibitive for high-value bridges where peg-out
+volume can absorb the fee.
+
+Three follow-up constructions in 2025–2026 attack the Assert size
+specifically by replacing the on-chain Groth16 verifier with a
+garbled-circuit-based fraud-proof mechanism. The garbled circuit
+itself is too large to put on Bitcoin directly, so the constructions
+post commitments and use cut-and-choose + adaptor signatures to
+ensure that revealing the on-chain signature also reveals enough
+information to disprove a fraudulent claim.
+
+### 12.2 BitVM3 — RSA construction (2025-07) — **withdrawn**
+
+The first attempt to use garbled circuits on Bitcoin for bridges. The
+original BitVM3 paper by Robin Linus proposed an RSA-based binding
+between garbled-circuit labels and Bitcoin signatures. Achieved ~60 kB
+Assert and ~200 B Disprove on paper.
+
+**Status:** withdrawn. Liam Eagen (later author of Glock) and Fairgate
+Labs identified core security flaws in the RSA construction. The
+paper was retracted. **Do not build on this.**
+
+Subsequent work continues under the BitVM3 banner using cut-and-choose
+rather than the broken RSA binding — see BitVM3-CC by BOB and others.
+
+### 12.3 BitVM3-CC (cut-and-choose) — BOB implementation
+
+BOB's engineering team implemented a cut-and-choose variant of BitVM3
+on Bitcoin mainnet, using Verifiable Secret Sharing Schemes (VSSS)
+and adaptor signatures. Demonstrates a ~$10.91 dispute cost on
+mainnet, with the Assert transaction ~87% cheaper than BitVM2.
+
+The construction is essentially a more careful cousin of the original
+BitVM3-RSA, replacing the broken RSA binding with multi-copy
+cut-and-choose where the prover commits to N garbled-circuit copies
+and the verifier opens t of them to check honest garbling.
+
+**Status:** demonstrated on mainnet by BOB, but the broader
+"BitVM3-CC" research line is still maturing. Reasonable to track as
+a credible 2027 alternative but too early to commit to.
+
+### 12.4 Glock — Garbled Locks for Bitcoin (Alpen Labs, 2025-08)
+
+**Paper:** [eprint 2025/1485](https://eprint.iacr.org/2025/1485),
+Liam Eagen, Alpen Labs.
+
+**Core idea.** Combine garbled circuits with a novel and very compact
+**designated-verifier SNARK (DV-SNARK)** to bind the garbled circuit's
+input/output labels directly to Bitcoin lock data. The DV-SNARK is
+constructed over binary elliptic curves, which Eagen argues have
+"nice synergies" with the garbled-circuit scheme.
+
+**Why it's smaller than BitVM2.** BitVM2 verifies Groth16, which is a
+universal SNARK and requires a verifier circuit of fixed substantial
+size when reduced to Bitcoin script. Glock's DV-SNARK is designed for
+a single specified verifier (the bridge contract), so it's
+specialised and much smaller. Combined with garbled-circuit fraud
+proofs, total on-chain footprint per dispute is in the few-kB range
+rather than MB.
+
+**Architecture sketch.**
+
+- **Setup:** federation runs cut-and-choose for honesty of N garbled
+  copies. t copies are opened publicly to prove honesty; the
+  remaining N-t are used for actual fraud-proof evaluation.
+- **Operator commits to a peg-out claim** by posting a signature
+  whose adaptor binds to a label of the garbled circuit.
+- **If the claim is wrong:** the corresponding garbled-circuit
+  evaluation reveals a secret that lets anyone reconstruct a "fraud
+  signature" — punishing the operator on-chain.
+- **If the claim is right:** no further on-chain interaction needed;
+  the operator's adaptor signature settles after timelock.
+
+**Efficiency.** Claimed 430–550× on-chain efficiency over BitVM2.
+Concretely: instead of a 2.6 MB Assert transaction, Glock's
+disprove-related on-chain footprint is in the few-kB range.
+
+**Status (2026-05).**
+
+- Paper published August 2025
+- Alpen Labs is building Glock into their Strata bridge as the
+  successor to the current BitVM2-based Strata bridge implementation
+- Starknet announced a strategic partnership with Alpen Labs in
+  October 2025 to use Glock as Starknet's BTC bridge primitive
+- **No mainnet deployment yet.** Strata's BitVM2 bridge runs on
+  Bitcoin signet only as of 2026-05; Glock transition is on the
+  roadmap, not live.
+- Research is active and the academic peer-review pipeline
+  is moving — multiple follow-up papers (Mosaic, Argo) build on or
+  refine Glock's primitives.
+
+**What this means for zkCoins.** Glock is the **most attractive 2026
+alternative** to BitVM2 if zkCoins is willing to wait. Its 1-of-N
+trust model is identical to BitVM2's; its on-chain cost is 100–1000×
+lower; and the construction is by the same team that wrote the
+Shielded CSV paper (Eagen, Linus). The fit is essentially perfect.
+
+The risk: it has not yet been deployed on mainnet by anyone. The
+trusted setup ceremony for Glock's DV-SNARK (if any — the DV-SNARK
+might not require a setup, the paper claims compactness without
+trusted setup, but verify before relying on this) is also a separate
+piece of coordination.
+
+### 12.5 Mosaic — Practical Malicious Security for Garbled Circuits on Bitcoin (Eagen et al., 2026-04)
+
+**Paper:** [eprint 2026/812](https://eprint.iacr.org/2026/812),
+Khambhati, Tiwari, Bajracharya, Bista, Eagen, Lewe, Feickert.
+
+**Core idea.** Where Glock uses DV-SNARKs to achieve compactness,
+Mosaic stays with traditional Groth16 verifier circuit but achieves
+malicious security via **cut-and-choose with polynomial label
+correlation**. The trick: labels across all N garbled copies are
+arranged as evaluations of a degree-t polynomial. The t shares
+revealed during cut-and-choose fall one short of the reconstruction
+threshold. Adaptor signatures ensure that the prover's on-chain
+witness commitment reveals the missing share as a byproduct. The
+evaluator can then reconstruct labels for all unchallenged copies by
+interpolation.
+
+**Killer feature.** The on-chain footprint is **independent of N**
+(the number of garbled copies used for cut-and-choose). Other
+cut-and-choose constructions need to post per-copy data on-chain
+that scales with N. Mosaic eliminates this scaling.
+
+**Practical.** Full protocol specification, Rust implementation,
+instantiated for trust-minimized Bitcoin bridging with a Groth16
+verifier circuit.
+
+**Status (2026-05).**
+
+- Paper published April 2026
+- Rust implementation exists (open-source per paper)
+- No production deployment yet
+- Same author family as Glock and Shielded CSV (Eagen)
+- Cleanly compatible with the existing Groth16-verifier ecosystem
+  (Plonky2 → Groth16 wrapping pipeline that Citrea uses works
+  unchanged)
+
+**What this means for zkCoins.** Mosaic is **the cleanest drop-in
+replacement** for BitVM2 because it keeps Groth16 as the verifier and
+therefore reuses the entire BitVM2 toolchain (trusted setup ceremony,
+Groth16 prover tools, `chainwayxyz/bitvm-zk-verifier`). It just cuts
+the Assert transaction footprint by a large factor.
+
+The risk: it's the youngest of the three (April 2026 paper). Has not
+seen the same testnet hours as Glock or production hours as BitVM2.
+
+### 12.6 Production state of major BitVM bridges (2026-05)
+
+| Bridge | Side-system | Construction | Status |
+| ------ | ----------- | ------------ | ------ |
+| Clementine | Citrea | BitVM2 | **Mainnet since 2026-01-27** |
+| GOAT Network bridge | GOAT Network | BitVM2 variant | **Testnet V3 since 2026-01-28** (permissionless-exit-first design) |
+| Strata bridge | Alpen | BitVM2 (Glock transition planned) | **Signet only**, 10 BTC fixed denomination, 64-block operator timeout, 36-block challenge |
+| BOB bridge | BOB | BitVM3-CC | Mainnet demo (cost-reduction proof of concept) |
+| Bitlayer bridge | Bitlayer | BitVM2 variant | Mainnet |
+
+**Reading guide.** As of May 2026, **only BitVM2 (and direct variants)
+have any mainnet exposure**. Everything garbled-circuit-based —
+BitVM3-CC, Glock, Mosaic — is at most demo or testnet. This will
+likely change over Q3–Q4 2026 as Strata and BOB push their Glock /
+BitVM3-CC bridges toward mainnet.
+
+### 12.7 Strategic implication for zkCoins
+
+If we were starting bridge implementation **today**:
+
+- BitVM2 / Clementine fork. Battle-tested, mainnet-proven, with
+  reusable trusted setup output. Trade-off: 2.6 MB Assert tx (~$60–200
+  at common fee rates).
+
+If we were starting bridge implementation **in Q3–Q4 2026**:
+
+- Wait for Strata's Glock transition or BOB's BitVM3-CC mainnet
+  hardening, then fork from there. Trade-off: more time before
+  zkCoins has a bridge, much cheaper on-chain dispute resolution.
+
+If we want to **hedge**:
+
+- Implement against an abstract "garbled-bridge-verifier" trait, with
+  BitVM2 as the v1 implementation and Glock/Mosaic as drop-in
+  replacements when one of them stabilises. The circuit-side
+  `IssuanceProof` and `BurnProof` contracts (§4) are identical in
+  any case — only the off-circuit Bitcoin scripting changes.
+
+The hedge is probably the right answer if implementation does not
+have to start this quarter. If implementation must start now and
+mainnet within a year, BitVM2 is forced.
+
+### 12.8 The "BTC denomination" question
+
+A practical note often overlooked: BitVM-family bridges typically
+require **fixed-denomination deposits** because the pre-signed
+transaction graph is parameterised on the deposit amount. Strata
+uses 10 BTC fixed denomination on testnet; Citrea uses similar
+quantisation on mainnet.
+
+For zkCoins, this means peg-ins would come in fixed chunks (e.g.,
+0.1 BTC, 1 BTC, 10 BTC) rather than arbitrary amounts. Users wanting
+smaller amounts would peg in 0.1 BTC and split internally; users
+wanting larger amounts would peg in multiple chunks.
+
+This is a UX consideration, not a protocol constraint. The Lightning
+swap design (`LIGHTNING_ATOMIC_SWAP.md`) is unaffected — it operates
+on arbitrary amounts because it consumes/produces zkCoins state
+which has no minimum increment.
+
+---
+
+## 13. Bottom Line
 
 - **D11 is the biggest unaddressed trust gap in zkCoins.** It is more
   significant than D2 (recipient hiding), D7 (reorg safety), or D8
@@ -745,18 +1000,40 @@ upgrade if/when it stabilises.
   tolerate a small privacy gap or a small reorg-safety gap; they
   cannot tolerate "the issuer can print unlimited supply".
 
-- **BitVM2 / Clementine is the gold standard for trustless Bitcoin
-  bridges in 2026-05.** Citrea has it in production; tooling exists;
-  the trust model is well-understood.
+- **BitVM2 / Clementine is the only mainnet-deployed trustless bridge
+  as of 2026-05.** Citrea has been live since 2026-01-27. Tooling,
+  trusted setup ceremony output, and operational documentation all
+  exist. If a bridge must ship within 12 months, this is the only
+  feasible cryptographic option.
+
+- **Glock and Mosaic are the credible 2026 successors** (both authored
+  by the Eagen line of researchers, same family as Shielded CSV
+  itself). Glock is the 430–550× more efficient alternative using
+  DV-SNARKs (Alpen Labs, Strata bridge transition planned); Mosaic
+  keeps Groth16 but cuts on-chain footprint independently of N
+  cut-and-choose copies (April 2026 paper with Rust impl). Neither
+  has mainnet exposure yet. See §12 for the full landscape.
+
+- **BitVM3-RSA was withdrawn** after security flaws were identified
+  by Eagen / Fairgate. The "BitVM3" name continues under the BitVM3-CC
+  (cut-and-choose) variant, which is what BOB demonstrated on mainnet.
 
 - **The realistic short-term path is a Liquid-style federated
   bridge.** It is implementable in months, provides meaningful
-  trust distribution, and can be upgraded to BitVM2 later without
-  protocol-layer changes.
+  trust distribution, and can be upgraded to BitVM2 / Glock / Mosaic
+  later without protocol-layer changes — the `IssuanceProof` and
+  `BurnProof` circuit contracts (§4) are agnostic to the bridge
+  construction.
 
-- **The realistic long-term path is BitVM2.** It requires federation
-  recruitment and trusted setup ceremony coordination — both
-  business-development work that takes time.
+- **The realistic 1-year cryptographic path is BitVM2.** Federation
+  recruitment and trusted setup ceremony coordination are the
+  bottleneck, not engineering.
+
+- **The realistic 2-year cryptographic path is Glock or Mosaic.** If
+  bridge implementation can wait into 2027, the on-chain efficiency
+  upgrade is worth the wait. The hedge: build the circuit side now,
+  pick the verifier construction when one of Glock/Mosaic has 6+
+  months of testnet history.
 
 - **`LIGHTNING_ATOMIC_SWAP.md` is unaffected.** The swap design's
   mathematical atomicity holds regardless of how mints work. What
@@ -768,26 +1045,48 @@ upgrade if/when it stabilises.
 
 ---
 
-## 13. References
+## 14. References
 
-- [BitVM2 paper (Robin Linus, Lukas Aumayr, Zeta Avarikioti, Matteo Maffei, Pedro Moreno-Sanchez)](https://eprint.iacr.org/2025/1158.pdf)
+### BitVM2 and Clementine (production-grade)
+- [BitVM2 paper (Linus, Aumayr, Avarikioti, Maffei, Moreno-Sanchez, eprint 2025/1158)](https://eprint.iacr.org/2025/1158.pdf)
 - [BitVM2 site](https://bitvm.org/bitvm2.html)
 - [Citrea Clementine bridge docs](https://docs.citrea.xyz/essentials/clementine-trust-minimized-bitcoin-bridge)
 - [Citrea Risc0-to-BitVM Trusted Setup Ceremony announcement](https://www.blog.citrea.xyz/citrea-completes-the-first-ever-trusted-setup-ceremony-for-zk-proofs-used-in-bitvm/)
 - [BitVM Groth16 Verifier Toolkit (chainwayxyz)](https://github.com/chainwayxyz/bitvm-zk-verifier)
-- [BitVM Github org](https://github.com/BitVM/BitVM)
+- [BitVM GitHub org](https://github.com/BitVM/BitVM)
 - [Fairgate review of BitVM2 Linus24 bridge](https://www.fairgate.io/post/3-a-review-of-the-the-bitvm2-based-linus24-bridge)
 - [Bitlayer BitVM bridge analysis](https://blog.bitlayer.org/BitVM_Bridge_Becomes_Practical/)
+
+### BitVM3 and cut-and-choose successors
+- [BitVM3 paper (eprint 2026/933)](https://eprint.iacr.org/2026/933.pdf) — includes both withdrawn RSA construction and cut-and-choose variants
 - [BOB BitVM3 cut-and-choose announcement](https://www.gobob.xyz/blog/bob-lowers-onchain-costs-for-bitvm3)
-- [BitVM3 paper](https://eprint.iacr.org/2026/933.pdf)
+- [Fairgate Computing on Bitcoin newsletter](https://www.fairgate.io/newsletter/) — ongoing coverage
+
+### Glock (Alpen Labs)
+- [Glock: Garbled Locks for Bitcoin (Eagen, eprint 2025/1485)](https://eprint.iacr.org/2025/1485)
+- [Glock paper PDF mirror (Alpen)](https://cdn.prod.website-files.com/67cfca80708eb505376820af/68a3e174eaff71d197ac4080_glock.pdf)
+- [Glock: A new standard for verification on Bitcoin (Alpen blog)](https://www.alpenlabs.io/blog/glock-verification-on-bitcoin)
+- [Efficient verifiable cut-and-choose for Glock (Alpen HackMD)](https://hackmd.io/@alpen/B1QfSSO5gg)
+- [Starknet × Alpen partnership announcement (Glock as Starknet BTC bridge)](https://www.starknet.io/blog/starknet-alpen-bitcoin-glock/)
+- [Strata bridge docs (currently BitVM2)](https://docs.alpenlabs.io/how-alpen-works/bitcoin-bridge)
+
+### Mosaic
+- [Mosaic: Practical Malicious Security for Garbled Circuits on Bitcoin (eprint 2026/812)](https://eprint.iacr.org/2026/812)
+
+### Survey / market context
+- [Bitcoin L2s in 2026: A Reality Check (hozk.io)](https://www.hozk.io/articles/bitcoin-l2s-in-2026-a-reality-check)
+- [State of Bitcoin: BitVM3, Glock & Bitcoin Dollar (Bitfinity)](https://www.blog.bitfinity.network/state-of-bitcoin-bitvm3-glock-bitcoin-dollar/)
+
+### Shielded CSV / zkCoins context
 - [Shielded CSV paper §"Issuance" predicate branch](https://eprint.iacr.org/2025/068)
 - `SPEC.md` §15 D11 — this repo
 - `MIGRATION_RESEARCH.md` §5.6 — self-funded MVP publisher
 
 ---
 
-## 14. Change Log
+## 15. Change Log
 
 | Date | Change |
 | ---- | ------ |
 | 2026-05-17 | Initial draft. |
+| 2026-05-17 | Add §12 "Beyond BitVM2 — 2026 Verification Landscape" covering BitVM3-RSA withdrawal, BitVM3-CC (BOB), Glock (Alpen Labs), Mosaic (Eagen et al.). Update §3 with 2026-landscape note. Update §11.1 / §11.2 / §11.3 comparison tables. Update §13 Bottom Line with hedging strategy. Refactor references into themed groups. |
