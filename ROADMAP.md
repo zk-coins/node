@@ -199,13 +199,15 @@ stages so each lands as its own reviewable commit on the branch):
     `recipient != owner` rejected; `amount` causing balance overflow
     rejected.
 
-- **5d-next-2 — bump `MAX_IN_COINS` to 8** ⏳. Mechanical: change the
-  constant, extend each `*_with_in_coins` test's slot array with
-  `dummy_non_inclusion_proof()` placeholders for the inactive
-  trailing slots. Watch for Plonky2 `circuit_digest` shape
-  compatibility — may need to bump the `common_data_for_recursion_c`
-  padding gate count if the larger circuit's natural size grows past
-  `1 << 12`.
+- **5d-next-2 — bump `MAX_IN_COINS` to 8** ✅ done in this revision.
+  `MAX_IN_COINS` const is now 8. `common_data_for_recursion_c`
+  padding bumped to `INNER_PAD_BITS = 13` (`1 << 13 = 8192` gates)
+  to accommodate the larger outer circuit. Test helper
+  `slots_first_active(&coin, &nip, &dummy_coin, &dummy_nip)` builds
+  a `MAX_IN_COINS`-length slot array with the first slot active.
+  All 4 `prove_*_with_in_coins` tests refactored to use it; build
+  and prove confirmed for `stage_5d_initial_with_one_active_in_coin`
+  (188s wall).
 
 - **5d-next-3 — source-side verification for in-coins** ⏳ (heaviest).
   Each in-coin requires recursively verifying its source proof

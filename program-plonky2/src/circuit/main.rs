@@ -106,13 +106,14 @@ pub const MMR_PROOF_PATH_LEN: usize = MMR_MAX_DEPTH - 1;
 
 /// Number of in-coin slots the circuit reserves. The state transition
 /// processes `MAX_IN_COINS` slots in fixed order; inactive slots are
-/// no-ops (masked by their per-slot `active` bit). SPEC §13 targets a
-/// production value of 8 — stage 5d ships with `1` as the
-/// minimum-viable structural commitment. Bumping the value is purely a
-/// matter of changing this constant and adjusting tests (no algorithmic
-/// change required); the circuit grows by ~512 Poseidon hashes per
-/// extra slot for the in-circuit SMT non-inclusion + insert walks.
-pub const MAX_IN_COINS: usize = 1;
+/// no-ops (masked by their per-slot `active` bit). Matches SPEC §13's
+/// production target. Each extra slot adds ~512 Poseidon hashes
+/// (the in-circuit SMT non-inclusion + insert walks at `TREE_DEPTH =
+/// 256`) plus ~80 arithmetic gates for the recipient + balance
+/// checks. The cyclic-recursion `common_data_for_recursion_c`
+/// padding must be sized to accommodate the resulting outer-circuit
+/// gate count — see that function for the current setting.
+pub const MAX_IN_COINS: usize = 8;
 
 /// Build the `CommonCircuitData` that the cyclic circuit references
 /// when verifying its own prior proof.
@@ -155,15 +156,21 @@ fn common_data_for_recursion_c() -> CommonCircuitData<F, D> {
     builder.verify_proof::<C>(&proof, &verifier_data, &data.common);
     let data = builder.build::<C>();
 
-    // Pass 3: verify once and pad to 2^12 gates with NoopGate. This is
-    // the gate-set shape `conditionally_verify_cyclic_proof_or_dummy`
-    // expects in Plonky2 1.1.0.
+    // Pass 3: verify once and pad to `INNER_PAD_BITS` gates with
+    // NoopGate. The padding fixes the inner circuit's `degree_bits`
+    // and MUST be ≥ ceil(log2(outer.num_gates)) for cyclic recursion
+    // to build. Stage 5d-next-2 grew the outer circuit to ~6k gates
+    // (8× in-coin slots × ~512 SMT hashes + apply_coin arithmetic +
+    // 5c+ checks); `INNER_PAD_BITS = 13` (1 << 13 = 8192) covers it
+    // with margin. Bumping the constant is the only required change
+    // when the outer circuit grows further.
+    const INNER_PAD_BITS: usize = 13;
     let config = CircuitConfig::standard_recursion_config();
     let mut builder = CircuitBuilder::<F, D>::new(config);
     let proof = builder.add_virtual_proof_with_pis(&data.common);
     let verifier_data = builder.add_virtual_verifier_data(data.common.config.fri_config.cap_height);
     builder.verify_proof::<C>(&proof, &verifier_data, &data.common);
-    while builder.num_gates() < 1 << 12 {
+    while builder.num_gates() < 1 << INNER_PAD_BITS {
         builder.add_gate(NoopGate, vec![]);
     }
     builder.build::<C>().common
@@ -1051,6 +1058,25 @@ mod tests {
         ProofData::from_field_elements(&pis)
     }
 
+    /// Test helper: build a `MAX_IN_COINS`-length slot array with the
+    /// first slot active (`(true, coin, nip)`) and all remaining slots
+    /// inactive (`(false, dummy_coin, dummy_nip)`). Callers must pin
+    /// the dummy values in local variables so their references outlive
+    /// the returned vector.
+    fn slots_first_active<'a>(
+        coin: &'a Coin,
+        nip: &'a NonInclusionProof,
+        dummy_coin: &'a Coin,
+        dummy_nip: &'a NonInclusionProof,
+    ) -> Vec<(bool, &'a Coin, &'a NonInclusionProof)> {
+        let mut v = Vec::with_capacity(MAX_IN_COINS);
+        v.push((true, coin, nip));
+        for _ in 1..MAX_IN_COINS {
+            v.push((false, dummy_coin, dummy_nip));
+        }
+        v
+    }
+
     /// Stage 5c+ Initial-side smoke test (unchanged behaviour from 5c):
     /// a non-mint account with `balance = 0` is accepted, and the
     /// public-input `ProofData` matches the off-circuit reconstruction.
@@ -1331,7 +1357,9 @@ mod tests {
         let mut final_account_state = account_state.clone();
         final_account_state.balance += coin.amount;
 
-        let in_coins = [(true, &coin, &nip)];
+        let dummy_nip = dummy_non_inclusion_proof();
+        let dummy_c = dummy_coin();
+        let in_coins = slots_first_active(&coin, &nip, &dummy_c, &dummy_nip);
         let proof = prove_initial_with_in_coins(&circuit, &account_state, history_root, &in_coins)
             .expect("prove init with in-coin");
         verify(&circuit, &proof).expect("verify");
@@ -1364,7 +1392,9 @@ mod tests {
             recipient: account_state.owner,
             amount: 0,
         };
-        let in_coins = [(true, &coin, &nip)];
+        let dummy_nip = dummy_non_inclusion_proof();
+        let dummy_c = dummy_coin();
+        let in_coins = slots_first_active(&coin, &nip, &dummy_c, &dummy_nip);
         assert!(prove_initial_with_in_coins(
             &circuit,
             &account_state,
@@ -1395,7 +1425,9 @@ mod tests {
             recipient: hash_bytes(b"some-other-owner"),
             amount: 1,
         };
-        let in_coins = [(true, &coin, &nip)];
+        let dummy_nip = dummy_non_inclusion_proof();
+        let dummy_c = dummy_coin();
+        let in_coins = slots_first_active(&coin, &nip, &dummy_c, &dummy_nip);
         assert!(prove_initial_with_in_coins(
             &circuit,
             &account_state,
@@ -1425,7 +1457,9 @@ mod tests {
             // u64::MAX + 1 overflows.
             amount: 1,
         };
-        let in_coins = [(true, &coin, &nip)];
+        let dummy_nip = dummy_non_inclusion_proof();
+        let dummy_c = dummy_coin();
+        let in_coins = slots_first_active(&coin, &nip, &dummy_c, &dummy_nip);
         assert!(prove_initial_with_in_coins(
             &circuit,
             &account_state,
