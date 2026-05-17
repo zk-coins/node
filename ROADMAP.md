@@ -32,7 +32,7 @@ person-days at full focus; multiply for part-time work.
 | 4c | In-circuit SMT non-inclusion gadget (verify only) | ✅ done | — | — |
 | 4c+ | In-circuit SMT insert gadget (new-root computation) | ✅ done | — | — |
 | 4d | Port `ProgramInputs` + `CommitmentMerkleProofs` types | ✅ done | — | — |
-| 5 | Monolithic state-transition circuit (recursion, padding, vk-pin) | 🟡 in progress | **3–5 d** | **high** (vk-pin correctness, first real recursion test) |
+| 5 | Monolithic state-transition circuit (recursion, padding, vk-pin) | ✅ done (5a/5b/5c/5c+/5d/5d-next-3); 5d-next-4 source-side cyclic verify deferred to 5d-next-5 (post-MVP) — see [MIGRATION_RESEARCH §7.21](./MIGRATION_RESEARCH.md#721-stage-5d-next-4-source-side-verification-blocked-on-plonky2-110--deferred-to-stage-5d-next-5-post-mvp) | — | — |
 | 6 | `script-plonky2/` host-side prover wrapper | ⏳ todo | 1–2 d | low |
 | 7 | Server: **replace** SP1 path with Plonky2 (no feature flag, no dual backend) | ⏳ todo | 2–3 d | low (closed test env — no migration logic needed) |
 | 8 | App / wallet: Schnorr-signing boundary, server-API integration | ⏳ todo | 1–2 d | low (server-side compute architecture — no wasm-crypto migration) |

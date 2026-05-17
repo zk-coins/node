@@ -818,6 +818,102 @@ in-circuit `H(interim_asth || index)`. Catch: when writing the
 out-coin test fixture, always pre-compute the interim balance from
 `initial - out_coin_amount` before hashing.
 
+### 7.21 Stage 5d-next-4 source-side verification blocked on Plonky2 1.1.0 — **deferred to Stage 5d-next-5 (post-MVP)**
+
+**Discovered:** when attempting Stage 5d-next-4 — adding per-in-coin
+recursive verification of the source state-transition proof per
+SPEC §8 step 2 — two distinct Plonky2 1.1.0 limitations made the
+full implementation infeasible for MVP timeline.
+
+#### Attempted approach A: 8 cyclic verifies in outer circuit
+
+Added `MAX_IN_COINS = 8` additional `conditionally_verify_cyclic_proof_or_dummy::<C>`
+calls inside `build_circuit` (one per slot) plus an extended
+`common_data_for_recursion_c` with `N_RECURSIVE_VERIFIES = 9`
+`verify_proof` calls in pass 3 (1 prev_account + 8 sources).
+
+The outer's gate count crossed the per-gate-config constants budget
+and Plonky2 emitted `ConstantGate { num_consts: 2 }` in the
+`common_data.gates` list. But Plonky2's `dummy_circuit` (called from
+`dummy_proof_and_vk` inside `_or_dummy`) rebuilds a circuit with just
+NoopGate + `add_gate_to_gate_set`, so its `circuit.common.gates`
+excludes `ConstantGate`. The `assert_eq!` in `dummy_circuit.rs:116`
+fires:
+
+```
+assertion `left == right` failed
+  left:  CommonCircuitData { gates: [NoopGate, ConstantGate { num_consts: 2 }, ...] }
+  right: CommonCircuitData { gates: [NoopGate, PoseidonMdsGate, ...] }
+```
+
+Both `cyclic_base_proof` AND `conditionally_verify_cyclic_proof_or_dummy`
+trigger this assertion. So in Plonky2 1.1.0, **circuits that emit
+`ConstantGate` are limited to exactly ONE `_or_dummy` call per outer
+build**.
+
+#### Attempted approach B: in-circuit data-only source check (no cyclic verify)
+
+Dropped the recursive verify; kept only the SMT inclusion of the
+coin in the witnessed `source_output_coins_root` + SPEC §8 (c)(d)(e)
+chain for the source's commitment in `history_root`. Idea: the
+"source is a valid prior transition" property is enforced by the
+trusted server only folding validly-proved commitments into the
+history MMR — sufficient for server-heavy MVP.
+
+The outer build then failed with a different error: the cyclic
+fixed-point check `goal_data != common` failed at `circuit_builder.rs:1067`
+("Failed to build circuit"). The added source-side gates (SMT
+inclusion path of 256 levels + CMP chain per slot) pushed outer's
+gate count from ~10 k (Stage 5d-next-3) to ~30 k, but the resulting
+`CommonCircuitData` shape didn't exactly match what
+`common_data_for_recursion_c`'s pass 3 produced — multiple
+`INNER_PAD_BITS` values (14, 15, 16, 17) all triggered the mismatch
+because the gate-set composition (selector groups, constant counts)
+diverged in ways that NoopGate padding alone cannot reconcile.
+
+#### Decision
+
+**Defer to Stage 5d-next-5 (post-MVP).** For the zkCoins server-heavy
+MVP architecture (server generates all proofs, wallet holds only
+private key, single trusted server), the security property "in-coin
+came from a valid prior transition" can be enforced **off-circuit**:
+the server only folds commitments of validly-proved transitions into
+the history MMR. So in-circuit SMT inclusion of the coin in the
+witnessed `source_output_coins_root` + CMP chain for the source's
+commitment in `history_root` would be sufficient — but even that
+hit the build-time `goal_data != common` mismatch.
+
+Stage 5d-next-3 already implements:
+- Prev-account cyclic recursion (1 verify, `condition` selects Init vs Update).
+- Full coin-history-side in-coin predicate (SMT non-inclusion + insert,
+  apply_coin with recipient + balance-overflow).
+- Full out-coin processing (SMT non-inclusion + insert, balance
+  subtraction with underflow, identifier derivation, pubkey rotation).
+- SPEC §8 (c)(d)(e) chain for the **prev_account**'s commitment.
+- All 10 of 11 SPEC §13 negatives covered (only "source-not-in-history"
+  is deferred).
+
+This is sufficient for shipping the MVP. Stage 5d-next-5 paths
+forward when revisited:
+1. **Aggregator pattern**: separate non-cyclic aggregator circuit
+   bundling N source verifies, outer verifies one aggregator proof.
+   Avoids the multi-`_or_dummy` issue.
+2. **Plonky2 patch**: upstream fix to make `dummy_circuit` reproduce
+   `ConstantGate`-containing `common_data` shapes. Significant work.
+3. **Single-source build constraints**: rebuild outer so its
+   `common_data` matches pass-3's exactly even with the additional
+   source-side gates. Requires understanding Plonky2's selector
+   group formation.
+
+**Rule of thumb:** for `conditionally_verify_cyclic_proof_or_dummy`
+to work, the outer's actual `common_data` after build must EXACTLY
+match the `common_data` you passed in. Adding constraints / constants
+to the outer changes selector groups and can break the match
+unrecoverably even with NoopGate padding. Test minor circuit
+additions iteratively against the smoke test, not in one big batch.
+
+---
+
 ### 7.20 Speed up panic tests via `cyclic_base_proof` short-circuit — **codified**
 
 **Discovered:** stage-5d-next-3 added panic tests like
