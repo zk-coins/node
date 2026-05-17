@@ -92,8 +92,7 @@ use plonky2::iop::target::BoolTarget;
 use plonky2::iop::witness::{PartialWitness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::{
-    CircuitConfig, CircuitData, CommonCircuitData, VerifierCircuitTarget,
-    VerifierOnlyCircuitData,
+    CircuitConfig, CircuitData, CommonCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData,
 };
 use plonky2::plonk::proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget};
 use plonky2::recursion::dummy_circuit::{cyclic_base_proof, dummy_circuit};
@@ -304,9 +303,7 @@ pub fn prove_aggregator(
         // selected branch, so the dummy is harmless here).
         let real = match (witness.active, witness.real_proof) {
             (true, Some(p)) => p,
-            (true, None) => panic!(
-                "prove_aggregator: active slot must supply a real_proof"
-            ),
+            (true, None) => panic!("prove_aggregator: active slot must supply a real_proof"),
             (false, _) => &dummy_proof,
         };
         pw.set_proof_with_pis_target::<C, D>(&slot_targets.real_proof, real)
@@ -349,7 +346,7 @@ mod tests {
     ///   is the Stage 5d-next-3 working shape (1 verify, no
     ///   `ConstantGate` mismatch).
     #[test]
-    fn aggregator_smoke_all_inactive() {
+    fn stage_5d_next_5_aggregator_smoke_all_inactive() {
         let st_circuit = build_circuit();
         let aggregator = build_source_aggregator_circuit(&st_circuit.common_data);
 
@@ -408,7 +405,7 @@ mod tests {
     /// `verifier_only`) accepts the source proof, and its `ProofData`
     /// PIs surface unchanged in the aggregator's slot-0 PIs.
     #[test]
-    fn aggregator_one_active_slot_with_init_source() {
+    fn stage_5d_next_5_aggregator_one_active_slot_with_init_source() {
         let st_circuit = build_circuit();
         let aggregator = build_source_aggregator_circuit(&st_circuit.common_data);
 

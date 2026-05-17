@@ -5,14 +5,35 @@ Tracking document for the per-in-coin recursive verification work (SPEC
 `MIGRATION_RESEARCH.md` §7.21 and the original design notes in
 `STAGE_5D_NEXT_4_DESIGN.md` (Option B / aggregator pattern).
 
-## Status
+## Status snapshot
 
 | Phase | Scope | Result |
 |------:|-------|--------|
-| 1 | Aggregator skeleton + smoke test | **Done.** Two tests green, ~36 s wall combined. |
-| 2a | Outer-circuit integration (`verify_proof(agg)` + `connect_hashes`) | **Blocked** on Plonky2 1.1.0 `dummy_circuit` shape mismatch. Attempt reverted. |
-| 2b | Per-slot source-side SMT + CMP gadgets | Blocked behind 2a. |
-| 3 | Positives + 3 SPEC §13 negatives + 100 % coverage | Blocked behind 2. |
+| 1 | Aggregator skeleton + smoke + active-slot test | **Done.** 2 release tests green, ~30–80 s wall combined depending on cold/warm build (single-threaded). |
+| 2a | Outer-circuit integration (`verify_proof(agg)` + `connect_hashes`) | **Blocked.** Plonky2 1.1.0 `dummy_circuit` shape mismatch. Attempt was implemented end-to-end then reverted; details below. |
+| 2b | Per-slot source-side SMT inclusion + CMP (c)(d)(e) chain + coupling check | **Not started.** Strictly blocked behind 2a — the per-slot gates only have a place to live once the aggregator is wired into the outer's PI extraction. |
+| 3 | Restored 4 cyclic positives + 3 new SPEC §13 negatives + 100 % line coverage | **Not started.** Blocked behind 2. The 4 positives and 3 negatives the issue enumerates need the source-side gadgets in 2b to be meaningful. |
+| 4 | Documentation | **Done in this PR** (this file). |
+
+### What's on the branch right now
+
+- `src/circuit/source_aggregator.rs` (462 lines including 2 release-mode tests).
+- `src/circuit/mod.rs` — one-line `pub mod source_aggregator;`.
+- `STAGE_5D_NEXT_5_AGGREGATOR.md` — this document.
+
+### What's NOT on the branch (deferred)
+
+- Any change to `src/circuit/main.rs`. Phase 2a was prototyped (extra
+  `verify_proof(agg)` + `connect_hashes` for vk binding + extended
+  `common_data_for_recursion_c`) and reverted after the dummy_circuit
+  shape mismatch was confirmed to be a Plonky2 1.1.0 limitation, not
+  a coding bug. The Phase 1 aggregator is therefore currently UNUSED
+  by the outer state-transition circuit — it's a standalone artifact
+  exercised only by its own unit tests.
+- Per-slot source-side gates (Phase 2b).
+- The 7 production-criterion tests from the issue (Phase 3).
+- 100 % line coverage (`cargo llvm-cov --fail-under-lines 100`).
+- Adjustments to `script-plonky2/` (parent session handles after merge).
 
 The aggregator (Phase 1) is correct in isolation. The remaining
 blocker is in the **outer** state-transition circuit: integrating a
@@ -23,11 +44,16 @@ requires `common_data_for_recursion_c` to model a SECOND
 recursion depends on, in a way that the original deferral
 (`MIGRATION_RESEARCH.md` §7.21) anticipated but did not yet solve.
 
-## Architecture (per the issue)
+## Architecture (target end state — per issue #19)
+
+The aggregator box (top) is implemented in this PR. The outer box
+(bottom) is **NOT** implemented in this PR — Phase 2a and 2b are
+target-state, included here so the next session can pick up the work
+without re-deriving the design.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ SourceAggregatorCircuit (NON-CYCLIC, built ONCE per outer)  │
+│ SourceAggregatorCircuit (NON-CYCLIC)            [PHASE 1, DONE] │
 │                                                             │
 │   For each slot i in 0..MAX_IN_COINS:                       │
 │     active[i]: BoolTarget                                   │
@@ -47,10 +73,11 @@ recursion depends on, in a way that the original deferral
 │     [MAX_IN_COINS*17 + 4 ..]: st verifier_data sigmas_cap   │
 └─────────────────────────────────────────────────────────────┘
                               │
-                              │ aggregator_proof
+                              │ aggregator_proof  (not yet
+                              │  consumed by outer; see Phase 2a)
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ Outer StateTransitionCircuit (CYCLIC on prev_account)       │
+│ Outer StateTransitionCircuit (CYCLIC)        [PHASE 2, BLOCKED]│
 │                                                             │
 │   conditionally_verify_cyclic_proof_or_dummy(               │
 │     condition,                                              │
@@ -58,7 +85,7 @@ recursion depends on, in a way that the original deferral
 │     common_data,                ← cyclic fixed-point        │
 │   )                                                         │
 │                                                             │
-│   verify_proof::<C>(                                        │
+│   verify_proof::<C>(                          [PHASE 2a]    │
 │     aggregator_proof,                                       │
 │     aggregator_verifier_data,   ← constant_verifier_data    │
 │     aggregator_common,                                      │
@@ -67,7 +94,7 @@ recursion depends on, in a way that the original deferral
 │   connect_hashes(claimed_st_digest, outer_vd.digest)        │
 │   connect_hashes(claimed_st_cap, outer_vd.cap)              │
 │                                                             │
-│   Per in-coin slot (Phase 2b):                              │
+│   Per in-coin slot                            [PHASE 2b]:   │
 │     SMT inclusion of coin_identifier in                     │
 │       source.output_coins_root                              │
 │     SPEC §8 (c)(d)(e) chain for source.commitment in        │
@@ -111,10 +138,10 @@ in the outer (for the aggregator) shifts the shape — see
 
 ## Phase 1: aggregator skeleton — **shipped**
 
-Files added:
+Files added / changed:
 
-- `src/circuit/source_aggregator.rs` (~280 lines, including 2 tests)
-- `src/circuit/mod.rs` — re-exports the module
+- `src/circuit/source_aggregator.rs` — 462 lines including 2 release-mode tests.
+- `src/circuit/mod.rs` — one-line `pub mod source_aggregator;`.
 
 Public API:
 
@@ -147,8 +174,8 @@ Tests (release, single-threaded):
 
 | Test | What it validates | Wall |
 |------|-------------------|------|
-| `aggregator_smoke_all_inactive` | 8 inactive slots, no real source proofs. Confirms dummy-branch + `cyclic_base_proof` integration. | ~16 s |
-| `aggregator_one_active_slot_with_init_source` | Slot 0 active with a real Initial state-transition proof. Confirms active branch + PI surface. | ~36 s combined |
+| `stage_5d_next_5_aggregator_smoke_all_inactive` | 8 inactive slots, no real source proofs. Confirms dummy-branch + `cyclic_base_proof` integration. | ~16 s |
+| `stage_5d_next_5_aggregator_one_active_slot_with_init_source` | Slot 0 active with a real Initial state-transition proof. Confirms active branch + PI surface. | ~36 s combined |
 
 The smoke test confirms the architectural workaround: aggregator's
 `conditionally_verify_proof` + hand-rolled dummy doesn't trigger the
@@ -287,12 +314,21 @@ surface; both will be needed when the outer integration is solved.
 
 ## Benchmark
 
-Apple M3 Ultra, `cargo test --release`:
+`cargo test --release --lib circuit::source_aggregator::tests:: -- --test-threads=1`,
+measured on an Apple M3 (24 GB) with varying scheduler load — these
+will scale up on the production Mac Studio M3 Ultra:
 
-- Aggregator + state-transition build: ~10 s.
-- All-inactive aggregator prove + verify: ~6 s.
-- Active-slot positive (state-transition `prove_initial` + aggregator
-  prove + verify): ~20 s combined.
+- Smoke (`stage_5d_next_5_aggregator_smoke_all_inactive`) alone:
+  ~15–20 s. Dominated by the Stage-5d-next-3 outer
+  `build_circuit()` call it shares with the aggregator setup.
+- Active-slot test
+  (`stage_5d_next_5_aggregator_one_active_slot_with_init_source`)
+  adds a real `prove_initial` source proof on top of the same
+  build; observed combined wall for both tests ~30–80 s depending on
+  cold vs. warm build cache and machine load.
 
-These are within the budget; the Phase 2 blocker is purely a circuit
-shape constraint, not a performance one.
+The variance is dominated by the fact that each test rebuilds the
+state-transition circuit independently — an `OnceLock` cache across
+tests is a future optimisation. The Phase 2 blocker is purely a
+circuit-shape constraint, not a performance one; wall times stay well
+within the issue's budget.
