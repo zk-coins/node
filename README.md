@@ -318,6 +318,19 @@ Skip stages only with concrete latency or cost data, not assumptions.
 | [zk-coins/docs](https://github.com/zk-coins/docs)         | Documentation ([docs.zkcoins.app](https://docs.zkcoins.app)) |
 | [zk-coins/research](https://github.com/zk-coins/research) | Protocol research, upstream repos, paper PDF                 |
 
+## Design Documents
+
+| Document                                                | Scope                                                                                                          | Status |
+| ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ------ |
+| [`LIGHTNING_ATOMIC_SWAP.md`](./LIGHTNING_ATOMIC_SWAP.md) | Trustless LN ↔ zkCoins atomic swap design (HTLC on inscription funding tx)                                     | Draft  |
+| [`BITVM_BRIDGE.md`](./BITVM_BRIDGE.md)                  | BTC ↔ zkCoins trustless mint/burn bridge — landscape, BitVM2 / Glock / Mosaic comparison, N=100 federation target | Draft  |
+| [`BRIDGE_MVP.md`](./BRIDGE_MVP.md)                      | Engineering spec for the bridge MVP — 8 phases, file-by-file, 5–7 months effort estimate                       | Draft  |
+
+These documents describe the bridge and swap roadmap. They
+presuppose the Plonky2 migration currently on `feat/plonky2-migration`
+(PR #17) and cross-reference `SPEC.md`, `MIGRATION_RESEARCH.md`, and
+`ROADMAP.md`, which currently live on that branch.
+
 ## Protocol
 
 Based on [Shielded CSV](https://eprint.iacr.org/2025/068) by Jonas Nick (Blockstream), Liam Eagen (Alpen Labs), Robin Linus (ZeroSync). Server code derived from [ZeroSync/ZKCoins](https://github.com/ZeroSync/ZKCoins).
