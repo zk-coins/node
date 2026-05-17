@@ -5,24 +5,29 @@ left off.
 
 ## Current branch + HEAD
 
-`feat/plonky2-migration`, latest commit: `b76bd39` (Step 7 prep —
-serde derives + persistence helpers). The full set of stage-5 +
-step-6 + step-7-prep commits is enumerated in
-[`../ROADMAP.md`](../ROADMAP.md) under the **Done** section.
+`feat/plonky2-migration`, latest commit: `a29bde7` (Step 7 estimate
+re-scoped to ~2 d after a cutover attempt surfaced semantic
+mismatches). The full set of stage-5 + step-6 + step-7-prep commits
+is enumerated in [`../ROADMAP.md`](../ROADMAP.md) under the **Done**
+section.
 
-## Step status summary (2026-05-17 evening)
+## Step status summary (2026-05-17 evening, end of session)
 
 - Steps 1–4: ✅ done
-- Step 5 (monolithic circuit, Stage 5d-next-3): ✅ done; 103 tests
+- Step 5 (monolithic circuit, Stage 5d-next-3): ✅ done; 107 tests
+  total (103 original + 4 new save/load + missing-path), all
   passing in 198 s wall (multi-threaded `cargo test --release --lib`)
 - Step 5d-next-4 (source-side cyclic verify): 🚫 **deferred to
   post-MVP Stage 5d-next-5** — attempted, see MIGRATION_RESEARCH §7.21
-  for the two Plonky2 1.1.0 blockers
+  for the two Plonky2 1.1.0 blockers (`_or_dummy` ConstantGate
+  mismatch + in-circuit data-only `goal_data != common` mismatch)
 - Step 6 (script-plonky2 prover host wrapper): ✅ done (`d96bb62`)
-- Step 7 prep (serde + persistence helpers): ✅ done (`b76bd39`);
-  mechanical server-side imports + workspace toolchain cutover
-  remaining (~1 d)
-- Steps 8–9: ⏳ todo
+- Step 7 prep (serde derives + persistence helpers): ✅ done
+  (`b76bd39`); remaining work re-scoped to ~2 d after a cutover
+  attempt found 4 semantic mismatches beyond mere "mechanical
+  renames" — see [`STEP7_PREP.md`](STEP7_PREP.md) "Semantic
+  mismatches that the original inventory missed"
+- Steps 8–9: ⏳ todo (1–2 d + 3–5 d)
 
 ## What works end-to-end
 
