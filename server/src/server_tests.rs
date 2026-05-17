@@ -98,14 +98,14 @@ async fn info_returns_network_name() {
 // --- GET /api/balance ---
 
 #[tokio::test]
-async fn balance_unknown_address_returns_not_found() {
+async fn balance_unknown_address_returns_ok_with_zero() {
     // 32 zero bytes in hex = 64 hex chars
     let address_hex = "00".repeat(32);
     let uri = format!("/api/balance?address={}", address_hex);
     let req = Request::get(&uri).body(Body::empty()).unwrap();
     let (status, body) = send_request(req).await;
 
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::OK);
 
     let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
     assert_eq!(resp.balance, 0);
