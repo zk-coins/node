@@ -298,11 +298,12 @@ async fn get_balance_handler(
         };
         match account_server.get_account_balance(&address) {
             Ok(balance) => (StatusCode::OK, Json(BalanceResponse { balance, username })),
+            // Unobserved address: canonical zero-balance state, not a not-found condition.
             Err(_) => (
-                StatusCode::NOT_FOUND,
+                StatusCode::OK,
                 Json(BalanceResponse {
                     balance: 0,
-                    username: None,
+                    username,
                 }),
             ),
         }
