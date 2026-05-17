@@ -69,7 +69,9 @@ MIGRATION_RESEARCH / CONTRIBUTING are not individually listed once
 they merely correct or extend this file — see `git log` for the
 exhaustive history.
 
-- (next commit) — feat: stage 5c+ — `CommitmentMerkleProofs` in-circuit (SPEC §8 (c)(d)(e); fixed-shape SMT inclusion at `TREE_DEPTH = 256` + 2× MMR inclusion at `MMR_PROOF_PATH_LEN = 31`; new `MMR_MAX_DEPTH = 32` const + `MMRProof::extend_to(depth)` + `MerkleMountainRange::root_extended(depth)` off-circuit helpers; new `select_hash` masking pattern so every constraint fires only when `condition = true`; `dummy_cmp()` placeholder used by `prove_initial` to populate the unused fields; tests: positive bootstrap chain (Init→Update with full CommitmentMerkleProofs verify) plus negatives for (b), (c), (d).)
+- (next commit) — feat: stage 5d (minimal) + 5e (partial) — in-coin slot processing for coin_history + four SPEC §13 negative tests. 5d adds `MAX_IN_COINS = 1` const, `InCoinSlotTargets` per slot (`active`, `coin_identifier`, 256-sibling `nip_path`), per-slot SMT non-inclusion + insert into `coin_history_root` masked by `active`, new `prove_initial_with_in_coins` / `prove_account_update_with_in_coins` wrappers, and 5 tests (1 positive + 1 negative + 3 panic guards). 5e adds 4 negative tests against the existing 5c+ predicates: tampered MMR (d) path, tampered MMR (e) path, wrong commitment_root_mmr_sibling, wrong history_root. Source-side checks for in-coins (recursive verify, source.output_coins_root SMT inclusion, source CommitmentMerkleProofs) and `apply_coin` semantics (recipient + balance + overflow) DEFERRED to stage 5d+.
+- [`2ce36ce`](./../../commit/2ce36ce) — test: cover assert_eq panic messages in set_cmp_witness (3 should_panic tests restoring 100% line coverage after 5c+)
+- [`4bc5f2f`](./../../commit/4bc5f2f) — feat: stage 5c+ — `CommitmentMerkleProofs` in-circuit (SPEC §8 (c)(d)(e); fixed-shape SMT inclusion at `TREE_DEPTH = 256` + 2× MMR inclusion at `MMR_PROOF_PATH_LEN = 31`; new `MMR_MAX_DEPTH = 32` const + `MMRProof::extend_to(depth)` + `MerkleMountainRange::root_extended(depth)` off-circuit helpers; new `select_hash` masking pattern so every constraint fires only when `condition = true`; `dummy_cmp()` placeholder used by `prove_initial` to populate the unused fields; tests: positive bootstrap chain (Init→Update with full CommitmentMerkleProofs verify) plus negatives for (b), (c), (d).)
 - [`4f317fe`](./../../commit/4f317fe) — refactor: SMT redesign to uncompressed fixed-256 paths (off-circuit `InclusionProof` / `NonInclusionProof` always carry exactly `TREE_DEPTH = 256` siblings; path compression removed from `insert` and proof generation; `NonInclusionProof.leaf` field dropped — non-inclusion now witnesses the empty-leaf default at the depth-256 slot; in-circuit `verify_smt_inclusion` / `verify_smt_non_inclusion` / `verify_smt_insert` reduced to a single `hash_up_full_path` engine; case A/B branch and `extension` parameter gone.)
 - [`bba6470`](./../../commit/bba6470) — feat: stage 5c — AccountUpdate branch (condition now a free witness; cyclic verify binds SPEC §8 (a); state continuity (b) via `condition * (account_state_hash - prev.account_state_hash) == 0`; coin_history carry-over via `select(condition, prev.coin_history_root, DEFAULT_HASHES[0])`; mint exception masked with `!condition`; 5 tests incl. Initial→AccountUpdate chain and state-discontinuity rejection; SPEC §8 (c)(d)(e) MMR/SMT history checks DEFERRED to stage 5c+)
 - [`d167237`](./../../commit/d167237) — feat: stage 5b — Initial-branch state-transition predicate (`circuit/main.rs` rewritten: counter payload replaced by 16-element `ProofData`, mint exception + empty-SMT roots + in-circuit Poseidon `AccountState::hash`, condition pinned `false`; 3 tests: mint accepted, non-mint zero-balance accepted, non-mint nonzero-balance rejected)
@@ -97,10 +99,10 @@ exhaustive history.
 - [`57cdce4`](./../../commit/57cdce4) — docs: migration research
 - [`496c652`](./../../commit/496c652) — docs: circuit specification
 
-**Test count on this branch:** 78 (all green on nightly-2025-04-15).
+**Test count on this branch:** 90 (all green on nightly-2025-04-15).
 Breakdown: `prelude` 1 · `hash` 5 · `merkle::smt` 19 · `merkle::mmr` 14 ·
 `types` 10 · `inputs` 5 · `circuit::mmr` 5 · `circuit::smt` 12 ·
-`circuit::main` 7.
+`circuit::main` 19.
 
 **Coverage:** **100% lines, 100% functions, 100% regions** on `program-plonky2/`
 as measured by `cargo llvm-cov --fail-under-lines 100`. Test modules
@@ -149,24 +151,96 @@ stages so each lands as its own reviewable commit on the branch):
   **SPEC §8 (c)(d)(e) — `CommitmentMerkleProofs` predicate proving
   prev was published in the global history MMR — is NOT YET WIRED.
   Stage 5c+ closes that gap.**
-- **5c+ — CommitmentMerkleProofs in-circuit** ✅ done in this
-  revision. SPEC §8 (c)(d)(e) all wired via in-circuit SMT inclusion
-  (`TREE_DEPTH = 256`) + 2× MMR inclusion (`MMR_PROOF_PATH_LEN = 31`).
-  New `MMR_MAX_DEPTH = 32` const + off-circuit
-  `MMRProof::extend_to(depth)` + `MerkleMountainRange::root_extended(depth)`
-  helpers bring variable-depth MMR proofs to the fixed shape the
-  circuit consumes. Every (c)(d)(e) check is masked with `condition`
-  via the `select_hash(condition, expected, computed)` pattern, so
-  Initial proofs (`condition = false`) trivially satisfy the
-  constraints with the `dummy_cmp()` placeholder. 7 tests in
-  `circuit::main`: 3 Initial-side (unchanged behaviour), 1 full
-  bootstrap Init→Update chain with real `CommitmentMerkleProofs`,
-  3 negatives (state-discontinuity, lying commitment_account_state_hash,
-  tampered SMT path).
-- **5d — fixed-shape padding (MAX_IN_COINS = 8)** ⏳. Pad the
-  per-input-coin loop to the fixed bound, including dummy-coin
-  semantics (amount = 0 → no-op).
-- **5e — 11 negative tests from SPEC §13** ⏳. Overflow, underflow,
+- **5c+ — CommitmentMerkleProofs in-circuit** ✅ done in commit
+  [`4bc5f2f`](./../../commit/4bc5f2f). SPEC §8 (c)(d)(e) all wired via
+  in-circuit SMT inclusion (`TREE_DEPTH = 256`) + 2× MMR inclusion
+  (`MMR_PROOF_PATH_LEN = 31`). Coverage-fix in
+  [`2ce36ce`](./../../commit/2ce36ce).
+- **5d — in-coin slots (minimal)** ✅ done in this revision.
+  `MAX_IN_COINS = 1` (production target is 8 per SPEC §13; bumping
+  the constant is mechanical). Per slot the circuit reserves an
+  `active` bit, a `coin_identifier`, and a 256-sibling
+  `nip_path`. Active slots prove SMT non-inclusion of
+  `coin_identifier` at the running `coin_history_root` and compute
+  the new root after inserting `coin_identifier` (used both as key
+  and as leaf value, making `coin_history` a set-membership SMT).
+  Inactive slots are masked no-ops. The `coin_history_root` running
+  value is chained through all slots and emitted as
+  `ProofData.coin_history_root`. **NOT YET WIRED (defer to 5d+):**
+  recursive verification of each in-coin's source proof, SMT
+  inclusion of `coin.identifier` in `source.output_coins_root`, the
+  source's own CommitmentMerkleProofs, and the apply_coin balance /
+  recipient update on `AccountState`. Without these, in-coins are
+  unsound (a prover can claim any `coin_identifier` was sent to
+  them); 5d+ closes the gap. New tests in `circuit::main`: positive
+  Init-with-1-active-in-coin into empty coin_history; tampered nip
+  path rejected; 3 panic guards (`nip_path` length, slot count for
+  `prove_initial_with_in_coins`, slot count for
+  `prove_account_update_with_in_coins`).
+- **5d-next — apply_coin semantics** ⏳. Add per-slot
+  `coin_recipient: HashOutTarget` + `coin_amount_lo` + `coin_amount_hi`
+  witnesses. Per slot, masked by `active`:
+  - **Recipient check:** `condition * (coin_recipient.elements[i] -
+    account.owner.elements[i]) == 0` for each of 4 elements
+    (already-masked form: `active * (recipient[i] - owner[i]) == 0`).
+  - **Balance addition with overflow check:** 32-bit limb add. Let
+    `masked_amount_lo = active * coin_amount_lo`. Compute
+    `sum_lo = balance_lo + masked_amount_lo`, split as
+    `new_lo + 2^32 * carry` with `range_check(new_lo, 32)` and
+    `carry` a `BoolTarget`. Then
+    `sum_hi = balance_hi + active * coin_amount_hi + carry`, split as
+    `new_hi + 2^32 * overflow`. Assert `overflow == 0`. Replaces
+    `(balance_lo, balance_hi)` for the next slot's chain.
+  - Running balance must be threaded through all slots like
+    `running_coin_history`. Final `(balance_lo, balance_hi)` feeds
+    `account_state_hash` at the end.
+
+  Cost estimate: ~80 in-circuit gates per slot (cheap compared to
+  the 512 Poseidon hashes for the SMT walks). Bumping `MAX_IN_COINS`
+  to 8 in parallel adds ~3500 extra Poseidon hashes — feasible if
+  the `common_data_for_recursion_c` padding (currently `1 << 12`
+  gates) accommodates the larger outer circuit. Verify the padding
+  is sufficient before bumping.
+
+- **5d-next-2 — bump `MAX_IN_COINS` to 8** ⏳. Mechanical: change the
+  constant, extend each `*_with_in_coins` test's slot array with
+  `dummy_non_inclusion_proof()` placeholders for the inactive
+  trailing slots. Watch for Plonky2 `circuit_digest` shape
+  compatibility — may need to bump the `common_data_for_recursion_c`
+  padding gate count if the larger circuit's natural size grows past
+  `1 << 12`.
+
+- **5d-next-3 — source-side verification for in-coins** ⏳ (heaviest).
+  Each in-coin requires recursively verifying its source proof
+  (another `StateTransitionCircuit` instance), then asserting SPEC §8:
+  `cp.output_coins_root` contains `coin.identifier` (SMT inclusion);
+  `cp.commitment_history_root` is a prefix of current `history_root`
+  (a CommitmentMerkleProofs (d)+(e) instance per in-coin);
+  `cp.output_coins_root == mp.commitment_out_coins_root`. Requires
+  multiple `conditionally_verify_cyclic_proof_or_dummy` calls — the
+  Plonky2 1.1.0 cyclic-recursion machinery accepts only one inner
+  proof per call, so we either iterate it `MAX_IN_COINS + 1` times
+  (once for prev_account, once per in-coin) or fold all inner proofs
+  through a recursive aggregator first. `common_data_for_recursion_c`
+  shape must match the outer circuit's actual verify_proof count;
+  scale the helper accordingly.
+- **5e — negative tests from SPEC §13** ✅ partial (subset of 11
+  covered against the current circuit). Four new in this revision:
+  `stage_5e_account_update_tampered_mmr_a_path_rejected`,
+  `stage_5e_account_update_tampered_mmr_b_path_rejected`,
+  `stage_5e_account_update_wrong_mmr_sibling_rejected`,
+  `stage_5e_account_update_wrong_history_root_rejected`. The
+  remaining §13 invariants (double-spend, identifier-mismatch,
+  overflow/underflow on amounts, wrong vk) **require** the deferred
+  5d+ machinery (source verification, apply_coin, out_coins) and land
+  with it. Already-covered SPEC §13 items via earlier stages:
+  Initial non-mint balance != 0 → rejected (5c+), Initial mint
+  accepted (5b/5c+), account-update mismatched state hash → rejected
+  (5c+), prev's commitment_history_root not in current MMR → rejected
+  (the four 5e tests above), input-coin double-spend or wrong
+  identifier — DEFERRED.
+
+  Original (pre-stage-5b) wording: Overflow, underflow,
   wrong vk, double-spend, wrong identifier, mismatched
   account_state_hash, etc.
 

@@ -82,11 +82,11 @@ use plonky2::recursion::cyclic_recursion::check_cyclic_proof_verifier_data;
 use plonky2::recursion::dummy_circuit::cyclic_base_proof;
 
 use crate::circuit::mmr::mmr_inclusion_root;
-use crate::circuit::smt::{key_bits_msb_first, smt_inclusion_root};
+use crate::circuit::smt::{hash_up_full_path, key_bits_msb_first, smt_inclusion_root};
 use crate::hash::{digest_from_bytes, HashDigest, ZERO_HASH};
 use crate::inputs::CommitmentMerkleProofs;
 use crate::merkle::merkle_mountain_range::MMR_MAX_DEPTH;
-use crate::merkle::sparse_merkle_tree::{DEFAULT_HASHES, TREE_DEPTH};
+use crate::merkle::sparse_merkle_tree::{NonInclusionProof, DEFAULT_HASHES, TREE_DEPTH};
 use crate::types::{AccountState, MINTING_ADDRESS};
 use crate::{C, D, F};
 
@@ -103,6 +103,16 @@ pub const N_PROOF_DATA_PUBLIC_INPUTS: usize = 16;
 /// from the leaf's parent (level 1) to the root (level
 /// `MMR_MAX_DEPTH - 1`).
 pub const MMR_PROOF_PATH_LEN: usize = MMR_MAX_DEPTH - 1;
+
+/// Number of in-coin slots the circuit reserves. The state transition
+/// processes `MAX_IN_COINS` slots in fixed order; inactive slots are
+/// no-ops (masked by their per-slot `active` bit). SPEC §13 targets a
+/// production value of 8 — stage 5d ships with `1` as the
+/// minimum-viable structural commitment. Bumping the value is purely a
+/// matter of changing this constant and adjusting tests (no algorithmic
+/// change required); the circuit grows by ~512 Poseidon hashes per
+/// extra slot for the in-circuit SMT non-inclusion + insert walks.
+pub const MAX_IN_COINS: usize = 1;
 
 /// Build the `CommonCircuitData` that the cyclic circuit references
 /// when verifying its own prior proof.
@@ -176,6 +186,31 @@ fn select_hash(
         *slot = builder.select(cond, if_true.elements[i], if_false.elements[i]);
     }
     HashOutTarget { elements: out }
+}
+
+/// Witness targets for one in-coin slot. Each `StateTransitionCircuit`
+/// reserves [`MAX_IN_COINS`] of these and processes them in order; an
+/// `active = false` slot is a no-op that passes `coin_history_root`
+/// through unchanged.
+///
+/// Per SPEC §8 stage 5d wires only the **coin-history side** of the
+/// in-coins predicate: the per-slot SMT non-inclusion-then-insert into
+/// `coin_history_root`. The source-side checks (recursive verification
+/// of the source proof, SMT inclusion of `coin.identifier` in
+/// `source.output_coins_root`, and SPEC §8 (c)(d)(e) for the source's
+/// own commitment) are DEFERRED to stage 5d+ — see module docstring.
+pub struct InCoinSlotTargets {
+    /// 1 → this slot inserts `coin_identifier` into `coin_history_root`.
+    /// 0 → slot is a no-op (all in-circuit constraints masked off).
+    pub active: BoolTarget,
+    /// Coin's unique identifier. Used both as the SMT *key* (its 256
+    /// bits select the leaf position) and the SMT *value* (so the
+    /// coin_history SMT acts as a SET membership structure).
+    pub coin_identifier: HashOutTarget,
+    /// 256 SMT siblings proving non-inclusion of `coin_identifier` at
+    /// `coin_history_root` *before* the insert. The same path is then
+    /// used to compute the new root after inserting the coin.
+    pub nip_path: Vec<HashOutTarget>,
 }
 
 /// Witness targets for the SPEC §8 `CommitmentMerkleProofs` predicate,
@@ -257,6 +292,10 @@ pub struct StateTransitionCircuit {
     /// CommitmentMerkleProofs witness bundle. Constraints fire only
     /// when `condition = true` (AccountUpdate branch).
     pub cmp: CommitmentMerkleProofsTargets,
+    /// `MAX_IN_COINS` in-coin slot witnesses processed in order.
+    /// Active slots advance `coin_history_root` via SMT non-inclusion
+    /// + insert; inactive slots pass it through unchanged.
+    pub in_coin_slots: Vec<InCoinSlotTargets>,
 }
 
 /// Build the Stage-5c+ state-transition circuit.
@@ -440,19 +479,80 @@ pub fn build_circuit() -> StateTransitionCircuit {
     let mmr_b_target = select_hash(&mut builder, condition, history_root, mmr_b_computed);
     builder.connect_hashes(mmr_b_computed, mmr_b_target);
 
-    // Coin-history carry-over.
+    // Coin-history carry-over: starting value picks prev's
+    // coin_history_root for AccountUpdate, empty SMT root for Initial.
     let empty_root = builder.constant_hash(DEFAULT_HASHES[0]);
-    let mut output_coin_history_root_elements = [builder.zero(); 4];
-    for (i, slot) in output_coin_history_root_elements.iter_mut().enumerate() {
+    let empty_leaf_default = builder.constant_hash(DEFAULT_HASHES[TREE_DEPTH]);
+    let mut running_coin_history_elements = [builder.zero(); 4];
+    for (i, slot) in running_coin_history_elements.iter_mut().enumerate() {
         *slot = builder.select(
             condition,
             prev_coin_history_root.elements[i],
             empty_root.elements[i],
         );
     }
-    let output_coin_history_root = HashOutTarget {
-        elements: output_coin_history_root_elements,
+    let mut running_coin_history = HashOutTarget {
+        elements: running_coin_history_elements,
     };
+
+    // Per-slot in-coin processing: each active slot proves that
+    // `coin_identifier` was absent from the current `coin_history_root`
+    // (SMT non-inclusion via the `nip_path`) and computes the new root
+    // after inserting `coin_identifier` (used both as key and as
+    // leaf value — coin_history acts as a SET membership structure).
+    // Inactive slots leave the running root unchanged.
+    let in_coin_slots: Vec<InCoinSlotTargets> = (0..MAX_IN_COINS)
+        .map(|_| InCoinSlotTargets {
+            active: builder.add_virtual_bool_target_safe(),
+            coin_identifier: builder.add_virtual_hash(),
+            nip_path: (0..TREE_DEPTH)
+                .map(|_| builder.add_virtual_hash())
+                .collect(),
+        })
+        .collect();
+
+    for slot in &in_coin_slots {
+        let coin_id_bits = key_bits_msb_first(&mut builder, slot.coin_identifier);
+
+        // Non-inclusion: hash up from `empty_leaf_default` (= the SMT's
+        // depth-256 default) through the witnessed siblings; the result
+        // must equal the running `coin_history_root` *if* this slot is
+        // active. Masked via `select_hash` so inactive slots are
+        // trivially satisfied.
+        let computed_old = hash_up_full_path(
+            &mut builder,
+            empty_leaf_default,
+            &coin_id_bits,
+            &slot.nip_path,
+        );
+        let target_old = select_hash(
+            &mut builder,
+            slot.active,
+            running_coin_history,
+            computed_old,
+        );
+        builder.connect_hashes(computed_old, target_old);
+
+        // Insert: hash up from `leaf_hash = Poseidon(coin_id || coin_id)`
+        // through the same siblings — this is the new root *if* this
+        // slot is active.
+        let mut new_leaf_input = Vec::with_capacity(8);
+        new_leaf_input.extend_from_slice(&slot.coin_identifier.elements);
+        new_leaf_input.extend_from_slice(&slot.coin_identifier.elements);
+        let new_leaf = builder.hash_n_to_hash_no_pad::<PoseidonHash>(new_leaf_input);
+        let computed_new = hash_up_full_path(&mut builder, new_leaf, &coin_id_bits, &slot.nip_path);
+
+        // Update running root: pick `computed_new` when active, else
+        // pass through unchanged.
+        running_coin_history = select_hash(
+            &mut builder,
+            slot.active,
+            computed_new,
+            running_coin_history,
+        );
+    }
+
+    let output_coin_history_root = running_coin_history;
 
     // Connect `ProofData` public inputs slot-by-slot.
     for i in 0..4 {
@@ -485,6 +585,7 @@ pub fn build_circuit() -> StateTransitionCircuit {
         pubkey_limbs,
         history_root,
         cmp,
+        in_coin_slots,
     }
 }
 
@@ -623,19 +724,89 @@ fn dummy_cmp() -> CommitmentMerkleProofs {
     }
 }
 
+/// Set the witnesses for one in-coin slot. Used by both proving paths:
+/// inactive slots get a dummy non-inclusion proof against an arbitrary
+/// (zeroed) `coin_history_root`; the masked check is satisfied
+/// vacuously by the slot's `active = false` bit.
+fn set_in_coin_slot_witness(
+    pw: &mut PartialWitness<F>,
+    slot: &InCoinSlotTargets,
+    active: bool,
+    coin_identifier: HashDigest,
+    nip: &NonInclusionProof,
+) {
+    pw.set_bool_target(slot.active, active).unwrap();
+    pw.set_hash_target(slot.coin_identifier, coin_identifier)
+        .unwrap();
+    assert_eq!(
+        nip.siblings.len(),
+        TREE_DEPTH,
+        "InCoinSlot: non-inclusion proof must be padded to TREE_DEPTH siblings"
+    );
+    for (i, sib) in nip.siblings.iter().enumerate() {
+        pw.set_hash_target(slot.nip_path[i], *sib).unwrap();
+    }
+}
+
+/// Build a dummy `NonInclusionProof` for populating inactive in-coin
+/// slot witnesses. Every sibling is `ZERO_HASH`; the slot's `active`
+/// bit being `false` masks off the in-circuit checks regardless.
+fn dummy_non_inclusion_proof() -> NonInclusionProof {
+    NonInclusionProof {
+        key: [0u8; 32],
+        root: ZERO_HASH,
+        siblings: vec![ZERO_HASH; TREE_DEPTH],
+    }
+}
+
 /// Prove the Initial-branch state transition for a given `account_state`
 /// and `history_root`.
+///
+/// All `MAX_IN_COINS` slots are populated with inactive dummies — Stage 5d
+/// could in principle allow Init proofs to also receive in-coins (per
+/// SPEC §8 the Initial branch falls through to the in-coins loop), but
+/// the test fixtures here demonstrate only the empty-in-coins case.
+/// To prove an Initial proof with active in-coin slots, use
+/// [`prove_initial_with_in_coins`].
 pub fn prove_initial(
     circuit: &StateTransitionCircuit,
     account_state: &AccountState,
     history_root: HashDigest,
 ) -> Result<ProofWithPublicInputs<F, C, D>> {
+    let dummy_nip = dummy_non_inclusion_proof();
+    let inactive_slots: Vec<(bool, HashDigest, &NonInclusionProof)> = (0..MAX_IN_COINS)
+        .map(|_| (false, ZERO_HASH, &dummy_nip))
+        .collect();
+    prove_initial_with_in_coins(circuit, account_state, history_root, &inactive_slots)
+}
+
+/// Like [`prove_initial`] but with caller-supplied in-coin slot
+/// witnesses. Each tuple is `(active, coin_identifier, &non_inclusion_proof)`;
+/// the caller MUST supply exactly `MAX_IN_COINS` tuples. Inactive slots
+/// can pass the zero-coin / [`dummy_non_inclusion_proof`] placeholder
+/// regardless of the current `coin_history_root` — the slot's
+/// `active = false` bit masks all in-circuit checks.
+pub fn prove_initial_with_in_coins(
+    circuit: &StateTransitionCircuit,
+    account_state: &AccountState,
+    history_root: HashDigest,
+    in_coins: &[(bool, HashDigest, &NonInclusionProof)],
+) -> Result<ProofWithPublicInputs<F, C, D>> {
+    assert_eq!(
+        in_coins.len(),
+        MAX_IN_COINS,
+        "prove_initial_with_in_coins: caller must supply exactly MAX_IN_COINS slot witnesses"
+    );
     let mut pw = PartialWitness::new();
     pw.set_bool_target(circuit.condition, false).unwrap();
     set_account_state_witness(&mut pw, circuit, account_state);
     pw.set_hash_target(circuit.history_root, history_root)
         .unwrap();
     set_cmp_witness(&mut pw, circuit, &dummy_cmp());
+    for (slot_targets, (active, coin_id, nip)) in circuit.in_coin_slots.iter().zip(in_coins.iter())
+    {
+        set_in_coin_slot_witness(&mut pw, slot_targets, *active, *coin_id, nip);
+    }
 
     // Dummy inner proof for the cyclic-recursion slot.
     let inner_pis = std::iter::empty::<(usize, F)>().collect();
@@ -670,12 +841,46 @@ pub fn prove_account_update(
     prev: &ProofWithPublicInputs<F, C, D>,
     cmp: &CommitmentMerkleProofs,
 ) -> Result<ProofWithPublicInputs<F, C, D>> {
+    let dummy_nip = dummy_non_inclusion_proof();
+    let inactive_slots: Vec<(bool, HashDigest, &NonInclusionProof)> = (0..MAX_IN_COINS)
+        .map(|_| (false, ZERO_HASH, &dummy_nip))
+        .collect();
+    prove_account_update_with_in_coins(
+        circuit,
+        account_state,
+        history_root,
+        prev,
+        cmp,
+        &inactive_slots,
+    )
+}
+
+/// Like [`prove_account_update`] but with caller-supplied in-coin slot
+/// witnesses. See [`prove_initial_with_in_coins`] for the contract on
+/// the `in_coins` slice.
+pub fn prove_account_update_with_in_coins(
+    circuit: &StateTransitionCircuit,
+    account_state: &AccountState,
+    history_root: HashDigest,
+    prev: &ProofWithPublicInputs<F, C, D>,
+    cmp: &CommitmentMerkleProofs,
+    in_coins: &[(bool, HashDigest, &NonInclusionProof)],
+) -> Result<ProofWithPublicInputs<F, C, D>> {
+    assert_eq!(
+        in_coins.len(),
+        MAX_IN_COINS,
+        "prove_account_update_with_in_coins: caller must supply exactly MAX_IN_COINS slot witnesses"
+    );
     let mut pw = PartialWitness::new();
     pw.set_bool_target(circuit.condition, true).unwrap();
     set_account_state_witness(&mut pw, circuit, account_state);
     pw.set_hash_target(circuit.history_root, history_root)
         .unwrap();
     set_cmp_witness(&mut pw, circuit, cmp);
+    for (slot_targets, (active, coin_id, nip)) in circuit.in_coin_slots.iter().zip(in_coins.iter())
+    {
+        set_in_coin_slot_witness(&mut pw, slot_targets, *active, *coin_id, nip);
+    }
     pw.set_proof_with_pis_target::<C, D>(&circuit.inner_proof_target, prev)
         .unwrap();
     pw.set_verifier_data_target(&circuit.verifier_data_target, &circuit.data.verifier_only)
@@ -964,6 +1169,220 @@ mod tests {
             .truncate(MMR_PROOF_PATH_LEN - 1);
         let mut pw = PartialWitness::new();
         set_cmp_witness(&mut pw, &circuit, &cmp);
+    }
+
+    /// Stage 5d positive: Initial proof with one active in-coin slot.
+    /// The slot inserts `coin_identifier` into the (initially empty)
+    /// coin_history SMT; the output `ProofData.coin_history_root` must
+    /// match the off-circuit `NonInclusionProof::insert` result.
+    #[test]
+    fn stage_5d_initial_with_one_active_in_coin() {
+        let circuit = build_circuit();
+        let mut account_state = AccountState::new(dummy_pubkey(11));
+        account_state.owner = *MINTING_ADDRESS;
+        account_state.balance = 1;
+
+        let history_root = hash_bytes(b"history@5d-in-coin");
+
+        // Off-circuit non-inclusion proof for `coin_identifier` in the
+        // empty SMT (root = DEFAULT_HASHES[0]).
+        let coin_identifier = hash_bytes(b"5d-coin-1");
+        let coin_key = digest_to_bytes(&coin_identifier);
+        let empty_smt = SparseMerkleTree::new();
+        let nip = empty_smt.generate_non_inclusion_proof(coin_key).unwrap();
+        assert!(nip.verify(), "off-circuit non-inclusion sanity");
+        let expected_new_coin_history = nip.insert(coin_identifier);
+
+        let in_coins = [(true, coin_identifier, &nip)];
+        let proof = prove_initial_with_in_coins(&circuit, &account_state, history_root, &in_coins)
+            .expect("prove init with in-coin");
+        verify(&circuit, &proof).expect("verify");
+
+        let recovered = pis_as_proof_data(&proof);
+        assert_eq!(recovered.coin_history_root, expected_new_coin_history);
+        assert_eq!(recovered.account_state_hash, account_state.hash());
+    }
+
+    /// Stage 5d negative: a tampered non-inclusion path on an active
+    /// slot must fail to prove (the `connect_hashes(computed_old,
+    /// running)` constraint rejects).
+    #[test]
+    fn stage_5d_initial_with_tampered_nip_path_rejected() {
+        let circuit = build_circuit();
+        let mut account_state = AccountState::new(dummy_pubkey(11));
+        account_state.owner = *MINTING_ADDRESS;
+        account_state.balance = 1;
+
+        let coin_identifier = hash_bytes(b"5d-tampered");
+        let coin_key = digest_to_bytes(&coin_identifier);
+        let empty_smt = SparseMerkleTree::new();
+        let mut nip = empty_smt.generate_non_inclusion_proof(coin_key).unwrap();
+        // Tamper a sibling — the recomputed root won't match
+        // `DEFAULT_HASHES[0]` and the in-circuit check fires.
+        nip.siblings[0] = hash_bytes(b"lying-sibling");
+
+        let in_coins = [(true, coin_identifier, &nip)];
+        assert!(prove_initial_with_in_coins(
+            &circuit,
+            &account_state,
+            hash_bytes(b"history"),
+            &in_coins,
+        )
+        .is_err());
+    }
+
+    /// Build-time assertion: `set_in_coin_slot_witness` rejects a
+    /// non-inclusion proof of the wrong length — the in-circuit gadget
+    /// expects exactly `TREE_DEPTH` siblings.
+    #[test]
+    #[should_panic(
+        expected = "InCoinSlot: non-inclusion proof must be padded to TREE_DEPTH siblings"
+    )]
+    fn stage_5d_set_in_coin_slot_witness_panics_on_short_nip_path() {
+        let circuit = build_circuit();
+        let mut nip = dummy_non_inclusion_proof();
+        nip.siblings.truncate(TREE_DEPTH - 1);
+        let mut pw = PartialWitness::new();
+        set_in_coin_slot_witness(&mut pw, &circuit.in_coin_slots[0], true, ZERO_HASH, &nip);
+    }
+
+    /// Build-time assertion: `prove_initial_with_in_coins` rejects a
+    /// caller that doesn't supply exactly `MAX_IN_COINS` slot witnesses.
+    #[test]
+    #[should_panic(
+        expected = "prove_initial_with_in_coins: caller must supply exactly MAX_IN_COINS slot witnesses"
+    )]
+    fn stage_5d_prove_initial_panics_on_wrong_slot_count() {
+        let circuit = build_circuit();
+        let account_state = AccountState::new(dummy_pubkey(7));
+        let _ = prove_initial_with_in_coins(
+            &circuit,
+            &account_state,
+            ZERO_HASH,
+            &[], // 0 slots, expected MAX_IN_COINS = 1
+        );
+    }
+
+    /// Build-time assertion: `prove_account_update_with_in_coins`
+    /// rejects a caller that doesn't supply exactly `MAX_IN_COINS`
+    /// slot witnesses.
+    #[test]
+    #[should_panic(
+        expected = "prove_account_update_with_in_coins: caller must supply exactly MAX_IN_COINS slot witnesses"
+    )]
+    fn stage_5d_prove_account_update_panics_on_wrong_slot_count() {
+        let circuit = build_circuit();
+        let mut account_state = AccountState::new(dummy_pubkey(11));
+        account_state.owner = *MINTING_ADDRESS;
+        account_state.balance = 1;
+        let (cmp, history_root_extended) =
+            build_test_commitment_witness(account_state.hash(), DEFAULT_HASHES[0]);
+        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH).expect("prove init");
+        let _ = prove_account_update_with_in_coins(
+            &circuit,
+            &account_state,
+            history_root_extended,
+            &init_proof,
+            &cmp,
+            &[], // 0 slots, expected MAX_IN_COINS = 1
+        );
+    }
+
+    /// Stage 5e (SPEC §13): tampered MMR-(d) path — proof that the
+    /// commitment_root sits in `history_root` is invalid. The
+    /// in-circuit check rejects.
+    #[test]
+    fn stage_5e_account_update_tampered_mmr_a_path_rejected() {
+        let circuit = build_circuit();
+        let mut account_state = AccountState::new(dummy_pubkey(31));
+        account_state.owner = *MINTING_ADDRESS;
+        account_state.balance = 1;
+
+        let (mut cmp, history_root_extended) =
+            build_test_commitment_witness(account_state.hash(), DEFAULT_HASHES[0]);
+        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH).expect("prove init");
+        cmp.commitment_root_history_proof.path[0] = hash_bytes(b"lying-mmr-a-sib");
+        assert!(prove_account_update(
+            &circuit,
+            &account_state,
+            history_root_extended,
+            &init_proof,
+            &cmp
+        )
+        .is_err());
+    }
+
+    /// Stage 5e (SPEC §13): tampered MMR-(e) path — proof that prev's
+    /// committed history is a prefix of `history_root` is invalid.
+    #[test]
+    fn stage_5e_account_update_tampered_mmr_b_path_rejected() {
+        let circuit = build_circuit();
+        let mut account_state = AccountState::new(dummy_pubkey(32));
+        account_state.owner = *MINTING_ADDRESS;
+        account_state.balance = 1;
+
+        let (mut cmp, history_root_extended) =
+            build_test_commitment_witness(account_state.hash(), DEFAULT_HASHES[0]);
+        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH).expect("prove init");
+        cmp.previous_root_history_proof.1.path[0] = hash_bytes(b"lying-mmr-b-sib");
+        assert!(prove_account_update(
+            &circuit,
+            &account_state,
+            history_root_extended,
+            &init_proof,
+            &cmp
+        )
+        .is_err());
+    }
+
+    /// Stage 5e (SPEC §13): wrong `commitment_root_mmr_sibling` — the
+    /// MMR-(d) leaf no longer hashes to the witnessed `commitment_root`
+    /// path, so the MMR-(d) verification fails.
+    #[test]
+    fn stage_5e_account_update_wrong_mmr_sibling_rejected() {
+        let circuit = build_circuit();
+        let mut account_state = AccountState::new(dummy_pubkey(33));
+        account_state.owner = *MINTING_ADDRESS;
+        account_state.balance = 1;
+
+        let (mut cmp, history_root_extended) =
+            build_test_commitment_witness(account_state.hash(), DEFAULT_HASHES[0]);
+        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH).expect("prove init");
+        cmp.commitment_root_mmr_sibling = hash_bytes(b"lying-prev-mmr-root");
+        assert!(prove_account_update(
+            &circuit,
+            &account_state,
+            history_root_extended,
+            &init_proof,
+            &cmp
+        )
+        .is_err());
+    }
+
+    /// Stage 5e (SPEC §13): AccountUpdate proved against a
+    /// `history_root` that the real MMR does not match. With (d)+(e)
+    /// wired, both MMR proofs would have to reconstruct to the lying
+    /// `history_root` — they can't, so the proof fails.
+    #[test]
+    fn stage_5e_account_update_wrong_history_root_rejected() {
+        let circuit = build_circuit();
+        let mut account_state = AccountState::new(dummy_pubkey(34));
+        account_state.owner = *MINTING_ADDRESS;
+        account_state.balance = 1;
+
+        let (cmp, _real_history_root) =
+            build_test_commitment_witness(account_state.hash(), DEFAULT_HASHES[0]);
+        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH).expect("prove init");
+        // Lie about the history_root — neither MMR proof reconstructs to it.
+        let lying_history_root = hash_bytes(b"lying-history");
+        assert!(prove_account_update(
+            &circuit,
+            &account_state,
+            lying_history_root,
+            &init_proof,
+            &cmp
+        )
+        .is_err());
     }
 
     /// Stage 5c+ negative (d): AccountUpdate where the SMT inclusion path
