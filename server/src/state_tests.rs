@@ -304,6 +304,27 @@ fn test_get_mmr_inclusion_proof_unknown_root_returns_err() {
 }
 
 #[test]
+fn test_get_mmr_inclusion_proof_known_root_returns_ok() {
+    // After update(), root_indices maps the pre-update MMR root to a
+    // (smt_root, leaf_index) tuple — feeding that root back must
+    // return Ok and the leaf must verify against the post-update MMR
+    // root via the returned proof.
+    let mut state = State::new();
+    let pre_root = state.mmr.root();
+
+    let commitment = create_test_commitment(
+        b"known-root test",
+        "0000000000000000000000000000000000000000000000000000000000000007",
+    );
+    let post_root = state.update(&[commitment]).expect("update");
+
+    let (smt_root, proof) = state
+        .get_mmr_inclusion_proof(pre_root)
+        .expect("inclusion proof for known prev_mmr_root");
+    assert!(proof.verify(hash_concat(&smt_root, &pre_root), post_root));
+}
+
+#[test]
 fn test_get_commitment_proof_returns_err_when_smt_has_key_but_mmr_empty() {
     // This inconsistent state cannot arise from normal operation
     // (update() always grows both trees together) — it is reached
