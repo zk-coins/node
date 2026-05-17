@@ -1,13 +1,41 @@
 //! Sparse Merkle tree, Poseidon-Goldilocks variant.
 //!
 //! Mirrors the SHA256 SMT in `program/src/merkle/sparse_merkle_tree.rs`
-//! algorithmically; only the hash function and value type change.
+//! algorithmically. Compared to the legacy compressed-path SP1 SMT, this
+//! port uses **uncompressed paths**: every inclusion / non-inclusion
+//! proof always carries exactly [`TREE_DEPTH`] sibling hashes, regardless
+//! of how sparsely the tree is populated. Empty subtrees contribute
+//! `DEFAULT_HASHES[level + 1]` siblings.
+//!
+//! ## Why uncompressed
+//!
+//! The compressed-path variant short-circuits a single-leaf subtree at
+//! level *K* by treating its level-*K* root as the leaf hash itself,
+//! producing a proof of length *K* ≤ 256. Plonky2 cyclic recursion
+//! requires the verifier circuit to have a **fixed shape** — the
+//! `circuit_digest` must be stable across builds — so a verifier that
+//! consumes variable-length proofs would produce a different
+//! `circuit_digest` per proof length and the recursion chain breaks.
+//!
+//! Storing always-`TREE_DEPTH` siblings makes the proof a constant-size
+//! object and lets the in-circuit gadget hash up exactly 256 levels
+//! every time. The trade-off is on-the-wire proof size: 256 × 32 B =
+//! 8 KiB per proof, vs. typically tens of bytes for compressed proofs
+//! in a sparsely-populated tree. For zkCoins' state-transition
+//! workflow that is dwarfed by the recursive ZK proof itself.
+//!
+//! ## Layout
 //!
 //! - Keys: `[u8; 32]`, MSB-first bit indexing (unchanged).
 //! - Values / node hashes: [`HashDigest`] (`HashOut<F>`, 4 Goldilocks elts).
 //! - `hash_concat(left, right)` is Poseidon two-to-one.
-//! - `DEFAULT_HASHES[depth] = ZERO_HASH`; higher levels derived by
-//!   self-concatenation, computed once via `LazyLock`.
+//! - `DEFAULT_HASHES[depth] = empty-leaf` (domain-separated seed at
+//!   depth = `TREE_DEPTH`); higher levels derived by self-concatenation,
+//!   computed once via `LazyLock`.
+//! - Internal `SparseMerkleTree::nodes` stores **uncompressed** parent
+//!   hashes at every level: `(level, parent_key) → hash`. Levels with
+//!   no real children are absent and the lookup falls back to
+//!   `DEFAULT_HASHES[level]`.
 //!
 //! Persistence helpers (file save/load) are intentionally absent for now —
 //! the host-side wiring will pick a serialisation when needed.
@@ -90,8 +118,34 @@ fn leaf_hash(value: &HashDigest, key: &[u8; 32]) -> HashDigest {
     hash_concat(value, &digest_from_bytes(key))
 }
 
-/// Inclusion proof: the key, plus sibling hashes along the path from the
-/// (single) leaf back up to the root.
+/// Hash up `start` through `siblings` (indexed by tree level, `siblings[level]`
+/// is the sibling at that level's parent node) using `key`'s MSB-first bits
+/// for swap direction. Walks from the deepest level (level `TREE_DEPTH - 1`,
+/// where the leaf's parent lives) up to the root.
+///
+/// Returns the root produced by this walk. Used by every proof verify path
+/// and by [`SparseMerkleTree::insert`]'s root computation.
+fn hash_up_full_path(start: HashDigest, key: &[u8; 32], siblings: &[HashDigest]) -> HashDigest {
+    debug_assert_eq!(siblings.len(), TREE_DEPTH);
+    let mut current = start;
+    for level in (0..TREE_DEPTH).rev() {
+        let branch = get_bit(key, level);
+        let sibling = siblings[level];
+        current = if branch {
+            hash_concat(&sibling, &current)
+        } else {
+            hash_concat(&current, &sibling)
+        };
+    }
+    current
+}
+
+/// Inclusion proof: the key, plus exactly [`TREE_DEPTH`] sibling hashes from
+/// the leaf's parent down to the root.
+///
+/// `siblings[level]` is the sibling at that level's parent node (i.e. the
+/// other child of the node at `(level, trim_key(key, level))`). Siblings at
+/// levels where the subtree is empty equal `DEFAULT_HASHES[level + 1]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InclusionProof {
     pub key: [u8; 32],
@@ -101,95 +155,54 @@ pub struct InclusionProof {
 impl InclusionProof {
     /// Returns true if the proof reconstructs to `expected_root` from `leaf`.
     pub fn verify(&self, leaf: HashDigest, expected_root: HashDigest) -> bool {
-        let mut current_hash = leaf_hash(&leaf, &self.key);
-        let mut siblings = self.siblings.clone();
-        while let Some(sibling) = siblings.pop() {
-            let branch = get_bit(&self.key, siblings.len());
-            current_hash = if branch {
-                hash_concat(&sibling, &current_hash)
-            } else {
-                hash_concat(&current_hash, &sibling)
-            };
+        if self.siblings.len() != TREE_DEPTH {
+            return false;
         }
-        current_hash == expected_root
+        let start = leaf_hash(&leaf, &self.key);
+        hash_up_full_path(start, &self.key, &self.siblings) == expected_root
     }
 }
 
-/// Non-inclusion proof: witnesses that `key` is *not* in the tree, by giving
-/// either the occupying-sibling (different key, real value) or empty-subtree
-/// (same key, default value) along the relevant path.
+/// Non-inclusion proof: witnesses that `key` is absent from the tree.
+///
+/// The proof walks from `DEFAULT_HASHES[TREE_DEPTH]` (the empty-leaf seed) up
+/// through `siblings` and verifies that the resulting root equals `root`. If
+/// the slot at `key`'s depth-`TREE_DEPTH` position were occupied, the walk
+/// would produce a different root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NonInclusionProof {
     pub key: [u8; 32],
     pub root: HashDigest,
     pub siblings: Vec<HashDigest>,
-    pub leaf: ([u8; 32], HashDigest),
 }
 
 impl NonInclusionProof {
     pub fn verify(&self) -> bool {
-        let mut siblings = self.siblings.clone();
-        let mut current_hash = if self.key == self.leaf.0 {
-            if self.leaf.1 != DEFAULT_HASHES[siblings.len()] {
-                return false;
-            }
-            self.leaf.1
-        } else {
-            debug_assert_ne!(self.leaf.0, self.key);
-            leaf_hash(&self.leaf.1, &self.leaf.0)
-        };
-        while let Some(sibling) = siblings.pop() {
-            current_hash = if get_bit(&self.leaf.0, siblings.len()) {
-                hash_concat(&sibling, &current_hash)
-            } else {
-                hash_concat(&current_hash, &sibling)
-            };
+        if self.siblings.len() != TREE_DEPTH {
+            return false;
         }
-        current_hash == self.root
+        let start = DEFAULT_HASHES[TREE_DEPTH];
+        hash_up_full_path(start, &self.key, &self.siblings) == self.root
     }
 
     /// Returns the new root after inserting `leaf` at `self.key`. Does not
     /// verify the proof itself; pair with [`Self::verify_and_insert`] when
     /// validation is required.
-    pub fn insert(&self, leaf: HashDigest) -> Result<HashDigest, &'static str> {
-        let mut siblings = self.siblings.clone();
-        let mut current_hash = if self.key == self.leaf.0 {
-            if self.leaf.1 != DEFAULT_HASHES[siblings.len()] {
-                return Err("Invalid non-inclusion proof");
-            }
-            leaf_hash(&leaf, &self.key)
-        } else {
-            debug_assert_ne!(self.leaf.0, self.key);
-            while get_bit(&self.key, siblings.len()) == get_bit(&self.leaf.0, siblings.len()) {
-                siblings.push(DEFAULT_HASHES[siblings.len() + 1])
-            }
-            let sibling = leaf_hash(&self.leaf.1, &self.leaf.0);
-            let leaf = leaf_hash(&leaf, &self.key);
-            if get_bit(&self.key, siblings.len()) {
-                hash_concat(&sibling, &leaf)
-            } else {
-                hash_concat(&leaf, &sibling)
-            }
-        };
-        while let Some(sibling) = siblings.pop() {
-            current_hash = if get_bit(&self.key, siblings.len()) {
-                hash_concat(&sibling, &current_hash)
-            } else {
-                hash_concat(&current_hash, &sibling)
-            };
-        }
-        Ok(current_hash)
+    pub fn insert(&self, leaf: HashDigest) -> HashDigest {
+        let start = leaf_hash(&leaf, &self.key);
+        hash_up_full_path(start, &self.key, &self.siblings)
     }
 
     pub fn verify_and_insert(&self, leaf: HashDigest) -> Result<HashDigest, &'static str> {
         if !self.verify() {
             return Err("Invalid non-inclusion proof");
         }
-        self.insert(leaf)
+        Ok(self.insert(leaf))
     }
 }
 
-/// Sparse Merkle tree: only stores nodes that differ from the level-default.
+/// Sparse Merkle tree: stores all internal nodes that differ from
+/// the level-default. Insert/proof code hashes through every level.
 #[derive(Debug)]
 pub struct SparseMerkleTree {
     nodes: HashMap<(usize, [u8; 32]), HashDigest>,
@@ -210,46 +223,52 @@ impl SparseMerkleTree {
         }
     }
 
-    /// Inserts `leaf` at `key`. Idempotent for identical re-insertions;
+    /// Sibling hash at level `parent_level + 1` of the node opposite the
+    /// branch taken by `key`'s bit at `parent_level`. Falls back to
+    /// `DEFAULT_HASHES[level + 1]` for empty subtrees.
+    fn sibling_at(&self, key: &[u8; 32], parent_level: usize) -> HashDigest {
+        let branch = get_bit(key, parent_level);
+        let parent_key = trim_key(key, parent_level);
+        let sibling_key = child_key(&parent_key, !branch, parent_level);
+        self.nodes
+            .get(&(parent_level + 1, sibling_key))
+            .cloned()
+            .unwrap_or(DEFAULT_HASHES[parent_level + 1])
+    }
+
+    /// Inserts `value` at `key`. Idempotent for identical re-insertions;
     /// errors on conflicting re-insertion.
-    pub fn insert(&mut self, key: [u8; 32], leaf: HashDigest) -> Result<(), &'static str> {
+    ///
+    /// Updates exactly one branch from `key`'s leaf at depth `TREE_DEPTH`
+    /// up to the root, recomputing each parent's hash unconditionally —
+    /// the uncompressed scheme means a singleton subtree's level-K root
+    /// is NOT `leaf_hash` itself but the result of hashing the leaf with
+    /// `TREE_DEPTH - K` levels of default siblings.
+    pub fn insert(&mut self, key: [u8; 32], value: HashDigest) -> Result<(), &'static str> {
         if self.leaf_values.contains_key(&key) {
-            return if self.leaf_values.get(&key) == Some(&leaf) {
+            return if self.leaf_values.get(&key) == Some(&value) {
                 Ok(())
             } else {
                 Err("Key already exists in the tree with different value")
             };
         }
+        self.leaf_values.insert(key, value);
 
-        let prev_leaf = self.leaf_values.insert(key, leaf);
-        debug_assert_eq!(prev_leaf, None);
+        let leaf_h = leaf_hash(&value, &key);
+        self.nodes.insert((TREE_DEPTH, key), leaf_h);
 
-        let leaf_h = leaf_hash(&leaf, &key);
         let mut current_hash = leaf_h;
         for level in (0..TREE_DEPTH).rev() {
             let branch = get_bit(&key, level);
             let parent_key = trim_key(&key, level);
-            let sibling_key = child_key(&parent_key, !branch, level);
-            let sibling = self
-                .nodes
-                .get(&(level + 1, sibling_key))
-                .cloned()
-                .unwrap_or(DEFAULT_HASHES[level + 1]);
-            self.nodes.insert(
-                (level + 1, child_key(&parent_key, branch, level)),
-                current_hash,
-            );
-            if current_hash != leaf_h || sibling != DEFAULT_HASHES[level + 1] {
-                current_hash = if branch {
-                    hash_concat(&sibling, &current_hash)
-                } else {
-                    hash_concat(&current_hash, &sibling)
-                };
-            }
+            let sibling = self.sibling_at(&key, level);
+            current_hash = if branch {
+                hash_concat(&sibling, &current_hash)
+            } else {
+                hash_concat(&current_hash, &sibling)
+            };
+            self.nodes.insert((level, parent_key), current_hash);
         }
-        let prev_root = self.nodes.insert((0, [0; 32]), current_hash);
-        debug_assert_ne!(prev_root, Some(current_hash));
-
         Ok(())
     }
 
@@ -260,83 +279,14 @@ impl SparseMerkleTree {
             .unwrap_or(DEFAULT_HASHES[0])
     }
 
-    pub fn generate_non_inclusion_proof(
-        &self,
-        key: [u8; 32],
-    ) -> Result<NonInclusionProof, &'static str> {
-        let mut siblings = Vec::with_capacity(TREE_DEPTH);
-
-        if self.nodes.contains_key(&(TREE_DEPTH, key)) {
-            return Err("Leaf exists in the tree");
-        }
-
-        let mut sibling_leaf = (key, DEFAULT_HASHES[TREE_DEPTH]);
-
-        if !self.nodes.contains_key(&(0, [0; 32])) {
-            return Ok(NonInclusionProof {
-                key,
-                root: DEFAULT_HASHES[0],
-                siblings,
-                leaf: (key, DEFAULT_HASHES[0]),
-            });
-        }
-
-        for level in 0..TREE_DEPTH {
-            let branch = get_bit(&key, level);
-            let parent_key = trim_key(&key, level);
-            if let Some(parent) = self.nodes.get(&(level, parent_key)) {
-                let sibling_key = child_key(&parent_key, !branch, level);
-                let sibling = self
-                    .nodes
-                    .get(&(level + 1, sibling_key))
-                    .cloned()
-                    .unwrap_or(DEFAULT_HASHES[level + 1]);
-                let key = child_key(&parent_key, branch, level);
-                let child = self
-                    .nodes
-                    .get(&(level + 1, key))
-                    .cloned()
-                    .unwrap_or(DEFAULT_HASHES[level + 1]);
-                if sibling == *parent || child == *parent {
-                    let mut parent_key = if child == *parent { key } else { sibling_key };
-                    for layer in level + 1..TREE_DEPTH {
-                        let key_1 = child_key(&parent_key, true, layer);
-                        let key_0 = child_key(&parent_key, false, layer);
-                        let node_1 = self
-                            .nodes
-                            .get(&(layer + 1, key_1))
-                            .cloned()
-                            .unwrap_or(DEFAULT_HASHES[layer + 1]);
-                        let node_0 = self
-                            .nodes
-                            .get(&(layer + 1, key_0))
-                            .cloned()
-                            .unwrap_or(DEFAULT_HASHES[layer + 1]);
-                        debug_assert!(node_1 == *parent || node_0 == *parent);
-                        parent_key = if node_1 == *parent { key_1 } else { key_0 };
-                    }
-                    sibling_leaf.0 = parent_key;
-                    sibling_leaf.1 = *self.leaf_values.get(&parent_key).unwrap();
-                    break;
-                }
-                siblings.push(sibling);
-            } else {
-                sibling_leaf.0 = key;
-                sibling_leaf.1 = DEFAULT_HASHES[level];
-                break;
-            }
-        }
-
-        Ok(NonInclusionProof {
-            key,
-            root: self.root(),
-            siblings,
-            leaf: sibling_leaf,
-        })
-    }
-
     pub fn get(&self, key: &[u8; 32]) -> Option<HashDigest> {
         self.leaf_values.get(key).cloned()
+    }
+
+    /// 256 siblings along `key`'s branch, in `siblings[level]` order
+    /// (`level` is the parent's level, sibling lives at `level + 1`).
+    fn collect_path_siblings(&self, key: &[u8; 32]) -> Vec<HashDigest> {
+        (0..TREE_DEPTH).map(|l| self.sibling_at(key, l)).collect()
     }
 
     pub fn generate_inclusion_proof(
@@ -346,45 +296,30 @@ impl SparseMerkleTree {
         if !self.nodes.contains_key(&(TREE_DEPTH, *key)) {
             return Err("Key does not exist in the tree");
         }
-
-        let commitment = self.get(key).unwrap();
-
-        let mut siblings = Vec::new();
-        let mut parent = self
-            .nodes
-            .get(&(0, [0; 32]))
-            .cloned()
-            .unwrap_or(DEFAULT_HASHES[0]);
-
-        for level in 0..TREE_DEPTH {
-            let branch = get_bit(key, level);
-            let parent_key = trim_key(key, level);
-            let sibling_key = child_key(&parent_key, !branch, level);
-            let sibling = self
-                .nodes
-                .get(&(level + 1, sibling_key))
-                .cloned()
-                .unwrap_or(DEFAULT_HASHES[level + 1]);
-            let ck = child_key(&parent_key, branch, level);
-            let child = self
-                .nodes
-                .get(&(level + 1, ck))
-                .cloned()
-                .unwrap_or(DEFAULT_HASHES[level + 1]);
-            if child == parent || sibling == parent {
-                break;
-            }
-            siblings.push(sibling);
-            parent = child;
-        }
-
+        let value = self.get(key).unwrap();
+        let siblings = self.collect_path_siblings(key);
         Ok((
             InclusionProof {
                 key: *key,
                 siblings,
             },
-            commitment,
+            value,
         ))
+    }
+
+    pub fn generate_non_inclusion_proof(
+        &self,
+        key: [u8; 32],
+    ) -> Result<NonInclusionProof, &'static str> {
+        if self.nodes.contains_key(&(TREE_DEPTH, key)) {
+            return Err("Leaf exists in the tree");
+        }
+        let siblings = self.collect_path_siblings(&key);
+        Ok(NonInclusionProof {
+            key,
+            root: self.root(),
+            siblings,
+        })
     }
 }
 
@@ -536,6 +471,7 @@ mod tests {
             );
             tree.insert(key, sample_value(i as u64)).unwrap();
             let (proof, commitment) = tree.generate_inclusion_proof(&key).unwrap();
+            assert_eq!(proof.siblings.len(), TREE_DEPTH);
             assert!(proof.verify(commitment, tree.root()));
         }
     }
@@ -545,6 +481,7 @@ mod tests {
         let mut tree = SparseMerkleTree::new();
         for (i, key) in sample_keys().into_iter().enumerate() {
             let proof = tree.generate_non_inclusion_proof(key).unwrap();
+            assert_eq!(proof.siblings.len(), TREE_DEPTH);
             assert_eq!(proof.root, tree.root());
             assert!(proof.verify());
             tree.insert(key, sample_value(i as u64)).unwrap();
@@ -586,51 +523,47 @@ mod tests {
         assert!(err.is_err());
     }
 
-    /// Build a 2-leaf tree where the lookup-key lands in an empty subtree at
-    /// level 0 (case A non-inclusion). Both inserted keys share bit 0, the
-    /// lookup goes to the opposite bit-0 side which has no node at level 1
-    /// → generate_non_inclusion_proof returns case A with leaf = (lookup, default).
-    fn case_a_tree_and_proof() -> (SparseMerkleTree, NonInclusionProof, [u8; 32]) {
-        let mut tree = SparseMerkleTree::new();
-        let k0 = [0u8; 32];
-        let mut k1 = [0u8; 32];
-        k1[0] = 0x40; // bit 1 = 1, bit 0 = 0
-        tree.insert(k0, sample_value(0)).unwrap();
-        tree.insert(k1, sample_value(1)).unwrap();
-        let lookup = {
-            let mut k = [0u8; 32];
-            k[0] = 0x80; // bit 0 = 1
-            k
-        };
-        let nip = tree.generate_non_inclusion_proof(lookup).unwrap();
-        assert_eq!(nip.key, nip.leaf.0, "must be case A for this fixture");
-        (tree, nip, lookup)
+    /// A non-inclusion proof with the wrong sibling count is rejected by
+    /// the length guard in `verify()` — the in-circuit gadget is built
+    /// against a fixed `TREE_DEPTH` shape and an off-circuit short proof
+    /// would silently underspecify the chain.
+    #[test]
+    fn non_inclusion_verify_rejects_short_proof() {
+        let tree = SparseMerkleTree::new();
+        let mut proof = tree.generate_non_inclusion_proof([1u8; 32]).unwrap();
+        proof.siblings.truncate(TREE_DEPTH - 1);
+        assert!(!proof.verify());
     }
 
     #[test]
-    fn non_inclusion_verify_rejects_wrong_default_value_in_case_a() {
-        let (_, mut nip, _) = case_a_tree_and_proof();
-        // Mutate other_value so it no longer matches DEFAULT_HASHES.
-        nip.leaf.1 = sample_value(99);
-        assert!(!nip.verify());
+    fn inclusion_verify_rejects_short_proof() {
+        let mut tree = SparseMerkleTree::new();
+        tree.insert([1u8; 32], sample_value(1)).unwrap();
+        let (mut proof, value) = tree.generate_inclusion_proof(&[1u8; 32]).unwrap();
+        proof.siblings.truncate(TREE_DEPTH - 1);
+        assert!(!proof.verify(value, tree.root()));
     }
 
     #[test]
     fn verify_and_insert_rejects_invalid_proof() {
-        let (_, mut nip, _) = case_a_tree_and_proof();
-        nip.leaf.1 = sample_value(99);
-        let err = nip.verify_and_insert(sample_value(7));
+        let tree = SparseMerkleTree::new();
+        let key = [1u8; 32];
+        let mut proof = tree.generate_non_inclusion_proof(key).unwrap();
+        // Tamper with a sibling: the verify() will reconstruct a different
+        // root than `proof.root`, so verify_and_insert refuses to insert.
+        proof.siblings[0] = sample_value(0xDEAD);
+        let err = proof.verify_and_insert(sample_value(7));
         assert!(err.is_err());
     }
 
     #[test]
-    fn non_inclusion_insert_rejects_case_a_with_wrong_default() {
-        // Call insert() directly (without verify) — the case-A branch checks
-        // the default and returns Err if mismatched.
-        let (_, mut nip, _) = case_a_tree_and_proof();
-        nip.leaf.1 = sample_value(99);
-        let err = nip.insert(sample_value(7));
-        assert!(err.is_err());
+    fn non_inclusion_after_insert_changes_root_field_fails() {
+        let tree = SparseMerkleTree::new();
+        let key = [1u8; 32];
+        let mut proof = tree.generate_non_inclusion_proof(key).unwrap();
+        // Pretend the root is something else; verify must catch.
+        proof.root = sample_value(0xBEEF);
+        assert!(!proof.verify());
     }
 
     /// Regression guard against the zero-state Poseidon collision: if
@@ -638,7 +571,7 @@ mod tests {
     /// would equal `Poseidon(all-zeros)` — and any leaf whose value+key both
     /// permute through the zero state (e.g. derived from a `0u32` input)
     /// would collide with `DEFAULT_HASHES[TREE_DEPTH - 1]`, breaking the
-    /// chase loop in `generate_non_inclusion_proof`. The domain-separated
+    /// chase loop in non-inclusion proof generation. The domain-separated
     /// empty-leaf seed prevents this.
     #[test]
     fn leaf_hash_never_collides_with_defaults() {
