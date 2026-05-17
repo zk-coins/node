@@ -2,9 +2,10 @@
 
 Companion document to [`SPEC.md`](./SPEC.md). Summarises what we can take from the upstream references, and — more importantly — flags where our current implementation has diverged from the published Shielded CSV protocol. Read this before writing any Plonky2 code.
 
-> **Fresh session?** Start with [`CLAUDE.md`](./CLAUDE.md) first for the
-> project invariants and reading order. This file's §7 (Lessons Learned)
-> is the *required reading before touching the affected code areas*.
+> **Fresh session?** Start with [`CONTRIBUTING.md`](./CONTRIBUTING.md)
+> § "Working on the Plonky2 Migration" first for the project invariants
+> and reading order. This file's §7 (Lessons Learned) is the *required
+> reading before touching the affected code areas*.
 
 ---
 
@@ -478,31 +479,45 @@ this annotation if they ship a `#[cfg(test)] mod tests` block — see
 
 ### 7.11 Hardware target is a Mac Studio M3 Ultra, single host — **codified**
 
-**Discovered:** explicit architecture decision (commit `79bd39e`).
+**Discovered:** explicit architecture decision (commit `79bd39e`,
+clarified shortly after).
 
 **Constraint:** zkCoins runs on a single Mac Studio M3 Ultra (96 GB
-unified RAM, Apple Silicon CPU). No discrete GPU. No external cloud
-proving service (no Succinct Prover Network, no AWS GPU, no Lambda
-Labs). If a design overshoots the performance budget, the design
-changes; we do not add hardware.
+unified RAM). On-box compute includes Performance + Efficiency cores,
+the integrated Apple Silicon GPU (reachable via Metal), Neural Engine,
+and AMX. **External** hardware (NVIDIA, CUDA, GPU farms) and external
+cloud proving services (Succinct Prover Network, AWS GPU, Lambda Labs)
+are **not** available. If a design overshoots the performance budget,
+the design changes; we do not add external hardware.
+
+**Important caveat about "GPU":** the M3 Ultra has a substantial
+integrated GPU (60- or 80-core depending on bin) usable via Metal.
+That GPU is on-box and would be fair game *if our prover library
+supported it*. Plonky2 currently ships only CPU and CUDA backends —
+no Metal — so the GPU sits idle for proving. This is a library
+property, not a constraint we imposed. If a Plonky2 Metal backend
+becomes available (or we port to Plonky3 which has more options), we
+may use the GPU.
 
 **Implications for design choices made earlier in this document:**
 
 - §5.3 (Hash function): Poseidon-Goldilocks performance must be
-  acceptable on Apple Silicon CPU. Plonky2 has no GPU path anyway, so
-  this constraint is structurally compatible.
+  acceptable on the M3 Ultra. Today that's CPU performance, since
+  Plonky2 has no Metal backend.
 - §5.4 (Schnorr boundary): unchanged — boundary lives at byte
   serialisation, no in-circuit secp256k1.
 - §6 sequencing: step 9's performance budget (`ROADMAP.md` step 9) is
   explicitly M3-Ultra-warm-proof ≤ 5 s, ideal ≤ 1 s, memory peak
   < 64 GB. If missed, knobs are design-level (reduce `MAX_IN_COINS`,
-  drop in-coin recursion, switch to folding) — never hardware.
+  drop in-coin recursion, switch to folding) — never external hardware.
 
 **Implication for the Plonky3 post-MVP path** (`ROADMAP.md`):
-BabyBear's GPU-friendliness is a generic benefit that does **not**
-apply to us. The motivation for switching to Plonky3 reduces to
-"matches SP1-era field choice / Plonky3-native ecosystem"; the
-performance argument is significantly weaker on CPU-only hardware.
+BabyBear's GPU-friendliness in the broader literature usually means
+CUDA-friendliness, which doesn't help us on Apple Silicon. The
+motivation for switching to Plonky3 reduces to "matches SP1-era field
+choice / Plonky3-native ecosystem". A separate question is whether
+Plonky3's GPU paths might include Metal — if so, that would change
+the calculation.
 
 ---
 

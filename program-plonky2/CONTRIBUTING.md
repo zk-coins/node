@@ -4,10 +4,11 @@ Operational handoff: how to build, test, lint, and not blow up the
 machine. This crate is **excluded from the parent workspace** and
 carries its own toolchain pin.
 
-> **Fresh contributor?** Read [`../CLAUDE.md`](../CLAUDE.md) first for
-> the project invariants and reading order. This file is the
-> operational *how*, but the rules in CLAUDE constrain what you may
-> change here.
+> **Fresh contributor?** Read [`../CONTRIBUTING.md`](../CONTRIBUTING.md)
+> § "Working on the Plonky2 Migration" first for the project invariants
+> and reading order. This file is the operational *how* for the migration
+> crate, but the rules in the repo-root CONTRIBUTING constrain what you
+> may change here.
 
 ## Why this crate is standalone
 
@@ -77,8 +78,11 @@ Acceptable exclusions:
   exclusion is necessary, not lazy.
 - Code that requires external services (live Bitcoin node) → mark with
   `#[cfg(feature = "integration-tests")]` and the integration tests run
-  separately in step 9's e2e plan. Note: there is no "GPU prover" path
-  in our architecture — the hardware target is M3 Ultra CPU-only.
+  separately in step 9's e2e plan. Note on hardware: the M3 Ultra has
+  its integrated GPU (Metal) available on the box, but Plonky2 currently
+  ships only CPU and CUDA backends. So in practice proving runs on CPU.
+  External NVIDIA / CUDA hardware and external cloud provers are out of
+  scope regardless.
 
 NOT acceptable: "I'll add tests later", "this is just MVP scaffolding",
 "the next gadget will cover it". MVP includes coverage; see ROADMAP
