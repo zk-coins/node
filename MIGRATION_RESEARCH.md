@@ -705,6 +705,41 @@ tree up front. The `_extended` / `extend_to` helpers preserve the
 fast off-circuit path while making the value the in-circuit verifier
 needs trivially derivable.
 
+### 7.17 Per-slot `active`-bit masking for variable-count loops — **codified**
+
+**Discovered:** stage-5d needed to support a per-account state
+transition processing 0..`MAX_IN_COINS` input coins, but the circuit
+shape must be fixed (otherwise `circuit_digest` changes per
+transaction → cyclic recursion breaks).
+
+**Pattern:** declare a constant `MAX_IN_COINS` slot count at the
+circuit-builder level. Each slot reserves witness targets including
+an `active: BoolTarget`. The slot's predicate is wrapped so that
+`active = false` makes every constraint trivially satisfied:
+
+- Equality / hash-match checks: `connect_hashes(computed, select_hash(active, expected, computed))`.
+- Value-update accumulators: `running = select_hash(active, new_value, running)`.
+
+This is the same `select_hash` masking pattern from §7.15, scaled
+out across a fixed list of slots. The off-circuit prover decides at
+runtime how many slots are active — the unused ones get a dummy
+witness (zeroed coin id, zero-filled proof path) that the masked
+constraints accept.
+
+**Caller ergonomics:** for the common case where all slots are
+inactive (e.g. Init proofs without in-coins), provide a thin wrapper
+`prove_*(args)` that delegates to the explicit
+`prove_*_with_in_coins(args, &inactive_dummies)`. The explicit
+variant remains available for tests and callers that need to control
+slot activity directly.
+
+**Performance cost:** each masked slot adds the *full* gate count of
+the underlying predicate (the masking doesn't save gates — it only
+makes the result vacuously satisfied). For stage 5d's SMT
+non-inclusion + insert this is ~512 Poseidon hashes per slot at
+`TREE_DEPTH = 256`. Bumping `MAX_IN_COINS` from 1 to 8 grows the
+circuit by ~3500 hashes — measure before committing to a target.
+
 ---
 
 ## 8. Local Artifacts

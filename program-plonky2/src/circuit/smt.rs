@@ -69,7 +69,13 @@ pub fn key_bits_msb_first<F: RichField + Extendable<D>, const D: usize>(
 /// every SMT proof gadget below: only the starting hash differs (leaf
 /// hash for inclusion / insert-new, empty-leaf default for
 /// non-inclusion / insert-old).
-fn hash_up_full_path<F: RichField + Extendable<D>, const D: usize>(
+///
+/// Exposed so external callers (e.g. the monolithic state-transition
+/// circuit in `circuit/main.rs`) can build masked variants of the
+/// inclusion / non-inclusion checks by reusing this engine with a
+/// custom `start` value and then connecting the result to a
+/// `select`-masked target.
+pub fn hash_up_full_path<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
     start: HashOutTarget,
     key_bits: &[BoolTarget],
