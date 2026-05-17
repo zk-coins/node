@@ -186,6 +186,155 @@ pub fn verify_smt_non_inclusion<F: RichField + Extendable<D>, const D: usize>(
     builder.connect_hashes(current, expected_root);
 }
 
+/// Verify an SMT non-inclusion proof AND compute the new root after
+/// inserting `(new_value, key)` at that key, asserting equality with
+/// `expected_new_root`.
+///
+/// Off-circuit equivalent:
+/// [`crate::merkle::sparse_merkle_tree::NonInclusionProof::verify_and_insert`].
+///
+/// The gadget unifies the two non-inclusion cases (mirroring the
+/// off-circuit `if self.key == self.leaf.0 { … } else { … }` branch in
+/// `NonInclusionProof::insert`) via the same `is_case_a` selector used
+/// by [`verify_smt_non_inclusion`]:
+///
+/// - **Case A** (empty subtree, `key == other_key`): the new leaf takes
+///   the place of the default at depth `path.len()`. New root =
+///   `leaf_hash(new_value, key)` hashed up `path.len()` levels using
+///   the existing siblings. The caller passes `extension` of length 0.
+/// - **Case B** (path-compressed neighbour, `key != other_key`): the
+///   existing leaf and the new leaf must be uncompressed down to the
+///   first level `D` where their keys diverge. The caller supplies
+///   `extension` of length `E = D - path.len() >= 1` (the off-circuit
+///   `insert` builds this by pushing `DEFAULT_HASHES[K+1..D+1]`). New
+///   root = ordered-pair of the two leaf hashes at divergence depth `D`,
+///   hashed up using `extension` followed by `path`.
+///
+/// `default_at_path_depth` is `DEFAULT_HASHES[path.len()]`, witnessed by
+/// the caller. The case-A invariant `is_case_a → other_value ==
+/// DEFAULT_HASHES[path.len()]` is enforced as a product-equals-zero
+/// constraint, identical to [`verify_smt_non_inclusion`].
+///
+/// `key_bits` and `other_key_bits` are full 256-bit MSB-first
+/// decompositions (use [`key_bits_msb_first`]). `key_bits` must be
+/// strictly longer than `path.len() + extension.len()` (the divergence
+/// bit at level `D` is read from `key_bits[D]`); `other_key_bits` must
+/// cover at least `path.len()` levels.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_smt_insert<F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
+    new_value: HashOutTarget,
+    key: HashOutTarget,
+    other_key: HashOutTarget,
+    other_value: HashOutTarget,
+    key_bits: &[BoolTarget],
+    other_key_bits: &[BoolTarget],
+    path: &[HashOutTarget],
+    extension: &[HashOutTarget],
+    expected_old_root: HashOutTarget,
+    expected_new_root: HashOutTarget,
+    default_at_path_depth: HashOutTarget,
+) {
+    let k = path.len();
+    let e = extension.len();
+    let combined_len = k + e;
+    assert!(
+        other_key_bits.len() >= k,
+        "verify_smt_insert: other_key_bits must cover at least path.len() levels"
+    );
+    assert!(
+        key_bits.len() > combined_len,
+        "verify_smt_insert: key_bits must cover at least path.len() + extension.len() + 1 levels"
+    );
+
+    // is_case_a = (key == other_key), element-wise AND of four `is_equal`.
+    let eqs: Vec<BoolTarget> = (0..4)
+        .map(|i| builder.is_equal(key.elements[i], other_key.elements[i]))
+        .collect();
+    let eq01 = builder.and(eqs[0], eqs[1]);
+    let eq23 = builder.and(eqs[2], eqs[3]);
+    let is_case_a = builder.and(eq01, eq23);
+
+    // Case-A invariant: is_case_a → other_value == default_at_path_depth.
+    for i in 0..4 {
+        let diff = builder.sub(other_value.elements[i], default_at_path_depth.elements[i]);
+        let product = builder.mul(is_case_a.target, diff);
+        builder.assert_zero(product);
+    }
+
+    // ===== Old-root verify (mirrors verify_smt_non_inclusion) =====
+    let mut other_leaf_input = Vec::with_capacity(8);
+    other_leaf_input.extend_from_slice(&other_value.elements);
+    other_leaf_input.extend_from_slice(&other_key.elements);
+    let other_leaf_h = builder.hash_n_to_hash_no_pad::<PoseidonHash>(other_leaf_input);
+
+    let mut verify_start_elements = [builder.zero(); 4];
+    for (i, elt) in verify_start_elements.iter_mut().enumerate() {
+        *elt = builder.select(is_case_a, other_value.elements[i], other_leaf_h.elements[i]);
+    }
+    let mut verify_current = HashOutTarget {
+        elements: verify_start_elements,
+    };
+    for (i, sibling) in path.iter().rev().enumerate() {
+        let bit = other_key_bits[k - 1 - i];
+        let (left, right) = swap_if(builder, bit, verify_current, *sibling);
+        let mut input = Vec::with_capacity(8);
+        input.extend_from_slice(&left.elements);
+        input.extend_from_slice(&right.elements);
+        verify_current = builder.hash_n_to_hash_no_pad::<PoseidonHash>(input);
+    }
+    builder.connect_hashes(verify_current, expected_old_root);
+
+    // ===== New-root computation =====
+    // new_leaf_h = Poseidon(new_value || key) — always computed (used by both cases).
+    let mut new_leaf_input = Vec::with_capacity(8);
+    new_leaf_input.extend_from_slice(&new_value.elements);
+    new_leaf_input.extend_from_slice(&key.elements);
+    let new_leaf_h = builder.hash_n_to_hash_no_pad::<PoseidonHash>(new_leaf_input);
+
+    // Case A starting hash: new_leaf_h itself (sits at depth `k`).
+    let start_a = new_leaf_h;
+
+    // Case B starting hash: ordered pair of (new_leaf_h, other_leaf_h) at
+    // divergence depth `combined_len`. Off-circuit:
+    //   if get_bit(key, siblings.len()) { hash_concat(sibling, leaf) }
+    //   else                            { hash_concat(leaf, sibling) }
+    // i.e. div_bit=1 puts new leaf on the right (sibling/other on left),
+    // div_bit=0 puts new leaf on the left.
+    let div_bit = key_bits[combined_len];
+    let (b_left, b_right) = swap_if(builder, div_bit, new_leaf_h, other_leaf_h);
+    let mut pair_input = Vec::with_capacity(8);
+    pair_input.extend_from_slice(&b_left.elements);
+    pair_input.extend_from_slice(&b_right.elements);
+    let start_b = builder.hash_n_to_hash_no_pad::<PoseidonHash>(pair_input);
+
+    // start = select(is_case_a, start_a, start_b)
+    let mut start_elements = [builder.zero(); 4];
+    for (i, elt) in start_elements.iter_mut().enumerate() {
+        *elt = builder.select(is_case_a, start_a.elements[i], start_b.elements[i]);
+    }
+    let mut new_current = HashOutTarget {
+        elements: start_elements,
+    };
+
+    // Walk up: extension siblings first (deepest), then path siblings.
+    // Combined slice = path ++ extension so that iter().rev() yields
+    // extension[E-1..0] then path[K-1..0] — matching the off-circuit
+    // `siblings.pop()` order after the divergence-padding push loop.
+    let mut combined: Vec<HashOutTarget> = Vec::with_capacity(combined_len);
+    combined.extend_from_slice(path);
+    combined.extend_from_slice(extension);
+    for (i, sibling) in combined.iter().rev().enumerate() {
+        let bit = key_bits[combined_len - 1 - i];
+        let (left, right) = swap_if(builder, bit, new_current, *sibling);
+        let mut input = Vec::with_capacity(8);
+        input.extend_from_slice(&left.elements);
+        input.extend_from_slice(&right.elements);
+        new_current = builder.hash_n_to_hash_no_pad::<PoseidonHash>(input);
+    }
+    builder.connect_hashes(new_current, expected_new_root);
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
@@ -510,5 +659,379 @@ mod tests {
         }
 
         assert!(data.prove(pw).is_err(), "tampered leaf must not prove");
+    }
+
+    // ===== verify_smt_insert tests =====
+    //
+    // Each fixture is paired with a shared `insert_round_trip` helper that
+    // computes the off-circuit `verify_and_insert` result, derives the
+    // case-B padding (matching the off-circuit `insert` push loop), and
+    // witnesses the gadget. The positive-case tests assert the gadget's
+    // computed new root matches off-circuit; the negative-case tests
+    // assert that tampered inputs fail to prove.
+
+    /// Compute the Case-B extension siblings exactly as `NonInclusionProof::insert`
+    /// does (the `while get_bit(key, sim_len) == get_bit(other_key, sim_len)` loop).
+    /// Returns an empty vec for Case A (`nip.key == nip.leaf.0`).
+    fn case_b_extension(
+        nip: &crate::merkle::sparse_merkle_tree::NonInclusionProof,
+    ) -> Vec<HashDigest> {
+        use crate::merkle::sparse_merkle_tree::{get_bit, DEFAULT_HASHES};
+        let mut ext = Vec::new();
+        if nip.key != nip.leaf.0 {
+            let mut sim_len = nip.siblings.len();
+            while get_bit(&nip.key, sim_len) == get_bit(&nip.leaf.0, sim_len) {
+                ext.push(DEFAULT_HASHES[sim_len + 1]);
+                sim_len += 1;
+            }
+        }
+        ext
+    }
+
+    /// Build the insert gadget against an off-circuit non-inclusion proof,
+    /// witness all inputs (using `expected_new_root` from off-circuit
+    /// `verify_and_insert`), prove, and verify. Returns the
+    /// `CircuitData` and the `PartialWitness` so negative tests can
+    /// inject mutations before calling `prove`.
+    fn build_insert_circuit_and_witness(
+        tree: &SparseMerkleTree,
+        nip: &crate::merkle::sparse_merkle_tree::NonInclusionProof,
+        new_value: HashDigest,
+        expected_new_root: HashDigest,
+    ) -> (
+        plonky2::plonk::circuit_data::CircuitData<F, C, D>,
+        PartialWitness<F>,
+    ) {
+        use crate::merkle::sparse_merkle_tree::DEFAULT_HASHES;
+
+        let path_len = nip.siblings.len();
+        let default_at_depth = DEFAULT_HASHES[path_len];
+        let extension_values = case_b_extension(nip);
+        let ext_len = extension_values.len();
+
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+
+        let new_value_t = builder.add_virtual_hash();
+        let key_t = builder.add_virtual_hash();
+        let other_key_t = builder.add_virtual_hash();
+        let other_value_t = builder.add_virtual_hash();
+        let old_root_t = builder.add_virtual_hash();
+        let new_root_t = builder.add_virtual_hash();
+        let default_t = builder.add_virtual_hash();
+        let path_t: Vec<HashOutTarget> =
+            (0..path_len).map(|_| builder.add_virtual_hash()).collect();
+        let extension_t: Vec<HashOutTarget> =
+            (0..ext_len).map(|_| builder.add_virtual_hash()).collect();
+        let key_bits = key_bits_msb_first(&mut builder, key_t);
+        let other_key_bits = key_bits_msb_first(&mut builder, other_key_t);
+        verify_smt_insert(
+            &mut builder,
+            new_value_t,
+            key_t,
+            other_key_t,
+            other_value_t,
+            &key_bits,
+            &other_key_bits,
+            &path_t,
+            &extension_t,
+            old_root_t,
+            new_root_t,
+            default_t,
+        );
+        let data = builder.build::<C>();
+
+        let mut pw = PartialWitness::new();
+        pw.set_hash_target(new_value_t, new_value).unwrap();
+        pw.set_hash_target(key_t, digest_from_bytes(&nip.key))
+            .unwrap();
+        pw.set_hash_target(other_key_t, digest_from_bytes(&nip.leaf.0))
+            .unwrap();
+        pw.set_hash_target(other_value_t, nip.leaf.1).unwrap();
+        pw.set_hash_target(old_root_t, tree.root()).unwrap();
+        pw.set_hash_target(new_root_t, expected_new_root).unwrap();
+        pw.set_hash_target(default_t, default_at_depth).unwrap();
+        for (i, sib) in nip.siblings.iter().enumerate() {
+            pw.set_hash_target(path_t[i], *sib).unwrap();
+        }
+        for (i, ext) in extension_values.iter().enumerate() {
+            pw.set_hash_target(extension_t[i], *ext).unwrap();
+        }
+
+        (data, pw)
+    }
+
+    fn insert_round_trip(
+        tree: &SparseMerkleTree,
+        nip: &crate::merkle::sparse_merkle_tree::NonInclusionProof,
+        new_value: HashDigest,
+    ) {
+        let expected_new_root = nip.verify_and_insert(new_value).expect("off-circuit");
+        let (data, pw) = build_insert_circuit_and_witness(tree, nip, new_value, expected_new_root);
+        let proof_with_pis = data.prove(pw).expect("prove failed");
+        data.verify(proof_with_pis).expect("verify failed");
+    }
+
+    /// Case A — lookup lands in an empty subtree at depth 2; insert there
+    /// places the new leaf at the same depth, hashing up with the existing
+    /// two siblings.
+    #[test]
+    fn smt_insert_case_a_empty_subtree() {
+        let k0 = [0u8; 32];
+        let mut k1 = [0u8; 32];
+        k1[0] = 0x40;
+        let mut lookup = [0u8; 32];
+        lookup[0] = 0x80;
+
+        let mut tree = SparseMerkleTree::new();
+        tree.insert(k0, hash_bytes(b"v0")).unwrap();
+        tree.insert(k1, hash_bytes(b"v1")).unwrap();
+        let nip = tree.generate_non_inclusion_proof(lookup).unwrap();
+        assert_eq!(nip.key, nip.leaf.0, "this scenario should be case A");
+
+        insert_round_trip(&tree, &nip, hash_bytes(b"new"));
+    }
+
+    /// Case B — 2-leaf tree where the path-compressed neighbour diverges
+    /// from the lookup at the level *just below* the non-inclusion proof
+    /// (E = 0). Smallest possible Case B: K = 1, E = 0, total walk = 1.
+    #[test]
+    fn smt_insert_case_b_shallow_divergence() {
+        let k0 = [0u8; 32];
+        let mut k1 = [0u8; 32];
+        k1[0] = 0x80; // bit 0 = 1
+        let mut lookup = [0u8; 32];
+        lookup[0] = 0xC0; // bits 0,1 = 1,1 — same first bit as k1, diverges at bit 1
+
+        let mut tree = SparseMerkleTree::new();
+        tree.insert(k0, hash_bytes(b"v0")).unwrap();
+        tree.insert(k1, hash_bytes(b"v1")).unwrap();
+        let nip = tree.generate_non_inclusion_proof(lookup).unwrap();
+        assert_ne!(nip.key, nip.leaf.0, "this scenario should be case B");
+
+        insert_round_trip(&tree, &nip, hash_bytes(b"new"));
+    }
+
+    /// Case B with a non-zero extension — 1-leaf tree where the new key
+    /// shares the first 31 bytes with k0 and diverges in the last byte at
+    /// bit 248. K = 0, E ≈ 248. Slower than the shallow test but exercises
+    /// the extension-padding walk.
+    #[test]
+    fn smt_insert_case_b_deep_divergence() {
+        let k0 = [0u8; 32];
+        let mut lookup = [0u8; 32];
+        lookup[31] = 0x80; // bit 248 = 1 — diverges from k0 at bit 248
+
+        let mut tree = SparseMerkleTree::new();
+        tree.insert(k0, hash_bytes(b"v0")).unwrap();
+        let nip = tree.generate_non_inclusion_proof(lookup).unwrap();
+        assert_ne!(nip.key, nip.leaf.0, "this scenario should be case B");
+        assert!(
+            !case_b_extension(&nip).is_empty(),
+            "deep divergence must produce extension siblings"
+        );
+
+        insert_round_trip(&tree, &nip, hash_bytes(b"new"));
+    }
+
+    /// Tampered new-leaf value: the gadget computes a new_root from the
+    /// lying `new_value` that doesn't match the honest `expected_new_root`
+    /// witnessed alongside it; `connect_hashes` fails.
+    #[test]
+    fn smt_insert_tampered_new_value_fails() {
+        let k0 = [0u8; 32];
+        let mut k1 = [0u8; 32];
+        k1[0] = 0x40;
+        let mut lookup = [0u8; 32];
+        lookup[0] = 0x80;
+
+        let mut tree = SparseMerkleTree::new();
+        tree.insert(k0, hash_bytes(b"v0")).unwrap();
+        tree.insert(k1, hash_bytes(b"v1")).unwrap();
+        let nip = tree.generate_non_inclusion_proof(lookup).unwrap();
+        let honest_new_value = hash_bytes(b"honest");
+        let expected_new_root = nip.verify_and_insert(honest_new_value).unwrap();
+
+        let (data, pw) =
+            build_insert_circuit_and_witness(&tree, &nip, hash_bytes(b"lie"), expected_new_root);
+        assert!(data.prove(pw).is_err(), "tampered new_value must not prove");
+    }
+
+    /// Tampered expected_new_root — same setup as the positive Case A test
+    /// but witness a wrong target root. `connect_hashes` fails.
+    #[test]
+    fn smt_insert_tampered_expected_new_root_fails() {
+        let k0 = [0u8; 32];
+        let mut k1 = [0u8; 32];
+        k1[0] = 0x40;
+        let mut lookup = [0u8; 32];
+        lookup[0] = 0x80;
+
+        let mut tree = SparseMerkleTree::new();
+        tree.insert(k0, hash_bytes(b"v0")).unwrap();
+        tree.insert(k1, hash_bytes(b"v1")).unwrap();
+        let nip = tree.generate_non_inclusion_proof(lookup).unwrap();
+
+        let (data, pw) = build_insert_circuit_and_witness(
+            &tree,
+            &nip,
+            hash_bytes(b"new"),
+            // Honest new_root would be `nip.verify_and_insert(...)`; we
+            // hand the gadget an unrelated digest instead.
+            hash_bytes(b"unrelated-root"),
+        );
+        assert!(
+            data.prove(pw).is_err(),
+            "tampered expected_new_root must not prove"
+        );
+    }
+
+    /// Case-A invariant: if `other_value` is not the default at the path
+    /// depth, the gadget rejects (mirrors the off-circuit
+    /// `if self.leaf.1 != DEFAULT_HASHES[siblings.len()] return Err`).
+    #[test]
+    fn smt_insert_case_a_wrong_default_fails() {
+        let k0 = [0u8; 32];
+        let mut k1 = [0u8; 32];
+        k1[0] = 0x40;
+        let mut lookup = [0u8; 32];
+        lookup[0] = 0x80;
+
+        let mut tree = SparseMerkleTree::new();
+        tree.insert(k0, hash_bytes(b"v0")).unwrap();
+        tree.insert(k1, hash_bytes(b"v1")).unwrap();
+        let nip = tree.generate_non_inclusion_proof(lookup).unwrap();
+        assert_eq!(nip.key, nip.leaf.0);
+
+        // Compute the would-be expected_new_root with the honest other_value,
+        // then witness a lying other_value.
+        let new_value = hash_bytes(b"new");
+        let expected_new_root = nip.verify_and_insert(new_value).unwrap();
+        let path_len = nip.siblings.len();
+        let default_at_depth = crate::merkle::sparse_merkle_tree::DEFAULT_HASHES[path_len];
+
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let new_value_t = builder.add_virtual_hash();
+        let key_t = builder.add_virtual_hash();
+        let other_key_t = builder.add_virtual_hash();
+        let other_value_t = builder.add_virtual_hash();
+        let old_root_t = builder.add_virtual_hash();
+        let new_root_t = builder.add_virtual_hash();
+        let default_t = builder.add_virtual_hash();
+        let path_t: Vec<HashOutTarget> =
+            (0..path_len).map(|_| builder.add_virtual_hash()).collect();
+        let extension_t: Vec<HashOutTarget> = Vec::new(); // Case A
+        let key_bits = key_bits_msb_first(&mut builder, key_t);
+        let other_key_bits = key_bits_msb_first(&mut builder, other_key_t);
+        verify_smt_insert(
+            &mut builder,
+            new_value_t,
+            key_t,
+            other_key_t,
+            other_value_t,
+            &key_bits,
+            &other_key_bits,
+            &path_t,
+            &extension_t,
+            old_root_t,
+            new_root_t,
+            default_t,
+        );
+        let data = builder.build::<C>();
+
+        let mut pw = PartialWitness::new();
+        pw.set_hash_target(new_value_t, new_value).unwrap();
+        pw.set_hash_target(key_t, digest_from_bytes(&nip.key))
+            .unwrap();
+        pw.set_hash_target(other_key_t, digest_from_bytes(&nip.leaf.0))
+            .unwrap();
+        // Lie: claim other_value is non-default while is_case_a = true.
+        pw.set_hash_target(other_value_t, hash_bytes(b"lie"))
+            .unwrap();
+        pw.set_hash_target(old_root_t, tree.root()).unwrap();
+        pw.set_hash_target(new_root_t, expected_new_root).unwrap();
+        pw.set_hash_target(default_t, default_at_depth).unwrap();
+        for (i, sib) in nip.siblings.iter().enumerate() {
+            pw.set_hash_target(path_t[i], *sib).unwrap();
+        }
+
+        assert!(
+            data.prove(pw).is_err(),
+            "case-A invariant must reject non-default other_value"
+        );
+    }
+
+    /// Gadget-build assertion: key_bits must be strictly longer than
+    /// path.len() + extension.len() so the divergence-bit lookup
+    /// `key_bits[combined_len]` is in bounds.
+    #[test]
+    #[should_panic(expected = "key_bits must cover at least path.len() + extension.len() + 1")]
+    fn smt_insert_short_key_bits_panics() {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let new_value_t = builder.add_virtual_hash();
+        let key_t = builder.add_virtual_hash();
+        let other_key_t = builder.add_virtual_hash();
+        let other_value_t = builder.add_virtual_hash();
+        let old_root_t = builder.add_virtual_hash();
+        let new_root_t = builder.add_virtual_hash();
+        let default_t = builder.add_virtual_hash();
+        let path_t: Vec<HashOutTarget> = (0..3).map(|_| builder.add_virtual_hash()).collect();
+        let extension_t: Vec<HashOutTarget> = Vec::new();
+        let bit0 = builder.add_virtual_bool_target_safe();
+        let bit1 = builder.add_virtual_bool_target_safe();
+        let bit2 = builder.add_virtual_bool_target_safe();
+        let other_key_bits = key_bits_msb_first(&mut builder, other_key_t);
+        // 3 key_bits with combined_len = 3 → not strictly greater.
+        verify_smt_insert(
+            &mut builder,
+            new_value_t,
+            key_t,
+            other_key_t,
+            other_value_t,
+            &[bit0, bit1, bit2],
+            &other_key_bits,
+            &path_t,
+            &extension_t,
+            old_root_t,
+            new_root_t,
+            default_t,
+        );
+    }
+
+    /// Gadget-build assertion: other_key_bits must cover path.len() so the
+    /// old-root walk can read `other_key_bits[k - 1 - i]`.
+    #[test]
+    #[should_panic(expected = "other_key_bits must cover at least path.len() levels")]
+    fn smt_insert_short_other_key_bits_panics() {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let new_value_t = builder.add_virtual_hash();
+        let key_t = builder.add_virtual_hash();
+        let other_key_t = builder.add_virtual_hash();
+        let other_value_t = builder.add_virtual_hash();
+        let old_root_t = builder.add_virtual_hash();
+        let new_root_t = builder.add_virtual_hash();
+        let default_t = builder.add_virtual_hash();
+        let path_t: Vec<HashOutTarget> = (0..3).map(|_| builder.add_virtual_hash()).collect();
+        let extension_t: Vec<HashOutTarget> = Vec::new();
+        let key_bits = key_bits_msb_first(&mut builder, key_t);
+        let bit0 = builder.add_virtual_bool_target_safe();
+        let bit1 = builder.add_virtual_bool_target_safe();
+        verify_smt_insert(
+            &mut builder,
+            new_value_t,
+            key_t,
+            other_key_t,
+            other_value_t,
+            &key_bits,
+            &[bit0, bit1], // only 2 — fewer than path.len() = 3
+            &path_t,
+            &extension_t,
+            old_root_t,
+            new_root_t,
+            default_t,
+        );
     }
 }
