@@ -69,7 +69,13 @@ MIGRATION_RESEARCH / CONTRIBUTING are not individually listed once
 they merely correct or extend this file — see `git log` for the
 exhaustive history.
 
-- (next commit) — docs(ROADMAP): refresh test count + combined-test entry after `d292855`.
+- [`6ea965a`](./../../commit/6ea965a) — docs: finalise session pickup — §7.20 + test-confirmation + verification checklist
+- [`7db536d`](./../../commit/7db536d) — docs: session-state pickup notes for next agent
+- [`50a1bd9`](./../../commit/50a1bd9) — test: speed up account_update panic-tests via cyclic_base_proof (~25 min wall saved per full sweep)
+- [`8fab78a`](./../../commit/8fab78a) — test: combined in-and-out integration test on AccountUpdate (mirror of `d292855` on the cyclic-recursion + CommitmentMerkleProofs path)
+- [`05c17f8`](./../../commit/05c17f8) — docs(SPEC): note MAX_OUT_COINS in the constants table
+- [`a502b8f`](./../../commit/a502b8f) — test: cover assert_eq panics on the *_in_and_out_coins wrappers (3 new should_panic tests for `prove_*_with_in_and_out_coins`)
+- [`508ec9c`](./../../commit/508ec9c) — docs(ROADMAP): refresh commit list + test count after MAX_OUT_COINS=8 bump
 - [`d292855`](./../../commit/d292855) — test: combined in-and-out integration test (one Initial proof exercising both in-coins and out-coins loops in a single transition; validates running-balance mutations and interim/final account_state_hash distinction compose correctly)
 - [`56f3a05`](./../../commit/56f3a05) — feat: stage 5d-next-3-bump — MAX_OUT_COINS to 8 (mirrors MAX_IN_COINS at SPEC §13's production target; INNER_PAD_BITS bumped 13 → 14)
 - [`1943316`](./../../commit/1943316) — docs: stage 5d-next-4 design doc for source verification

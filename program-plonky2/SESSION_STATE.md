@@ -117,10 +117,9 @@ at the current production parameters (`MAX_IN_COINS = MAX_OUT_COINS
 | `stage_5d_initial_with_one_active_in_coin` | ✅ | 188 s wall, single in-coin |
 | `stage_5d_next_3_initial_with_one_active_out_coin` | ✅ | 761 s wall, single out-coin |
 | `stage_5d_next_3_initial_combined_in_and_out_coin` | ✅ | 781 s wall, both loops active |
+| `stage_5d_next_3_account_update_combined_in_and_out_coin` | ✅ | 926 s wall, both loops + cyclic recursion + CMP (b)(c)(d)(e) chain |
 
 What was **left running at session end** (not in this snapshot):
-- `cargo test -- stage_5d_next_3_account_update_combined_in_and_out_coin`
-  (commit `8fab78a`, two cyclic proofs, ~25-35 min wall expected).
 - `cargo test -- stage_5d_next_3_prove` (commit `a502b8f`, slow
   panic tests; superseded by `50a1bd9` which speeds them up).
 
