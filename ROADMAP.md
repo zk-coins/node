@@ -32,7 +32,7 @@ person-days at full focus; multiply for part-time work.
 | 4c | In-circuit SMT non-inclusion gadget (verify only) | ✅ done | — | — |
 | 4c+ | In-circuit SMT insert gadget (new-root computation) | ✅ done | — | — |
 | 4d | Port `ProgramInputs` + `CommitmentMerkleProofs` types | ✅ done | — | — |
-| 5 | Monolithic state-transition circuit (recursion, padding, vk-pin) | ⏳ todo | **3–5 d** | **high** (vk-pin correctness, first real recursion test) |
+| 5 | Monolithic state-transition circuit (recursion, padding, vk-pin) | 🟡 in progress | **3–5 d** | **high** (vk-pin correctness, first real recursion test) |
 | 6 | `script-plonky2/` host-side prover wrapper | ⏳ todo | 1–2 d | low |
 | 7 | Server: **replace** SP1 path with Plonky2 (no feature flag, no dual backend) | ⏳ todo | 2–3 d | low (closed test env — no migration logic needed) |
 | 8 | App / wallet: Schnorr-signing boundary, server-API integration | ⏳ todo | 1–2 d | low (server-side compute architecture — no wasm-crypto migration) |
@@ -69,6 +69,7 @@ MIGRATION_RESEARCH / CONTRIBUTING are not individually listed once
 they merely correct or extend this file — see `git log` for the
 exhaustive history.
 
+- [`83fa0c1`](./../../commit/83fa0c1) — feat: stage 5a — cyclic recursion plumbing PoC (`circuit/main.rs`, 2 tests: base + 1 recursive cycle)
 - [`6cf949c`](./../../commit/6cf949c) — feat: SMT insert verify gadget (8 tests: 3 positive incl. deep-divergence Case B, 3 negative incl. case-A invariant, 2 build-time assertion panics)
 - [`79bd39e`](./../../commit/79bd39e) — docs: hardware target — M3 Ultra single host, no external hardware, no cloud prover (later corrected to note the integrated Apple GPU IS available, just unused by Plonky2 today)
 - [`e14d9df`](./../../commit/e14d9df) — feat: 100% test coverage on program-plonky2 (16 new tests + MMR refactor + coverage(off) annotations)
@@ -92,9 +93,10 @@ exhaustive history.
 - [`57cdce4`](./../../commit/57cdce4) — docs: migration research
 - [`496c652`](./../../commit/496c652) — docs: circuit specification
 
-**Test count on this branch:** 72 (all green on nightly-2025-04-15).
+**Test count on this branch:** 74 (all green on nightly-2025-04-15).
 Breakdown: `prelude` 1 · `hash` 5 · `merkle::smt` 18 · `merkle::mmr` 11 ·
-`types` 10 · `inputs` 5 · `circuit::mmr` 5 · `circuit::smt` 17.
+`types` 10 · `inputs` 5 · `circuit::mmr` 5 · `circuit::smt` 17 ·
+`circuit::main` 2.
 
 **Coverage:** **100% lines, 100% functions, 100% regions** on `program-plonky2/`
 as measured by `cargo llvm-cov --fail-under-lines 100`. Test modules
@@ -109,13 +111,37 @@ rather than carrying its own perpetually-uncovered branch.
 
 ## In Progress
 
-*(none — every "done" line is committed and on the branch.)*
+**Step 5 — Monolithic state-transition circuit** (🟡, broken into five
+stages so each lands as its own reviewable commit on the branch):
+
+- **5a — recursion plumbing PoC** ✅ done in [`83fa0c1`](./../../commit/83fa0c1).
+  `circuit/main.rs` skeleton with `conditionally_verify_cyclic_proof_or_dummy`,
+  `add_verifier_data_public_inputs`, three-pass
+  `common_data_for_recursion`, and a counter payload (`counter = if
+  condition { inner.counter + 1 } else { 0 }`). Two tests covering
+  base + 1 recursive cycle. This is the R1 evidence that cyclic
+  recursion + `circuit_digest` pinning work in our Plonky2 1.1.0
+  setup.
+- **5b — Initial branch with real predicate** ⏳ next. Wire the
+  `InitialProof` state-transition logic (mint exception, empty
+  coin_history seed, `ProofData` emission) using the existing
+  hash / SMT / MMR gadgets. Counter payload disappears here.
+- **5c — AccountUpdate branch** ⏳. Add prev-proof recursive
+  verification, history-root chaining, `coin_history` carry-over.
+- **5d — fixed-shape padding (MAX_IN_COINS = 8)** ⏳. Pad the
+  per-input-coin loop to the fixed bound, including dummy-coin
+  semantics (amount = 0 → no-op).
+- **5e — 11 negative tests from SPEC §13** ⏳. Overflow, underflow,
+  wrong vk, double-spend, wrong identifier, mismatched
+  account_state_hash, etc.
+
+Each stage carries the 100 % line coverage gate before commit.
 
 ---
 
 ## Next (in order)
 
-### Step 5 — Monolithic state-transition circuit — **NEXT**
+### Step 5 — Monolithic state-transition circuit — 🟡 **in progress** (see *In Progress* above)
 **Effort:** 3–5 days.
 **Files:** `program-plonky2/src/circuit/main.rs` (new) — the equivalent of `program/src/main.rs`.
 **Scope:** assemble all gadgets into the full circuit; implement Initial vs. AccountUpdate branch via `conditionally_verify_cyclic_proof_or_dummy`; fix `MAX_IN_COINS = 8`; pin `vk` via `add_verifier_data_public_inputs`; commit `ProofData` as 16-element public output.
