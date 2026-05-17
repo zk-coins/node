@@ -56,7 +56,8 @@ this migration branch.
    not alternative. "Minimal" reduces the surface; "100%" keeps what
    remains clean. Gate: `cargo llvm-cov --fail-under-lines 100 -- --test-threads=1`
    from inside the affected crate. Current state on `program-plonky2`:
-   100% lines / functions / regions, 64 tests.
+   100% lines / functions / regions, 72 tests. See `ROADMAP.md`
+   § "Done" for the live test count and breakdown.
 5. **Plonky2 is bridge tech; Plonky3 is the long-term destination.**
    But we do not preemptively adopt BabyBear / Poseidon2 inside this
    migration — see `MIGRATION_RESEARCH.md` §5 (decisions) and ROADMAP
