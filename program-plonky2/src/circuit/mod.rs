@@ -9,4 +9,5 @@
 pub mod main;
 pub mod mmr;
 pub mod smt;
+pub mod source_aggregator;
 mod util;
