@@ -146,7 +146,7 @@ fn hash_up_full_path(start: HashDigest, key: &[u8; 32], siblings: &[HashDigest])
 /// `siblings[level]` is the sibling at that level's parent node (i.e. the
 /// other child of the node at `(level, trim_key(key, level))`). Siblings at
 /// levels where the subtree is empty equal `DEFAULT_HASHES[level + 1]`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InclusionProof {
     pub key: [u8; 32],
     pub siblings: Vec<HashDigest>,
@@ -169,7 +169,7 @@ impl InclusionProof {
 /// through `siblings` and verifies that the resulting root equals `root`. If
 /// the slot at `key`'s depth-`TREE_DEPTH` position were occupied, the walk
 /// would produce a different root.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NonInclusionProof {
     pub key: [u8; 32],
     pub root: HashDigest,
@@ -203,7 +203,7 @@ impl NonInclusionProof {
 
 /// Sparse Merkle tree: stores all internal nodes that differ from
 /// the level-default. Insert/proof code hashes through every level.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct SparseMerkleTree {
     nodes: HashMap<(usize, [u8; 32]), HashDigest>,
     leaf_values: HashMap<[u8; 32], HashDigest>,
@@ -321,6 +321,30 @@ impl SparseMerkleTree {
             siblings,
         })
     }
+}
+
+/// Persist a `SparseMerkleTree` to `path` via bincode. Matches the
+/// SP1-era `zkcoins_program::merkle::sparse_merkle_tree::save_merkle_tree`
+/// shape — used by the server's `State::save_to_files` cutover.
+pub fn save_merkle_tree(tree: &SparseMerkleTree, path: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let file = std::fs::File::create(path)?;
+    let serialized = bincode::serialize(tree)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let mut writer = std::io::BufWriter::new(file);
+    writer.write_all(&serialized)?;
+    Ok(())
+}
+
+/// Load a `SparseMerkleTree` from `path` previously written by
+/// [`save_merkle_tree`].
+pub fn load_merkle_tree(path: &str) -> std::io::Result<SparseMerkleTree> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut buffer = Vec::new();
+    reader.read_to_end(&mut buffer)?;
+    bincode::deserialize(&buffer).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -582,5 +606,44 @@ mod tests {
                 assert_ne!(lh, *default, "leaf {i} hash equals DEFAULT_HASHES[{l}]");
             }
         }
+    }
+
+    /// `save_merkle_tree` + `load_merkle_tree` round-trip preserves
+    /// the tree's leaf set + root + inclusion proofs.
+    #[test]
+    fn save_load_round_trip() {
+        let mut tree = SparseMerkleTree::new();
+        for (i, key) in sample_keys().into_iter().enumerate().take(5) {
+            tree.insert(key, sample_value(i as u64)).unwrap();
+        }
+        let original_root = tree.root();
+
+        // Write to a temp file via `tempfile` isn't available without
+        // a dep — use a deterministic per-test path under
+        // `std::env::temp_dir()` instead.
+        let path = std::env::temp_dir().join("zkcoins-plonky2-smt-roundtrip.bin");
+        let path_str = path.to_str().unwrap();
+        save_merkle_tree(&tree, path_str).expect("save");
+        let loaded = load_merkle_tree(path_str).expect("load");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(loaded.root(), original_root);
+        // Re-derive an inclusion proof from the loaded tree and
+        // verify against the original root.
+        let (proof, value) = loaded
+            .generate_inclusion_proof(&sample_keys()[0])
+            .expect("inclusion proof");
+        assert_eq!(value, sample_value(0));
+        assert!(proof.verify(value, original_root));
+    }
+
+    /// Build-time assertion: `load_merkle_tree` propagates I/O
+    /// errors when the path doesn't exist.
+    #[test]
+    fn load_merkle_tree_missing_path_errors() {
+        let path = std::env::temp_dir().join("zkcoins-plonky2-smt-does-not-exist.bin");
+        std::fs::remove_file(&path).ok();
+        let result = load_merkle_tree(path.to_str().unwrap());
+        assert!(result.is_err());
     }
 }
