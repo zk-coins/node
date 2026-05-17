@@ -4,18 +4,18 @@
 (specifically D11), `MIGRATION_RESEARCH.md`, `ROADMAP.md`, and
 [`LIGHTNING_ATOMIC_SWAP.md`](./LIGHTNING_ATOMIC_SWAP.md).
 
-> **Branch note.** This document presupposes the Plonky2 migration
-> currently on `feat/plonky2-migration` (PR #17). `SPEC.md`,
-> `MIGRATION_RESEARCH.md`, and `ROADMAP.md` live on that branch and
-> will resolve on `develop` only after PR #17 lands. Until then, view
-> cross-references against `feat/plonky2-migration`.
-
 **Authoritative source for:** how zkCoins removes the operator-controlled
 mint (D11) by binding mint operations to provable BTC custody on Bitcoin
 L1 via a BitVM2-style bridge.
 
 **Audience:** Engineers and stakeholders evaluating zkCoins's path from
 MVP-with-trusted-issuer to mainnet-with-cryptographic-issuance.
+
+> **Branch note.** This document presupposes the Plonky2 migration
+> currently on `feat/plonky2-migration` (PR #17). `SPEC.md`,
+> `MIGRATION_RESEARCH.md`, and `ROADMAP.md` live on that branch and
+> will resolve on `develop` only after PR #17 lands. Until then, view
+> cross-references against `feat/plonky2-migration`.
 
 ---
 
@@ -358,8 +358,9 @@ members from independent organisations. Citrea uses ~20.
 - The Schnorr/SHA256 boundary at the wallet (BIP-340 still off-circuit)
 - The SMT/MMR scanner architecture for normal sends
 - The Lightning atomic swap design — `LIGHTNING_ATOMIC_SWAP.md`
-  remains correct, and a swap-LP becomes anyone with bridge
-  deposit/withdraw capability instead of "DFX as sole minter"
+  remains correct, and a swap liquidity provider becomes anyone
+  with bridge deposit/withdraw capability instead of relying on a
+  single sole minter
 
 ---
 
@@ -572,9 +573,10 @@ majority of federation".
 - **Trade-off:** explicitly trusts the federation majority; if k
   members collude, BTC can be stolen
 
-This is **what DFX could realistically run today** with existing
-infrastructure. It is **not** trustless in the BitVM2 sense, but it
-is trust-distributed and well-understood by the market.
+This is **what a single-organisation issuer could realistically run
+today** with existing infrastructure. It is **not** trustless in the
+BitVM2 sense, but it is trust-distributed and well-understood by the
+market.
 
 ### 8.2 Optimistic bridge with permissionless challenge (no SNARK on Bitcoin)
 
@@ -601,10 +603,11 @@ side-chain state"). Adds hardware-level enforcement to 8.1.
 
 ### 8.4 Recommendation
 
-For a DFX-led zkCoins launch, **8.1 (Liquid-style) is the realistic
-short-term path**. BitVM2 is the long-term aspiration but requires
-federation recruitment and trusted setup ceremony coordination that
-do not fit a self-funded single-org timeline.
+For a single-organisation-led zkCoins launch, **8.1 (Liquid-style)
+is the realistic short-term path**. BitVM2 is the long-term
+aspiration but requires federation recruitment and trusted setup
+ceremony coordination that do not fit a self-funded single-org
+timeline.
 
 The migration path is clean: a Liquid-style bridge in v2 can be
 upgraded to a BitVM2 bridge in v3 by replacing the trust model at
@@ -687,8 +690,9 @@ Zcash's t/z address model.
 
 4. **Liquidity bootstrapping.** Operators need BTC inventory to front
    peg-outs. Where does it come from? Self-funded by federation
-   members, with fee compensation. DFX can plausibly bootstrap with
-   reasonable inventory.
+   members, with fee compensation. The initiating operator can
+   plausibly bootstrap with reasonable inventory before recruiting
+   further federation members.
 
 5. **Fee model.** Bridge fees per peg-in and peg-out. Should match
    market rates (Liquid is 0% currently; Citrea has small fees).
@@ -728,7 +732,7 @@ Zcash's t/z address model.
 
 | Model | Trust assumption | Slashing | Compute-on-Bitcoin |
 | ----- | ---------------- | -------- | ------------------ |
-| Today (D11) | 100% trust DFX as minter | None | None |
+| Today (D11) | 100% trust in the single operator-minter | None | None |
 | Liquid-style federation | k-of-n federation honest majority | Off-chain governance | None |
 | Optimistic + governance dispute | 1-of-n + governance recourse | Off-chain | None |
 | BitVM2 / Clementine | 1-of-n setup honesty + 1-of-n watchtower | On-chain via Bitcoin Groth16 verifier (~2.6 MB Assert) | Yes (Groth16) |
@@ -1054,8 +1058,9 @@ which has no minimum increment.
   should be corrected.
 
 - **Federation target: N=100 independent members.** The MVP runs with
-  N=3 (same data centre, all DFX-operated — engineering correctness
-  only, not real trust distribution). The production target is
+  N=3 (same data centre, all operated by a single organisation —
+  engineering correctness only, not real trust distribution). The
+  production target is
   N=100, the practical upper bound of the BitVM2 framework today per
   Bitlayer's analysis (*"in practice the value of n can be 100"*).
   Strict 1-of-N honesty: 1 honest key deletion among 100 independent
@@ -1117,3 +1122,4 @@ which has no minimum increment.
 | 2026-05-17 | §13 Bottom Line: add explicit production federation target of N=100 (practical upper bound of BitVM2 framework per Bitlayer). Beyond N=100 noted as open research, not current goal. |
 | 2026-05-17 | Consistency audit pass: §12.4 — correct the Glock trusted-setup claim (Glock's DV-SNARK is instantiated with Pari which requires a circuit-specific trusted setup, comparable to Groth16; the previous "the DV-SNARK might not require a setup" wording was wrong). Add a branch note at the top explaining that `SPEC.md` / `MIGRATION_RESEARCH.md` / `ROADMAP.md` currently live on `feat/plonky2-migration` only. |
 | 2026-05-17 | Audit round 2: §6.2 Step 1 — fix proof-name inconsistency ("WithdrawalProof" was a one-off term; renamed to `BurnProof` consistent with §6.3 and §4.1) and correct the §5.2 cross-reference to §6.3. |
+| 2026-05-17 | Audit round 3: harmonise header structure (Status / Authoritative source / Audience / Branch note). Remove organisation-specific "DFX" references in §4.5, §8.1, §8.4, §10.4, §11.1, and §13 — replaced with generic operator/issuer wording for consistency with the rest of the repo. |
