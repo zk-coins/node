@@ -69,7 +69,8 @@ MIGRATION_RESEARCH / CONTRIBUTING are not individually listed once
 they merely correct or extend this file — see `git log` for the
 exhaustive history.
 
-- (next commit) — feat: stage 5b — Initial-branch state-transition predicate (`circuit/main.rs` rewritten: counter payload replaced by 16-element `ProofData`, mint exception + empty-SMT roots + in-circuit Poseidon `AccountState::hash`, condition pinned `false`; 3 tests: mint accepted, non-mint zero-balance accepted, non-mint nonzero-balance rejected)
+- (next commit) — feat: stage 5c — AccountUpdate branch (condition now a free witness; cyclic verify binds SPEC §8 (a); state continuity (b) via `condition * (account_state_hash - prev.account_state_hash) == 0`; coin_history carry-over via `select(condition, prev.coin_history_root, DEFAULT_HASHES[0])`; mint exception masked with `!condition`; 5 tests incl. Initial→AccountUpdate chain and state-discontinuity rejection; SPEC §8 (c)(d)(e) MMR/SMT history checks DEFERRED to stage 5c+)
+- [`d167237`](./../../commit/d167237) — feat: stage 5b — Initial-branch state-transition predicate (`circuit/main.rs` rewritten: counter payload replaced by 16-element `ProofData`, mint exception + empty-SMT roots + in-circuit Poseidon `AccountState::hash`, condition pinned `false`; 3 tests: mint accepted, non-mint zero-balance accepted, non-mint nonzero-balance rejected)
 - [`83fa0c1`](./../../commit/83fa0c1) — feat: stage 5a — cyclic recursion plumbing PoC (`circuit/main.rs`, 2 tests: base + 1 recursive cycle; superseded by stage 5b)
 - [`6cf949c`](./../../commit/6cf949c) — feat: SMT insert verify gadget (8 tests: 3 positive incl. deep-divergence Case B, 3 negative incl. case-A invariant, 2 build-time assertion panics)
 - [`79bd39e`](./../../commit/79bd39e) — docs: hardware target — M3 Ultra single host, no external hardware, no cloud prover (later corrected to note the integrated Apple GPU IS available, just unused by Plonky2 today)
@@ -94,10 +95,10 @@ exhaustive history.
 - [`57cdce4`](./../../commit/57cdce4) — docs: migration research
 - [`496c652`](./../../commit/496c652) — docs: circuit specification
 
-**Test count on this branch:** 75 (all green on nightly-2025-04-15).
+**Test count on this branch:** 77 (all green on nightly-2025-04-15).
 Breakdown: `prelude` 1 · `hash` 5 · `merkle::smt` 18 · `merkle::mmr` 11 ·
 `types` 10 · `inputs` 5 · `circuit::mmr` 5 · `circuit::smt` 17 ·
-`circuit::main` 3.
+`circuit::main` 5.
 
 **Coverage:** **100% lines, 100% functions, 100% regions** on `program-plonky2/`
 as measured by `cargo llvm-cov --fail-under-lines 100`. Test modules
@@ -123,19 +124,34 @@ stages so each lands as its own reviewable commit on the branch):
   condition { inner.counter + 1 } else { 0 }`). The R1 evidence that
   cyclic recursion + `circuit_digest` pinning work in our Plonky2
   1.1.0 setup. Tests and payload replaced in 5b.
-- **5b — Initial branch with real predicate** ✅ done in this revision.
-  Counter payload replaced by 16-element `ProofData` public output.
-  In-circuit Poseidon `AccountState::hash` (with 32-bit balance limbs
-  and 56-bit pubkey limbs, both range-checked), `is_minting` predicate
-  via element-wise `is_equal` AND, mint exception enforced as
-  `(1 - is_minting) * balance_limb == 0`, `output_coins_root` and
-  `coin_history_root` constants from `DEFAULT_HASHES[0]`. `condition`
-  is constrained to `false` so the cyclic inner-proof slot is always
-  the dummy — Stage 5c lifts that constraint. Three tests in
-  `circuit::main`: mint exception accepted, non-mint zero-balance
-  accepted, non-mint nonzero-balance rejected.
-- **5c — AccountUpdate branch** ⏳ next. Add prev-proof recursive
-  verification, history-root chaining, `coin_history` carry-over.
+- **5b — Initial branch with real predicate** ✅ done in
+  [`d167237`](./../../commit/d167237). Counter payload replaced by
+  16-element `ProofData` public output. In-circuit Poseidon
+  `AccountState::hash` (with 32-bit balance limbs and 56-bit pubkey
+  limbs, both range-checked), `is_minting` predicate via element-wise
+  `is_equal` AND, mint exception enforced as `(1 - is_minting) *
+  balance_limb == 0`, `output_coins_root` and `coin_history_root`
+  constants from `DEFAULT_HASHES[0]`. `condition` constrained to
+  `false`. Three tests in `circuit::main`.
+- **5c — AccountUpdate branch** ✅ done in this revision. `condition`
+  is now a free witness. `conditionally_verify_cyclic_proof_or_dummy`
+  binds SPEC §8 (a) (same circuit via `circuit_digest`). State
+  continuity (b) enforced as `condition * (account_state_hash[i] -
+  prev.account_state_hash[i]) == 0` for each of the 4 hash elements.
+  `coin_history_root` carry-over via `select(condition,
+  prev.coin_history_root, DEFAULT_HASHES[0])`. Mint exception masked
+  with `(1 - condition) * (1 - is_minting)` so it only applies to
+  Initial. 5 tests in `circuit::main`: 3 Initial-side from 5b plus a
+  full Initial→AccountUpdate chain (recursive verify works
+  end-to-end) and an AccountUpdate state-discontinuity rejection.
+  **SPEC §8 (c)(d)(e) — `CommitmentMerkleProofs` predicate proving
+  prev was published in the global history MMR — is NOT YET WIRED.
+  Stage 5c+ closes that gap.**
+- **5c+ — CommitmentMerkleProofs in-circuit** ⏳ next. Port (c)(d)(e)
+  using fixed-length SMT + MMR inclusion gadgets (pad off-circuit
+  proofs to `TREE_DEPTH = 256` for SMT, `MMR_MAX_DEPTH` TBD for MMR).
+  Without this, the AccountUpdate predicate is unsound: a malicious
+  prover could chain on top of a `prev` that was never published.
 - **5d — fixed-shape padding (MAX_IN_COINS = 8)** ⏳. Pad the
   per-input-coin loop to the fixed bound, including dummy-coin
   semantics (amount = 0 → no-op).
