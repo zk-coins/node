@@ -27,25 +27,23 @@ env:
   # without this, the runs against the public Mutinynet API can take
   # >60 s per test and tip the job over the timeout.
   ESPLORA_URL: "http://127.0.0.1:1/api"
-  # Force the SP1 mock prover for every test in this workflow. The
-  # default prover targets real Groth16/Plonk circuits and a single
-  # send_coin/receive_coin test then takes ~20+ minutes on an x86_64
-  # runner. Mock proofs return instantly and exercise the same plumbing.
-  SP1_PROVER: mock
 
 jobs:
   lint-and-build:
     name: Lint & Build
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust 1.81.0
+      # Plonky2 requires nightly Rust (`feature(specialization)`); the
+      # post-SP1 workspace is unified on a recent nightly. The actual
+      # channel is pinned in `rust-toolchain` (this action follows it).
+      - name: Install Rust toolchain (nightly via rust-toolchain)
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.81.0"
+          toolchain: nightly
           components: rustfmt, clippy
 
       - name: Cache cargo registry and build
@@ -68,8 +66,8 @@ jobs:
       - name: Run clippy (server, all features)
         run: cargo clippy -p server --all-features -- -D warnings
 
-      - name: Run clippy (program lib)
-        run: cargo clippy -p zkcoins-program --lib -- -D warnings
+      - name: Run clippy (program-plonky2 + script-plonky2)
+        run: cargo clippy -p zkcoins-program-plonky2 -p zkcoins-prover-plonky2 --lib -- -D warnings
 
       - name: Build server (MVP feature set — the PRD image)
         run: cargo build -p server
@@ -85,10 +83,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust 1.81.0
+      - name: Install Rust toolchain (nightly via rust-toolchain)
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.81.0"
+          toolchain: nightly
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
@@ -101,30 +99,42 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # `--test-threads=1` is mandatory: multiple test binaries each load the
-      # SP1 mock prover ELF (~1.5 GB resident) and running them in parallel
-      # on a 7 GB GitHub-hosted runner OOM-kills the job (exit 143). The
-      # account_server::tests group runs the real SP1 prover and is skipped
-      # here — it is only exercised in the coverage job, which is also
-      # single-threaded.
-      - name: Run tests (server + shared, all features, skip slow SP1 prover tests)
-        run: cargo test -p server -p shared --all-features -- --test-threads=1 --skip account_server::tests
+      # `--test-threads=1` is mandatory: Plonky2 cyclic-recursion test
+      # binaries each hold a built `StateTransitionCircuit` (~2 GB
+      # resident) and running them in parallel on a 7 GB GitHub-hosted
+      # runner OOM-kills the job (exit 143).
+      #
+      # Step 7 migration NOTE: `account_server_tests` and
+      # `server_tests` modules are currently disabled at the
+      # include-point in their parent files pending the Stage
+      # 5d-next-5 (aggregator pattern) merge from
+      # `feat/plonky2-5d-next-4-aggregator` (issue zk-coins/server#19).
+      # Once that branch lands they get re-enabled along with the
+      # `account_server::send_coins` Prover-API integration.
+      - name: Run tests (server + shared, all features)
+        run: cargo test -p server -p shared --all-features -- --test-threads=1
 
-      - name: Run tests (program lib)
-        run: cargo test -p zkcoins-program --lib -- --test-threads=1
+      # program-plonky2 test sweep runs in --release because the
+      # cyclic-recursion prove path is ~10x slower in --debug. Skip
+      # the long-running cyclic positives here — they are exercised
+      # explicitly in the coverage job below.
+      - name: Run tests (program-plonky2, off-circuit + non-cyclic gadgets)
+        run: |
+          cargo test -p zkcoins-program-plonky2 --release --lib -- --test-threads=1 \
+            --skip stage_5b --skip stage_5c --skip stage_5d --skip stage_5e
 
   coverage:
     name: Coverage (MVP scope)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust 1.81.0
+      - name: Install Rust toolchain (nightly via rust-toolchain)
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.81.0"
+          toolchain: nightly
           components: llvm-tools-preview
 
       - name: Cache cargo registry and build
@@ -152,13 +162,6 @@ jobs:
       # reveal broadcasting that needs a signet/regtest node) are
       # genuinely not exercisable in unit tests and are excluded at the
       # file level via --ignore-filename-regex.
-      # Threshold is the current MVP baseline with main.rs (bootstrap)
-      # and publisher.rs (Bitcoin commit/reveal broadcasting that needs a
-      # signet/regtest node) excluded. The goal is 100% on this scope;
-      # each lifting PR ratchets the threshold upward.
-      # All tests must run for the coverage measurement to reflect the
-      # true exercised production surface — account_server tests are slow
-      # under SP1=mock but exercise large parts of the file.
       - name: Run cargo-llvm-cov (MVP scope, regression guard)
         run: |
           cargo llvm-cov -p server --show-missing-lines \

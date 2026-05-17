@@ -91,6 +91,7 @@ pub struct BalanceResponse {
     username: Option<String>,
 }
 
+#[cfg(any(feature = "address-list", feature = "usernames", feature = "lnurl"))]
 #[derive(Serialize, Deserialize)]
 pub struct AddressesResponse {
     addresses: Vec<String>,
@@ -115,9 +116,13 @@ pub struct MintRequest {
     amount: u64,
 }
 
+// `ReceiveCoinRequest` was the SP1-era POST body shape for a coin
+// drop. It is currently unused — the receive flow is exercised via
+// scanner + state.update — but kept as a placeholder for the future
+// authenticated push endpoint. Mark `dead_code` to silence the lint.
+#[allow(dead_code)]
 #[derive(Deserialize)]
 pub struct ReceiveCoinRequest {
-    #[allow(dead_code)]
     coin_proof: Proof,
 }
 
@@ -232,12 +237,14 @@ pub struct ClaimUsernameRequest {
     timestamp: u64,
 }
 
+#[cfg(any(feature = "usernames", feature = "lnurl"))]
 #[derive(Serialize, Deserialize)]
 pub struct UsernameResponse {
     username: String,
     address: String,
 }
 
+#[cfg(feature = "lnurl")]
 #[derive(Serialize, Deserialize)]
 pub struct LnurlpResponse {
     tag: String,
@@ -249,6 +256,7 @@ pub struct LnurlpResponse {
     metadata: String,
 }
 
+#[cfg(any(feature = "usernames", feature = "lnurl"))]
 #[derive(Serialize, Deserialize)]
 pub struct LnurlErrorResponse {
     status: String,
@@ -327,7 +335,7 @@ async fn get_address_handler(State(state): State<AppState>) -> impl IntoResponse
     let hex_addresses: Vec<String> = account_server
         .get_addresses()
         .iter()
-        .map(|addr| format!("0x{}", hex::encode(addr)))
+        .map(|addr| format!("0x{}", hex::encode(digest_to_bytes(addr))))
         .collect();
 
     Json(AddressesResponse {
@@ -511,15 +519,16 @@ async fn mint_handler(
         }
     };
 
-    let mut account_address = [0u8; 32];
+    let mut account_address_bytes = [0u8; 32];
     if account_address_vec.len() == 32 {
-        account_address.copy_from_slice(&account_address_vec);
+        account_address_bytes.copy_from_slice(&account_address_vec);
     } else {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(SendCoinResponse::default()),
         );
     }
+    let account_address = digest_from_bytes(&account_address_bytes);
 
     // Generate keys and get necessary info while holding the minting_account lock briefly
     let (minting_pubkey, next_minting_pubkey, prev_commitment_pubkey, num_pubkeys_before_mint) = {
@@ -601,12 +610,17 @@ async fn mint_handler(
                     // Handle appropriately, maybe log an error or return a specific response.
                     eprintln!("WARNING: num_pubkeys changed unexpectedly during mint operation.");
                 }
-                let proof_data = match bincode::deserialize::<ProofData>(
-                    &coin_proofs[0].proof.public_values.to_vec(),
-                ) {
-                    Ok(data) => data,
+                let pis: Result<
+                    [zkcoins_program::F;
+                        zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS],
+                    _,
+                > = coin_proofs[0].proof.public_inputs
+                    [..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
+                    .try_into();
+                let proof_data = match pis {
+                    Ok(pis) => ProofData::from_field_elements(&pis),
                     Err(e) => {
-                        eprintln!("Failed to deserialize proof data: {}", e);
+                        eprintln!("Failed to deserialize proof public_inputs: {:?}", e);
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(SendCoinResponse::default()),
@@ -889,7 +903,7 @@ async fn claim_username_handler(
                 .into_response()
         }
     };
-    let mut address = [0u8; 32];
+    let mut address_bytes = [0u8; 32];
     if address_vec.len() != 32 {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -900,11 +914,12 @@ async fn claim_username_handler(
         )
             .into_response();
     }
-    address.copy_from_slice(&address_vec);
+    address_bytes.copy_from_slice(&address_vec);
+    let address = digest_from_bytes(&address_bytes);
 
     // Verify public key matches address: sha256(compressed_pubkey) == address
     let pk_hash: [u8; 32] = Sha256::digest(request.public_key.serialize()).into();
-    if pk_hash != address {
+    if pk_hash != address_bytes {
         return (
             StatusCode::UNAUTHORIZED,
             Json(LnurlErrorResponse {
@@ -1000,7 +1015,7 @@ async fn claim_username_handler(
         StatusCode::OK,
         Json(UsernameResponse {
             username: normalized,
-            address: format!("0x{}", hex::encode(address)),
+            address: format!("0x{}", hex::encode(digest_to_bytes(&address))),
         }),
     )
         .into_response()
@@ -1010,7 +1025,10 @@ async fn claim_username_handler(
 /// then falls back to hex-prefix matching against known account addresses.
 /// Only used by the gated username and LNURL handlers.
 #[cfg(any(feature = "usernames", feature = "lnurl"))]
-fn resolve_identifier(state: &AppState, identifier: &str) -> Option<([u8; 32], String)> {
+fn resolve_identifier(
+    state: &AppState,
+    identifier: &str,
+) -> Option<(zkcoins_program::hash::HashDigest, String)> {
     let normalized = identifier.to_lowercase();
 
     // 1. Check custom username
@@ -1025,7 +1043,7 @@ fn resolve_identifier(state: &AppState, identifier: &str) -> Option<([u8; 32], S
     account_server
         .get_addresses()
         .into_iter()
-        .find(|addr| hex::encode(addr).starts_with(&normalized))
+        .find(|addr| hex::encode(digest_to_bytes(addr)).starts_with(&normalized))
         .map(|addr| (addr, normalized))
 }
 
@@ -1039,7 +1057,7 @@ async fn resolve_username_handler(
             StatusCode::OK,
             Json(UsernameResponse {
                 username: resolved_name,
-                address: format!("0x{}", hex::encode(address)),
+                address: format!("0x{}", hex::encode(digest_to_bytes(&address))),
             }),
         )
             .into_response(),

@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use shared::commitment::Commitment;
 use std::collections::HashMap;
 use std::io;
-use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes, hash_concat, HashDigest, ZERO_HASH};
+use zkcoins_program::hash::{
+    digest_from_bytes, digest_to_bytes, hash_concat, HashDigest, ZERO_HASH,
+};
 use zkcoins_program::merkle::merkle_mountain_range::{
     load_mmr, save_mmr, MMRProof, MerkleMountainRange,
 };

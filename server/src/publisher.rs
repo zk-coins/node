@@ -150,7 +150,7 @@ pub fn inscription_txs(
         // Sign with the tweaked keypair
         let message = secp256k1::Message::from_digest_slice(&signature_hash[..]).unwrap();
         let keypair = secp256k1::Keypair::from_secret_key(&secp256k1, &sk);
-        let tweaked_keypair = keypair.tap_tweak(&secp256k1, None).to_inner();
+        let tweaked_keypair = keypair.tap_tweak(&secp256k1, None).to_keypair();
         let signature = secp256k1.sign_schnorr(&message, &tweaked_keypair);
 
         // Add the signature to the witness

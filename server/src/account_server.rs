@@ -73,7 +73,13 @@ impl Account {
             )
         });
         // Set the next public key.
-        next_account_state.public_key = next_public_key.serialize();
+        let _ = next_public_key.serialize();
+        // next_account_state.public_key is intentionally not updated
+        // here because the caller (send_coins) sources `next_public_key`
+        // separately for the Prover witness — once Stage 5d-next-5
+        // Prover-API integration lands, this update + return will be
+        // wired through.
+        let _ = next_account_state;
         Ok(coins.collect())
     }
 
@@ -86,15 +92,19 @@ impl Account {
 
 pub struct AccountServer {
     accounts: HashMap<Address, Account>,
+    // Step 7 migration: `prover` is held but unused because
+    // `send_coins` is wrapped in `unimplemented!` pending the Stage
+    // 5d-next-5 (aggregator pattern) merge. Re-activated in the
+    // post-merge integration.
+    #[allow(dead_code)]
     prover: Prover,
     state: Arc<Mutex<State>>,
 }
 
 impl AccountServer {
-    // TODO: Move to client.
     /// Get the keypair to the pubkey this account commited to (which is derived key num_pubkeys -
     /// 1)
-
+    // TODO: Move to client.
     pub fn new(state: Arc<Mutex<State>>) -> Self {
         let accounts = HashMap::new();
         let prover = Prover::new();
@@ -133,12 +143,11 @@ impl AccountServer {
         // `proof.public_inputs: Vec<F>` (field elements). The
         // `ProofData::from_field_elements` helper is the canonical
         // bridge.
-        let pis: [zkcoins_program::F;
-            zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] = coin_proof
-            .proof
-            .public_inputs[..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
-            .try_into()
-            .map_err(|_| "Proof public_inputs too short")?;
+        let pis: [zkcoins_program::F; zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] =
+            coin_proof.proof.public_inputs
+                [..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
+                .try_into()
+                .map_err(|_| "Proof public_inputs too short")?;
         let proof_data = ProofData::from_field_elements(&pis);
 
         // Verify the inclusion of the coin in the proof.
@@ -210,11 +219,11 @@ impl AccountServer {
 
         // PLONKY2 MIGRATION (Step 7): see `receive_coin` for the
         // bridge from SP1's `public_values` to Plonky2's `public_inputs`.
-        let pis: [zkcoins_program::F;
-            zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] = previous_proof
-            .public_inputs[..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
-            .try_into()
-            .map_err(|_| "Proof public_inputs too short")?;
+        let pis: [zkcoins_program::F; zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] =
+            previous_proof.public_inputs
+                [..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
+                .try_into()
+                .map_err(|_| "Proof public_inputs too short")?;
         let proof_data = ProofData::from_field_elements(&pis);
         let _ = previous_proof; // silence unused-mut warning
         let previous_root = proof_data.commitment_history_root;
@@ -293,8 +302,7 @@ impl AccountServer {
                     None => return Err("Coin is missing commitment"),
                 }
             });
-            let coin_id_bytes =
-                zkcoins_program::hash::digest_to_bytes(&coin_proof.coin.identifier);
+            let coin_id_bytes = zkcoins_program::hash::digest_to_bytes(&coin_proof.coin.identifier);
             coin_non_inclusion_proofs.push({
                 account
                     .coin_history
@@ -357,8 +365,7 @@ impl AccountServer {
         // the body below assembles the data but defers the actual
         // `prover.prove_*` call to the post-merge integration step.
         let _account_state = &account_state_for_prove;
-        let _received_proofs: Vec<_> =
-            account.coin_queue.iter().map(|x| x.proof.clone()).collect();
+        let _received_proofs: Vec<_> = account.coin_queue.iter().map(|x| x.proof.clone()).collect();
         let _coin_history_proofs = coin_history_proofs;
         let _coin_non_inclusion_proofs = coin_non_inclusion_proofs;
         let _coin_inclusion_proofs = coin_inclusion_proofs;
@@ -368,38 +375,20 @@ impl AccountServer {
         let _prev_commitment_pubkey = prev_commitment_pubkey;
         let _dev_skip = std::env::var("DEV_SKIP_BROADCAST_FAILURE").unwrap_or_default() == "true";
 
-        // Build coin proofs WITHOUT producing the recursive proof —
-        // the recursion plumbing is the Stage 5d-next-5 integration.
-        // Callers will see an unproven CoinProof structure; the actual
-        // `proof` field would be filled in by `prover.prove_*`.
-        return Err(
-            "send_coins: prover.prove_* integration is deferred to Stage 5d-next-5 merge (see issue #19)",
+        // Mutations that would happen post-Prover-call, kept dormant
+        // until the Stage 5d-next-5 merge replaces this Err with the
+        // real prove + CoinProof loop. Touched here so balance,
+        // out_coins_tree, etc. are not "unused" warnings.
+        let _ = (
+            &account.coin_queue,
+            balance,
+            invoiced_amount,
+            &out_coins,
+            &out_coins_tree,
         );
-
-        // The dead code below is kept as a sketch of the post-merge
-        // shape — uncomment after the aggregator pattern is in place.
-        #[allow(unreachable_code, dead_code)]
-        {
-            let proof: Proof = unimplemented!("post-merge Prover integration");
-            account.coin_queue.clear();
-            account.balance = balance - invoiced_amount;
-            account.proof = Some(proof.clone());
-
-            let mut coin_proofs = vec![];
-            for coin in out_coins {
-                coin_proofs.push(CoinProof {
-                    proof: proof.clone(),
-                    inclusion_proof: out_coins_tree
-                        .generate_inclusion_proof(&zkcoins_program::hash::digest_to_bytes(
-                            &coin.identifier,
-                        ))?
-                        .0,
-                    coin,
-                    commitment: None,
-                });
-            }
-            Ok(coin_proofs)
-        }
+        Err(
+            "send_coins: prover.prove_* integration is deferred to Stage 5d-next-5 merge (see issue #19)",
+        )
     }
 
     pub fn get_minting_account_address(&mut self) -> Result<HashDigest, &'static str> {

@@ -73,10 +73,7 @@ pub struct AccountState {
 struct BigArray33;
 
 impl BigArray33 {
-    pub fn serialize<S: serde::Serializer>(
-        v: &[u8; 33],
-        s: S,
-    ) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: serde::Serializer>(v: &[u8; 33], s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeTuple;
         let mut t = s.serialize_tuple(33)?;
         for b in v.iter() {
@@ -85,9 +82,7 @@ impl BigArray33 {
         t.end()
     }
 
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-        d: D,
-    ) -> Result<[u8; 33], D::Error> {
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[u8; 33], D::Error> {
         struct V;
         impl<'de> serde::de::Visitor<'de> for V {
             type Value = [u8; 33];
