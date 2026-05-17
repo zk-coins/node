@@ -69,7 +69,13 @@ MIGRATION_RESEARCH / CONTRIBUTING are not individually listed once
 they merely correct or extend this file — see `git log` for the
 exhaustive history.
 
-- (next commit) — feat: stage 5d-next — apply_coin (recipient + balance + overflow). Per-slot witnesses extended with `coin_recipient`, `coin_amount_lo`, `coin_amount_hi`. Active slots assert `coin_recipient == account.owner` and `balance += coin_amount` with overflow check via `split_le(sum, 33)`. Running balance threaded through `MAX_IN_COINS` slots; final balance fed to a second Poseidon hash for the public `ProofData.account_state_hash`. New tests: positive (1 active in-coin, balance increases by 42, final hash matches off-circuit `apply_coin`); negatives (wrong recipient rejected, overflow rejected).
+- (next commit) — docs(ROADMAP): refresh test count + combined-test entry after `d292855`.
+- [`d292855`](./../../commit/d292855) — test: combined in-and-out integration test (one Initial proof exercising both in-coins and out-coins loops in a single transition; validates running-balance mutations and interim/final account_state_hash distinction compose correctly)
+- [`56f3a05`](./../../commit/56f3a05) — feat: stage 5d-next-3-bump — MAX_OUT_COINS to 8 (mirrors MAX_IN_COINS at SPEC §13's production target; INNER_PAD_BITS bumped 13 → 14)
+- [`1943316`](./../../commit/1943316) — docs: stage 5d-next-4 design doc for source verification
+- [`6b5a885`](./../../commit/6b5a885) — feat: stage 5d-next-3 — out-coins processing
+- [`b2b82e7`](./../../commit/b2b82e7) — feat: stage 5d-next-2 — bump MAX_IN_COINS to 8
+- [`0195f71`](./../../commit/0195f71) — feat: stage 5d-next — apply_coin (recipient + balance + overflow). Per-slot witnesses extended with `coin_recipient`, `coin_amount_lo`, `coin_amount_hi`. Active slots assert `coin_recipient == account.owner` and `balance += coin_amount` with overflow check via `split_le(sum, 33)`. Running balance threaded through `MAX_IN_COINS` slots; final balance fed to a second Poseidon hash for the public `ProofData.account_state_hash`. New tests: positive (1 active in-coin, balance increases by 42, final hash matches off-circuit `apply_coin`); negatives (wrong recipient rejected, overflow rejected).
 - [`7db3c29`](./../../commit/7db3c29) — feat: stage 5d (minimal) + 5e (partial) — in-coin slot processing for coin_history + four SPEC §13 negative tests. 5d adds `MAX_IN_COINS = 1` const, `InCoinSlotTargets` per slot (`active`, `coin_identifier`, 256-sibling `nip_path`), per-slot SMT non-inclusion + insert into `coin_history_root` masked by `active`, new `prove_initial_with_in_coins` / `prove_account_update_with_in_coins` wrappers, and 5 tests (1 positive + 1 negative + 3 panic guards). 5e adds 4 negative tests against the existing 5c+ predicates.
 - [`2ce36ce`](./../../commit/2ce36ce) — test: cover assert_eq panic messages in set_cmp_witness (3 should_panic tests restoring 100% line coverage after 5c+)
 - [`4bc5f2f`](./../../commit/4bc5f2f) — feat: stage 5c+ — `CommitmentMerkleProofs` in-circuit (SPEC §8 (c)(d)(e); fixed-shape SMT inclusion at `TREE_DEPTH = 256` + 2× MMR inclusion at `MMR_PROOF_PATH_LEN = 31`; new `MMR_MAX_DEPTH = 32` const + `MMRProof::extend_to(depth)` + `MerkleMountainRange::root_extended(depth)` off-circuit helpers; new `select_hash` masking pattern so every constraint fires only when `condition = true`; `dummy_cmp()` placeholder used by `prove_initial` to populate the unused fields; tests: positive bootstrap chain (Init→Update with full CommitmentMerkleProofs verify) plus negatives for (b), (c), (d).)
@@ -100,10 +106,10 @@ exhaustive history.
 - [`57cdce4`](./../../commit/57cdce4) — docs: migration research
 - [`496c652`](./../../commit/496c652) — docs: circuit specification
 
-**Test count on this branch:** 98 (all green on nightly-2025-04-15).
+**Test count on this branch:** 99 (all green on nightly-2025-04-15).
 Breakdown: `prelude` 1 · `hash` 5 · `merkle::smt` 19 · `merkle::mmr` 14 ·
 `types` 10 · `inputs` 5 · `circuit::mmr` 5 · `circuit::smt` 12 ·
-`circuit::main` 27.
+`circuit::main` 28.
 
 **Coverage:** **100% lines, 100% functions, 100% regions** on `program-plonky2/`
 as measured by `cargo llvm-cov --fail-under-lines 100`. Test modules
