@@ -55,13 +55,60 @@ fn pubkey_to_limbs(pk: &PublicKey) -> [F; 5] {
     out
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AccountState {
     /// `Address = H(initial_public_key_bytes)`. Set once at creation.
     pub owner: Address,
     pub balance: Amount,
-    /// Current commitment public key. Rotates each send.
+    /// Current commitment public key. Rotates each send. Wrapped in
+    /// `serde(with = "serde_big_array_local")` because serde's default
+    /// derive only handles `[T; N]` for `N ≤ 32`.
+    #[serde(with = "BigArray33")]
     pub public_key: PublicKey,
+}
+
+/// Tiny helper module supplying the `serialize` / `deserialize`
+/// functions that `#[serde(with = "BigArray33")]` looks up. Avoids
+/// pulling in the `serde-big-array` dependency for one 33-byte type.
+struct BigArray33;
+
+impl BigArray33 {
+    pub fn serialize<S: serde::Serializer>(
+        v: &[u8; 33],
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut t = s.serialize_tuple(33)?;
+        for b in v.iter() {
+            t.serialize_element(b)?;
+        }
+        t.end()
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> Result<[u8; 33], D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = [u8; 33];
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("[u8; 33]")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut out = [0u8; 33];
+                for (i, slot) in out.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_tuple(33, V)
+    }
 }
 
 impl AccountState {
@@ -99,7 +146,7 @@ impl AccountState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CoinTemplate {
     pub recipient: Address,
     pub amount: Amount,
@@ -111,7 +158,7 @@ impl CoinTemplate {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Coin {
     pub identifier: HashDigest,
     pub recipient: Address,
@@ -153,7 +200,7 @@ pub fn calculate_coin_identifier(account_state_hash: HashDigest, coin_index: u32
 /// Public output of the state-transition proof. Field-element-serialised
 /// (no bincode) so the in-circuit `commit` and off-circuit reconstruction
 /// agree element-for-element.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProofData {
     pub account_state_hash: HashDigest,
     pub output_coins_root: HashDigest,

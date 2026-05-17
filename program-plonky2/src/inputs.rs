@@ -17,7 +17,7 @@ use crate::merkle::merkle_mountain_range::MMRProof;
 use crate::merkle::sparse_merkle_tree::{InclusionProof, NonInclusionProof};
 use crate::types::{AccountState, Coin, ProofData, PublicKey};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ProofType {
     InitialProof,
     AccountUpdateProof,
@@ -29,7 +29,7 @@ pub enum ProofType {
 /// Off-circuit verification methods mirror the SP1 implementation; the
 /// in-circuit gadget for the same predicate will land in the monolithic
 /// circuit module.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommitmentMerkleProofs {
     /// Root of the commitment SMT in which `commitment_proof` proves
     /// inclusion.

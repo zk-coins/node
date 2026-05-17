@@ -32,7 +32,7 @@ pub const MMR_MAX_DEPTH: usize = 32;
 /// `index` is the leaf's position in the bottom level (the order it was
 /// appended). `path` is the sibling hash at each level walking up from the
 /// leaf to the level just below the root.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MMRProof {
     pub index: u32,
     pub path: MerklePath,
@@ -72,7 +72,7 @@ impl MMRProof {
 }
 
 /// Append-only fixed-shape padded Merkle tree.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct MerkleMountainRange {
     count: usize,
     capacity: usize,
@@ -213,6 +213,30 @@ impl MerkleMountainRange {
             Some(&self.levels[0][index])
         }
     }
+}
+
+/// Persist a `MerkleMountainRange` to `path` via bincode. Matches
+/// the SP1-era `zkcoins_program::merkle::merkle_mountain_range`
+/// helper shape — used by the server's `State::save_to_files` cutover.
+pub fn save_mmr(mmr: &MerkleMountainRange, path: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let file = std::fs::File::create(path)?;
+    let serialized = bincode::serialize(mmr)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let mut writer = std::io::BufWriter::new(file);
+    writer.write_all(&serialized)?;
+    Ok(())
+}
+
+/// Load a `MerkleMountainRange` from `path` previously written by
+/// [`save_mmr`].
+pub fn load_mmr(path: &str) -> std::io::Result<MerkleMountainRange> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut buffer = Vec::new();
+    reader.read_to_end(&mut buffer)?;
+    bincode::deserialize(&buffer).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -398,5 +422,36 @@ mod tests {
             let leaf = tree.levels[0][i];
             assert!(proof.verify(leaf, root));
         }
+    }
+
+    /// `save_mmr` + `load_mmr` round-trip preserves the MMR's leaf
+    /// set + root + inclusion proofs.
+    #[test]
+    fn save_load_round_trip() {
+        let mut mmr = MerkleMountainRange::new();
+        for i in 0..6 {
+            mmr.append(leaf_of(&format!("leaf_{i}")));
+        }
+        let original_root = mmr.root();
+
+        let path = std::env::temp_dir().join("zkcoins-plonky2-mmr-roundtrip.bin");
+        let path_str = path.to_str().unwrap();
+        save_mmr(&mmr, path_str).expect("save");
+        let loaded = load_mmr(path_str).expect("load");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(loaded.root(), original_root);
+        let proof = loaded.get_proof(0).expect("proof");
+        assert!(proof.verify(loaded.get_leaf(0).copied().unwrap(), original_root));
+    }
+
+    /// Build-time assertion: `load_mmr` propagates I/O errors when
+    /// the path doesn't exist.
+    #[test]
+    fn load_mmr_missing_path_errors() {
+        let path = std::env::temp_dir().join("zkcoins-plonky2-mmr-does-not-exist.bin");
+        std::fs::remove_file(&path).ok();
+        let result = load_mmr(path.to_str().unwrap());
+        assert!(result.is_err());
     }
 }
