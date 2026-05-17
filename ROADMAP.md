@@ -30,7 +30,7 @@ person-days at full focus; multiply for part-time work.
 | 4a | In-circuit MMR inclusion gadget | ✅ done | — | — |
 | 4b | In-circuit SMT inclusion gadget | ✅ done | — | — |
 | 4c | In-circuit SMT non-inclusion gadget (verify only) | ✅ done | — | — |
-| 4c+ | In-circuit SMT insert gadget (new-root computation) | ⏳ todo | 1 d | medium (fixed-depth padding) |
+| 4c+ | In-circuit SMT insert gadget (new-root computation) | ✅ done | — | — |
 | 4d | Port `ProgramInputs` + `CommitmentMerkleProofs` types | ✅ done | — | — |
 | 5 | Monolithic state-transition circuit (recursion, padding, vk-pin) | ⏳ todo | **3–5 d** | **high** (vk-pin correctness, first real recursion test) |
 | 6 | `script-plonky2/` host-side prover wrapper | ⏳ todo | 1–2 d | low |
@@ -69,6 +69,7 @@ MIGRATION_RESEARCH / CONTRIBUTING are not individually listed once
 they merely correct or extend this file — see `git log` for the
 exhaustive history.
 
+- [`6cf949c`](./../../commit/6cf949c) — feat: SMT insert verify gadget (8 tests: 3 positive incl. deep-divergence Case B, 3 negative incl. case-A invariant, 2 build-time assertion panics)
 - [`79bd39e`](./../../commit/79bd39e) — docs: hardware target — M3 Ultra single host, no external hardware, no cloud prover (later corrected to note the integrated Apple GPU IS available, just unused by Plonky2 today)
 - [`e14d9df`](./../../commit/e14d9df) — feat: 100% test coverage on program-plonky2 (16 new tests + MMR refactor + coverage(off) annotations)
 - [`2b6f2cb`](./../../commit/2b6f2cb) — docs: consistency review pass — fix stale counts, add glossary, reconcile §6
@@ -91,9 +92,9 @@ exhaustive history.
 - [`57cdce4`](./../../commit/57cdce4) — docs: migration research
 - [`496c652`](./../../commit/496c652) — docs: circuit specification
 
-**Test count on this branch:** 64 (all green on nightly-2025-04-15).
+**Test count on this branch:** 72 (all green on nightly-2025-04-15).
 Breakdown: `prelude` 1 · `hash` 5 · `merkle::smt` 18 · `merkle::mmr` 11 ·
-`types` 10 · `inputs` 5 · `circuit::mmr` 5 · `circuit::smt` 9.
+`types` 10 · `inputs` 5 · `circuit::mmr` 5 · `circuit::smt` 17.
 
 **Coverage:** **100% lines, 100% functions, 100% regions** on `program-plonky2/`
 as measured by `cargo llvm-cov --fail-under-lines 100`. Test modules
@@ -114,17 +115,7 @@ rather than carrying its own perpetually-uncovered branch.
 
 ## Next (in order)
 
-### Step 4c+ — SMT insert gadget (new-root computation) — **NEXT**
-**Effort:** ~1 day.
-**Files:** `program-plonky2/src/circuit/smt.rs` (extends the existing module).
-**Mirror of:** `NonInclusionProof::insert` / `verify_and_insert`.
-**Test plan (100% coverage gate applies):**
-  - After non-inclusion verify, also assert the computed new-root matches the off-circuit `verify_and_insert` result. Both case A (empty subtree) and case B (path-compressed neighbour).
-  - Negative: tampered new leaf or wrong padding rejected.
-**Risk:** Medium. The off-circuit insert has a variable-length default-hash padding loop driven by where `key` and `other_key` diverge. In-circuit either: (a) compute the divergence depth as a witness and conditionally hash up to `TREE_DEPTH` always, or (b) require the host to pre-pad the path to a fixed depth. Plan: (b).
-**Relation to Step 5:** the fixed-depth padding scheme that 4c+ introduces is the same scheme the monolithic circuit needs. The two pieces can either land in one PR or in sequence; either way **4c+ must complete before Step 5 can use the SMT insert gadget**.
-
-### Step 5 — Monolithic state-transition circuit
+### Step 5 — Monolithic state-transition circuit — **NEXT**
 **Effort:** 3–5 days.
 **Files:** `program-plonky2/src/circuit/main.rs` (new) — the equivalent of `program/src/main.rs`.
 **Scope:** assemble all gadgets into the full circuit; implement Initial vs. AccountUpdate branch via `conditionally_verify_cyclic_proof_or_dummy`; fix `MAX_IN_COINS = 8`; pin `vk` via `add_verifier_data_public_inputs`; commit `ProofData` as 16-element public output.
