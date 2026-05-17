@@ -106,10 +106,10 @@ exhaustive history.
 - [`57cdce4`](./../../commit/57cdce4) — docs: migration research
 - [`496c652`](./../../commit/496c652) — docs: circuit specification
 
-**Test count on this branch:** 99 (all green on nightly-2025-04-15).
+**Test count on this branch:** 102 (all green on nightly-2025-04-15).
 Breakdown: `prelude` 1 · `hash` 5 · `merkle::smt` 19 · `merkle::mmr` 14 ·
 `types` 10 · `inputs` 5 · `circuit::mmr` 5 · `circuit::smt` 12 ·
-`circuit::main` 28.
+`circuit::main` 31.
 
 **Coverage:** **100% lines, 100% functions, 100% regions** on `program-plonky2/`
 as measured by `cargo llvm-cov --fail-under-lines 100`. Test modules
