@@ -519,6 +519,91 @@ choice / Plonky3-native ecosystem". A separate question is whether
 Plonky3's GPU paths might include Metal — if so, that would change
 the calculation.
 
+### 7.12 BitVM's `common_data_for_recursion` is broken under Plonky2 1.1.0 — **codified**
+
+**Discovered:** building the stage-5a cyclic-recursion PoC (commit
+`83fa0c1`).
+
+**Symptom:** copying BitVM/zkCoins's `common_data_for_recursion`
+verbatim into `circuit/main.rs` and calling
+`builder.build::<C>()` on the outer cyclic circuit panics with
+`Failed to build circuit` at `plonky2/src/plonk/circuit_builder.rs:1067`.
+No useful error message; the panic comes from a shape-mismatch deep
+in the verifier-data wiring.
+
+**Root cause:** BitVM is pinned to **Plonky2 0.2.0**. In that version
+the canonical `common_data_for_recursion` is **two `verify_proof`
+calls in pass 2 and three in pass 3, plus a `ConstantGate` added to
+the gate set**. Plonky2 1.1.0's
+`conditionally_verify_cyclic_proof_or_dummy` produces a different
+gate set and public-input shape, so the BitVM-shaped common-data is
+no longer a fixed point. The library's outer build then rejects the
+mismatch.
+
+**Fix:** port Plonky2 1.1.0's own canonical
+`recursion::cyclic_recursion::tests::common_data_for_recursion`
+verbatim — **one `verify_proof` call per pass plus `NoopGate`
+padding to `1 << 12` gates**. See
+`program-plonky2/src/circuit/main.rs::common_data_for_recursion_c`
+for the working implementation with full source comments.
+
+**Why we keep both versions in mind:** if anyone later restores
+BitVM's three-pass shape (e.g., on the theory that "more verifies =
+more robust"), the build will fail again. The 1.1.0 canonical shape
+is the only one that works with 1.1.0's `conditionally_verify_*`
+machinery; this is not a stylistic preference.
+
+**Ordering subtlety:** the BitVM reference order is
+`add_virtual_public_input` → `add_verifier_data_public_inputs` →
+`common_data_for_recursion` → `common_data.num_public_inputs = …`.
+Plonky2 1.1.0's own canonical test orders it
+`add_virtual_public_input` → `common_data_for_recursion` →
+`add_verifier_data_public_inputs` → `common_data.num_public_inputs = …`
+instead. The `common_data_for_recursion` function is stateless w.r.t.
+the outer builder, so logically the order shouldn't matter — but
+match the canonical order to avoid surprises.
+
+### 7.13 Coverage debt from unreachable Plonky2 `Result<()>` calls — **codified**
+
+**Discovered:** stage-5a (`83fa0c1`) initial draft used `?` to
+propagate the `Result` of
+`conditionally_verify_cyclic_proof_or_dummy`. `cargo llvm-cov` flagged
+the `Err` arm as uncovered, dropping line coverage below the 100 %
+gate.
+
+**The pattern:** Plonky2 library functions like
+`conditionally_verify_cyclic_proof_or_dummy`,
+`pw.set_target`, `pw.set_proof_with_pis_target`,
+`pw.set_verifier_data_target` all return `Result<…>` even though, in
+correct usage, they only return `Err` under invariants we control by
+construction (e.g., "common_data well-formed", "target not already
+set"). These are unreachable error paths in our code, but `llvm-cov`
+counts the branch.
+
+**Fix recipe — analogous to §7.9 (Option-based defensive checks):**
+- For functions that exist only for error propagation (like
+  `build_cyclic_circuit`), make the function infallible by `.expect`-ing
+  the unreachable `Err` and dropping `Result<…>` from the signature.
+  The `expect` message documents the invariant that makes `Err` impossible.
+- For witness-population calls inside helpers that already return
+  `Result<…>` for other reasons (e.g. `data.prove`), keep `.unwrap()`
+  inline; the surrounding `Result` covers the rest of the contract.
+
+**Why this is *not* a fallback** (per `feedback_no_fallbacks`):
+`.expect` doesn't replace bad output with default output — it
+*panics* if the invariant ever breaks. The function's contract is
+"this never returns Err under our usage"; making that explicit via
+`.expect("…")` is documentation, not silent recovery. If the
+invariant later breaks (e.g., library API changes), tests will catch
+it via the panic, not a wrong-result soft failure.
+
+**Residual region not covered:** the `.expect` itself still produces
+one llvm-cov region for the panic branch (the `.unwrap_or_else(panic)`
+expansion). That's 1 missed region per call. For the line-based MVP
+gate (`cargo llvm-cov --fail-under-lines 100`) this is fine; for the
+region-coverage stretch it's the unavoidable cost of unreachable
+defensive paths in `Result`-returning library APIs.
+
 ---
 
 ## 8. Local Artifacts
