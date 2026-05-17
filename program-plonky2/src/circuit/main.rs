@@ -122,10 +122,11 @@ pub const MAX_IN_COINS: usize = 8;
 /// `out_coin.identifier` is asserted to equal
 /// `Poseidon(interim_account_state_hash || slot_index)`, mirroring
 /// the off-circuit [`crate::types::calculate_coin_identifier`].
-/// Stage 5d-next-3 ships `MAX_OUT_COINS = 1` as the minimum viable
-/// commitment; bumping is mechanical, costing ~512 Poseidon hashes
-/// + ~80 arithmetic gates per slot.
-pub const MAX_OUT_COINS: usize = 1;
+/// Matches SPEC §13's production target of 8. Each extra slot costs
+/// ~512 Poseidon hashes + ~80 arithmetic gates; the cyclic-recursion
+/// `common_data_for_recursion_c` padding must be sized to accommodate
+/// the resulting outer-circuit gate count.
+pub const MAX_OUT_COINS: usize = 8;
 
 /// Build the `CommonCircuitData` that the cyclic circuit references
 /// when verifying its own prior proof.
@@ -171,12 +172,16 @@ fn common_data_for_recursion_c() -> CommonCircuitData<F, D> {
     // Pass 3: verify once and pad to `INNER_PAD_BITS` gates with
     // NoopGate. The padding fixes the inner circuit's `degree_bits`
     // and MUST be ≥ ceil(log2(outer.num_gates)) for cyclic recursion
-    // to build. Stage 5d-next-2 grew the outer circuit to ~6k gates
-    // (8× in-coin slots × ~512 SMT hashes + apply_coin arithmetic +
-    // 5c+ checks); `INNER_PAD_BITS = 13` (1 << 13 = 8192) covers it
-    // with margin. Bumping the constant is the only required change
-    // when the outer circuit grows further.
-    const INNER_PAD_BITS: usize = 13;
+    // to build. Outer circuit size as of stage 5d-next-3 (full
+    // production parameters):
+    //   - 8 in-coin slots × ~512 SMT hashes ≈ 4 k
+    //   - 8 out-coin slots × ~512 SMT hashes ≈ 4 k
+    //   - 5c+ commitment proofs (SMT 256 + 2× MMR 31) ≈ 0.3 k
+    //   - apply_coin + identifier derivation + 3 account-state hashes ≈ 0.2 k
+    //   - cyclic-verify shape + NoopGate padding to power of 2
+    // Total ≈ 8-10 k gates → `INNER_PAD_BITS = 14` (1 << 14 = 16384)
+    // gives generous headroom.
+    const INNER_PAD_BITS: usize = 14;
     let config = CircuitConfig::standard_recursion_config();
     let mut builder = CircuitBuilder::<F, D>::new(config);
     let proof = builder.add_virtual_proof_with_pis(&data.common);
@@ -1854,8 +1859,7 @@ mod tests {
         let in_coins = (0..MAX_IN_COINS)
             .map(|_| (false, &dummy_c, &dummy_nip))
             .collect::<Vec<_>>();
-        let out_coins =
-            out_slots_first_active(expected_out_id, out_coin_amount, &nip, &dummy_nip);
+        let out_coins = out_slots_first_active(expected_out_id, out_coin_amount, &nip, &dummy_nip);
 
         let history_root = hash_bytes(b"history@5d-next-3-out");
         let proof = prove_initial_with_in_and_out_coins(
