@@ -16,6 +16,17 @@ use crate::hash::{hash_concat, HashDigest, ZERO_HASH};
 
 pub type MerklePath = Vec<HashDigest>;
 
+/// Maximum MMR depth used for fixed-shape in-circuit verification. Supports
+/// up to 2^(MMR_MAX_DEPTH - 1) leaves. Variable-depth proofs and roots
+/// produced by the off-circuit MMR are padded / extended to this depth via
+/// [`MerkleMountainRange::root_extended`] and [`MMRProof::extend_to`]
+/// before being consumed in-circuit.
+///
+/// Picked so a single zkCoins server can run for many years of state
+/// transitions without exhausting the MMR; the closed test env makes
+/// this a free parameter (no on-chain commitment to a specific depth).
+pub const MMR_MAX_DEPTH: usize = 32;
+
 /// Inclusion proof for a leaf in an MMR.
 ///
 /// `index` is the leaf's position in the bottom level (the order it was
@@ -45,6 +56,18 @@ impl MMRProof {
             idx /= 2;
         }
         computed == expected_root
+    }
+
+    /// Pad `self.path` with `ZERO_HASH` siblings to length `target_path_len`.
+    /// Used to bring a variable-depth proof from the off-circuit MMR (depth =
+    /// `log2(capacity)`) up to the fixed depth that the in-circuit gadget
+    /// expects. The padded proof verifies against
+    /// [`MerkleMountainRange::root_extended`] at the same target depth.
+    pub fn extend_to(mut self, target_path_len: usize) -> Self {
+        while self.path.len() < target_path_len {
+            self.path.push(ZERO_HASH);
+        }
+        self
     }
 }
 
@@ -135,6 +158,22 @@ impl MerkleMountainRange {
         } else {
             self.levels[self.tree_depth() - 1][0]
         }
+    }
+
+    /// Root extended to a fixed `target_path_len`. Computed by walking the
+    /// natural [`Self::root`] up through additional levels of
+    /// `hash_concat(current, ZERO_HASH)`. Used at the protocol boundary
+    /// when handing the history root to a fixed-shape in-circuit verifier:
+    /// the verifier needs the root and the proof to agree on a fixed
+    /// number of levels, achieved by both extending the root and the proof
+    /// path (via [`MMRProof::extend_to`]) to the same target.
+    pub fn root_extended(&self, target_path_len: usize) -> HashDigest {
+        let mut current = self.root();
+        let natural_path_len = self.tree_depth() - 1;
+        for _ in natural_path_len..target_path_len {
+            current = hash_concat(&current, &ZERO_HASH);
+        }
+        current
     }
 
     /// Inclusion proof for the leaf at `index`. Returns `Err` if out of range.
@@ -305,6 +344,43 @@ mod tests {
         let proof = tree.get_proof(2).unwrap();
         assert_eq!(proof.path[0], ZERO_HASH);
         assert!(proof.verify(leaf_of("c"), tree.root()));
+    }
+
+    #[test]
+    fn extend_to_and_root_extended_round_trip() {
+        // A 2-leaf MMR has natural path length 1 (one sibling).
+        let mut tree = MerkleMountainRange::new();
+        tree.append(leaf_of("a"));
+        tree.append(leaf_of("b"));
+        let proof = tree.get_proof(0).unwrap();
+        assert_eq!(proof.path.len(), 1);
+
+        // Extend to MMR_MAX_DEPTH and verify against the extended root.
+        let target_len = MMR_MAX_DEPTH - 1;
+        let extended_proof = proof.extend_to(target_len);
+        let extended_root = tree.root_extended(target_len);
+        assert_eq!(extended_proof.path.len(), target_len);
+        assert!(extended_proof.verify(leaf_of("a"), extended_root));
+    }
+
+    #[test]
+    fn root_extended_at_natural_depth_equals_natural_root() {
+        let mut tree = MerkleMountainRange::new();
+        tree.append(leaf_of("a"));
+        tree.append(leaf_of("b"));
+        let natural_path_len = tree.tree_depth() - 1;
+        assert_eq!(tree.root_extended(natural_path_len), tree.root());
+    }
+
+    #[test]
+    fn extend_to_idempotent_at_target() {
+        let mut tree = MerkleMountainRange::new();
+        tree.append(leaf_of("a"));
+        let proof = tree.get_proof(0).unwrap();
+        let extended = proof.clone().extend_to(MMR_MAX_DEPTH - 1);
+        // Already at target — extending again is a no-op.
+        let extended_again = extended.clone().extend_to(MMR_MAX_DEPTH - 1);
+        assert_eq!(extended, extended_again);
     }
 
     #[test]
