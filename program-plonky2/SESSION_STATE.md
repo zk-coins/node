@@ -30,22 +30,34 @@ with **everything except source-side verification of in-coins**:
 - `INNER_PAD_BITS = 14` (1 << 14 = 16 384 gates) covers the
   ~10 k outer circuit gates with margin.
 
-## What's deferred (the one big gap)
+## What's deferred to post-MVP / Stage 5d-next-5
 
 **Stage 5d-next-4 — source-side in-coin verification.** Design doc
 at [`STAGE_5D_NEXT_4_DESIGN.md`](STAGE_5D_NEXT_4_DESIGN.md).
-Implementation effort estimate: 4–8 hours of focused work + multiple
-20–40-min test cycles. Three SPEC §13 negatives are blocked by this:
+**Attempted in commit `c1df545` (subsequently reverted)** — see
+[`../MIGRATION_RESEARCH.md` §7.21](../MIGRATION_RESEARCH.md) for the
+two Plonky2 1.1.0 blockers (multi-`_or_dummy` ConstantGate mismatch +
+in-circuit data-only common_data shape mismatch).
 
+For zkCoins server-heavy MVP, source-side verification is enforced
+**off-circuit**: the trusted server only folds validly-proved
+commitments into the history MMR. Stage 5d-next-3's prev_account
+CMP + the SPEC §8 (c)(d)(e) chain still provides the
+"prev-account-state is in history" guarantee for the AccountUpdate
+branch.
+
+Three SPEC §13 negatives remain off-circuit-only:
 - Input coin whose source proof is NOT in commitment history.
 - Input coin whose identifier is NOT in source's `output_coins_root`.
 - Wrong `vk` on a recursive source proof.
 
-When you tackle it, **read the design doc first** — the
-`common_data_for_recursion_c` shape needs N verify_proof calls
-(N = `MAX_IN_COINS + 1` = 9) and `INNER_PAD_BITS` likely climbs to
-17. Use a `OnceLock`-cached `StateTransitionCircuit` in tests to
-avoid paying the build cost per-test.
+These are enforced by server-side input validation before proving;
+they cannot bypass the trusted server's history-MMR folding step.
+
+Stage 5d-next-5 paths forward (post-MVP):
+1. Aggregator pattern (separate non-cyclic sub-circuit).
+2. Plonky2 upstream patch for multi-instance `_or_dummy`.
+3. Per-slot common_data shape matching via iterative bisection.
 
 ## Test count + budget
 

@@ -1,0 +1,24 @@
+[workspace]
+# Empty workspace table prevents the parent stable-toolchain workspace
+# from absorbing this crate (Plonky2 needs nightly, parent is pinned
+# to stable for SP1). Matches `program-plonky2/Cargo.toml`'s pattern.
+
+[package]
+name = "zkcoins-prover-plonky2"
+version = "0.0.1"
+edition = "2021"
+
+# Standalone crate, intentionally excluded from the parent workspace.
+# Shares its nightly toolchain with `program-plonky2` (the Plonky2
+# library requires nightly Rust for `feature(specialization)`).
+# Build:
+#   (cd script-plonky2 && cargo build)
+# (uses ../program-plonky2/rust-toolchain.toml via symlink)
+
+[dependencies]
+zkcoins-program-plonky2 = { path = "../program-plonky2" }
+plonky2 = "1.1.0"
+anyhow = "1.0"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
