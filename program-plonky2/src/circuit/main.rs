@@ -923,6 +923,49 @@ mod tests {
         .is_err());
     }
 
+    /// Build-time assertion: `set_cmp_witness` rejects a `cmp` whose
+    /// SMT inclusion proof is short of `TREE_DEPTH` siblings — the
+    /// in-circuit gadget is built against a fixed 256-level shape, so
+    /// a malformed witness would silently skip levels.
+    #[test]
+    #[should_panic(expected = "SMT inclusion proof must be padded to TREE_DEPTH siblings")]
+    fn stage_5c_plus_set_cmp_witness_panics_on_short_smt_path() {
+        let circuit = build_circuit();
+        let mut cmp = dummy_cmp();
+        cmp.commitment_proof.siblings.truncate(TREE_DEPTH - 1);
+        let mut pw = PartialWitness::new();
+        set_cmp_witness(&mut pw, &circuit, &cmp);
+    }
+
+    /// Build-time assertion: `set_cmp_witness` rejects a `cmp` whose
+    /// MMR (d) path is short of `MMR_PROOF_PATH_LEN` siblings.
+    #[test]
+    #[should_panic(expected = "MMR proof (d) must be extended to MMR_PROOF_PATH_LEN siblings")]
+    fn stage_5c_plus_set_cmp_witness_panics_on_short_mmr_a_path() {
+        let circuit = build_circuit();
+        let mut cmp = dummy_cmp();
+        cmp.commitment_root_history_proof
+            .path
+            .truncate(MMR_PROOF_PATH_LEN - 1);
+        let mut pw = PartialWitness::new();
+        set_cmp_witness(&mut pw, &circuit, &cmp);
+    }
+
+    /// Build-time assertion: `set_cmp_witness` rejects a `cmp` whose
+    /// MMR (e) path is short of `MMR_PROOF_PATH_LEN` siblings.
+    #[test]
+    #[should_panic(expected = "MMR proof (e) must be extended to MMR_PROOF_PATH_LEN siblings")]
+    fn stage_5c_plus_set_cmp_witness_panics_on_short_mmr_b_path() {
+        let circuit = build_circuit();
+        let mut cmp = dummy_cmp();
+        cmp.previous_root_history_proof
+            .1
+            .path
+            .truncate(MMR_PROOF_PATH_LEN - 1);
+        let mut pw = PartialWitness::new();
+        set_cmp_witness(&mut pw, &circuit, &cmp);
+    }
+
     /// Stage 5c+ negative (d): AccountUpdate where the SMT inclusion path
     /// has been tampered with. (d) catches it via `connect_hashes`.
     #[test]
