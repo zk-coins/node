@@ -1,9 +1,15 @@
 # Lightning ↔ zkCoins Atomic Swap — Design Document
 
-**Status:** Design draft. No code yet. Companion to [`SPEC.md`](./SPEC.md),
-[`MIGRATION_RESEARCH.md`](./MIGRATION_RESEARCH.md), and
-[`ROADMAP.md`](./ROADMAP.md). Authoritative source for *how* trustless LN
-↔ zkCoins swaps work, *not* for the wider zkCoins protocol itself.
+**Status:** Design draft. No code yet. Companion to `SPEC.md`,
+`MIGRATION_RESEARCH.md`, and `ROADMAP.md`. Authoritative source for
+*how* trustless LN ↔ zkCoins swaps work, *not* for the wider zkCoins
+protocol itself.
+
+> **Branch note.** This document presupposes the Plonky2 migration
+> currently on `feat/plonky2-migration` (PR #17). `SPEC.md`,
+> `MIGRATION_RESEARCH.md`, and `ROADMAP.md` live on that branch and
+> will resolve on `develop` only after PR #17 lands. Until then, view
+> cross-references against `feat/plonky2-migration`.
 
 **Audience:** Engineers picking up swap implementation. Assumes familiarity
 with `SPEC.md` (account model, coin format, inscription mechanics) and
@@ -1292,3 +1298,4 @@ A draft sequence; not a commitment.
 | Date       | Change |
 | ---------- | ------ |
 | 2026-05-17 | Initial draft. |
+| 2026-05-17 | Consistency audit pass: add branch note at the top explaining that `SPEC.md` / `MIGRATION_RESEARCH.md` / `ROADMAP.md` currently live on `feat/plonky2-migration` only. |

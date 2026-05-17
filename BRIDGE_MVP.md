@@ -12,6 +12,12 @@ decisions made in `BITVM_BRIDGE.md` §12–§13.
 decisions, the implementation order, the test plan, and the
 non-goals.
 
+> **Branch note.** This document presupposes the Plonky2 migration
+> currently on `feat/plonky2-migration` (PR #17). `SPEC.md`,
+> `MIGRATION_RESEARCH.md`, and `ROADMAP.md` live on that branch and
+> will resolve on `develop` only after PR #17 lands. Until then, view
+> cross-references against `feat/plonky2-migration`.
+
 ---
 
 ## 1. Scope
@@ -980,12 +986,13 @@ So nobody scope-creeps:
   why BitVM2 for v1
 - [`LIGHTNING_ATOMIC_SWAP.md`](./LIGHTNING_ATOMIC_SWAP.md) — LN swap layer
   that this bridge enables
-- [`SPEC.md`](./SPEC.md) — protocol specification (D11 will close with
-  this MVP)
-- [`MIGRATION_RESEARCH.md`](./MIGRATION_RESEARCH.md) — Plonky2 lessons
-  (§7.12 cyclic-recursion gotcha specifically relevant to Phase 2)
-- [`ROADMAP.md`](./ROADMAP.md) — `feat/plonky2-migration` progress;
-  this MVP starts after step 9
+- `SPEC.md` — protocol specification (D11 will close with this MVP).
+  Currently on `feat/plonky2-migration`.
+- `MIGRATION_RESEARCH.md` — Plonky2 lessons (§7.12 cyclic-recursion
+  gotcha specifically relevant to Phase 2). Currently on
+  `feat/plonky2-migration`.
+- `ROADMAP.md` — `feat/plonky2-migration` progress; this MVP starts
+  after step 9. Currently on `feat/plonky2-migration`.
 - [Citrea Clementine bridge docs](https://docs.citrea.xyz/essentials/clementine-trust-minimized-bitcoin-bridge)
 - [BitVM Groth16 Verifier Toolkit (chainwayxyz)](https://github.com/chainwayxyz/bitvm-zk-verifier)
 - [polymerdao/plonky2-sha256](https://github.com/polymerdao/plonky2-sha256)
@@ -999,3 +1006,4 @@ So nobody scope-creeps:
 | ---- | ------ |
 | 2026-05-17 | Initial draft. |
 | 2026-05-17 | §2.2: add "Federation scaling beyond N=3" as deferred item with production target N=100 (1-of-N strict, practical upper bound of BitVM2 framework). Beyond N=100 noted as open research, not current goal. |
+| 2026-05-17 | Consistency audit pass: add branch note at the top explaining that `SPEC.md` / `MIGRATION_RESEARCH.md` / `ROADMAP.md` currently live on `feat/plonky2-migration` only; downgrade hyperlinks to those files to plain references (with branch annotation) in §15 References. |

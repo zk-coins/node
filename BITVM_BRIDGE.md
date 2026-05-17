@@ -1,8 +1,14 @@
 # BitVM Bridge — Trustless Mint/Burn for zkCoins
 
-**Status:** Design draft. No code yet. Companion to [`SPEC.md`](./SPEC.md)
-(specifically D11), [`MIGRATION_RESEARCH.md`](./MIGRATION_RESEARCH.md),
-[`ROADMAP.md`](./ROADMAP.md), and [`LIGHTNING_ATOMIC_SWAP.md`](./LIGHTNING_ATOMIC_SWAP.md).
+**Status:** Design draft. No code yet. Companion to `SPEC.md`
+(specifically D11), `MIGRATION_RESEARCH.md`, `ROADMAP.md`, and
+[`LIGHTNING_ATOMIC_SWAP.md`](./LIGHTNING_ATOMIC_SWAP.md).
+
+> **Branch note.** This document presupposes the Plonky2 migration
+> currently on `feat/plonky2-migration` (PR #17). `SPEC.md`,
+> `MIGRATION_RESEARCH.md`, and `ROADMAP.md` live on that branch and
+> will resolve on `develop` only after PR #17 lands. Until then, view
+> cross-references against `feat/plonky2-migration`.
 
 **Authoritative source for:** how zkCoins removes the operator-controlled
 mint (D11) by binding mint operations to provable BTC custody on Bitcoin
@@ -880,11 +886,15 @@ trust model is identical to BitVM2's; its on-chain cost is 100–1000×
 lower; and the construction is by the same team that wrote the
 Shielded CSV paper (Eagen, Linus). The fit is essentially perfect.
 
-The risk: it has not yet been deployed on mainnet by anyone. The
-trusted setup ceremony for Glock's DV-SNARK (if any — the DV-SNARK
-might not require a setup, the paper claims compactness without
-trusted setup, but verify before relying on this) is also a separate
-piece of coordination.
+The risk: it has not yet been deployed on mainnet by anyone. Glock
+**does require a circuit-specific trusted setup** — its DV-SNARK is
+instantiated with Pari (Eagen et al., eprint 2024/1245), and the
+Pari paper states explicitly: *"Pari requires a circuit-specific
+trusted setup, but the relevant prior work (namely, Groth16) also
+requires such a setup."* So the setup-coordination burden is
+comparable to BitVM2/Groth16, not eliminated. The advantage of
+Glock over BitVM2 is on-chain efficiency and proof size (Pari is
+the smallest known SNARK at 160 bytes), not setup transparency.
 
 ### 12.5 Mosaic — Practical Malicious Security for Garbled Circuits on Bitcoin (Eagen et al., 2026-04)
 
@@ -1105,3 +1115,4 @@ which has no minimum increment.
 | 2026-05-17 | Initial draft. |
 | 2026-05-17 | Add §12 "Beyond BitVM2 — 2026 Verification Landscape" covering BitVM3-RSA withdrawal, BitVM3-CC (BOB), Glock (Alpen Labs), Mosaic (Eagen et al.). Update §3 with 2026-landscape note. Update §11.1 / §11.2 / §11.3 comparison tables. Update §13 Bottom Line with hedging strategy. Refactor references into themed groups. |
 | 2026-05-17 | §13 Bottom Line: add explicit production federation target of N=100 (practical upper bound of BitVM2 framework per Bitlayer). Beyond N=100 noted as open research, not current goal. |
+| 2026-05-17 | Consistency audit pass: §12.4 — correct the Glock trusted-setup claim (Glock's DV-SNARK is instantiated with Pari which requires a circuit-specific trusted setup, comparable to Groth16; the previous "the DV-SNARK might not require a setup" wording was wrong). Add a branch note at the top explaining that `SPEC.md` / `MIGRATION_RESEARCH.md` / `ROADMAP.md` currently live on `feat/plonky2-migration` only. |
