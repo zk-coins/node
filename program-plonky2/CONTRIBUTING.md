@@ -90,22 +90,30 @@ NOT acceptable: "I'll add tests later", "this is just MVP scaffolding",
 
 ## Test runtime characteristics
 
-| Module           | Speed     | Why                                            |
-| ---------------- | --------- | ---------------------------------------------- |
-| `hash::tests`    | <1 s      | Just Poseidon hashes; no circuit.              |
-| `merkle::*`      | <2 s      | Off-circuit SMT/MMR operations.                |
-| `types::tests`   | <1 s      | Pure data shapes; one Poseidon per test.       |
-| `inputs::tests`  | <2 s      | Same plus a small e2e SMT+MMR roundtrip.       |
-| `circuit::*`     | **5–60 s per test** | Each builds a CircuitData under `standard_recursion_config` and runs a real prove + verify. |
+| Module                      | Speed                | Why                                            |
+| --------------------------- | -------------------- | ---------------------------------------------- |
+| `hash::tests`               | <1 s                 | Just Poseidon hashes; no circuit.              |
+| `merkle::*`                 | <2 s                 | Off-circuit SMT/MMR operations.                |
+| `types::tests`              | <1 s                 | Pure data shapes; one Poseidon per test.       |
+| `inputs::tests`             | <2 s                 | Same plus a small e2e SMT+MMR roundtrip.       |
+| `circuit::mmr`, `circuit::smt` | **5–30 s per test** | Builds a small (no cyclic-recursion) circuit and runs one prove + verify. |
+| `circuit::main` cyclic positive | **3–15 min per test** | Builds the full monolithic state-transition circuit (`INNER_PAD_BITS = 14`, `1 << 14 = 16 384`-gate inner shape) and runs a real cyclic-recursive prove + verify. Time scales with the number of active in-coin / out-coin slots. |
+| `circuit::main` cyclic negative | **2–10 min per test** | Same build cost, but the prover fails early at the unsatisfied constraint instead of generating a full proof. |
+| `circuit::main` panic guards | **~30 s per test** | Just `build_circuit()` then immediate `should_panic`. |
 
-A full circuit-test sweep (currently 11 tests) takes ~10 minutes serially.
-With parallel test threads (default), memory peak is much higher because
-each thread holds its own circuit in memory.
+A full circuit-test sweep at production parameters (`MAX_IN_COINS = MAX_OUT_COINS = 8`)
+runs ~22 cyclic tests at 3–15 min each. Serial runtime is multiple hours;
+parallel runtime is bounded by CPU + RAM (each test holds ~2 GB live).
 
 **Always use `--test-threads=1` for circuit tests on a memory-constrained
 machine.** See `feedback_cleanup_test_binaries.md` in `~/.claude/.../memory/`
 for the orphan-binary issue: if you abort a circuit test, the prover
 process can leak ~30 GB of swap-resident memory and survive for hours.
+
+When iterating on `circuit::main`, prefer running a single test by name
+rather than the whole module (`cargo test stage_5d_initial_with_one_active_in_coin`).
+The build-cache hits across runs make the second invocation near-instant
+for cargo itself; the prove is what dominates.
 
 ```bash
 # After interrupted test runs:

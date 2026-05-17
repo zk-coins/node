@@ -1976,7 +1976,8 @@ mod tests {
         );
     }
 
-    /// Build-time assertion: out-coin slot count guard.
+    /// Build-time assertion: out-coin slot count guard on
+    /// `prove_initial_with_in_and_out_coins`.
     #[test]
     #[should_panic(
         expected = "prove_initial_with_in_and_out_coins: caller must supply exactly MAX_OUT_COINS out-coin slot witnesses"
@@ -1995,6 +1996,90 @@ mod tests {
             ZERO_HASH,
             &in_coins,
             &[], // 0 out-coin slots, expected MAX_OUT_COINS
+            &account_state.public_key,
+        );
+    }
+
+    /// Build-time assertion: in-coin slot count guard on
+    /// `prove_initial_with_in_and_out_coins`.
+    #[test]
+    #[should_panic(
+        expected = "prove_initial_with_in_and_out_coins: caller must supply exactly MAX_IN_COINS in-coin slot witnesses"
+    )]
+    fn stage_5d_next_3_prove_initial_panics_on_wrong_in_slot_count() {
+        let circuit = build_circuit();
+        let account_state = AccountState::new(dummy_pubkey(7));
+        let dummy_nip = dummy_non_inclusion_proof();
+        let out_coins = (0..MAX_OUT_COINS)
+            .map(|_| (false, ZERO_HASH, 0u64, &dummy_nip))
+            .collect::<Vec<_>>();
+        let _ = prove_initial_with_in_and_out_coins(
+            &circuit,
+            &account_state,
+            ZERO_HASH,
+            &[], // 0 in-coin slots, expected MAX_IN_COINS
+            &out_coins,
+            &account_state.public_key,
+        );
+    }
+
+    /// Build-time assertion: in-coin slot count guard on
+    /// `prove_account_update_with_in_and_out_coins`.
+    #[test]
+    #[should_panic(
+        expected = "prove_account_update_with_in_and_out_coins: caller must supply exactly MAX_IN_COINS in-coin slot witnesses"
+    )]
+    fn stage_5d_next_3_prove_account_update_panics_on_wrong_in_slot_count() {
+        let circuit = build_circuit();
+        let mut account_state = AccountState::new(dummy_pubkey(8));
+        account_state.owner = *MINTING_ADDRESS;
+        account_state.balance = 1;
+        let (cmp, history_root_extended) =
+            build_test_commitment_witness(account_state.hash(), DEFAULT_HASHES[0]);
+        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH).expect("prove init");
+        let dummy_nip = dummy_non_inclusion_proof();
+        let out_coins = (0..MAX_OUT_COINS)
+            .map(|_| (false, ZERO_HASH, 0u64, &dummy_nip))
+            .collect::<Vec<_>>();
+        let _ = prove_account_update_with_in_and_out_coins(
+            &circuit,
+            &account_state,
+            history_root_extended,
+            &init_proof,
+            &cmp,
+            &[], // wrong: expected MAX_IN_COINS
+            &out_coins,
+            &account_state.public_key,
+        );
+    }
+
+    /// Build-time assertion: out-coin slot count guard on
+    /// `prove_account_update_with_in_and_out_coins`.
+    #[test]
+    #[should_panic(
+        expected = "prove_account_update_with_in_and_out_coins: caller must supply exactly MAX_OUT_COINS out-coin slot witnesses"
+    )]
+    fn stage_5d_next_3_prove_account_update_panics_on_wrong_out_slot_count() {
+        let circuit = build_circuit();
+        let mut account_state = AccountState::new(dummy_pubkey(9));
+        account_state.owner = *MINTING_ADDRESS;
+        account_state.balance = 1;
+        let (cmp, history_root_extended) =
+            build_test_commitment_witness(account_state.hash(), DEFAULT_HASHES[0]);
+        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH).expect("prove init");
+        let dummy_nip = dummy_non_inclusion_proof();
+        let dummy_c = dummy_coin();
+        let in_coins = (0..MAX_IN_COINS)
+            .map(|_| (false, &dummy_c, &dummy_nip))
+            .collect::<Vec<_>>();
+        let _ = prove_account_update_with_in_and_out_coins(
+            &circuit,
+            &account_state,
+            history_root_extended,
+            &init_proof,
+            &cmp,
+            &in_coins,
+            &[], // wrong: expected MAX_OUT_COINS
             &account_state.public_key,
         );
     }
