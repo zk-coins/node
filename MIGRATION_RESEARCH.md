@@ -777,6 +777,47 @@ Reserve `add_virtual_*` for prover-driven witnesses (e.g. real
 secret-key inputs, side channels, off-circuit results that you must
 trust the prover for).
 
+### 7.19 `account_state.hash` lifecycle inside a transition — **codified**
+
+**Discovered:** stage 5d-next-3 (out-coins). The same
+`AccountState::hash` value plays three different roles inside the
+SPEC §8 state-transition predicate, and conflating them broke a
+positive test with a cryptic "Partition was set twice with different
+values" Plonky2 error.
+
+**The three hashes:**
+
+| Role | Inputs | Used by |
+| --- | --- | --- |
+| `initial_account_state_hash` | `owner` + INITIAL balance + INITIAL pubkey | SPEC §8 (b) state continuity, (c) commitment-witness check |
+| `interim_account_state_hash` | `owner` + POST-in-coins-AND-out-coins balance + INITIAL pubkey | Out-coin identifier derivation: `out_coin.identifier == H(interim_asth || index)` |
+| `final_account_state_hash` | `owner` + POST-in-coins-AND-out-coins balance + NEW pubkey | Public output `ProofData.account_state_hash` |
+
+**Why three not one:**
+- The in-coin loop mutates the running balance via `apply_coin`.
+- The out-coin loop further mutates it via `send_coins`.
+- The pubkey is rotated *after* identifier derivation, *before* the
+  final commit.
+
+So:
+- (b) and (c) compare against `prev.account_state_hash` and
+  `mp.commitment_account_state_hash`, both of which witness the
+  state at *start* of the transition. Use INITIAL balance + INITIAL
+  pubkey.
+- The out-coin identifier `H(account_hash || index)` is computed
+  *after* subtractions per SPEC §8 step 3. Use POST-subtraction
+  balance + INITIAL pubkey (rotation happens *after* the loop).
+- The committed public output is the state at the *end* of the
+  transition. Use POST-subtraction balance + NEW pubkey.
+
+**Common test mistake:** computing the off-circuit expected
+identifier `H(account_hash || index)` using the INITIAL balance.
+The in-circuit identifier-equality check then fails with a wire
+conflict because the prover-supplied identifier doesn't match the
+in-circuit `H(interim_asth || index)`. Catch: when writing the
+out-coin test fixture, always pre-compute the interim balance from
+`initial - out_coin_amount` before hashing.
+
 ---
 
 ## 8. Local Artifacts
