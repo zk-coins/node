@@ -4,6 +4,19 @@
 //! aggregated proof that the outer [`crate::circuit::main`] circuit can
 //! verify with a single regular (non-cyclic) `verify_proof` call.
 //!
+//! # Status — read first
+//!
+//! This module is **Phase 1 only** of issue #19. The aggregator is
+//! currently **NOT consumed by the outer state-transition circuit**
+//! ([`crate::circuit::main::build_circuit`]) — it lives here as a
+//! self-contained artifact exercised by its own unit tests. Phase 2a
+//! (outer-side `verify_proof(aggregator)` + `connect_hashes`) and
+//! Phase 2b (per-in-coin SMT + CMP source-side gates) are blocked on
+//! a Plonky2 1.1.0 `dummy_circuit` shape mismatch documented in
+//! [`STAGE_5D_NEXT_5_AGGREGATOR.md`] at the crate root. Do not assume
+//! adding `verify_proof(aggregator)` to the outer will Just Work —
+//! the attempt was made and reverted in this PR; the doc explains why.
+//!
 //! ## Why this exists
 //!
 //! Per SPEC §8 step 2 the in-coins predicate requires, per slot, a
