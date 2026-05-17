@@ -2,7 +2,9 @@ use super::*;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
 use std::str::FromStr;
-use zkcoins_program::merkle::{hash_concat, HASH_SIZE};
+use zkcoins_program::hash::hash_concat;
+
+const HASH_SIZE: usize = 32;
 
 // Helper function to create a test commitment with a given message
 fn create_test_commitment(message: &[u8], key_hex: &str) -> Commitment {
@@ -208,7 +210,8 @@ fn test_reproduce_tree_verify() {
     ];
     //let key: [u8; 32] = bitcoin::hashes::sha256::Hash::hash(&key).to_byte_array();
     //let mut smt = SparseMerkleTree::new(256);
-    state.smt.insert(key, [1; HASH_SIZE]).unwrap();
+    let leaf = zkcoins_program::hash::digest_from_bytes(&[1; HASH_SIZE]);
+    state.smt.insert(key, leaf).unwrap();
     let root = state.smt.root();
 
     //// Get the complete proof (SMT + MMR)
@@ -218,7 +221,7 @@ fn test_reproduce_tree_verify() {
 
     let (smt_proof, _) = proof_result.unwrap();
 
-    assert!(smt_proof.verify([1; HASH_SIZE], root));
+    assert!(smt_proof.verify(leaf, root));
 }
 
 #[test]
@@ -295,7 +298,7 @@ fn test_get_mmr_inclusion_proof_unknown_root_returns_err() {
     // get_mmr_inclusion_proof must return Err when the previous MMR
     // root passed in is not tracked in root_indices.
     let state = State::new();
-    let unknown_root = [99u8; 32];
+    let unknown_root = zkcoins_program::hash::digest_from_bytes(&[99u8; 32]);
     let result = state.get_mmr_inclusion_proof(unknown_root);
     assert!(result.is_err());
 }
@@ -378,7 +381,7 @@ fn test_load_from_files_falls_back_to_zero_prev_root() {
 
     let loaded =
         State::load_from_files(smt_path.to_str().unwrap(), mmr_path.to_str().unwrap()).unwrap();
-    assert_eq!(loaded.prev_mmr_root, [0u8; 32]);
+    assert_eq!(loaded.prev_mmr_root, zkcoins_program::hash::ZERO_HASH);
 
     // Tidy up.
     std::fs::remove_dir_all(&dir).ok();

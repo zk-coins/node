@@ -193,7 +193,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                         Ok(new_root) => {
                             println!(
                                 "Added to State. New MMR root: {}",
-                                hex::encode(new_root)
+                                hex::encode(zkcoins_program::hash::digest_to_bytes(&new_root))
                             );
 
                             // Save the state after each update
