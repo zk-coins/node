@@ -69,7 +69,8 @@ MIGRATION_RESEARCH / CONTRIBUTING are not individually listed once
 they merely correct or extend this file — see `git log` for the
 exhaustive history.
 
-- (next commit) — feat: stage 5c — AccountUpdate branch (condition now a free witness; cyclic verify binds SPEC §8 (a); state continuity (b) via `condition * (account_state_hash - prev.account_state_hash) == 0`; coin_history carry-over via `select(condition, prev.coin_history_root, DEFAULT_HASHES[0])`; mint exception masked with `!condition`; 5 tests incl. Initial→AccountUpdate chain and state-discontinuity rejection; SPEC §8 (c)(d)(e) MMR/SMT history checks DEFERRED to stage 5c+)
+- (next commit) — refactor: SMT redesign to uncompressed fixed-256 paths (off-circuit `InclusionProof` / `NonInclusionProof` always carry exactly `TREE_DEPTH = 256` siblings; path compression removed from `insert` and proof generation; `NonInclusionProof.leaf` field dropped — non-inclusion now witnesses the empty-leaf default at the depth-256 slot; in-circuit `verify_smt_inclusion` / `verify_smt_non_inclusion` / `verify_smt_insert` reduced to a single `hash_up_full_path` engine; case A/B branch and `extension` parameter gone. Required for Plonky2 cyclic recursion `circuit_digest` stability across proof shapes. Test count 77 → 73, 100 % lines coverage retained.)
+- [`bba6470`](./../../commit/bba6470) — feat: stage 5c — AccountUpdate branch (condition now a free witness; cyclic verify binds SPEC §8 (a); state continuity (b) via `condition * (account_state_hash - prev.account_state_hash) == 0`; coin_history carry-over via `select(condition, prev.coin_history_root, DEFAULT_HASHES[0])`; mint exception masked with `!condition`; 5 tests incl. Initial→AccountUpdate chain and state-discontinuity rejection; SPEC §8 (c)(d)(e) MMR/SMT history checks DEFERRED to stage 5c+)
 - [`d167237`](./../../commit/d167237) — feat: stage 5b — Initial-branch state-transition predicate (`circuit/main.rs` rewritten: counter payload replaced by 16-element `ProofData`, mint exception + empty-SMT roots + in-circuit Poseidon `AccountState::hash`, condition pinned `false`; 3 tests: mint accepted, non-mint zero-balance accepted, non-mint nonzero-balance rejected)
 - [`83fa0c1`](./../../commit/83fa0c1) — feat: stage 5a — cyclic recursion plumbing PoC (`circuit/main.rs`, 2 tests: base + 1 recursive cycle; superseded by stage 5b)
 - [`6cf949c`](./../../commit/6cf949c) — feat: SMT insert verify gadget (8 tests: 3 positive incl. deep-divergence Case B, 3 negative incl. case-A invariant, 2 build-time assertion panics)
@@ -95,9 +96,9 @@ exhaustive history.
 - [`57cdce4`](./../../commit/57cdce4) — docs: migration research
 - [`496c652`](./../../commit/496c652) — docs: circuit specification
 
-**Test count on this branch:** 77 (all green on nightly-2025-04-15).
-Breakdown: `prelude` 1 · `hash` 5 · `merkle::smt` 18 · `merkle::mmr` 11 ·
-`types` 10 · `inputs` 5 · `circuit::mmr` 5 · `circuit::smt` 17 ·
+**Test count on this branch:** 73 (all green on nightly-2025-04-15).
+Breakdown: `prelude` 1 · `hash` 5 · `merkle::smt` 19 · `merkle::mmr` 11 ·
+`types` 10 · `inputs` 5 · `circuit::mmr` 5 · `circuit::smt` 12 ·
 `circuit::main` 5.
 
 **Coverage:** **100% lines, 100% functions, 100% regions** on `program-plonky2/`
