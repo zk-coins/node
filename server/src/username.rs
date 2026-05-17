@@ -70,11 +70,20 @@ impl UsernameStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zkcoins_program::hash::digest_from_bytes;
+
+    /// Test helper: byte literal → Poseidon `HashDigest = HashOut<F>`.
+    /// Stage 7 Plonky2 migration replaced the SP1-era `Address = [u8; 32]`
+    /// with `HashOut<F>`; tests that previously used `[N; 32]` literals
+    /// now go through `digest_from_bytes`.
+    fn addr(seed: u8) -> Address {
+        digest_from_bytes(&[seed; 32])
+    }
 
     #[test]
     fn claim_and_resolve() {
         let mut store = UsernameStore::new();
-        let address = [1u8; 32];
+        let address = addr(1);
 
         store.claim("Alice", address).unwrap();
         assert_eq!(store.resolve("alice"), Some(address));
@@ -85,14 +94,14 @@ mod tests {
     #[test]
     fn duplicate_username_rejected() {
         let mut store = UsernameStore::new();
-        store.claim("alice", [1u8; 32]).unwrap();
-        assert!(store.claim("alice", [2u8; 32]).is_err());
+        store.claim("alice", addr(1)).unwrap();
+        assert!(store.claim("alice", addr(2)).is_err());
     }
 
     #[test]
     fn duplicate_address_rejected() {
         let mut store = UsernameStore::new();
-        let address = [1u8; 32];
+        let address = addr(1);
         store.claim("alice", address).unwrap();
         assert!(store.claim("bob", address).is_err());
     }
@@ -100,34 +109,34 @@ mod tests {
     #[test]
     fn invalid_username_rejected() {
         let mut store = UsernameStore::new();
-        assert!(store.claim("", [1u8; 32]).is_err());
-        assert!(store.claim("hello world", [2u8; 32]).is_err());
-        assert!(store.claim("hello@world", [3u8; 32]).is_err());
-        assert!(store.claim(&"a".repeat(65), [4u8; 32]).is_err());
+        assert!(store.claim("", addr(1)).is_err());
+        assert!(store.claim("hello world", addr(2)).is_err());
+        assert!(store.claim("hello@world", addr(3)).is_err());
+        assert!(store.claim(&"a".repeat(65), addr(4)).is_err());
     }
 
     #[test]
     fn valid_usernames_accepted() {
         let mut store = UsernameStore::new();
-        store.claim("alice", [1u8; 32]).unwrap();
-        store.claim("bob-99", [2u8; 32]).unwrap();
-        store.claim("carol_x", [3u8; 32]).unwrap();
-        store.claim("dave.btc", [4u8; 32]).unwrap();
+        store.claim("alice", addr(1)).unwrap();
+        store.claim("bob-99", addr(2)).unwrap();
+        store.claim("carol_x", addr(3)).unwrap();
+        store.claim("dave.btc", addr(4)).unwrap();
     }
 
     #[test]
     fn save_and_load_roundtrip() {
         let path = "/tmp/zkcoins-test-usernames.bin";
         let mut store = UsernameStore::new();
-        store.claim("alice", [1u8; 32]).unwrap();
-        store.claim("bob", [2u8; 32]).unwrap();
+        store.claim("alice", addr(1)).unwrap();
+        store.claim("bob", addr(2)).unwrap();
 
         store.save_to_file(path).unwrap();
         let loaded = UsernameStore::load_from_file(path).unwrap();
 
-        assert_eq!(loaded.resolve("alice"), Some([1u8; 32]));
-        assert_eq!(loaded.resolve("bob"), Some([2u8; 32]));
-        assert_eq!(loaded.get_username(&[1u8; 32]), Some("alice"));
+        assert_eq!(loaded.resolve("alice"), Some(addr(1)));
+        assert_eq!(loaded.resolve("bob"), Some(addr(2)));
+        assert_eq!(loaded.get_username(&addr(1)), Some("alice"));
         assert_eq!(loaded.resolve("nonexistent"), None);
 
         std::fs::remove_file(path).ok();
@@ -136,7 +145,7 @@ mod tests {
     #[test]
     fn resolve_is_case_insensitive() {
         let mut store = UsernameStore::new();
-        let address = [5u8; 32];
+        let address = addr(5);
         store.claim("Alice", address).unwrap();
 
         // Resolve with different casings
@@ -149,7 +158,7 @@ mod tests {
     #[test]
     fn get_username_returns_none_for_unknown() {
         let store = UsernameStore::new();
-        let unknown_address = [99u8; 32];
+        let unknown_address = addr(99);
         assert_eq!(store.get_username(&unknown_address), None);
     }
 }

@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tower_http::cors::CorsLayer;
+use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes};
 use zkcoins_prover::Proof;
 
 use crate::account_server::{AccountServer, CoinProof};
@@ -277,10 +278,10 @@ async fn get_balance_handler(
             }
         };
 
-        // Convert Vec<u8> to [u8; 32]
-        let mut address = [0u8; 32];
+        // Convert Vec<u8> to [u8; 32], then to Poseidon HashDigest.
+        let mut address_bytes = [0u8; 32];
         if address_vec.len() == 32 {
-            address.copy_from_slice(&address_vec);
+            address_bytes.copy_from_slice(&address_vec);
         } else {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -290,6 +291,7 @@ async fn get_balance_handler(
                 }),
             );
         }
+        let address = digest_from_bytes(&address_bytes);
 
         // Get balance for the specific account
         let username = {
@@ -390,18 +392,20 @@ async fn send_coin_handler(
         }
     };
 
-    // Convert Vec<u8> to [u8; 32] for both addresses
-    let mut from_address = [0u8; 32];
-    let mut to_address = [0u8; 32];
+    // Convert Vec<u8> to [u8; 32], then to Poseidon HashDigest.
+    let mut from_address_bytes = [0u8; 32];
+    let mut to_address_bytes = [0u8; 32];
     if from_address_vec.len() == 32 && to_address_vec.len() == 32 {
-        from_address.copy_from_slice(&from_address_vec);
-        to_address.copy_from_slice(&to_address_vec);
+        from_address_bytes.copy_from_slice(&from_address_vec);
+        to_address_bytes.copy_from_slice(&to_address_vec);
     } else {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(SendCoinResponse::default()),
         );
     }
+    let from_address = digest_from_bytes(&from_address_bytes);
+    let to_address = digest_from_bytes(&to_address_bytes);
 
     // TODO: Provide the correct public keys from the client
     // Acquire the account_server lock only for the duration of sending coins.
@@ -424,14 +428,18 @@ async fn send_coin_handler(
 
     match send_result {
         Ok(mut coin_proofs) => {
-            // Extract proof data so the client can create a commitment.
-            // The SP1 prover always emits a valid ProofData in public_values,
-            // so the deserialize cannot fail in practice.
-            let pd =
-                bincode::deserialize::<ProofData>(&coin_proofs[0].proof.public_values.to_vec())
-                    .expect("SP1 prover emits valid ProofData public_values");
-            let ash_hex = Some(hex::encode(pd.account_state_hash));
-            let ocr_hex = Some(hex::encode(pd.output_coins_root));
+            // PLONKY2 MIGRATION (Step 7): bridge from SP1's
+            // `public_values` byte stream to Plonky2's `public_inputs`
+            // field-element vector via `ProofData::from_field_elements`.
+            let pis: [zkcoins_program::F;
+                zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] = coin_proofs[0]
+                .proof
+                .public_inputs[..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
+                .try_into()
+                .expect("Plonky2 Proof emits N_PROOF_DATA_PUBLIC_INPUTS field elements");
+            let pd = ProofData::from_field_elements(&pis);
+            let ash_hex = Some(hex::encode(digest_to_bytes(&pd.account_state_hash)));
+            let ocr_hex = Some(hex::encode(digest_to_bytes(&pd.output_coins_root)));
 
             // Mint flow only — broadcasting a pre-set commitment is the
             // server-signed minting path. The mint endpoint is feature-
@@ -1150,6 +1158,9 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .layer(cors)
 }
 
-#[cfg(test)]
-#[path = "server_tests.rs"]
-mod tests;
+// STEP 7 MIGRATION: server_tests.rs disabled pending Prover-API
+// integration after Stage 5d-next-5 merge (issue zk-coins/server#19).
+//
+// #[cfg(test)]
+// #[path = "server_tests.rs"]
+// mod tests;

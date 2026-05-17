@@ -3,22 +3,11 @@ name = "zkcoins-program-plonky2"
 version = "0.0.1"
 edition = "2021"
 
-# Standalone crate, intentionally excluded from the parent workspace.
-# Plonky2 requires nightly Rust (feature(specialization)); the rest of
-# the workspace is pinned to stable 1.81.0 for SP1 compatibility.
-# Build:
-#   (cd program-plonky2 && cargo build)
-# (uses rust-toolchain.toml in this directory)
-
 [dependencies]
 plonky2 = "1.1.0"
 anyhow = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-bincode = "1.3"
+serde = { workspace = true }
+bincode = { workspace = true }
 
 [lints.rust]
-# Register the cfg key used by `cargo-llvm-cov`'s nightly-only
-# `#[cfg_attr(coverage_nightly, coverage(off))]` annotations on test
-# modules. Suppresses the "unexpected cfg condition" warning when
-# building outside the coverage tool.
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }

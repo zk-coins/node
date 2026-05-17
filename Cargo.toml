@@ -1,15 +1,10 @@
 [workspace]
 members = [
-    "program",
-    "script",
+    "program-plonky2",
+    "script-plonky2",
     "server",
-    "shared"]
-# program-plonky2 is intentionally excluded: plonky2 requires nightly Rust
-# (feature(specialization)) while the rest of the workspace is pinned to
-# stable 1.81.0 for SP1. Build it standalone with its own toolchain:
-#   (cd program-plonky2 && cargo build)   # uses program-plonky2/rust-toolchain.toml
-# See MIGRATION_RESEARCH.md §6.
-exclude = ["program-plonky2"]
+    "shared",
+]
 resolver = "2"
 
 [workspace.dependencies]
@@ -19,8 +14,7 @@ serde = { version = "1.0", features = ["derive"] }
 rand = "0.8"
 blake3 = "1.6.1"
 lazy_static = "1.5.0"
-bitcoin = { version = "0.32.5", features = ["rand", "rand-std"] }
-sp1-sdk = "4.0.0"
+bitcoin = { version = "0.32.5", features = ["rand", "rand-std", "serde"] }
 
 [profile.dev]
 opt-level = 3
@@ -28,22 +22,3 @@ opt-level = 3
 [workspace.package]
 version = "1.1.0"
 edition = "2021"
-
-[patch.crates-io]
-sp1-zkvm = { git = "https://github.com/succinctlabs/sp1", tag = "v4.1.2" }
-sp1-lib = { git = "https://github.com/succinctlabs/sp1", tag = "v4.1.2" }
-sp1-primitives = { git = "https://github.com/succinctlabs/sp1", tag = "v4.1.2" }
-sp1-sdk = { git = "https://github.com/succinctlabs/sp1", tag = "v4.1.2" }
-sp1-build = { git = "https://github.com/succinctlabs/sp1", tag = "v4.1.2" }
-sp1-core-executor = { git = "https://github.com/succinctlabs/sp1", tag = "v4.1.2" }
-sp1-curves = { git = "https://github.com/succinctlabs/sp1", tag = "v4.1.2" }
-sp1-stark = { git = "https://github.com/succinctlabs/sp1", tag = "v4.1.2" }
-sp1-derive = { git = "https://github.com/succinctlabs/sp1", tag = "v4.1.2" }
-sp1-core-machine = { git = "https://github.com/succinctlabs/sp1", tag = "v4.1.2" }
-sp1-cuda = { git = "https://github.com/succinctlabs/sp1", tag = "v4.1.2" }
-sp1-prover = { git = "https://github.com/succinctlabs/sp1", tag = "v4.1.2" }
-sp1-recursion-circuit = { git = "https://github.com/succinctlabs/sp1", tag = "v4.1.2" }
-sp1-recursion-compiler = { git = "https://github.com/succinctlabs/sp1", tag = "v4.1.2" }
-sp1-recursion-core = { git = "https://github.com/succinctlabs/sp1", tag = "v4.1.2" }
-sp1-recursion-derive = { git = "https://github.com/succinctlabs/sp1", tag = "v4.1.2" }
-sp1-recursion-gnark-ffi = { git = "https://github.com/succinctlabs/sp1", tag = "v4.1.2" }

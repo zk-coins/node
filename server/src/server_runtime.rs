@@ -61,7 +61,7 @@ pub async fn start_rest_server(
             .expect("Failed to create private key.");
         println!(
             "Set MINTING_ADDRESS to {:?}",
-            &zkcoins_program::MINTING_ADDRESS
+            &*zkcoins_program::types::MINTING_ADDRESS
         );
         let mut minting_client = ClientAccount::new(private_key);
         // ClientAccount::new starts with num_pubkeys=0, but each successful
@@ -100,7 +100,7 @@ pub async fn start_rest_server(
         }
         assert_eq!(
             minting_client.address,
-            zkcoins_program::MINTING_ADDRESS,
+            *zkcoins_program::types::MINTING_ADDRESS,
             "Minting account address mismatch — minting_secret.bin or MINTING_ADDRESS constant is wrong"
         );
         Arc::new(Mutex::new(minting_client))
@@ -124,7 +124,7 @@ pub async fn start_rest_server(
             let mut minting_server_account = crate::account_server::Account::new();
             minting_server_account.balance = u64::MAX;
             account_server_guard
-                .import_account(zkcoins_program::MINTING_ADDRESS, minting_server_account);
+                .import_account(*zkcoins_program::types::MINTING_ADDRESS, minting_server_account);
             if let Err(e) = account_server_guard.save_to_file(&state.accounts_path) {
                 eprintln!("Failed to save initial accounts file: {}", e);
             }

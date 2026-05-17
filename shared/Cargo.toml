@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-zkcoins-program = { path = "../program/" }
+zkcoins-program = { path = "../program-plonky2/", package = "zkcoins-program-plonky2" }
 lazy_static = { workspace = true }
 bitcoin = { workspace = true }
 sha2 = { workspace = true }

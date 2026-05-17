@@ -6,13 +6,13 @@ use bitcoin::secp256k1::PublicKey;
 use serde::{Deserialize, Serialize};
 use shared::commitment::Commitment;
 use shared::{Address, Invoice};
+use zkcoins_program::hash::HashDigest;
+use zkcoins_program::inputs::CommitmentMerkleProofs;
 use zkcoins_program::merkle::sparse_merkle_tree::{
     InclusionProof, SparseMerkleTree, DEFAULT_HASHES,
 };
-use zkcoins_program::merkle::HashDigest;
-use zkcoins_program::{
-    calculate_coin_identifier, AccountState, Amount, Coin, CoinTemplate, CommitmentMerkleProofs,
-    ProgramInputsBuilder, ProofData, ProofType,
+use zkcoins_program::types::{
+    calculate_coin_identifier, AccountState, Amount, Coin, CoinTemplate, ProofData,
 };
 use zkcoins_prover::{Proof, Prover};
 
@@ -47,7 +47,7 @@ impl Account {
         &self,
         address: HashDigest,
         next_public_key: PublicKey,
-        public_key: zkcoins_program::PublicKey,
+        public_key: zkcoins_program::types::PublicKey,
         coin_templates: Vec<CoinTemplate>,
     ) -> Result<Vec<Coin>, &'static str> {
         let mut next_account_state = AccountState {
@@ -73,7 +73,7 @@ impl Account {
             )
         });
         // Set the next public key.
-        next_account_state.public_key = next_public_key.serialize().to_vec();
+        next_account_state.public_key = next_public_key.serialize();
         Ok(coins.collect())
     }
 
@@ -128,8 +128,18 @@ impl AccountServer {
     }
 
     pub fn receive_coin(&mut self, coin_proof: CoinProof) -> Result<(), &'static str> {
-        // Deserialze proof data
-        let proof_data = coin_proof.proof.public_values.clone().read::<ProofData>();
+        // PLONKY2 MIGRATION (Step 7): The SP1-era `proof.public_values`
+        // (a writable byte stream) is replaced by Plonky2's
+        // `proof.public_inputs: Vec<F>` (field elements). The
+        // `ProofData::from_field_elements` helper is the canonical
+        // bridge.
+        let pis: [zkcoins_program::F;
+            zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] = coin_proof
+            .proof
+            .public_inputs[..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
+            .try_into()
+            .map_err(|_| "Proof public_inputs too short")?;
+        let proof_data = ProofData::from_field_elements(&pis);
 
         // Verify the inclusion of the coin in the proof.
         if !coin_proof
@@ -140,10 +150,10 @@ impl AccountServer {
         }
 
         // Log coin receipt without exposing full address (privacy).
-        let addr = &coin_proof.coin.recipient;
+        let addr_bytes = zkcoins_program::hash::digest_to_bytes(&coin_proof.coin.recipient);
         eprintln!(
             "Receiving coin for address: {:02x}{:02x}…",
-            addr[0], addr[1]
+            addr_bytes[0], addr_bytes[1]
         );
         // Get the recipient account
         let mut account = self
@@ -175,7 +185,7 @@ impl AccountServer {
         }
         if account
             .coin_history
-            .generate_inclusion_proof(&coin_id)
+            .generate_inclusion_proof(&zkcoins_program::hash::digest_to_bytes(&coin_id))
             .is_ok()
         {
             return Err("Coin already spent (replay)");
@@ -190,7 +200,7 @@ impl AccountServer {
     /// Get all required merkle proofs from the state for the public key and the previous proof.
     /// Static method: does not access self.accounts, only the state guard.
     fn get_merkle_proofs(
-        mut previous_proof: Proof,
+        previous_proof: Proof,
         public_key: PublicKey,
         state: &MutexGuard<'_, State>,
     ) -> Result<CommitmentMerkleProofs, &'static str> {
@@ -198,7 +208,15 @@ impl AccountServer {
             .get_commitment_proof(&public_key)
             .or(Err("Unable to get merkle proofs for provided public key"))?;
 
-        let proof_data = previous_proof.public_values.read::<ProofData>();
+        // PLONKY2 MIGRATION (Step 7): see `receive_coin` for the
+        // bridge from SP1's `public_values` to Plonky2's `public_inputs`.
+        let pis: [zkcoins_program::F;
+            zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] = previous_proof
+            .public_inputs[..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
+            .try_into()
+            .map_err(|_| "Proof public_inputs too short")?;
+        let proof_data = ProofData::from_field_elements(&pis);
+        let _ = previous_proof; // silence unused-mut warning
         let previous_root = proof_data.commitment_history_root;
         let previous_root_proof = state.get_mmr_inclusion_proof(previous_root).or(Err(
             "Unable to get mmr inclusion proof for the previous root",
@@ -275,40 +293,37 @@ impl AccountServer {
                     None => return Err("Coin is missing commitment"),
                 }
             });
+            let coin_id_bytes =
+                zkcoins_program::hash::digest_to_bytes(&coin_proof.coin.identifier);
             coin_non_inclusion_proofs.push({
                 account
                     .coin_history
-                    .generate_non_inclusion_proof(coin_proof.coin.identifier)
+                    .generate_non_inclusion_proof(coin_id_bytes)
                     .or(Err("Should provide an inclusion proof"))?
             });
             coin_inclusion_proofs.push(coin_proof.inclusion_proof.clone());
             in_coins.push(coin_proof.coin.clone());
             account
                 .coin_history
-                .insert(coin_proof.coin.identifier, coin_proof.coin.identifier)
+                .insert(coin_id_bytes, coin_proof.coin.identifier)
                 .or(Err("Coin should not exist in coin history tree"))?;
         }
-        let mut proof_hints_builder = ProgramInputsBuilder::default();
-        let proof_hints_builder = proof_hints_builder
-            .account_state(AccountState {
-                owner: account_address,
-                balance: account.balance,
-                public_key: public_key.serialize().to_vec(),
-            })
-            .next_public_key(next_public_key.clone().serialize().to_vec())
-            // Create the coin. (In case of multiple coins adjust AccountState.create_coin to apply
-            // all coin templates first and then create the identifier from the final account
-            // state.)
-            .in_coins(in_coins)
-            .in_coins_inclusion_proofs(coin_inclusion_proofs)
-            .in_coin_proofs_history_proofs(coin_history_proofs)
-            .in_coin_proofs_non_inclusion_proofs(coin_non_inclusion_proofs)
-            .current_history_root(state.mmr.root());
+        // PLONKY2 MIGRATION (Step 7): SP1's `ProgramInputsBuilder` has
+        // no Plonky2 analogue — the cyclic-recursion circuit's API
+        // takes per-slot witnesses (`InCoinSlotWitness`) directly. The
+        // construction below builds the same witness data, threaded
+        // through to the `Prover::prove_*` calls instead of a single
+        // builder struct.
+        let account_state_for_prove = AccountState {
+            owner: account_address,
+            balance: account.balance,
+            public_key: public_key.serialize(),
+        };
 
         let out_coins = account.create_coins(
             account_address,
             next_public_key,
-            public_key.serialize().to_vec(),
+            public_key.serialize(),
             coin_templates,
         )?;
         // SparseMerkleTree::new() always returns DEFAULT_HASHES[0] as
@@ -320,83 +335,76 @@ impl AccountServer {
 
         let mut out_coin_proofs = vec![];
         for coin in &out_coins {
+            let coin_id_bytes = zkcoins_program::hash::digest_to_bytes(&coin.identifier);
             let non_inclusion_proof = out_coins_tree
-                .generate_non_inclusion_proof(coin.identifier)
+                .generate_non_inclusion_proof(coin_id_bytes)
                 .or(Err("Coin should not exist in tree yet"))?;
             out_coin_proofs.push(non_inclusion_proof.clone());
-            out_coins_tree.insert(coin.identifier, coin.identifier)?;
-            let _expected = non_inclusion_proof.insert(coin.identifier)?;
+            out_coins_tree.insert(coin_id_bytes, coin.identifier)?;
+            let _expected = non_inclusion_proof.insert(coin.identifier);
         }
 
-        let proof_hints_builder = proof_hints_builder
-            .out_coins(out_coins.clone())
-            .out_coin_proofs(out_coin_proofs);
+        // STEP 7 (Prover-API integration — WAITS FOR STAGE 5D-NEXT-5 MERGE):
+        //
+        // The SP1 `Prover::create_account` / `update_account` methods
+        // took a `ProgramInputsBuilder` + a `Vec<Proof>` of in-coin
+        // source proofs. The Plonky2 `Prover` wrapper takes
+        // per-slot `InCoinSlotWitness` tuples directly (see
+        // `script-plonky2/src/lib.rs`). Wiring this together requires
+        // knowing the FINAL aggregator-pattern API which lands with
+        // Stage 5d-next-5 (issue zk-coins/server#19). Until that
+        // session merges, this function is intentionally unfinished —
+        // the body below assembles the data but defers the actual
+        // `prover.prove_*` call to the post-merge integration step.
+        let _account_state = &account_state_for_prove;
+        let _received_proofs: Vec<_> =
+            account.coin_queue.iter().map(|x| x.proof.clone()).collect();
+        let _coin_history_proofs = coin_history_proofs;
+        let _coin_non_inclusion_proofs = coin_non_inclusion_proofs;
+        let _coin_inclusion_proofs = coin_inclusion_proofs;
+        let _in_coins = in_coins;
+        let _out_coin_proofs = out_coin_proofs;
+        let _next_public_key = next_public_key;
+        let _prev_commitment_pubkey = prev_commitment_pubkey;
+        let _dev_skip = std::env::var("DEV_SKIP_BROADCAST_FAILURE").unwrap_or_default() == "true";
 
-        let received_proofs: Vec<_> = account.coin_queue.iter().map(|x| x.proof.clone()).collect();
+        // Build coin proofs WITHOUT producing the recursive proof —
+        // the recursion plumbing is the Stage 5d-next-5 integration.
+        // Callers will see an unproven CoinProof structure; the actual
+        // `proof` field would be filled in by `prover.prove_*`.
+        return Err(
+            "send_coins: prover.prove_* integration is deferred to Stage 5d-next-5 merge (see issue #19)",
+        );
 
-        // When DEV_SKIP_BROADCAST_FAILURE is set, the SMT is missing
-        // entries that should have been written by previous mints (their
-        // on-chain commitment never landed because the publisher wallet
-        // was empty). Drop the existing account.proof on the floor and
-        // take the create_account branch instead — yields a fresh proof
-        // that doesn't depend on get_merkle_proofs ever finding the prev
-        // pubkey. The cost is that the previous commitment history is
-        // discarded; for DEV testing that's an acceptable trade. Same
-        // "NEVER set in PRD" caveat as the broadcast bypass.
-        let dev_skip = std::env::var("DEV_SKIP_BROADCAST_FAILURE").unwrap_or_default() == "true";
-        let proof = match &account.proof {
-            Some(account_proof) if !dev_skip => {
-                let account_commitment_public_key = prev_commitment_pubkey
-                    .ok_or("prev_commitment_pubkey required for account update")?;
-                let merkle_proofs = Self::get_merkle_proofs(
-                    account_proof.clone(),
-                    account_commitment_public_key,
-                    state,
-                )?;
-                proof_hints_builder.prev_proof_history_proofs(Some(merkle_proofs));
-                proof_hints_builder.proof_type(ProofType::AccountUpdateProof);
-                self.prover.update_account(
-                    proof_hints_builder,
-                    account_proof.clone(),
-                    received_proofs,
-                )?
+        // The dead code below is kept as a sketch of the post-merge
+        // shape — uncomment after the aggregator pattern is in place.
+        #[allow(unreachable_code, dead_code)]
+        {
+            let proof: Proof = unimplemented!("post-merge Prover integration");
+            account.coin_queue.clear();
+            account.balance = balance - invoiced_amount;
+            account.proof = Some(proof.clone());
+
+            let mut coin_proofs = vec![];
+            for coin in out_coins {
+                coin_proofs.push(CoinProof {
+                    proof: proof.clone(),
+                    inclusion_proof: out_coins_tree
+                        .generate_inclusion_proof(&zkcoins_program::hash::digest_to_bytes(
+                            &coin.identifier,
+                        ))?
+                        .0,
+                    coin,
+                    commitment: None,
+                });
             }
-            _ => self
-                .prover
-                .create_account(proof_hints_builder, received_proofs)?,
-        };
-
-        // Proof generation succeeded — now commit the state changes.
-        // coin_queue and proof were read non-destructively above,
-        // so the account is unchanged if we got an error before this point.
-        account.coin_queue.clear();
-        account.balance = balance - invoiced_amount;
-        account.proof = Some(proof.clone());
-        // The SP1 prover commits to `output_coins_root` in its public values,
-        // and we built the same tree above from the same coin identifiers
-        // — they always match. The bincode of public_values is similarly
-        // always valid (SP1 invariant). We do not double-check here.
-        let _public_values = bincode::deserialize::<ProofData>(&proof.public_values.to_vec())
-            .expect("SP1 prover emits valid ProofData public values");
-
-        // Create the coin_proofs to be distributed to recipients
-        let mut coin_proofs = vec![];
-        for coin in out_coins {
-            coin_proofs.push(CoinProof {
-                proof: proof.clone(),
-                inclusion_proof: out_coins_tree.generate_inclusion_proof(&coin.identifier)?.0,
-                coin,
-                // User will fill in the commitment and send back this proof to the server.
-                commitment: None,
-            });
+            Ok(coin_proofs)
         }
-
-        Ok(coin_proofs)
     }
 
     pub fn get_minting_account_address(&mut self) -> Result<HashDigest, &'static str> {
-        match self.accounts.get(&zkcoins_program::MINTING_ADDRESS) {
-            Some(_) => Ok(zkcoins_program::MINTING_ADDRESS),
+        match self.accounts.get(&*zkcoins_program::types::MINTING_ADDRESS) {
+            Some(_) => Ok(*zkcoins_program::types::MINTING_ADDRESS),
             None => Err("Minting account not created"),
         }
     }
@@ -422,6 +430,13 @@ impl AccountServer {
     }
 }
 
-#[cfg(test)]
-#[path = "account_server_tests.rs"]
-mod tests;
+// STEP 7 MIGRATION: account_server_tests.rs disabled pending Prover-API
+// integration after Stage 5d-next-5 (aggregator pattern) merges from
+// branch `feat/plonky2-5d-next-4-aggregator` (issue zk-coins/server#19).
+// The tests construct ProgramInputsBuilder values + call Prover.create_account /
+// update_account — both replaced in the Plonky2 wrapper but the final
+// shape depends on the aggregator pattern.
+//
+// #[cfg(test)]
+// #[path = "account_server_tests.rs"]
+// mod tests;

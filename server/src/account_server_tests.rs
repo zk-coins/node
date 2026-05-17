@@ -11,7 +11,7 @@ use bitcoin::{
 };
 use lazy_static::lazy_static;
 use shared::{commitment::Commitment, ProofData};
-use zkcoins_program::MINTING_ADDRESS;
+use zkcoins_program::types::MINTING_ADDRESS;
 
 lazy_static! {
     static ref SECP256K1_TEST_CTX: Secp256k1<All> = Secp256k1::new();
