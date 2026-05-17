@@ -1,19 +1,21 @@
 # Lightning ↔ zkCoins Atomic Swap — Design Document
 
 **Status:** Design draft. No code yet. Companion to `SPEC.md`,
-`MIGRATION_RESEARCH.md`, and `ROADMAP.md`. Authoritative source for
-*how* trustless LN ↔ zkCoins swaps work, *not* for the wider zkCoins
-protocol itself.
+`MIGRATION_RESEARCH.md`, `ROADMAP.md`, and
+[`BITVM_BRIDGE.md`](./BITVM_BRIDGE.md).
+
+**Authoritative source for:** *how* trustless LN ↔ zkCoins swaps work
+— not for the wider zkCoins protocol itself.
+
+**Audience:** Engineers picking up swap implementation. Assumes
+familiarity with `SPEC.md` (account model, coin format, inscription
+mechanics) and basic Bitcoin/Lightning HTLC mechanics.
 
 > **Branch note.** This document presupposes the Plonky2 migration
 > currently on `feat/plonky2-migration` (PR #17). `SPEC.md`,
 > `MIGRATION_RESEARCH.md`, and `ROADMAP.md` live on that branch and
 > will resolve on `develop` only after PR #17 lands. Until then, view
 > cross-references against `feat/plonky2-migration`.
-
-**Audience:** Engineers picking up swap implementation. Assumes familiarity
-with `SPEC.md` (account model, coin format, inscription mechanics) and
-basic Bitcoin/Lightning HTLC mechanics.
 
 ---
 
@@ -122,7 +124,10 @@ Per `SPEC.md` §5 and §11:
 1. The sender's server generates a state-transition proof (`ProofData`)
    covering balance update, output coin creation, and history extension.
 2. The sender's wallet signs `SHA256(serialize(asth) ‖ serialize(ocr))`
-   with BIP-340 Schnorr.
+   with BIP-340 Schnorr. Here `asth` is the account state hash and
+   `ocr` is the output coins root (the Merkle root of the SMT
+   containing the send's output coin identifiers); both abbreviations
+   match `SPEC.md`'s glossary.
 3. The server (or any party with the signed `Commitment`) constructs a
    Taproot commit-reveal pair where the commit tx's txid hex begins
    with `4242`, and the reveal tx's witness contains the inscription
@@ -872,9 +877,8 @@ swap volume. Easy to GPU-accelerate; not necessary for v1.
 ### 15.1 What the provider learns
 
 - **Recipient zkCoins address** (Flow A) or sender's zkCoins address
-  (Flow B). The full `Address = H(initial_pubkey)`. Cyrill confirms
-  this is acceptable for the DFX-operated provider given Compliance
-  needs.
+  (Flow B). The full `Address = H(initial_pubkey)`. Acceptable for
+  regulated providers who already perform KYC on swap counterparties.
 - **Amount.** Necessarily, since it's the swap amount.
 - **The user's Bitcoin pubkey** (claim/refund pubkey on U_lock).
   Recommend fresh key per swap.
@@ -984,7 +988,7 @@ This is the operationally interesting question. Options:
   zkCoins protocol parameters; could be 6 or 100 depending on threat
   model.
 
-For DFX as provider, I would default to **6 confirmations** (~1 hour
+A regulated provider should default to **6 confirmations** (~1 hour
 wait) until D7 is fixed. After D7 is fixed (the scanner can gracefully
 handle inscription reorg by rolling back state and re-inserting), the
 depth can drop back to 3 or even 1 with appropriate scanner logic.
@@ -1008,7 +1012,7 @@ just allows lower latency.
 
 ---
 
-## 17. Plonky2 Relevance (Spoiler: Orthogonal)
+## 17. Plonky2 Relevance — Orthogonal to the Swap Design
 
 The PR #17 Plonky2 migration is **not a blocker** for swap
 implementation. Specifically:
@@ -1065,11 +1069,11 @@ refactors.
 | Cross-chain step | None needed (asset lives on BTC) | The "chain" boundary is Bitcoin (LN funds + inscription) ↔ zkCoins state |
 | RFQ-style quote mechanism | Yes, native | Easy to add as out-of-band layer |
 
-### 18.3 vs. naïve "trusted DFX swap service"
+### 18.3 vs. naïve "trusted swap service"
 
-| Property | Trusted DFX | Trustless HTLC |
-| -------- | ----------- | --------------- |
-| Trust assumption | DFX honours its claims | None (cryptographic) |
+| Property | Trusted custodial service | Trustless HTLC |
+| -------- | ------------------------- | --------------- |
+| Trust assumption | The custodian honours its claims | None (cryptographic) |
 | Bitcoin-script complexity | None | Standard P2TR with 2 leaves |
 | Build effort | Low (just an exchange API) | Medium (Boltz-backend fork + zkCoins integration) |
 | Risk if provider compromised | User funds at risk | None — cryptographic atomicity |
@@ -1209,3 +1213,4 @@ A draft sequence; not a commitment.
 | 2026-05-17 | Initial draft. |
 | 2026-05-17 | Consistency audit pass: add branch note at the top explaining that `SPEC.md` / `MIGRATION_RESEARCH.md` / `ROADMAP.md` currently live on `feat/plonky2-migration` only. |
 | 2026-05-17 | Audit round 2: restructure §9 from a stream-of-consciousness exploration of four candidate patterns to a single recommended construction (§9.2 mirror of Flow A) plus a brief §9.3 explaining why the alternatives were rejected. Promote §9.2 to the canonical Flow B; remove §9.3 (LN hold invoice) and §9.4 (renamed to §9.2) as numbered alternatives. Fix four broken internal cross-references (§10/§15 corrected to §12/§16). Renumber open-questions list to drop the gap left after removing the pattern-choice question. |
+| 2026-05-17 | Audit round 3: harmonise header structure across all three bridge docs (Status / Authoritative source / Audience / Branch note, in that order). Remove organisation-specific references ("DFX", a personal name) — replace with generic operator/issuer wording, consistent with the rest of the repo where the same convention is followed (`MIGRATION_RESEARCH.md` is the single exception with one such mention). Define `asth` / `ocr` at first use in §4.2. Tighten §17 heading. |
