@@ -80,6 +80,16 @@ non-negotiable.
 - Multi-coin peg-outs in a single burn (MVP: one burn per peg-out)
 - Production trusted setup ceremony (MVP: single-contributor SRS
   marked "DO NOT USE IN PRODUCTION")
+- **Federation scaling beyond N=3.** Target federation size for the
+  production bridge is **N=100 independent members** with a 1-of-N
+  setup-honesty assumption (1 honest key deletion suffices). N=100
+  is the practical upper bound of BitVM2's framework today per
+  Bitlayer's analysis (*"in practice the value of n can be 100"*).
+  Beyond N=100 is open research and not a current goal. Intermediate
+  milestones expected: N=10 → N=30 → N=100. Each step is a separate
+  setup ceremony with all new members. Federation-member recruitment
+  is a business-development concern, not engineering, and out of MVP
+  scope.
 
 ### 2.3 Out of scope (post-MVP, may need separate spec)
 
@@ -988,3 +998,4 @@ So nobody scope-creeps:
 | Date | Change |
 | ---- | ------ |
 | 2026-05-17 | Initial draft. |
+| 2026-05-17 | §2.2: add "Federation scaling beyond N=3" as deferred item with production target N=100 (1-of-N strict, practical upper bound of BitVM2 framework). Beyond N=100 noted as open research, not current goal. |

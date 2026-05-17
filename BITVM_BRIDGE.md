@@ -1043,6 +1043,20 @@ which has no minimum increment.
   Currently it is not listed there. This is a documentation gap that
   should be corrected.
 
+- **Federation target: N=100 independent members.** The MVP runs with
+  N=3 (same data centre, all DFX-operated — engineering correctness
+  only, not real trust distribution). The production target is
+  N=100, the practical upper bound of the BitVM2 framework today per
+  Bitlayer's analysis (*"in practice the value of n can be 100"*).
+  Strict 1-of-N honesty: 1 honest key deletion among 100 independent
+  setup members suffices. Going beyond N=100 is open research
+  (Bitlayer: *"It is necessary to research a permissionless
+  multi-party OP challenge protocol that could expand BitVM's
+  existing 1-of-n trust model to 1-of-N, where N is much larger
+  than n"*) and not a current goal. Federation-member recruitment
+  to N=100 is business-development, not engineering. Intermediate
+  milestones expected: N=10 → N=30 → N=100. See `BRIDGE_MVP.md` §2.2.
+
 ---
 
 ## 14. References
@@ -1090,3 +1104,4 @@ which has no minimum increment.
 | ---- | ------ |
 | 2026-05-17 | Initial draft. |
 | 2026-05-17 | Add §12 "Beyond BitVM2 — 2026 Verification Landscape" covering BitVM3-RSA withdrawal, BitVM3-CC (BOB), Glock (Alpen Labs), Mosaic (Eagen et al.). Update §3 with 2026-landscape note. Update §11.1 / §11.2 / §11.3 comparison tables. Update §13 Bottom Line with hedging strategy. Refactor references into themed groups. |
+| 2026-05-17 | §13 Bottom Line: add explicit production federation target of N=100 (practical upper bound of BitVM2 framework per Bitlayer). Beyond N=100 noted as open research, not current goal. |
