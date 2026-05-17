@@ -2325,6 +2325,75 @@ mod tests {
         assert_eq!(recovered.coin_history_root, expected_coin_history_root);
     }
 
+    /// Stage 5d-next-3 integration: AccountUpdate proof that uses
+    /// BOTH the in-coins AND out-coins loops on top of an Init prev.
+    /// Mirrors `stage_5d_next_3_initial_combined_in_and_out_coin` but
+    /// exercises the cyclic-recursion path (`condition = true`) +
+    /// the SPEC §8 (c)(d)(e) CommitmentMerkleProofs chain alongside
+    /// the apply_coin and send_coins logic.
+    #[test]
+    fn stage_5d_next_3_account_update_combined_in_and_out_coin() {
+        let circuit = build_circuit();
+        let mut account_state = AccountState::new(dummy_pubkey(61));
+        account_state.owner = *MINTING_ADDRESS;
+        account_state.balance = 100;
+
+        let (cmp, history_root_extended) =
+            build_test_commitment_witness(account_state.hash(), DEFAULT_HASHES[0]);
+        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH).expect("prove init");
+        verify(&circuit, &init_proof).expect("verify init");
+
+        let in_coin_id = hash_bytes(b"5d-combined-update-in");
+        let in_coin_key = digest_to_bytes(&in_coin_id);
+        let empty_smt = SparseMerkleTree::new();
+        let in_nip = empty_smt.generate_non_inclusion_proof(in_coin_key).unwrap();
+        let in_coin = Coin {
+            identifier: in_coin_id,
+            recipient: account_state.owner,
+            amount: 30,
+        };
+        let expected_coin_history_root = in_nip.insert(in_coin_id);
+
+        let out_coin_amount: u64 = 50;
+        let mut interim_account_state = account_state.clone();
+        interim_account_state.balance =
+            account_state.balance + in_coin.amount - out_coin_amount;
+        let interim_asth = interim_account_state.hash();
+        let expected_out_id = crate::types::calculate_coin_identifier(interim_asth, 0);
+        let out_id_key = digest_to_bytes(&expected_out_id);
+        let out_nip = empty_smt.generate_non_inclusion_proof(out_id_key).unwrap();
+        let expected_output_coins_root = out_nip.insert(expected_out_id);
+
+        let next_pubkey = dummy_pubkey(161);
+
+        let dummy_nip = dummy_non_inclusion_proof();
+        let dummy_c = dummy_coin();
+        let in_coins = slots_first_active(&in_coin, &in_nip, &dummy_c, &dummy_nip);
+        let out_coins =
+            out_slots_first_active(expected_out_id, out_coin_amount, &out_nip, &dummy_nip);
+
+        let update_proof = prove_account_update_with_in_and_out_coins(
+            &circuit,
+            &account_state,
+            history_root_extended,
+            &init_proof,
+            &cmp,
+            &in_coins,
+            &out_coins,
+            &next_pubkey,
+        )
+        .expect("prove account_update combined");
+        verify(&circuit, &update_proof).expect("verify update");
+
+        let recovered = pis_as_proof_data(&update_proof);
+        let mut final_account_state = interim_account_state.clone();
+        final_account_state.public_key = next_pubkey;
+        assert_eq!(recovered.account_state_hash, final_account_state.hash());
+        assert_eq!(recovered.output_coins_root, expected_output_coins_root);
+        assert_eq!(recovered.commitment_history_root, history_root_extended);
+        assert_eq!(recovered.coin_history_root, expected_coin_history_root);
+    }
+
     /// Stage 5e SPEC §13 — double-spend: two active in-coin slots
     /// presenting the SAME `coin_identifier`. The first slot inserts
     /// into the coin_history SMT successfully. The second slot's
