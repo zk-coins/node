@@ -48,7 +48,7 @@ impl MMRProof {
         let mut computed = leaf;
         let mut idx = self.index;
         for sibling in &self.path {
-            computed = if idx % 2 == 0 {
+            computed = if idx.is_multiple_of(2) {
                 hash_concat(&computed, sibling)
             } else {
                 hash_concat(sibling, &computed)
@@ -184,7 +184,11 @@ impl MerkleMountainRange {
         let mut proof = Vec::with_capacity(self.tree_depth() - 1);
         let mut idx = index;
         for level in 0..(self.tree_depth() - 1) {
-            let sibling_index = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+            let sibling_index = if idx.is_multiple_of(2) {
+                idx + 1
+            } else {
+                idx - 1
+            };
             // Same reasoning as in `append`: levels[level].len() is a power of
             // two and `sibling_index` is in `[0, len-1]` for any valid idx.
             // Collapsed into `.get()` so the unreachable bound check shares one
@@ -221,8 +225,7 @@ impl MerkleMountainRange {
 pub fn save_mmr(mmr: &MerkleMountainRange, path: &str) -> std::io::Result<()> {
     use std::io::Write;
     let file = std::fs::File::create(path)?;
-    let serialized = bincode::serialize(mmr)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let serialized = bincode::serialize(mmr).map_err(std::io::Error::other)?;
     let mut writer = std::io::BufWriter::new(file);
     writer.write_all(&serialized)?;
     Ok(())
@@ -236,7 +239,7 @@ pub fn load_mmr(path: &str) -> std::io::Result<MerkleMountainRange> {
     let mut reader = std::io::BufReader::new(file);
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer)?;
-    bincode::deserialize(&buffer).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    bincode::deserialize(&buffer).map_err(std::io::Error::other)
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]

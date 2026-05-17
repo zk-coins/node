@@ -329,8 +329,7 @@ impl SparseMerkleTree {
 pub fn save_merkle_tree(tree: &SparseMerkleTree, path: &str) -> std::io::Result<()> {
     use std::io::Write;
     let file = std::fs::File::create(path)?;
-    let serialized = bincode::serialize(tree)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let serialized = bincode::serialize(tree).map_err(std::io::Error::other)?;
     let mut writer = std::io::BufWriter::new(file);
     writer.write_all(&serialized)?;
     Ok(())
@@ -344,7 +343,7 @@ pub fn load_merkle_tree(path: &str) -> std::io::Result<SparseMerkleTree> {
     let mut reader = std::io::BufReader::new(file);
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer)?;
-    bincode::deserialize(&buffer).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    bincode::deserialize(&buffer).map_err(std::io::Error::other)
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
