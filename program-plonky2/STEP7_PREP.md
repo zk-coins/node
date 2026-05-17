@@ -135,17 +135,65 @@ code changes.
 
 ## Aggregate estimate
 
+**REVISED 2026-05-17 after an attempted mechanical cutover surfaced
+substantial semantic mismatches beyond pure renames.** The original
+"~45 min mechanical" estimate was too optimistic — see "Semantic
+mismatches" below.
+
 | Category | Files affected | Effort |
 | -------- | -------------- | ------ |
 | 🔧 Mechanical renames / import swaps | account_server.rs, server.rs, state.rs (partial), shared/{lib.rs, commitment.rs}, server/Cargo.toml, root Cargo.toml | ~45 min |
-| 🧩 Layout-dependent (waits for Step 5's `ProofData::from_proof`) | account_server.rs (3 sites), server.rs (1 site) | ~30 min once Step 5 is final |
-| 🛠 New work (must build, not just rename) | persistence helpers (`save_to_file` / `load_from_file`) for the new SMT and MMR — serde-derive support for `HashOut<F>` may need a feature flag on plonky2 | ~3–4 hours |
-| ⚙ Open decisions | (i) MMR-leaf hash SHA256 vs Poseidon (file 3 L66–71); (ii) script/ crate fate; (iii) workspace toolchain unification | ~2 hours of discussion + execution |
+| 🧩 `HashDigest` semantic shift — `[u8;32]` → `HashOut<F>` (NOT just a type alias swap) | account_server.rs, state.rs, server.rs, server_tests.rs (~30 call sites), shared/commitment.rs (`get_account_state_hash` return type) | ~3–4 hours |
+| 🧩 Proof public-input access — `proof.public_values` (SP1) → `proof.public_inputs` (Plonky2, different element type, different deserialisation) | account_server.rs (3 sites), server.rs (1 site) | ~1 hour |
+| 🛠 `ProgramInputsBuilder` doesn't exist in Plonky2 — server's `send_coins` path needs a different shape (per-slot witnesses instead of batched builder) | account_server.rs (`send_coins`) | ~2–3 hours |
+| 🛠 `Prover::create_account` / `update_account` signatures differ — Plonky2 wrapper uses `prove_initial_with_in_coins` / `prove_account_update_with_in_coins`. Server needs adapter | account_server.rs, server.rs | ~1 hour |
+| 🛠 Persistence helpers (`save_merkle_tree` / `load_merkle_tree` / `save_mmr` / `load_mmr`) | **DONE** in commit `b76bd39` | ✅ |
+| ⚙ Workspace toolchain unification: stable→nightly (entire workspace) | root rust-toolchain, all member Cargo.toml | ~1 hour to migrate + verify shared/server build on nightly |
+| ⚙ MMR leaf hash decision — SHA256 vs Poseidon | state.rs (L66–71) | confirmed Poseidon per arch invariant; ~30 min implement |
+| ⚙ `script/` crate deletion | repo cleanup | ~15 min |
+| Test infrastructure: ~25 `hex::encode(MINTING_ADDRESS)` calls now need `digest_to_bytes(&MINTING_ADDRESS)` first | server_tests.rs, account_server_tests.rs | ~1 hour |
 | State file cleanup | runbook only, not code | trivial |
 
-**Realistic Step 7 estimate: 1–1.5 days full-time** (vs. the ROADMAP's 2–3 days). The 🛠 persistence-helper work is the only real engineering; the rest is renames and three deserialisation rewrites.
+**REVISED Step 7 estimate: 2 days full-time.** The 🛠 persistence
+helpers are now done, but the 🧩 semantic shifts in HashDigest +
+proof public-inputs + ProgramInputsBuilder absence are larger than
+the original "45 min mechanical" assumption.
 
-The estimate moves to the lower end if Step 5 ships `ProofData::from_proof(&Proof)` as a public helper (eliminating the 🧩 work).
+## Semantic mismatches that the original inventory missed
+
+Discovered during the 2026-05-17 attempted cutover (subsequently
+reverted to keep the repo buildable):
+
+1. **`HashDigest = [u8; 32]` (SP1) vs `HashDigest = HashOut<F>` (Plonky2):**
+   the alias name is the same, but the underlying type is different
+   (4 × `GoldilocksField` elements vs raw bytes). Implications:
+   - `hex::encode(MINTING_ADDRESS)` (used 25+ times in
+     `server_tests.rs`) needs `hex::encode(digest_to_bytes(&MINTING_ADDRESS))`.
+   - `HashOut::default()` for empty initialisation, not `[0u8; 32]`.
+   - `serialize().to_vec()` byte concatenation no longer applicable —
+     `hash_concat` returns `HashOut`, must `digest_to_bytes` before
+     adding to byte stream.
+   - `Sha256::update(some_hash)` requires `AsRef<[u8]>` — `HashOut`
+     doesn't impl that.
+2. **`proof.public_values` (SP1) vs `proof.public_inputs` (Plonky2):**
+   field name AND element type differ. SP1 uses `SP1PublicValues`
+   (read/write byte stream); Plonky2 uses `Vec<F>` of field elements.
+   `ProofData::from_field_elements` (already in program-plonky2) is
+   the bridge.
+3. **`ProgramInputsBuilder` (SP1) has no Plonky2 analogue.** SP1
+   batched all inputs into a single struct passed to the prover; the
+   Plonky2 monolithic circuit uses per-slot witnesses
+   (`InCoinSlotTargets`). The server's `send_coins` path must
+   restructure from "build inputs → call create/update" to
+   "construct in_coins tuples → call prove_initial_with_in_coins".
+4. **`Prover::create_account` / `update_account`** are SP1-specific
+   method names; the Plonky2 wrapper uses
+   `prove_initial`/`prove_initial_with_in_coins` etc. Either rename
+   wrapper methods or rewrite server call sites.
+5. **`HASH_SIZE` constant** (SP1: `pub const HASH_SIZE: usize = 32;`)
+   not present in program-plonky2. Add as `pub const HASH_SIZE: usize = 32;`
+   in `hash` module or update callers to literal `32` /
+   `core::mem::size_of::<HashDigest>()`.
 
 ---
 
