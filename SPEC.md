@@ -52,6 +52,7 @@ Abbreviations and shorthand used throughout this spec and the surrounding docume
 | **D1–D11** | Divergences | Numbered list of differences between this implementation and Shielded CSV eprint 2025/068 (`MIGRATION_RESEARCH.md` §3, summarised in SPEC §15). |
 | **R1–R6** | Risks | Numbered entries in the ROADMAP risk register. |
 | **MAX_IN_COINS** | — | `= 8`. Fixed bound on input coins per send (Plonky2 circuit is fixed-shape; see decision §5.2 in MIGRATION_RESEARCH). |
+| **MAX_OUT_COINS** | — | `= 8`. Fixed bound on output coins per send; same fixed-shape rationale as `MAX_IN_COINS`. |
 | **TREE_DEPTH** | — | `= 256`. SMT depth (one level per key bit). |
 | **Step N** | — | Refers to the corresponding row in ROADMAP's *Status at a Glance* table. |
 | **BIP-340** | — | Bitcoin Schnorr signature scheme over secp256k1. The wallet uses BIP-340 to sign `SHA256(serialize(asth) ‖ serialize(ocr))`. |
