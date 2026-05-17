@@ -202,7 +202,7 @@ recovers via the refund leaf.
 Step 1. Burn: User invokes the side-chain's burn function. On Citrea
         this is `safeWithdraw` on a contract; for zkCoins it would be
         a coin-send to a designated BURN_ADDRESS or — paper-aligned —
-        a dedicated WithdrawalProof predicate branch (§5.2).
+        a dedicated BurnProof predicate branch (§6.3).
 
 Step 2. Payout request: User submits a Payout transaction template
         signed with SIGHASH_SINGLE|ANYONECANPAY, identifying their
@@ -1116,3 +1116,4 @@ which has no minimum increment.
 | 2026-05-17 | Add §12 "Beyond BitVM2 — 2026 Verification Landscape" covering BitVM3-RSA withdrawal, BitVM3-CC (BOB), Glock (Alpen Labs), Mosaic (Eagen et al.). Update §3 with 2026-landscape note. Update §11.1 / §11.2 / §11.3 comparison tables. Update §13 Bottom Line with hedging strategy. Refactor references into themed groups. |
 | 2026-05-17 | §13 Bottom Line: add explicit production federation target of N=100 (practical upper bound of BitVM2 framework per Bitlayer). Beyond N=100 noted as open research, not current goal. |
 | 2026-05-17 | Consistency audit pass: §12.4 — correct the Glock trusted-setup claim (Glock's DV-SNARK is instantiated with Pari which requires a circuit-specific trusted setup, comparable to Groth16; the previous "the DV-SNARK might not require a setup" wording was wrong). Add a branch note at the top explaining that `SPEC.md` / `MIGRATION_RESEARCH.md` / `ROADMAP.md` currently live on `feat/plonky2-migration` only. |
+| 2026-05-17 | Audit round 2: §6.2 Step 1 — fix proof-name inconsistency ("WithdrawalProof" was a one-off term; renamed to `BurnProof` consistent with §6.3 and §4.1) and correct the §5.2 cross-reference to §6.3. |
