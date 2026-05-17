@@ -818,6 +818,48 @@ in-circuit `H(interim_asth || index)`. Catch: when writing the
 out-coin test fixture, always pre-compute the interim balance from
 `initial - out_coin_amount` before hashing.
 
+### 7.20 Speed up panic tests via `cyclic_base_proof` short-circuit — **codified**
+
+**Discovered:** stage-5d-next-3 added panic tests like
+`stage_5d_next_3_prove_account_update_panics_on_wrong_in_slot_count`
+to cover the `assert_eq!`-message lines in
+`prove_account_update_with_in_and_out_coins`. The first draft
+called `prove_initial(...)` to construct a real prev proof before
+invoking the function — paying **~13 min wall clock** per "panic"
+test at `MAX_IN_COINS = MAX_OUT_COINS = 8`. Multiply by N panic
+tests and the test sweep balloons.
+
+**The trick:** the slot-count `assert_eq!`s fire at the **top** of
+the function, before any witness setting, before `prove`. The
+`prev: &ProofWithPublicInputs<F, C, D>` parameter is never consumed
+in the panic path. Substitute a `cyclic_base_proof(common_data,
+verifier_only, empty_pis)` dummy — type-equivalent, ~10 ms to
+construct, panic short-circuits before it's touched.
+
+```rust
+let dummy_inner_pis = std::iter::empty::<(usize, F)>().collect();
+let dummy_prev = cyclic_base_proof(
+    &circuit.common_data,
+    &circuit.data.verifier_only,
+    dummy_inner_pis,
+);
+let _ = prove_account_update_with_in_and_out_coins(
+    &circuit, &account_state, ZERO_HASH, &dummy_prev, &dummy_cmp(),
+    &[],  // wrong slot count — assert_eq! fires here
+    &out_coins, &account_state.public_key,
+);
+```
+
+Net savings on stage 5d-next-3: ~25 min wall per full test sweep
+(2 account-update panic tests × ~13 min each). Pattern generalises
+to any `should_panic` test whose target's expensive arguments are
+only consumed *after* the panic point.
+
+**Rule of thumb:** when writing a `should_panic` test for a
+function with expensive arguments, look at where the panic fires
+in the function body — if the arguments aren't accessed before
+that point, substitute dummies.
+
 ---
 
 ## 8. Local Artifacts

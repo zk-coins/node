@@ -105,3 +105,70 @@ post-`50a1bd9` is the next session's first task.**
 - DEV deployment (Step 9).
 
 Those are sequential after Step 5 lands.
+
+## Test confirmation status (end of session)
+
+What was **explicitly proved to pass** on this session's machine,
+at the current production parameters (`MAX_IN_COINS = MAX_OUT_COINS
+= 8`, `INNER_PAD_BITS = 14`):
+
+| Test | Confirmed | Run notes |
+| --- | --- | --- |
+| `stage_5d_initial_with_one_active_in_coin` | ✅ | 188 s wall, single in-coin |
+| `stage_5d_next_3_initial_with_one_active_out_coin` | ✅ | 761 s wall, single out-coin |
+| `stage_5d_next_3_initial_combined_in_and_out_coin` | ✅ | 781 s wall, both loops active |
+
+What was **left running at session end** (not in this snapshot):
+- `cargo test -- stage_5d_next_3_account_update_combined_in_and_out_coin`
+  (commit `8fab78a`, two cyclic proofs, ~25-35 min wall expected).
+- `cargo test -- stage_5d_next_3_prove` (commit `a502b8f`, slow
+  panic tests; superseded by `50a1bd9` which speeds them up).
+
+What is **high-confidence but unrun** at MAX=8:
+- All 5b / 5c / 5c+ tests (existed at smaller MAX, behave identically
+  when the active-slot count is unchanged; the wrappers pad with
+  inactive dummies).
+- All 5e negative tests (same pattern as previously verified at
+  MAX_IN_COINS=1).
+- The remaining 4 stage_5d panic tests.
+
+## Next session — verification checklist
+
+Before adding new features:
+
+1. `cd ~/Documents/GitHub/zkcoins/server-claude && git fetch && git
+   pull --ff-only origin feat/plonky2-migration` — pull any
+   parallel work since `7db536d`.
+2. `cd program-plonky2 && cargo check` — should be a no-op build.
+3. `cargo test --lib` — full sweep at MAX=8. Expect ~1-2 hours
+   multi-threaded.
+4. `cargo llvm-cov --fail-under-lines 100 -- --test-threads=1` —
+   the coverage gate. Expect ~3-5 hours sequential. Critical to
+   re-confirm the 100% lines metric on the current source state —
+   it was 99.70% before the 5d work and was line-by-line audited
+   to stay at 100% via per-assertion panic tests, but a fresh run
+   is the authoritative check.
+
+If any test fails: bisect against the commit list in
+[`../ROADMAP.md`](../ROADMAP.md) Done section.
+
+After confirmation: tackle stage 5d-next-4 source verification per
+[`STAGE_5D_NEXT_4_DESIGN.md`](STAGE_5D_NEXT_4_DESIGN.md). Read the
+design first — the multi-cyclic-verify architectural decision
+(Option A vs B vs C) matters.
+
+## Lesson index in MIGRATION_RESEARCH §7
+
+For quick orientation, the relevant lessons from this session:
+
+| § | Topic |
+| --- | --- |
+| 7.12 | BitVM's `common_data_for_recursion` is broken under Plonky2 1.1.0 |
+| 7.13 | Coverage debt from unreachable `Result<()>` calls — use `.expect()` |
+| 7.14 | Path-compressed SMTs are incompatible with cyclic recursion |
+| 7.15 | Conditional constraints via `select_hash` masking |
+| 7.16 | MMR `root_extended` / `extend_to` for fixed-depth verification |
+| 7.17 | Per-slot `active`-bit masking for variable-count loops |
+| 7.18 | `add_virtual_target` requires explicit witnessing; prefer `split_le` |
+| 7.19 | `account_state.hash` has three roles (initial / interim / final) |
+| 7.20 | Speed up panic tests via `cyclic_base_proof` short-circuit |
