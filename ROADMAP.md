@@ -33,8 +33,8 @@ person-days at full focus; multiply for part-time work.
 | 4c+ | In-circuit SMT insert gadget (new-root computation) | ✅ done | — | — |
 | 4d | Port `ProgramInputs` + `CommitmentMerkleProofs` types | ✅ done | — | — |
 | 5 | Monolithic state-transition circuit (recursion, padding, vk-pin) | ✅ done (5a/5b/5c/5c+/5d/5d-next-3); 5d-next-4 source-side cyclic verify deferred to 5d-next-5 (post-MVP) — see [MIGRATION_RESEARCH §7.21](./MIGRATION_RESEARCH.md#721-stage-5d-next-4-source-side-verification-blocked-on-plonky2-110--deferred-to-stage-5d-next-5-post-mvp) | — | — |
-| 6 | `script-plonky2/` host-side prover wrapper | ⏳ todo | 1–2 d | low |
-| 7 | Server: **replace** SP1 path with Plonky2 (no feature flag, no dual backend) | ⏳ todo | 2–3 d | low (closed test env — no migration logic needed) |
+| 6 | `script-plonky2/` host-side prover wrapper | ✅ done (`d96bb62`) | — | — |
+| 7 | Server: **replace** SP1 path with Plonky2 (no feature flag, no dual backend) | 🟡 in progress — 🛠 persistence helpers + serde derives done (`b76bd39`); 🔧 mechanical server-side imports + workspace toolchain cutover remaining | ~1 d | low (closed test env — no migration logic needed) |
 | 8 | App / wallet: Schnorr-signing boundary, server-API integration | ⏳ todo | 1–2 d | low (server-side compute architecture — no wasm-crypto migration) |
 | 9 | DEV deployment + end-to-end roundtrip on signet | ⏳ todo | 3–5 d | medium |
 | — | Pre-mainnet blockers: D2/D10 (recipient hiding), D7 (reorg safety), D8 (per-coin nullifier-accum) | ⏳ todo | **+2–3 weeks** | high (real protocol redesign) |
@@ -69,6 +69,9 @@ MIGRATION_RESEARCH / CONTRIBUTING are not individually listed once
 they merely correct or extend this file — see `git log` for the
 exhaustive history.
 
+- [`b76bd39`](./../../commit/b76bd39) — feat(program-plonky2): step 7 prep — serde derives + persistence helpers (SMT/MMR/types/inputs all get `Serialize`/`Deserialize`; `save_merkle_tree` / `load_merkle_tree` / `save_mmr` / `load_mmr` ported from SP1-era helpers; 4 new tests for round-trip + missing-path I/O errors; `[u8; 33]` pubkey worked around with inline `BigArray33` helper to dodge serde's N≤32 derive limit)
+- [`d96bb62`](./../../commit/d96bb62) — feat(script-plonky2): step 6 — host-side prover wrapper around `StateTransitionCircuit` (new crate `script-plonky2/` with `Prover` struct + `prove_initial` / `prove_account_update` / `verify` thin wrappers; mirrors the SP1-era `script/` crate shape; nightly toolchain via rust-toolchain.toml symlink to program-plonky2)
+- [`c1df545`](./../../commit/c1df545) — docs: defer Stage 5d-next-4 source-side cyclic verify to 5d-next-5 (post-MVP) — Plonky2 1.1.0's `dummy_circuit` can't reproduce `ConstantGate`-containing common_data shapes (Approach A) AND the in-circuit data-only fallback hit `goal_data != common` mismatch at build (Approach B); the trusted server folding only validly-proved commitments into history MMR makes Stage 5d-next-3 + prev_account CMP sufficient for server-heavy MVP. See MIGRATION_RESEARCH §7.21.
 - [`6ea965a`](./../../commit/6ea965a) — docs: finalise session pickup — §7.20 + test-confirmation + verification checklist
 - [`7db536d`](./../../commit/7db536d) — docs: session-state pickup notes for next agent
 - [`50a1bd9`](./../../commit/50a1bd9) — test: speed up account_update panic-tests via cyclic_base_proof (~25 min wall saved per full sweep)
