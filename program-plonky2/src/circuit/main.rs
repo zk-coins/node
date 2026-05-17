@@ -2030,13 +2030,20 @@ mod tests {
         expected = "prove_account_update_with_in_and_out_coins: caller must supply exactly MAX_IN_COINS in-coin slot witnesses"
     )]
     fn stage_5d_next_3_prove_account_update_panics_on_wrong_in_slot_count() {
+        // The slot-count `assert_eq!` fires at the top of the function,
+        // before any witness setting or proving. Hand it a
+        // `cyclic_base_proof` dummy for `prev` instead of paying ~13 min
+        // to generate a real Init proof — the panic short-circuits
+        // before `prev` is consumed.
         let circuit = build_circuit();
-        let mut account_state = AccountState::new(dummy_pubkey(8));
-        account_state.owner = *MINTING_ADDRESS;
-        account_state.balance = 1;
-        let (cmp, history_root_extended) =
-            build_test_commitment_witness(account_state.hash(), DEFAULT_HASHES[0]);
-        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH).expect("prove init");
+        let account_state = AccountState::new(dummy_pubkey(8));
+        let cmp = dummy_cmp();
+        let dummy_inner_pis = std::iter::empty::<(usize, F)>().collect();
+        let dummy_prev = cyclic_base_proof(
+            &circuit.common_data,
+            &circuit.data.verifier_only,
+            dummy_inner_pis,
+        );
         let dummy_nip = dummy_non_inclusion_proof();
         let out_coins = (0..MAX_OUT_COINS)
             .map(|_| (false, ZERO_HASH, 0u64, &dummy_nip))
@@ -2044,8 +2051,8 @@ mod tests {
         let _ = prove_account_update_with_in_and_out_coins(
             &circuit,
             &account_state,
-            history_root_extended,
-            &init_proof,
+            ZERO_HASH,
+            &dummy_prev,
             &cmp,
             &[], // wrong: expected MAX_IN_COINS
             &out_coins,
@@ -2060,13 +2067,16 @@ mod tests {
         expected = "prove_account_update_with_in_and_out_coins: caller must supply exactly MAX_OUT_COINS out-coin slot witnesses"
     )]
     fn stage_5d_next_3_prove_account_update_panics_on_wrong_out_slot_count() {
+        // Same `cyclic_base_proof` short-circuit as the in-slot test.
         let circuit = build_circuit();
-        let mut account_state = AccountState::new(dummy_pubkey(9));
-        account_state.owner = *MINTING_ADDRESS;
-        account_state.balance = 1;
-        let (cmp, history_root_extended) =
-            build_test_commitment_witness(account_state.hash(), DEFAULT_HASHES[0]);
-        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH).expect("prove init");
+        let account_state = AccountState::new(dummy_pubkey(9));
+        let cmp = dummy_cmp();
+        let dummy_inner_pis = std::iter::empty::<(usize, F)>().collect();
+        let dummy_prev = cyclic_base_proof(
+            &circuit.common_data,
+            &circuit.data.verifier_only,
+            dummy_inner_pis,
+        );
         let dummy_nip = dummy_non_inclusion_proof();
         let dummy_c = dummy_coin();
         let in_coins = (0..MAX_IN_COINS)
@@ -2075,8 +2085,8 @@ mod tests {
         let _ = prove_account_update_with_in_and_out_coins(
             &circuit,
             &account_state,
-            history_root_extended,
-            &init_proof,
+            ZERO_HASH,
+            &dummy_prev,
             &cmp,
             &in_coins,
             &[], // wrong: expected MAX_OUT_COINS
@@ -2356,8 +2366,7 @@ mod tests {
 
         let out_coin_amount: u64 = 50;
         let mut interim_account_state = account_state.clone();
-        interim_account_state.balance =
-            account_state.balance + in_coin.amount - out_coin_amount;
+        interim_account_state.balance = account_state.balance + in_coin.amount - out_coin_amount;
         let interim_asth = interim_account_state.hash();
         let expected_out_id = crate::types::calculate_coin_identifier(interim_asth, 0);
         let out_id_key = digest_to_bytes(&expected_out_id);
