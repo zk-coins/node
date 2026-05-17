@@ -69,7 +69,8 @@ MIGRATION_RESEARCH / CONTRIBUTING are not individually listed once
 they merely correct or extend this file — see `git log` for the
 exhaustive history.
 
-- (next commit) — refactor: SMT redesign to uncompressed fixed-256 paths (off-circuit `InclusionProof` / `NonInclusionProof` always carry exactly `TREE_DEPTH = 256` siblings; path compression removed from `insert` and proof generation; `NonInclusionProof.leaf` field dropped — non-inclusion now witnesses the empty-leaf default at the depth-256 slot; in-circuit `verify_smt_inclusion` / `verify_smt_non_inclusion` / `verify_smt_insert` reduced to a single `hash_up_full_path` engine; case A/B branch and `extension` parameter gone. Required for Plonky2 cyclic recursion `circuit_digest` stability across proof shapes. Test count 77 → 73, 100 % lines coverage retained.)
+- (next commit) — feat: stage 5c+ — `CommitmentMerkleProofs` in-circuit (SPEC §8 (c)(d)(e); fixed-shape SMT inclusion at `TREE_DEPTH = 256` + 2× MMR inclusion at `MMR_PROOF_PATH_LEN = 31`; new `MMR_MAX_DEPTH = 32` const + `MMRProof::extend_to(depth)` + `MerkleMountainRange::root_extended(depth)` off-circuit helpers; new `select_hash` masking pattern so every constraint fires only when `condition = true`; `dummy_cmp()` placeholder used by `prove_initial` to populate the unused fields; tests: positive bootstrap chain (Init→Update with full CommitmentMerkleProofs verify) plus negatives for (b), (c), (d).)
+- [`4f317fe`](./../../commit/4f317fe) — refactor: SMT redesign to uncompressed fixed-256 paths (off-circuit `InclusionProof` / `NonInclusionProof` always carry exactly `TREE_DEPTH = 256` siblings; path compression removed from `insert` and proof generation; `NonInclusionProof.leaf` field dropped — non-inclusion now witnesses the empty-leaf default at the depth-256 slot; in-circuit `verify_smt_inclusion` / `verify_smt_non_inclusion` / `verify_smt_insert` reduced to a single `hash_up_full_path` engine; case A/B branch and `extension` parameter gone.)
 - [`bba6470`](./../../commit/bba6470) — feat: stage 5c — AccountUpdate branch (condition now a free witness; cyclic verify binds SPEC §8 (a); state continuity (b) via `condition * (account_state_hash - prev.account_state_hash) == 0`; coin_history carry-over via `select(condition, prev.coin_history_root, DEFAULT_HASHES[0])`; mint exception masked with `!condition`; 5 tests incl. Initial→AccountUpdate chain and state-discontinuity rejection; SPEC §8 (c)(d)(e) MMR/SMT history checks DEFERRED to stage 5c+)
 - [`d167237`](./../../commit/d167237) — feat: stage 5b — Initial-branch state-transition predicate (`circuit/main.rs` rewritten: counter payload replaced by 16-element `ProofData`, mint exception + empty-SMT roots + in-circuit Poseidon `AccountState::hash`, condition pinned `false`; 3 tests: mint accepted, non-mint zero-balance accepted, non-mint nonzero-balance rejected)
 - [`83fa0c1`](./../../commit/83fa0c1) — feat: stage 5a — cyclic recursion plumbing PoC (`circuit/main.rs`, 2 tests: base + 1 recursive cycle; superseded by stage 5b)
@@ -96,10 +97,10 @@ exhaustive history.
 - [`57cdce4`](./../../commit/57cdce4) — docs: migration research
 - [`496c652`](./../../commit/496c652) — docs: circuit specification
 
-**Test count on this branch:** 73 (all green on nightly-2025-04-15).
-Breakdown: `prelude` 1 · `hash` 5 · `merkle::smt` 19 · `merkle::mmr` 11 ·
+**Test count on this branch:** 78 (all green on nightly-2025-04-15).
+Breakdown: `prelude` 1 · `hash` 5 · `merkle::smt` 19 · `merkle::mmr` 14 ·
 `types` 10 · `inputs` 5 · `circuit::mmr` 5 · `circuit::smt` 12 ·
-`circuit::main` 5.
+`circuit::main` 7.
 
 **Coverage:** **100% lines, 100% functions, 100% regions** on `program-plonky2/`
 as measured by `cargo llvm-cov --fail-under-lines 100`. Test modules
@@ -148,11 +149,20 @@ stages so each lands as its own reviewable commit on the branch):
   **SPEC §8 (c)(d)(e) — `CommitmentMerkleProofs` predicate proving
   prev was published in the global history MMR — is NOT YET WIRED.
   Stage 5c+ closes that gap.**
-- **5c+ — CommitmentMerkleProofs in-circuit** ⏳ next. Port (c)(d)(e)
-  using fixed-length SMT + MMR inclusion gadgets (pad off-circuit
-  proofs to `TREE_DEPTH = 256` for SMT, `MMR_MAX_DEPTH` TBD for MMR).
-  Without this, the AccountUpdate predicate is unsound: a malicious
-  prover could chain on top of a `prev` that was never published.
+- **5c+ — CommitmentMerkleProofs in-circuit** ✅ done in this
+  revision. SPEC §8 (c)(d)(e) all wired via in-circuit SMT inclusion
+  (`TREE_DEPTH = 256`) + 2× MMR inclusion (`MMR_PROOF_PATH_LEN = 31`).
+  New `MMR_MAX_DEPTH = 32` const + off-circuit
+  `MMRProof::extend_to(depth)` + `MerkleMountainRange::root_extended(depth)`
+  helpers bring variable-depth MMR proofs to the fixed shape the
+  circuit consumes. Every (c)(d)(e) check is masked with `condition`
+  via the `select_hash(condition, expected, computed)` pattern, so
+  Initial proofs (`condition = false`) trivially satisfy the
+  constraints with the `dummy_cmp()` placeholder. 7 tests in
+  `circuit::main`: 3 Initial-side (unchanged behaviour), 1 full
+  bootstrap Init→Update chain with real `CommitmentMerkleProofs`,
+  3 negatives (state-discontinuity, lying commitment_account_state_hash,
+  tampered SMT path).
 - **5d — fixed-shape padding (MAX_IN_COINS = 8)** ⏳. Pad the
   per-input-coin loop to the fixed bound, including dummy-coin
   semantics (amount = 0 → no-op).

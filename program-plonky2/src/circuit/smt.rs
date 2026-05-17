@@ -111,14 +111,31 @@ fn smt_leaf_hash<F: RichField + Extendable<D>, const D: usize>(
     builder.hash_n_to_hash_no_pad::<PoseidonHash>(input)
 }
 
-/// Verify an SMT inclusion proof in-circuit.
-///
-/// Off-circuit equivalent:
-/// [`crate::merkle::sparse_merkle_tree::InclusionProof::verify`].
+/// Compute the SMT root from an inclusion proof in-circuit, without
+/// constraining it to any expected value. Caller responsibility is to
+/// connect the returned `HashOutTarget` to its expected root (possibly
+/// via [`builder.connect_hashes`] or a masked / `select`-based path,
+/// e.g. when the inclusion check should only fire under a guard
+/// condition).
 ///
 /// `key_bits` must contain the full 256-bit MSB-first decomposition of
 /// `key` (use [`key_bits_msb_first`]); `path` must have exactly
 /// [`TREE_DEPTH`] sibling hashes.
+pub fn smt_inclusion_root<F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
+    leaf: HashOutTarget,
+    key: HashOutTarget,
+    key_bits: &[BoolTarget],
+    path: &[HashOutTarget],
+) -> HashOutTarget {
+    let start = smt_leaf_hash(builder, leaf, key);
+    hash_up_full_path(builder, start, key_bits, path)
+}
+
+/// Verify an SMT inclusion proof in-circuit.
+///
+/// Off-circuit equivalent:
+/// [`crate::merkle::sparse_merkle_tree::InclusionProof::verify`].
 pub fn verify_smt_inclusion<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
     leaf: HashOutTarget,
@@ -127,8 +144,7 @@ pub fn verify_smt_inclusion<F: RichField + Extendable<D>, const D: usize>(
     path: &[HashOutTarget],
     expected_root: HashOutTarget,
 ) {
-    let start = smt_leaf_hash(builder, leaf, key);
-    let computed = hash_up_full_path(builder, start, key_bits, path);
+    let computed = smt_inclusion_root(builder, leaf, key, key_bits, path);
     builder.connect_hashes(computed, expected_root);
 }
 

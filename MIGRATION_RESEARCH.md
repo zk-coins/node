@@ -604,6 +604,107 @@ gate (`cargo llvm-cov --fail-under-lines 100`) this is fine; for the
 region-coverage stretch it's the unavoidable cost of unreachable
 defensive paths in `Result`-returning library APIs.
 
+### 7.14 Path-compressed SMTs are incompatible with cyclic recursion — **codified**
+
+**Discovered:** stage-5c+ work in progress. The SMT shipped in
+`6cf949c` used path compression — a single-leaf subtree at level *K*
+had its level-*K* root equal to the leaf hash directly (no hashing
+through default siblings down to depth `TREE_DEPTH`). Off-circuit
+proofs had variable length *K* ≤ 256.
+
+**Why it broke:** Plonky2 cyclic recursion requires a stable
+`circuit_digest` across builds. The verifier shape — including the
+number of hash levels processed by the SMT-inclusion gadget — must
+be fixed at build time. Variable-length proofs would have produced
+a circuit with `circuit_digest` depending on proof shape, breaking
+the recursion fixed-point.
+
+**Fix:** rewrite the off-circuit SMT to produce always-`TREE_DEPTH`
+sibling proofs (`refactor: SMT to uncompressed fixed-256-depth
+paths`). Empty subtrees contribute `DEFAULT_HASHES[level + 1]`
+siblings, so the on-the-wire proof is 256 × 32 B = 8 KiB regardless
+of sparsity. The off-circuit `insert` removes the `current != leaf_h
+&& sibling == default → skip hash` short-circuit. Case A/B logic in
+`NonInclusionProof` is gone too — non-inclusion is now a proof that
+the depth-256 slot holds `DEFAULT_HASHES[TREE_DEPTH]`, full stop.
+
+**Operational consequence:** roots produced by the new `insert`
+differ from the pre-refactor compressed roots. The closed-test-env
+strategy (`feedback_zkcoins_closed_test_env`) makes this a free
+choice — no on-the-wire compatibility to preserve.
+
+**Lesson for future merkle structures:** if a structure will be
+verified inside a cyclic-recursive circuit, build the off-circuit
+proof generator to emit *fixed-shape* proofs from day one. Path
+compression and similar size-saving tricks save bytes off-chain but
+cost a redesign once you need ZK over the same data.
+
+### 7.15 Conditional constraints via `select_hash` masking — **codified**
+
+**Discovered:** stage-5c+ added SPEC §8 (c)(d)(e) checks that fire
+only on the AccountUpdate branch (`condition = true`). The
+`verify_smt_inclusion` / `verify_mmr_inclusion` gadgets internally do
+`connect_hashes(computed, expected_root)`, which is unconditional —
+they cannot be "switched off" by a guard.
+
+**Fix recipe:** expose a "compute-only" variant of each verify
+gadget (`smt_inclusion_root`, `mmr_inclusion_root`) that returns the
+reconstructed root *without* asserting equality. The caller then
+constructs the masked target via
+
+```rust
+let target = select_hash(builder, condition, expected_witness, computed);
+builder.connect_hashes(computed, target);
+```
+
+When `condition = false`, `select_hash` collapses to `computed` and
+the resulting constraint `connect_hashes(computed, computed)` is
+trivially satisfied. When `condition = true`, `target = expected_witness`
+and the honest check fires.
+
+**Why not skip-via-builder-condition:** Plonky2's `CircuitBuilder`
+doesn't have a "conditional region" primitive — every gate fires.
+Masking via `select` over the *target value* is the standard pattern
+(used by Plonky2's own `conditionally_verify_cyclic_proof_or_dummy`,
+the cyclic recursion machinery, etc.).
+
+**Witness-population implication:** the masked-off branch still needs
+*some* witness in the placeholders. Stage-5c+ uses a `dummy_cmp()`
+helper that constructs a syntactically valid but semantically empty
+`CommitmentMerkleProofs` (all `ZERO_HASH`, all-zero indices). The
+masked equality constraints accept any witness when `condition = false`.
+
+### 7.16 MMR root_extended / extend_to for fixed-depth verification — **codified**
+
+**Discovered:** stage-5c+ needed the in-circuit MMR-inclusion gadget
+to run at a fixed depth (`MMR_PROOF_PATH_LEN = MMR_MAX_DEPTH - 1 = 31`),
+but the off-circuit `MerkleMountainRange` uses capacity-doubling and
+produces variable-depth proofs (typically much shorter — `log2(N)`
+for a tree with `N` leaves).
+
+**Fix:** keep the MMR's natural shape (capacity doubles on demand)
+but add two helpers:
+- `MerkleMountainRange::root_extended(target_path_len)` — start from
+  the natural root, then walk up additional levels of
+  `hash_concat(current, ZERO_HASH)` until the path reaches
+  `target_path_len`. This is what the in-circuit gadget compares
+  against.
+- `MMRProof::extend_to(target_path_len)` — pad the proof's
+  `path` with `ZERO_HASH` siblings to `target_path_len`. The padded
+  proof verifies against `root_extended(target_path_len)`.
+
+The MMR root committed at the protocol boundary (e.g. inside
+`ProofData::commitment_history_root`) is always the extended root at
+the chosen `MMR_MAX_DEPTH`; everyone — off-circuit MMR users and the
+in-circuit verifier — agrees on the same value.
+
+**Why this beats redesigning the MMR:** the off-circuit MMR's
+capacity-doubling shape is convenient for incremental appends
+(O(log N) updates). A fixed-shape rewrite would re-allocate the full
+tree up front. The `_extended` / `extend_to` helpers preserve the
+fast off-circuit path while making the value the in-circuit verifier
+needs trivially derivable.
+
 ---
 
 ## 8. Local Artifacts

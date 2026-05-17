@@ -7,41 +7,30 @@
 //! ## Stage status
 //!
 //! - **5a — recursion plumbing PoC**: done in commit `83fa0c1`,
-//!   superseded by 5b. Counter payload, `condition`-toggled cycle.
+//!   superseded by 5b.
 //! - **5b — Initial branch with real predicate**: done in commit
-//!   `d167237`. 16-element `ProofData` payload, in-circuit Poseidon
-//!   `AccountState::hash`, mint exception, `condition` pinned `false`.
-//! - **5c — AccountUpdate branch** ✅ this revision. `condition` is
-//!   free; when `true`, the `conditionally_verify_cyclic_proof_or_dummy`
-//!   call binds the inner proof to *this* circuit (SPEC §8 (a)). The
-//!   inner proof's `ProofData` public inputs are extracted from
-//!   `inner_proof_target.public_inputs[0..16]` and used to enforce
-//!   state continuity (SPEC §8 (b): `H(account_state) ==
-//!   prev.account_state_hash`) and `coin_history` carry-over
-//!   (`output.coin_history_root == prev.coin_history_root`). The mint
-//!   exception is masked with `!condition` so it only applies to
-//!   Initial proofs. **NOT YET WIRED:** SPEC §8 (c)(d)(e) — the
-//!   `CommitmentMerkleProofs` predicate that proves the prev proof was
-//!   published in the global history MMR. Without (c)(d)(e), a
-//!   malicious prover could craft an account-update chain on top of a
-//!   `prev` that was never published. Stage 5c+ closes this gap with
-//!   in-circuit SMT + MMR inclusion proofs of `CommitmentMerkleProofs`.
-//! - **5c+ / 5d / 5e** — see ROADMAP "In Progress" section.
-//!
-//! ## What the AccountUpdate branch enforces today (Stage 5c)
-//!
-//! Per SPEC §8 the AccountUpdate proof's predicate is:
-//!
-//! ```text
-//! prev := verify_proof(inputs.prev_proof_public_values, vk)
-//! assert vk == prev.vk                          // (a) — cyclic_verify
-//! assert account_state.hash() == prev.account_state_hash    // (b) — wired
-//! mp := inputs.prev_proof_history_proofs
-//! assert account_state.hash() == mp.commitment_account_state_hash  // (c) — DEFERRED to 5c+
-//! assert mp.verify_commitment(history_root)                        // (d) — DEFERRED to 5c+
-//! assert mp.verify_previous_root(prev.commitment_history_root, history_root)  // (e) — DEFERRED to 5c+
-//! output.coin_history_root := prev.coin_history_root
-//! ```
+//!   `d167237`.
+//! - **5c — AccountUpdate branch**: done in commit `bba6470`. SPEC §8
+//!   (a) + (b) wired, `coin_history` carry-over, mint exception
+//!   masked.
+//! - **5c+ — CommitmentMerkleProofs in-circuit** ✅ this revision.
+//!   SPEC §8 (c)(d)(e) wired against fixed-shape SMT + MMR proofs.
+//!   Specifically: (c) is `account_state.hash() ==
+//!   mp.commitment_account_state_hash` via element-wise difference
+//!   masked with `condition`; (d) is `mp.verify_commitment(history_root)`,
+//!   which is an in-circuit SMT inclusion of `commitment = h(asth || ocr)`
+//!   in `commitment_root` followed by MMR inclusion of
+//!   `h(commitment_root || commitment_root_mmr_sibling)` in `history_root`;
+//!   (e) is `mp.verify_previous_root(prev.commitment_history_root,
+//!   history_root)`, i.e. MMR inclusion of `h(previous_root_history_proof.0
+//!   || prev.commitment_history_root)` in `history_root`.
+//!   Every (c)(d)(e) check is masked: each `connect_hashes(computed,
+//!   expected)` is re-targeted as `connect_hashes(computed,
+//!   select_hash(condition, expected_witness, computed))`. When
+//!   `condition = false` the `select` collapses to `computed` and the
+//!   constraint is trivially satisfied; when `condition = true` it
+//!   reduces to the honest check.
+//! - **5d / 5e** — see ROADMAP "In Progress" section.
 //!
 //! ## Public-input layout (unchanged from 5b)
 //!
@@ -55,29 +44,27 @@
 //! | 8..12      | commitment_history_root  |
 //! | 12..16     | coin_history_root        |
 //!
+//! ## Fixed-shape requirements
+//!
+//! The circuit consumes:
+//! - One SMT inclusion proof of depth [`TREE_DEPTH`] = 256.
+//! - Two MMR inclusion proofs of depth [`MMR_PROOF_PATH_LEN`] =
+//!   `MMR_MAX_DEPTH - 1` = 31.
+//!
+//! Off-circuit producers must extend their (variable-depth) proofs to
+//! these fixed depths before witnessing — see
+//! [`crate::merkle::merkle_mountain_range::MMRProof::extend_to`] and
+//! [`crate::merkle::merkle_mountain_range::MerkleMountainRange::root_extended`]
+//! for the MMR helper. The SMT is already uncompressed-fixed-depth by
+//! construction (see the SMT redesign commit).
+//!
 //! ## Branch selection via `condition`
 //!
-//! `condition` is now a witnessed `BoolTarget` (not pinned). Convention:
-//! - `false` → Initial branch (no prior proof; dummy in inner slot)
-//! - `true`  → AccountUpdate branch (real prev proof in inner slot)
-//!
-//! The two-branch output selection uses `builder.select(condition,
-//! account_update_value, initial_value)` for `coin_history_root`. The
-//! mint-exception constraint is masked with `!condition` so it only
-//! applies to Initial. The state-continuity constraint is masked with
-//! `condition` so it only applies to AccountUpdate.
-//!
-//! ## Range-checks on witnessed limbs
-//!
-//! `account_state.balance` and `account_state.public_key` are packed
-//! into field elements off-circuit via
-//! [`crate::types::AccountState::hash`] using fixed limb widths
-//! (32-bit halves for balance, 56-bit chunks for the 33-byte pubkey).
-//! The in-circuit version range-checks each witnessed limb to the same
-//! bound — without that, a malicious prover could supply out-of-range
-//! limbs that compute a perfectly valid `account_state_hash` but cannot
-//! be reproduced by the off-circuit `AccountState::hash`. The
-//! range-checks make in-circuit and off-circuit hashes provably agree.
+//! - `false` → Initial (dummy inner; cyclic verify uses dummy; all
+//!   AccountUpdate-only constraints — state continuity, (c)(d)(e),
+//!   coin_history carry-over — are masked off).
+//! - `true`  → AccountUpdate (real prev proof in inner slot; all
+//!   AccountUpdate-only constraints fire; mint exception masked off).
 
 use anyhow::Result;
 use plonky2::field::types::Field;
@@ -94,7 +81,12 @@ use plonky2::plonk::proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget};
 use plonky2::recursion::cyclic_recursion::check_cyclic_proof_verifier_data;
 use plonky2::recursion::dummy_circuit::cyclic_base_proof;
 
-use crate::merkle::sparse_merkle_tree::DEFAULT_HASHES;
+use crate::circuit::mmr::mmr_inclusion_root;
+use crate::circuit::smt::{key_bits_msb_first, smt_inclusion_root};
+use crate::hash::{digest_from_bytes, HashDigest, ZERO_HASH};
+use crate::inputs::CommitmentMerkleProofs;
+use crate::merkle::merkle_mountain_range::MMR_MAX_DEPTH;
+use crate::merkle::sparse_merkle_tree::{DEFAULT_HASHES, TREE_DEPTH};
 use crate::types::{AccountState, MINTING_ADDRESS};
 use crate::{C, D, F};
 
@@ -105,6 +97,12 @@ use crate::{C, D, F};
 /// the verifier-data slots added by `add_verifier_data_public_inputs`
 /// follow these and are not counted here.
 pub const N_PROOF_DATA_PUBLIC_INPUTS: usize = 16;
+
+/// Fixed in-circuit MMR proof path length. Equal to
+/// `MMR_MAX_DEPTH - 1` because an MMR proof has one sibling per level
+/// from the leaf's parent (level 1) to the root (level
+/// `MMR_MAX_DEPTH - 1`).
+pub const MMR_PROOF_PATH_LEN: usize = MMR_MAX_DEPTH - 1;
 
 /// Build the `CommonCircuitData` that the cyclic circuit references
 /// when verifying its own prior proof.
@@ -161,6 +159,65 @@ fn common_data_for_recursion_c() -> CommonCircuitData<F, D> {
     builder.build::<C>().common
 }
 
+/// Element-wise `select` over a `HashOutTarget`. Returns `if_true` if
+/// `cond` is true, else `if_false`. Used to mask off conditional
+/// constraints by retargetting `connect_hashes(computed, expected)` to
+/// `connect_hashes(computed, select_hash(cond, expected_witness,
+/// computed))` — when `cond = false` the resulting target collapses to
+/// `computed` and the constraint is trivially satisfied.
+fn select_hash(
+    builder: &mut CircuitBuilder<F, D>,
+    cond: BoolTarget,
+    if_true: HashOutTarget,
+    if_false: HashOutTarget,
+) -> HashOutTarget {
+    let mut out = [builder.zero(); 4];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = builder.select(cond, if_true.elements[i], if_false.elements[i]);
+    }
+    HashOutTarget { elements: out }
+}
+
+/// Witness targets for the SPEC §8 `CommitmentMerkleProofs` predicate,
+/// bundled so they can be threaded through [`StateTransitionCircuit`]
+/// and [`set_cmp_witness`] in one shot.
+///
+/// Sizes are pinned to the fixed-shape constants
+/// ([`TREE_DEPTH`] for the SMT, [`MMR_PROOF_PATH_LEN`] for the MMR
+/// proofs) so the verifier circuit has a stable `circuit_digest`.
+pub struct CommitmentMerkleProofsTargets {
+    /// SMT root containing the prev proof's commitment leaf.
+    pub commitment_root: HashOutTarget,
+    /// SMT key at which the commitment is stored (= hash of prev pubkey).
+    pub smt_key: HashOutTarget,
+    /// 256 sibling hashes along the SMT path (level 0 = topmost).
+    pub smt_path: Vec<HashOutTarget>,
+    /// MMR-proof (d) index: leaf position of `(commitment_root,
+    /// commitment_root_mmr_sibling)` in the history MMR.
+    pub mmr_a_index: Target,
+    /// MMR-proof (d) path: 31 sibling hashes.
+    pub mmr_a_path: Vec<HashOutTarget>,
+    /// The previous MMR root at the time `commitment_root` was folded
+    /// in — paired with `commitment_root` to form the MMR leaf for (d).
+    pub commitment_root_mmr_sibling: HashOutTarget,
+    /// The SMT root committed to the MMR alongside `prev.commitment_history_root`
+    /// for proof (e).
+    pub prev_smt_in_mmr_leaf: HashOutTarget,
+    /// MMR-proof (e) index.
+    pub mmr_b_index: Target,
+    /// MMR-proof (e) path: 31 sibling hashes.
+    pub mmr_b_path: Vec<HashOutTarget>,
+    /// Witness for SPEC §8 (c): the account-state-hash committed to by
+    /// the prev proof. Constrained to equal `account_state_hash`
+    /// in-circuit (under `condition`).
+    pub commitment_account_state_hash: HashOutTarget,
+    /// Witness for the second half of the commitment preimage:
+    /// `commitment = h(asth || ocr)`. Constrained implicitly by the
+    /// SMT inclusion check — the commitment value computed in-circuit
+    /// must match what the SMT stores.
+    pub commitment_out_coins_root: HashOutTarget,
+}
+
 /// Handle to the built state-transition circuit plus the witness
 /// targets a caller needs to populate when proving.
 ///
@@ -197,41 +254,16 @@ pub struct StateTransitionCircuit {
     pub pubkey_limbs: [Target; 5],
     /// Witness target: the current commitment-history root.
     pub history_root: HashOutTarget,
+    /// CommitmentMerkleProofs witness bundle. Constraints fire only
+    /// when `condition = true` (AccountUpdate branch).
+    pub cmp: CommitmentMerkleProofsTargets,
 }
 
-/// Build the Stage-5c state-transition circuit.
+/// Build the Stage-5c+ state-transition circuit.
 ///
-/// Layout:
-/// - 16 public inputs (`ProofData::to_field_elements`), registered before
-///   `add_verifier_data_public_inputs()` per the Plonky2 API contract.
-/// - Verifier-data public inputs (4 hash elements + cap), added by
-///   `add_verifier_data_public_inputs()`.
-/// - One inner proof target (dummy or real per `condition`).
-///
-/// Constraints:
-/// 1. **Public-input layout.** The 16 `ProofData` slots get connected
-///    to the in-circuit computed values per the table in the module
-///    docstring.
-/// 2. **Mint exception (Initial-only).** `!condition * !is_minting *
-///    balance_limb == 0` for each balance limb. Folding two booleans
-///    into one mask: `init_and_not_minting = (1 - condition) *
-///    (1 - is_minting)`. Then `init_and_not_minting * balance_limb ==
-///    0`.
-/// 3. **State continuity (AccountUpdate-only).** `condition *
-///    (account_state_hash[i] - prev_account_state_hash[i]) == 0` for
-///    each of the 4 hash elements. When `condition = false`, the
-///    constraint is trivially satisfied; the dummy inner proof's
-///    public_inputs[0..4] are unconstrained so prev can be anything.
-/// 4. **Coin-history carry-over.** Output's `coin_history_root` =
-///    `select(condition, prev.coin_history_root, DEFAULT_HASHES[0])`.
-/// 5. **Cyclic verification.** `conditionally_verify_cyclic_proof_or_dummy`
-///    binds vk via `circuit_digest`; this is SPEC §8 (a).
-///
-/// Returns the built circuit unconditionally. Per [`MIGRATION_RESEARCH.md`]
-/// §7.13 the `Result<()>` from `conditionally_verify_cyclic_proof_or_dummy`
-/// is `.expect()`-ed because its only Err path is malformed
-/// `common_data`, which is impossible here (we construct `common_data`
-/// via the three-pass helper).
+/// Beyond the 5b/5c predicate, this revision wires SPEC §8 (c)(d)(e)
+/// against fixed-shape SMT + MMR inclusion proofs. See module docstring
+/// for the constraint breakdown and the masking pattern.
 pub fn build_circuit() -> StateTransitionCircuit {
     let config = CircuitConfig::standard_recursion_config();
     let mut builder = CircuitBuilder::<F, D>::new(config);
@@ -241,28 +273,28 @@ pub fn build_circuit() -> StateTransitionCircuit {
     let proof_data_pis: [Target; N_PROOF_DATA_PUBLIC_INPUTS] =
         std::array::from_fn(|_| builder.add_virtual_public_input());
 
-    // Build common_data BEFORE add_verifier_data_public_inputs, then
-    // pin num_public_inputs AFTER, matching Plonky2 1.1.0's own
-    // `recursion::cyclic_recursion::tests::test_cyclic_recursion`.
     let mut common_data = common_data_for_recursion_c();
     let verifier_data_target = builder.add_verifier_data_public_inputs();
     common_data.num_public_inputs = builder.num_public_inputs();
 
-    // Stage 5c: `condition` is a free witness. Caller passes `true`
-    // for AccountUpdate (real prev proof) or `false` for Initial
-    // (dummy inner).
     let condition = builder.add_virtual_bool_target_safe();
     let inner_proof_target = builder.add_virtual_proof_with_pis(&common_data);
 
-    // Extract prev's ProofData public inputs from the inner proof's
-    // public-input slots. Slot layout matches our own (we verify
-    // *this* circuit recursively).
+    // Extract prev's ProofData fields from the inner proof's PI slots.
     let prev_account_state_hash = HashOutTarget {
         elements: [
             inner_proof_target.public_inputs[0],
             inner_proof_target.public_inputs[1],
             inner_proof_target.public_inputs[2],
             inner_proof_target.public_inputs[3],
+        ],
+    };
+    let prev_commitment_history_root = HashOutTarget {
+        elements: [
+            inner_proof_target.public_inputs[8],
+            inner_proof_target.public_inputs[9],
+            inner_proof_target.public_inputs[10],
+            inner_proof_target.public_inputs[11],
         ],
     };
     let prev_coin_history_root = HashOutTarget {
@@ -302,9 +334,7 @@ pub fn build_circuit() -> StateTransitionCircuit {
     let not_minting = builder.not(is_minting);
     let not_condition = builder.not(condition);
 
-    // Mint exception (Initial-only): mask = (!condition) AND (!is_minting).
-    // Implemented as multiplication of the boolean targets — both are
-    // {0, 1} so the product is {0, 1}.
+    // Mint exception (Initial-only):
     let mint_mask = builder.mul(not_condition.target, not_minting.target);
     let mul_lo = builder.mul(mint_mask, balance_lo);
     builder.assert_zero(mul_lo);
@@ -320,8 +350,7 @@ pub fn build_circuit() -> StateTransitionCircuit {
     state_elements.extend_from_slice(&pubkey_limbs);
     let account_state_hash = builder.hash_n_to_hash_no_pad::<PoseidonHash>(state_elements);
 
-    // State continuity (AccountUpdate-only):
-    // `condition * (account_state_hash[i] - prev_account_state_hash[i]) == 0`.
+    // SPEC §8 (b) — state continuity (AccountUpdate-only):
     for i in 0..4 {
         let diff = builder.sub(
             account_state_hash.elements[i],
@@ -331,8 +360,87 @@ pub fn build_circuit() -> StateTransitionCircuit {
         builder.assert_zero(masked);
     }
 
-    // Coin-history carry-over: output is `prev.coin_history_root` when
-    // condition=true, else `DEFAULT_HASHES[0]`.
+    // ===== CommitmentMerkleProofs witness bundle =====
+
+    let cmp = CommitmentMerkleProofsTargets {
+        commitment_root: builder.add_virtual_hash(),
+        smt_key: builder.add_virtual_hash(),
+        smt_path: (0..TREE_DEPTH)
+            .map(|_| builder.add_virtual_hash())
+            .collect(),
+        mmr_a_index: builder.add_virtual_target(),
+        mmr_a_path: (0..MMR_PROOF_PATH_LEN)
+            .map(|_| builder.add_virtual_hash())
+            .collect(),
+        commitment_root_mmr_sibling: builder.add_virtual_hash(),
+        prev_smt_in_mmr_leaf: builder.add_virtual_hash(),
+        mmr_b_index: builder.add_virtual_target(),
+        mmr_b_path: (0..MMR_PROOF_PATH_LEN)
+            .map(|_| builder.add_virtual_hash())
+            .collect(),
+        commitment_account_state_hash: builder.add_virtual_hash(),
+        commitment_out_coins_root: builder.add_virtual_hash(),
+    };
+
+    // SPEC §8 (c): account_state_hash == cmp.commitment_account_state_hash,
+    // masked with `condition`.
+    for i in 0..4 {
+        let diff = builder.sub(
+            account_state_hash.elements[i],
+            cmp.commitment_account_state_hash.elements[i],
+        );
+        let masked = builder.mul(condition.target, diff);
+        builder.assert_zero(masked);
+    }
+
+    // SPEC §8 (d), first half: commitment = h(asth || ocr), SMT inclusion
+    // of `commitment` at `smt_key` in `commitment_root`.
+    let mut commitment_input = Vec::with_capacity(8);
+    commitment_input.extend_from_slice(&cmp.commitment_account_state_hash.elements);
+    commitment_input.extend_from_slice(&cmp.commitment_out_coins_root.elements);
+    let commitment = builder.hash_n_to_hash_no_pad::<PoseidonHash>(commitment_input);
+
+    let smt_key_bits = key_bits_msb_first(&mut builder, cmp.smt_key);
+    let smt_computed_root = smt_inclusion_root(
+        &mut builder,
+        commitment,
+        cmp.smt_key,
+        &smt_key_bits,
+        &cmp.smt_path,
+    );
+    let smt_target_root = select_hash(
+        &mut builder,
+        condition,
+        cmp.commitment_root,
+        smt_computed_root,
+    );
+    builder.connect_hashes(smt_computed_root, smt_target_root);
+
+    // SPEC §8 (d), second half: MMR inclusion of
+    // h(commitment_root || commitment_root_mmr_sibling) in history_root.
+    let mut mmr_a_leaf_input = Vec::with_capacity(8);
+    mmr_a_leaf_input.extend_from_slice(&cmp.commitment_root.elements);
+    mmr_a_leaf_input.extend_from_slice(&cmp.commitment_root_mmr_sibling.elements);
+    let mmr_a_leaf = builder.hash_n_to_hash_no_pad::<PoseidonHash>(mmr_a_leaf_input);
+    let mmr_a_index_bits = builder.split_le(cmp.mmr_a_index, MMR_PROOF_PATH_LEN);
+    let mmr_a_computed =
+        mmr_inclusion_root(&mut builder, mmr_a_leaf, &mmr_a_index_bits, &cmp.mmr_a_path);
+    let mmr_a_target = select_hash(&mut builder, condition, history_root, mmr_a_computed);
+    builder.connect_hashes(mmr_a_computed, mmr_a_target);
+
+    // SPEC §8 (e): MMR inclusion of
+    // h(prev_smt_in_mmr_leaf || prev.commitment_history_root) in history_root.
+    let mut mmr_b_leaf_input = Vec::with_capacity(8);
+    mmr_b_leaf_input.extend_from_slice(&cmp.prev_smt_in_mmr_leaf.elements);
+    mmr_b_leaf_input.extend_from_slice(&prev_commitment_history_root.elements);
+    let mmr_b_leaf = builder.hash_n_to_hash_no_pad::<PoseidonHash>(mmr_b_leaf_input);
+    let mmr_b_index_bits = builder.split_le(cmp.mmr_b_index, MMR_PROOF_PATH_LEN);
+    let mmr_b_computed =
+        mmr_inclusion_root(&mut builder, mmr_b_leaf, &mmr_b_index_bits, &cmp.mmr_b_path);
+    let mmr_b_target = select_hash(&mut builder, condition, history_root, mmr_b_computed);
+    builder.connect_hashes(mmr_b_computed, mmr_b_target);
+
+    // Coin-history carry-over.
     let empty_root = builder.constant_hash(DEFAULT_HASHES[0]);
     let mut output_coin_history_root_elements = [builder.zero(); 4];
     for (i, slot) in output_coin_history_root_elements.iter_mut().enumerate() {
@@ -354,9 +462,7 @@ pub fn build_circuit() -> StateTransitionCircuit {
         builder.connect(proof_data_pis[12 + i], output_coin_history_root.elements[i]);
     }
 
-    // Cyclic verification: binds the inner proof to *this* circuit's
-    // `circuit_digest` when condition=true; passes through a dummy
-    // when condition=false.
+    // Cyclic verification.
     builder
         .conditionally_verify_cyclic_proof_or_dummy::<C>(
             condition,
@@ -378,6 +484,7 @@ pub fn build_circuit() -> StateTransitionCircuit {
         balance_hi,
         pubkey_limbs,
         history_root,
+        cmp,
     }
 }
 
@@ -415,32 +522,122 @@ fn set_account_state_witness(
     }
 }
 
+/// Set the witnesses for the `CommitmentMerkleProofs` bundle.
+///
+/// Used by both proving paths:
+/// - `prove_initial` calls this with a *dummy* `cmp` (typically
+///   `CommitmentMerkleProofs::dummy()`), since the masked constraints
+///   are trivially satisfied with `condition = false` for any witness.
+/// - `prove_account_update` calls this with the real `cmp` matching
+///   the prev proof and current history.
+fn set_cmp_witness(
+    pw: &mut PartialWitness<F>,
+    circuit: &StateTransitionCircuit,
+    cmp: &CommitmentMerkleProofs,
+) {
+    pw.set_hash_target(circuit.cmp.commitment_root, cmp.commitment_root)
+        .unwrap();
+    pw.set_hash_target(
+        circuit.cmp.smt_key,
+        digest_from_bytes(&cmp.commitment_proof.key),
+    )
+    .unwrap();
+    assert_eq!(
+        cmp.commitment_proof.siblings.len(),
+        TREE_DEPTH,
+        "CommitmentMerkleProofs: SMT inclusion proof must be padded to TREE_DEPTH siblings"
+    );
+    for (i, sib) in cmp.commitment_proof.siblings.iter().enumerate() {
+        pw.set_hash_target(circuit.cmp.smt_path[i], *sib).unwrap();
+    }
+    pw.set_target(
+        circuit.cmp.mmr_a_index,
+        F::from_canonical_u32(cmp.commitment_root_history_proof.index),
+    )
+    .unwrap();
+    assert_eq!(
+        cmp.commitment_root_history_proof.path.len(),
+        MMR_PROOF_PATH_LEN,
+        "CommitmentMerkleProofs: MMR proof (d) must be extended to MMR_PROOF_PATH_LEN siblings"
+    );
+    for (i, sib) in cmp.commitment_root_history_proof.path.iter().enumerate() {
+        pw.set_hash_target(circuit.cmp.mmr_a_path[i], *sib).unwrap();
+    }
+    pw.set_hash_target(
+        circuit.cmp.commitment_root_mmr_sibling,
+        cmp.commitment_root_mmr_sibling,
+    )
+    .unwrap();
+    pw.set_hash_target(
+        circuit.cmp.prev_smt_in_mmr_leaf,
+        cmp.previous_root_history_proof.0,
+    )
+    .unwrap();
+    pw.set_target(
+        circuit.cmp.mmr_b_index,
+        F::from_canonical_u32(cmp.previous_root_history_proof.1.index),
+    )
+    .unwrap();
+    assert_eq!(
+        cmp.previous_root_history_proof.1.path.len(),
+        MMR_PROOF_PATH_LEN,
+        "CommitmentMerkleProofs: MMR proof (e) must be extended to MMR_PROOF_PATH_LEN siblings"
+    );
+    for (i, sib) in cmp.previous_root_history_proof.1.path.iter().enumerate() {
+        pw.set_hash_target(circuit.cmp.mmr_b_path[i], *sib).unwrap();
+    }
+    pw.set_hash_target(
+        circuit.cmp.commitment_account_state_hash,
+        cmp.commitment_account_state_hash,
+    )
+    .unwrap();
+    pw.set_hash_target(
+        circuit.cmp.commitment_out_coins_root,
+        cmp.commitment_out_coins_root,
+    )
+    .unwrap();
+}
+
+/// Build a syntactically-valid but semantically-empty
+/// `CommitmentMerkleProofs` for use as the dummy witness in
+/// [`prove_initial`]. Every field gets a deterministic placeholder
+/// (mostly `ZERO_HASH`); the masked constraints in the circuit ignore
+/// the values when `condition = false`.
+fn dummy_cmp() -> CommitmentMerkleProofs {
+    use crate::merkle::merkle_mountain_range::MMRProof;
+    use crate::merkle::sparse_merkle_tree::InclusionProof;
+    CommitmentMerkleProofs {
+        commitment_root: ZERO_HASH,
+        commitment_proof: InclusionProof {
+            key: [0u8; 32],
+            siblings: vec![ZERO_HASH; TREE_DEPTH],
+        },
+        commitment_root_history_proof: MMRProof::new(vec![ZERO_HASH; MMR_PROOF_PATH_LEN], 0),
+        commitment_root_mmr_sibling: ZERO_HASH,
+        previous_root_history_proof: (
+            ZERO_HASH,
+            MMRProof::new(vec![ZERO_HASH; MMR_PROOF_PATH_LEN], 0),
+        ),
+        commitment_account_state_hash: ZERO_HASH,
+        commitment_out_coins_root: ZERO_HASH,
+    }
+}
+
 /// Prove the Initial-branch state transition for a given `account_state`
 /// and `history_root`.
-///
-/// Sets `condition = false`, supplies a [`cyclic_base_proof`] dummy in
-/// the inner-proof slot, and runs the prover.
-///
-/// On success the proof's public inputs are
-/// [`crate::types::ProofData::to_field_elements`] with
-/// `account_state_hash = account_state.hash()`,
-/// `output_coins_root = coin_history_root = DEFAULT_HASHES[0]`, and
-/// `commitment_history_root = history_root`.
 pub fn prove_initial(
     circuit: &StateTransitionCircuit,
     account_state: &AccountState,
-    history_root: HashOut<F>,
+    history_root: HashDigest,
 ) -> Result<ProofWithPublicInputs<F, C, D>> {
     let mut pw = PartialWitness::new();
     pw.set_bool_target(circuit.condition, false).unwrap();
     set_account_state_witness(&mut pw, circuit, account_state);
     pw.set_hash_target(circuit.history_root, history_root)
         .unwrap();
+    set_cmp_witness(&mut pw, circuit, &dummy_cmp());
 
-    // Dummy inner proof. Initial reads no inner public inputs in
-    // Stage 5c (prev is masked out by condition=false), so empty seed.
-    // `cyclic_base_proof` consumes `hashbrown::HashMap`; `.collect()`
-    // infers the right type from the function signature.
+    // Dummy inner proof for the cyclic-recursion slot.
     let inner_pis = std::iter::empty::<(usize, F)>().collect();
     pw.set_proof_with_pis_target::<C, D>(
         &circuit.inner_proof_target,
@@ -454,31 +651,31 @@ pub fn prove_initial(
 }
 
 /// Prove an AccountUpdate transition consuming `prev` as the recursive
-/// inner proof.
+/// inner proof plus a [`CommitmentMerkleProofs`] witnessing that `prev`
+/// is published in the global history at `history_root`.
 ///
-/// Sets `condition = true`. The cyclic-verification machinery enforces
-/// that `prev` was generated by *this same circuit* (SPEC §8 (a)).
-/// Stage 5c additionally enforces:
-/// - **(b)** state continuity: `account_state.hash() ==
-///   prev.public_inputs[0..4]`.
-/// - **coin_history carry-over**: the output ProofData's
-///   `coin_history_root` equals `prev.public_inputs[12..16]`.
+/// The proof's history-side fields (SMT inclusion path, MMR inclusion
+/// paths) must be pre-padded to the fixed shape the circuit expects:
+/// - `commitment_proof.siblings.len() == TREE_DEPTH = 256`
+/// - `commitment_root_history_proof.path.len() == MMR_PROOF_PATH_LEN = 31`
+/// - `previous_root_history_proof.1.path.len() == MMR_PROOF_PATH_LEN = 31`
 ///
-/// Stage 5c does NOT enforce SPEC §8 (c)(d)(e) — the
-/// `CommitmentMerkleProofs` predicate proving `prev` was published in
-/// the global history MMR. That landed in Stage 5c+ (see module
-/// docstring).
+/// The `history_root` parameter must be
+/// `mmr.root_extended(MMR_PROOF_PATH_LEN)` for the same MMR depth
+/// (see [`crate::merkle::merkle_mountain_range::MerkleMountainRange::root_extended`]).
 pub fn prove_account_update(
     circuit: &StateTransitionCircuit,
     account_state: &AccountState,
-    history_root: HashOut<F>,
+    history_root: HashDigest,
     prev: &ProofWithPublicInputs<F, C, D>,
+    cmp: &CommitmentMerkleProofs,
 ) -> Result<ProofWithPublicInputs<F, C, D>> {
     let mut pw = PartialWitness::new();
     pw.set_bool_target(circuit.condition, true).unwrap();
     set_account_state_witness(&mut pw, circuit, account_state);
     pw.set_hash_target(circuit.history_root, history_root)
         .unwrap();
+    set_cmp_witness(&mut pw, circuit, cmp);
     pw.set_proof_with_pis_target::<C, D>(&circuit.inner_proof_target, prev)
         .unwrap();
     pw.set_verifier_data_target(&circuit.verifier_data_target, &circuit.data.verifier_only)
@@ -489,10 +686,6 @@ pub fn prove_account_update(
 
 /// Verify a state-transition proof, including the cross-check that its
 /// embedded verifier-data digest matches the circuit's own.
-///
-/// Wraps [`check_cyclic_proof_verifier_data`] (binds the proof to
-/// *this* circuit, not just any circuit with compatible common data)
-/// and [`CircuitData::verify`] (the standard Plonky2 verification path).
 pub fn verify(
     circuit: &StateTransitionCircuit,
     proof: &ProofWithPublicInputs<F, C, D>,
@@ -505,12 +698,15 @@ pub fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::hash_bytes;
+    use crate::hash::{digest_to_bytes, hash_bytes, hash_concat};
+    use crate::inputs::CommitmentMerkleProofs;
+    use crate::merkle::merkle_mountain_range::MerkleMountainRange;
+    use crate::merkle::sparse_merkle_tree::SparseMerkleTree;
     use crate::types::ProofData;
 
     fn dummy_pubkey(seed: u8) -> [u8; 33] {
         let mut pk = [0u8; 33];
-        pk[0] = 0x02; // compressed even-y prefix
+        pk[0] = 0x02;
         for (i, b) in pk.iter_mut().enumerate().skip(1) {
             *b = seed.wrapping_add(i as u8);
         }
@@ -525,112 +721,235 @@ mod tests {
         ProofData::from_field_elements(&pis)
     }
 
-    /// Stage 5c smoke test for the Initial branch: a non-mint account
-    /// with `balance = 0` is accepted. Same shape as the 5b test but
-    /// with `condition` now a free witness rather than pinned.
+    /// Stage 5c+ Initial-side smoke test (unchanged behaviour from 5c):
+    /// a non-mint account with `balance = 0` is accepted, and the
+    /// public-input `ProofData` matches the off-circuit reconstruction.
+    /// The CommitmentMerkleProofs witness is the empty dummy.
     #[test]
-    fn stage_5c_initial_non_mint_zero_balance_accepted() {
+    fn stage_5c_plus_initial_non_mint_zero_balance_accepted() {
         let circuit = build_circuit();
         let account_state = AccountState::new(dummy_pubkey(7));
         assert_ne!(account_state.owner, *MINTING_ADDRESS);
 
-        let history_root = hash_bytes(b"history@5c-init");
+        let history_root = hash_bytes(b"history@5c+-init");
         let proof = prove_initial(&circuit, &account_state, history_root).expect("prove initial");
         verify(&circuit, &proof).expect("verify initial");
-
-        let recovered = pis_as_proof_data(&proof);
-        let expected = ProofData {
-            account_state_hash: account_state.hash(),
-            output_coins_root: DEFAULT_HASHES[0],
-            commitment_history_root: history_root,
-            coin_history_root: DEFAULT_HASHES[0],
-        };
-        assert_eq!(recovered, expected);
-    }
-
-    /// Stage 5c mint exception: an account whose `owner ==
-    /// MINTING_ADDRESS` may carry any starting balance.
-    #[test]
-    fn stage_5c_initial_mint_with_balance_accepted() {
-        let circuit = build_circuit();
-        let mut account_state = AccountState::new(dummy_pubkey(99));
-        account_state.owner = *MINTING_ADDRESS;
-        account_state.balance = 21_000_000_000_000;
-
-        let history_root = hash_bytes(b"history@5c-mint");
-        let proof = prove_initial(&circuit, &account_state, history_root).expect("prove mint");
-        verify(&circuit, &proof).expect("verify mint");
 
         let recovered = pis_as_proof_data(&proof);
         assert_eq!(recovered.account_state_hash, account_state.hash());
         assert_eq!(recovered.coin_history_root, DEFAULT_HASHES[0]);
     }
 
-    /// Stage 5c negative: non-mint account with balance != 0 → rejected
-    /// (mint exception still binds in the Initial branch).
+    /// Mint exception under the masked predicate.
     #[test]
-    fn stage_5c_initial_non_mint_nonzero_balance_rejected() {
+    fn stage_5c_plus_initial_mint_with_balance_accepted() {
+        let circuit = build_circuit();
+        let mut account_state = AccountState::new(dummy_pubkey(99));
+        account_state.owner = *MINTING_ADDRESS;
+        account_state.balance = 21_000_000_000_000;
+
+        let history_root = hash_bytes(b"history@5c+-mint");
+        let proof = prove_initial(&circuit, &account_state, history_root).expect("prove mint");
+        verify(&circuit, &proof).expect("verify mint");
+    }
+
+    /// Mint-exception negative.
+    #[test]
+    fn stage_5c_plus_initial_non_mint_nonzero_balance_rejected() {
         let circuit = build_circuit();
         let mut account_state = AccountState::new(dummy_pubkey(7));
         assert_ne!(account_state.owner, *MINTING_ADDRESS);
         account_state.balance = 1;
 
-        let history_root = hash_bytes(b"history@5c-illegal");
+        let history_root = hash_bytes(b"history@5c+-illegal");
         assert!(prove_initial(&circuit, &account_state, history_root).is_err());
     }
 
-    /// Stage 5c primary test: an Initial → AccountUpdate chain. Builds a
-    /// minting Initial proof, then proves an AccountUpdate that keeps the
-    /// same `account_state` (state continuity holds) and verifies the
-    /// resulting recursive proof. The recursive proof's
-    /// `coin_history_root` must equal the prev's (carry-over).
+    /// Build a `CommitmentMerkleProofs` witness for an Initial → AccountUpdate
+    /// chain on the same account state.
+    ///
+    /// The off-circuit setup mirrors what the server scanner would do:
+    /// 1. Build the commitment value `c = h(asth || ocr)` for the prev proof.
+    /// 2. Build the SMT containing `(pk_hash → c)`.
+    /// 3. Fold the SMT root into the history MMR alongside the empty prev
+    ///    MMR root.
+    /// 4. Build extended MMR proofs (a) and (e) at depth
+    ///    `MMR_PROOF_PATH_LEN`.
+    ///
+    /// Returns `(cmp, extended_history_root)`.
+    fn build_test_commitment_witness(
+        prev_asth: HashDigest,
+        prev_ocr: HashDigest,
+    ) -> (CommitmentMerkleProofs, HashDigest) {
+        // SMT key derived from the prev pubkey hash (placeholder bytes).
+        let pk_hash = hash_bytes(b"5c+-test-pubkey");
+        let pk_key = digest_to_bytes(&pk_hash);
+
+        // Commitment value committed to in the SMT.
+        let commitment = hash_concat(&prev_asth, &prev_ocr);
+
+        let mut smt = SparseMerkleTree::new();
+        smt.insert(pk_key, commitment).unwrap();
+        let smt_root = smt.root();
+        let (smt_inclusion, _) = smt.generate_inclusion_proof(&pk_key).unwrap();
+
+        // History MMR: fold `(smt_root, ZERO_HASH)` as the first leaf.
+        // The bootstrap pattern: Init was proved against the empty
+        // history (`prev.commitment_history_root == ZERO_HASH`), so the
+        // (e) MMR leaf `h(smt_root || prev.commitment_history_root)`
+        // coincides with the (d) MMR leaf `h(smt_root || prev_mmr_root)`.
+        // Both MMR proofs point to the same MMR leaf at index 0.
+        let prev_mmr_root = ZERO_HASH;
+        let mmr_leaf = hash_concat(&smt_root, &prev_mmr_root);
+        let mut mmr = MerkleMountainRange::new();
+        mmr.append(mmr_leaf);
+        let history_root_extended = mmr.root_extended(MMR_PROOF_PATH_LEN);
+        let mmr_proof = mmr.get_proof(0).unwrap().extend_to(MMR_PROOF_PATH_LEN);
+        assert!(mmr_proof.verify(mmr_leaf, history_root_extended));
+
+        let cmp = CommitmentMerkleProofs {
+            commitment_root: smt_root,
+            commitment_proof: smt_inclusion,
+            commitment_root_history_proof: mmr_proof.clone(),
+            commitment_root_mmr_sibling: prev_mmr_root,
+            previous_root_history_proof: (smt_root, mmr_proof),
+            commitment_account_state_hash: prev_asth,
+            commitment_out_coins_root: prev_ocr,
+        };
+        (cmp, history_root_extended)
+    }
+
+    /// Primary 5c+ positive test: an Initial → AccountUpdate chain with a
+    /// real `CommitmentMerkleProofs` witness. The prev proof's commitment
+    /// is published in the SMT, the SMT is folded into the MMR, and the
+    /// AccountUpdate proof verifies the (c)(d)(e) chain in-circuit.
     #[test]
-    fn stage_5c_initial_then_account_update_chain() {
+    fn stage_5c_plus_initial_then_account_update_with_commitment_proofs() {
         let circuit = build_circuit();
 
-        // Initial proof: mint account with non-zero balance.
+        // Initial proof: mint account.
         let mut account_state = AccountState::new(dummy_pubkey(11));
         account_state.owner = *MINTING_ADDRESS;
         account_state.balance = 1_000_000;
 
-        let history_root = hash_bytes(b"history@5c-chain");
-        let init_proof = prove_initial(&circuit, &account_state, history_root).expect("prove init");
+        // Bootstrap pattern: Init commits to the EMPTY history
+        // (`prev.commitment_history_root == ZERO_HASH`); after Init the
+        // server folds its commitment into the MMR, giving the
+        // post-fold `history_root_extended` against which Update is
+        // proved. The fixture matches that exact layout — (e)'s leaf
+        // shape `h(smt_root || ZERO_HASH)` coincides with (d)'s leaf.
+        let prev_asth = account_state.hash();
+        let prev_ocr = DEFAULT_HASHES[0];
+        let (cmp, history_root_extended) = build_test_commitment_witness(prev_asth, prev_ocr);
+
+        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH).expect("prove init");
         verify(&circuit, &init_proof).expect("verify init");
 
-        // AccountUpdate: same account_state (continuity), same history.
-        // Stage 5c does not yet enforce CommitmentMerkleProofs, so the
-        // identical history_root is acceptable here.
-        let update_proof =
-            prove_account_update(&circuit, &account_state, history_root, &init_proof)
-                .expect("prove update");
+        let update_proof = prove_account_update(
+            &circuit,
+            &account_state,
+            history_root_extended,
+            &init_proof,
+            &cmp,
+        )
+        .expect("prove update");
         verify(&circuit, &update_proof).expect("verify update");
 
-        // Carry-over: the update's coin_history_root must equal the
-        // init's coin_history_root (which is DEFAULT_HASHES[0]).
+        // Carry-over: update.coin_history_root == init.coin_history_root.
         let init_pd = pis_as_proof_data(&init_proof);
         let update_pd = pis_as_proof_data(&update_proof);
         assert_eq!(update_pd.coin_history_root, init_pd.coin_history_root);
         assert_eq!(update_pd.account_state_hash, account_state.hash());
+        assert_eq!(update_pd.commitment_history_root, history_root_extended);
     }
 
-    /// Stage 5c negative: AccountUpdate where the current account_state
+    /// Stage 5c+ negative: AccountUpdate where the current account_state
     /// hashes to something different from prev's `account_state_hash` →
-    /// rejected by the state-continuity constraint.
+    /// rejected by (b).
     #[test]
-    fn stage_5c_account_update_state_discontinuity_rejected() {
+    fn stage_5c_plus_account_update_state_discontinuity_rejected() {
         let circuit = build_circuit();
 
-        // Build a prev proof for one account_state.
         let mut prev_state = AccountState::new(dummy_pubkey(42));
         prev_state.owner = *MINTING_ADDRESS;
         prev_state.balance = 500;
-        let history_root = hash_bytes(b"history@5c-disc");
-        let prev_proof =
-            prove_initial(&circuit, &prev_state, history_root).expect("prove prev init");
 
-        // Try to update with a DIFFERENT account_state. Continuity must fail.
+        let prev_asth = prev_state.hash();
+        let (cmp, history_root_extended) =
+            build_test_commitment_witness(prev_asth, DEFAULT_HASHES[0]);
+        let prev_proof = prove_initial(&circuit, &prev_state, ZERO_HASH).expect("prove prev init");
+
+        // Try to update with a DIFFERENT account_state.
         let mut next_state = prev_state.clone();
-        next_state.balance += 1; // changes account_state_hash
-        assert!(prove_account_update(&circuit, &next_state, history_root, &prev_proof).is_err());
+        next_state.balance += 1;
+        assert!(prove_account_update(
+            &circuit,
+            &next_state,
+            history_root_extended,
+            &prev_proof,
+            &cmp
+        )
+        .is_err());
+    }
+
+    /// Stage 5c+ negative (c): AccountUpdate where mp.commitment_account_state_hash
+    /// is lied about so it no longer matches `account_state.hash()`.
+    #[test]
+    fn stage_5c_plus_account_update_wrong_commitment_account_state_hash_rejected() {
+        let circuit = build_circuit();
+
+        let mut account_state = AccountState::new(dummy_pubkey(123));
+        account_state.owner = *MINTING_ADDRESS;
+        account_state.balance = 1;
+
+        let true_asth = account_state.hash();
+        let (mut cmp, history_root_extended) =
+            build_test_commitment_witness(true_asth, DEFAULT_HASHES[0]);
+
+        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH).expect("prove init");
+
+        // Mutate ONLY the witnessed commitment_account_state_hash; leave
+        // the SMT (which still contains the honest commitment) intact.
+        // (c) catches the mismatch via the masked equality constraint.
+        cmp.commitment_account_state_hash = hash_bytes(b"lying-asth");
+
+        assert!(prove_account_update(
+            &circuit,
+            &account_state,
+            history_root_extended,
+            &init_proof,
+            &cmp
+        )
+        .is_err());
+    }
+
+    /// Stage 5c+ negative (d): AccountUpdate where the SMT inclusion path
+    /// has been tampered with. (d) catches it via `connect_hashes`.
+    #[test]
+    fn stage_5c_plus_account_update_tampered_smt_path_rejected() {
+        let circuit = build_circuit();
+
+        let mut account_state = AccountState::new(dummy_pubkey(77));
+        account_state.owner = *MINTING_ADDRESS;
+        account_state.balance = 1;
+
+        let true_asth = account_state.hash();
+        let (mut cmp, history_root_extended) =
+            build_test_commitment_witness(true_asth, DEFAULT_HASHES[0]);
+
+        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH).expect("prove init");
+
+        // Tamper a sibling deep in the SMT path — the computed
+        // commitment_root will differ from the witnessed one.
+        cmp.commitment_proof.siblings[0] = hash_bytes(b"lying-sibling");
+
+        assert!(prove_account_update(
+            &circuit,
+            &account_state,
+            history_root_extended,
+            &init_proof,
+            &cmp
+        )
+        .is_err());
     }
 }

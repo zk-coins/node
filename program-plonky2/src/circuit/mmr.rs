@@ -19,27 +19,23 @@ use plonky2::plonk::circuit_builder::CircuitBuilder;
 
 use super::util::swap_if;
 
-/// Verify an MMR inclusion proof in-circuit.
+/// Compute the MMR root from an inclusion proof in-circuit, without
+/// constraining it to any expected root. Caller is responsible for
+/// connecting the returned `HashOutTarget` to its expected value.
 ///
-/// Adds constraints that fail the proof unless `leaf` hashes up through
-/// `path` (with sibling ordering driven by the LSB-first bits of `index`)
-/// to `expected_root`.
-///
-/// `index_bits` is a pre-split bit-decomposition of the index. The caller
-/// is responsible for ensuring its length matches `path.len()` and that
-/// the bits are valid (i.e. each is constrained to `{0, 1}` — which
-/// `builder.split_le(...)` guarantees).
-pub fn verify_mmr_inclusion<F: RichField + Extendable<D>, const D: usize>(
+/// `index_bits` must have the same length as `path` and represent the
+/// LSB-first bit decomposition of the leaf's index (within the
+/// fixed-shape MMR depth chosen by the caller).
+pub fn mmr_inclusion_root<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
     leaf: HashOutTarget,
     index_bits: &[BoolTarget],
     path: &[HashOutTarget],
-    expected_root: HashOutTarget,
-) {
+) -> HashOutTarget {
     assert_eq!(
         index_bits.len(),
         path.len(),
-        "verify_mmr_inclusion: index_bits and path must have equal length"
+        "mmr_inclusion_root: index_bits and path must have equal length"
     );
     let mut current = leaf;
     for (bit, sibling) in index_bits.iter().zip(path.iter()) {
@@ -49,6 +45,22 @@ pub fn verify_mmr_inclusion<F: RichField + Extendable<D>, const D: usize>(
         input.extend_from_slice(&right.elements);
         current = builder.hash_n_to_hash_no_pad::<PoseidonHash>(input);
     }
+    current
+}
+
+/// Verify an MMR inclusion proof in-circuit.
+///
+/// Adds constraints that fail the proof unless `leaf` hashes up through
+/// `path` (with sibling ordering driven by the LSB-first bits of `index`)
+/// to `expected_root`.
+pub fn verify_mmr_inclusion<F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
+    leaf: HashOutTarget,
+    index_bits: &[BoolTarget],
+    path: &[HashOutTarget],
+    expected_root: HashOutTarget,
+) {
+    let current = mmr_inclusion_root(builder, leaf, index_bits, path);
     builder.connect_hashes(current, expected_root);
 }
 
