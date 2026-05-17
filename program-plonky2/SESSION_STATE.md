@@ -5,29 +5,54 @@ left off.
 
 ## Current branch + HEAD
 
-`feat/plonky2-migration`, latest commit: `a29bde7` (Step 7 estimate
-re-scoped to ~2 d after a cutover attempt surfaced semantic
-mismatches). The full set of stage-5 + step-6 + step-7-prep commits
-is enumerated in [`../ROADMAP.md`](../ROADMAP.md) under the **Done**
-section.
+`feat/plonky2-migration`, latest commit: `00adbb4` (Step 7
+workspace + server-side migration; Prover-API integration in
+`send_coins` deferred to post-merge of Stage 5d-next-5). The full
+set of commits is enumerated in [`../ROADMAP.md`](../ROADMAP.md)
+under the **Done** section.
 
-## Step status summary (2026-05-17 evening, end of session)
+## Step status summary (end of 2026-05-17 session)
 
 - Steps 1–4: ✅ done
 - Step 5 (monolithic circuit, Stage 5d-next-3): ✅ done; 107 tests
-  total (103 original + 4 new save/load + missing-path), all
-  passing in 198 s wall (multi-threaded `cargo test --release --lib`)
+  total, all passing in 198 s wall
 - Step 5d-next-4 (source-side cyclic verify): 🚫 **deferred to
-  post-MVP Stage 5d-next-5** — attempted, see MIGRATION_RESEARCH §7.21
-  for the two Plonky2 1.1.0 blockers (`_or_dummy` ConstantGate
-  mismatch + in-circuit data-only `goal_data != common` mismatch)
+  Stage 5d-next-5** — being worked on **in parallel** on branch
+  `feat/plonky2-5d-next-4-aggregator` per
+  [zk-coins/server#19](https://github.com/zk-coins/server/issues/19)
 - Step 6 (script-plonky2 prover host wrapper): ✅ done (`d96bb62`)
-- Step 7 prep (serde derives + persistence helpers): ✅ done
-  (`b76bd39`); remaining work re-scoped to ~2 d after a cutover
-  attempt found 4 semantic mismatches beyond mere "mechanical
-  renames" — see [`STEP7_PREP.md`](STEP7_PREP.md) "Semantic
-  mismatches that the original inventory missed"
+- Step 7 (server replacement): 🟡 **mostly done** (`00adbb4`).
+  Workspace toolchain unified to nightly. `program/` + `script/`
+  deleted. shared + server fully migrated to Plonky2-era modules
+  with HashDigest type-shift handled at all boundaries. 31 server
+  tests passing. **`account_server::send_coins` Prover-API
+  integration deferred** until Stage 5d-next-5 merges — wrapped
+  in `unimplemented!` with TODO marker, ~0.5 d to complete.
 - Steps 8–9: ⏳ todo (1–2 d + 3–5 d)
+
+## Active parallel work
+
+Stage 5d-next-5 (source-side verification via aggregator pattern)
+is being implemented in **another Claude session** on a separate
+branch `feat/plonky2-5d-next-4-aggregator` (issue
+[zk-coins/server#19](https://github.com/zk-coins/server/issues/19)).
+
+That session's scope is hermetic to `program-plonky2/src/circuit/`
++ new `source_aggregator.rs` + new `STAGE_5D_NEXT_5_AGGREGATOR.md`.
+It is forbidden from touching ROADMAP.md / SESSION_STATE.md /
+STEP7_PREP.md / MIGRATION_RESEARCH.md / server/ / shared/ /
+root Cargo.toml / rust-toolchain to avoid merge conflicts.
+
+After that branch lands, the main session integrates:
+1. Rebase parallel branch onto current HEAD.
+2. Update `script-plonky2/src/lib.rs` Prover wrapper to expose the
+   new aggregator construction API.
+3. Wire `account_server::send_coins` to the new Prover API
+   (replacing the `unimplemented!` block introduced in `00adbb4`).
+4. Re-enable `account_server_tests` + `server_tests` modules.
+5. Run `cargo llvm-cov --fail-under-lines 100 -- --test-threads=1`.
+6. Fold `STAGE_5D_NEXT_5_AGGREGATOR.md` into
+   `MIGRATION_RESEARCH.md §7.22`.
 
 ## What works end-to-end
 
