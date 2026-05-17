@@ -4,7 +4,7 @@ This document specifies the zkCoins state-transition circuit (currently implemen
 
 > **Scope note.** This spec describes the **zkCoins MVP variant** of the Shielded CSV protocol, not the paper as published. It deliberately departs from [eprint 2025/068](https://eprint.iacr.org/2025/068) in 11 concrete ways — see §15 "Divergences from Shielded CSV (paper)" below, and [`MIGRATION_RESEARCH.md`](./MIGRATION_RESEARCH.md) for full analysis against the upstream reference implementation at [`ShieldedCSV/ShieldedCSV`](https://github.com/ShieldedCSV/ShieldedCSV).
 >
-> **New here?** Start with [`CLAUDE.md`](./CLAUDE.md) for the project invariants, decision recipe, and reading order. This spec is the *what*; CLAUDE is the *how to navigate*.
+> **New here?** Start with [`CONTRIBUTING.md`](./CONTRIBUTING.md) § "Working on the Plonky2 Migration" for the project invariants, decision recipe, and reading order. This spec is the *what*; CONTRIBUTING is the *how to navigate*.
 
 The reference implementation lives in:
 

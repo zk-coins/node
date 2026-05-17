@@ -2,6 +2,149 @@
 
 This guide covers everything you need to develop, test, and deploy the zkCoins backend.
 
+If you arrived here while working on the `feat/plonky2-migration` branch (or any of its successors), read § "Working on the Plonky2 Migration" *first* — it covers project invariants, the decision recipe for "should this go in the MVP?", a pre-push checklist, and the known foot-guns. The rest of this file is the long-standing dev guide for the `develop`/SP1 branch.
+
+---
+
+## Working on the Plonky2 Migration
+
+Canonical entry point for any session (agent or human) picking up the
+`feat/plonky2-migration` branch without prior context. Read this section,
+then dive into the linked documents in the order given below.
+
+### Reading order
+
+1. **This section** — invariants, decision recipe, gates.
+2. **[`ROADMAP.md`](./ROADMAP.md)** — live status table, per-step plans,
+   effort, risk register, post-MVP Plonky3 path.
+3. **[`SPEC.md`](./SPEC.md)** — what the protocol *does*. Glossary,
+   divergences from the paper (§15), full circuit spec.
+4. **[`MIGRATION_RESEARCH.md`](./MIGRATION_RESEARCH.md)** — why we
+   chose what we chose. §3 (11 divergences), §5 (6 locked-in design
+   decisions), **§7 Lessons Learned** (11 gotchas — required reading
+   before touching the affected code areas).
+5. **[`program-plonky2/CONTRIBUTING.md`](./program-plonky2/CONTRIBUTING.md)**
+   — operational handoff for the migration crate: toolchain,
+   build/test/lint, coverage gate, gadget-authoring pattern.
+
+### Project invariants (non-negotiable)
+
+The five constraints below are decided and apply across every PR on
+this migration branch.
+
+1. **Server-side compute architecture.** The server generates every ZK
+   proof, holds every Merkle tree, broadcasts every Taproot inscription.
+   The wallet holds only the user's private key and signs BIP-340 Schnorr
+   over `SHA256(serialize(asth) ‖ serialize(ocr))`. No in-browser
+   Poseidon, no wasm-Plonky2 verifier, no in-app ZK gadget.
+2. **Closed test environment** — DEV *and* PRD. No external users, no
+   real money, no migration of existing state. Step 7 of the ROADMAP
+   deletes the SP1 path outright; no Cargo feature flag, no dual
+   backend. On cutover the server state files are wiped and the new
+   Plonky2 server starts fresh.
+3. **Hardware target: Mac Studio M3 Ultra, 96 GB unified RAM, single
+   host.** All on-box compute resources are available (Performance +
+   Efficiency cores, the integrated Apple GPU reachable via Metal,
+   Neural Engine, AMX). **No external hardware** (no NVIDIA, no CUDA,
+   no GPU farms). **No external cloud proving services** (no Succinct
+   Prover Network, no AWS GPU, no Lambda Labs). Note: Plonky2 today
+   has no Metal backend, so the integrated GPU is effectively idle for
+   proving — that's a library property, not a constraint we imposed.
+   Performance budget: warm proof ≤ 5 s (target ≤ 1 s), cold-start
+   ≤ 30 s, memory peak < 64 GB.
+4. **MVP = minimal feature surface + 100% test coverage.** Simultaneous,
+   not alternative. "Minimal" reduces the surface; "100%" keeps what
+   remains clean. Gate: `cargo llvm-cov --fail-under-lines 100 -- --test-threads=1`
+   from inside the affected crate. Current state on `program-plonky2`:
+   100% lines / functions / regions, 64 tests.
+5. **Plonky2 is bridge tech; Plonky3 is the long-term destination.**
+   But we do not preemptively adopt BabyBear / Poseidon2 inside this
+   migration — see `MIGRATION_RESEARCH.md` §5 (decisions) and ROADMAP
+   "Considered alternative".
+
+### Decision recipe — should this go in the MVP?
+
+Run this checklist in order on every proposed change. Stop at the
+first "no".
+
+1. **Is X on the critical path for the one-shot user loop?** (create
+   account → mint → send → receive → balance) If no, defer to post-MVP.
+2. **Does X compromise invariant 1 (server-side compute)?** If yes,
+   redesign so all heavy compute is server-side.
+3. **Does X require external hardware or cloud services (invariant 3)?**
+   If yes, redesign.
+4. **Does X assume migration logic (invariant 2)?** If yes, redesign
+   to "replace not migrate" or defer until mainnet launch.
+5. **Can X be tested to 100% coverage including negative paths
+   (invariant 4)?** If not, refactor or gate behind a Cargo feature.
+6. **Does X drift from the divergence list (`SPEC.md` §15)?** If yes,
+   updating the divergence list is part of the PR.
+
+If all six pass, X enters the MVP. Update `ROADMAP.md` Status-at-a-Glance
+and the relevant `### Step N` section *in the same PR*.
+
+### Pre-push checklist
+
+From inside the affected crate (use `program-plonky2/` for the
+migration code; workspace root for `program`/`server`/`shared`/`script`):
+
+```bash
+cargo build
+cargo test -- --test-threads=1
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo llvm-cov --fail-under-lines 100 -- --test-threads=1   # only for program-plonky2 currently
+```
+
+All five must pass. After push, poll CI until it goes green; if red,
+investigate and fix — never abandon a red CI run.
+
+### Branch hygiene
+
+- No force-pushes, even to side branches.
+- No `--no-verify` on commits.
+- No squashing by the agent — Cyrill squashes at merge time if needed.
+- Cyrill merges PRs; agents open them as drafts.
+- Doc-only commits to `ROADMAP.md` / `SPEC.md` / `MIGRATION_RESEARCH.md`
+  / `CONTRIBUTING.md` / `program-plonky2/CONTRIBUTING.md` that just
+  correct or extend these files are not individually listed in
+  `ROADMAP.md` "Done" — they're in `git log`.
+
+### Where to put new knowledge
+
+When you discover a new gotcha or take a new decision, the right home is:
+
+| Type of knowledge | Where |
+| --- | --- |
+| Protocol-level fact (circuit invariant, public-input change) | `SPEC.md` |
+| Why we chose / didn't choose something | `MIGRATION_RESEARCH.md` §5 or §7 |
+| New status / step / risk | `ROADMAP.md` |
+| Toolchain or workflow detail for the migration crate | `program-plonky2/CONTRIBUTING.md` |
+| Cross-cutting invariant for the whole project | This section |
+
+Don't duplicate prose across files — the second copy will drift.
+Link from one to the other.
+
+### Common foot-guns (already encountered)
+
+Condensed pointers into [`MIGRATION_RESEARCH.md`](./MIGRATION_RESEARCH.md) §7:
+
+1. Don't seed `DEFAULT_HASHES[TREE_DEPTH]` with `ZERO_HASH` in
+   Poseidon SMTs — structural collision (§7.1).
+2. `pw.set_target(t, v)` returns `Result` in plonky2 1.x — must
+   handle (§7.3).
+3. Pack 7 bytes per Goldilocks element, never 8 — modulus safety (§7.4).
+4. Defensive bounds checks: use `Option::get().copied().unwrap_or(...)`,
+   not explicit `if/else` — keeps coverage at 100% (§7.9).
+5. Every `#[cfg(test)] mod tests` needs `#[cfg_attr(coverage_nightly, coverage(off))]` (§7.10).
+6. No external GPU / cloud assumption in performance plans — single
+   Mac Studio M3 Ultra (§7.11).
+7. Kill orphan `cargo test` binaries after long circuit-test runs —
+   they leak 30+ GB of swap (§7.6).
+8. `gh` in background tasks needs `--repo <owner>/<repo>` (§7.7).
+
+---
+
 ## Quick Start
 
 ```bash
