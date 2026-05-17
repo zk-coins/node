@@ -100,10 +100,10 @@ exhaustive history.
 - [`57cdce4`](./../../commit/57cdce4) — docs: migration research
 - [`496c652`](./../../commit/496c652) — docs: circuit specification
 
-**Test count on this branch:** 92 (all green on nightly-2025-04-15).
+**Test count on this branch:** 98 (all green on nightly-2025-04-15).
 Breakdown: `prelude` 1 · `hash` 5 · `merkle::smt` 19 · `merkle::mmr` 14 ·
 `types` 10 · `inputs` 5 · `circuit::mmr` 5 · `circuit::smt` 12 ·
-`circuit::main` 21.
+`circuit::main` 27.
 
 **Coverage:** **100% lines, 100% functions, 100% regions** on `program-plonky2/`
 as measured by `cargo llvm-cov --fail-under-lines 100`. Test modules
@@ -209,35 +209,78 @@ stages so each lands as its own reviewable commit on the branch):
   and prove confirmed for `stage_5d_initial_with_one_active_in_coin`
   (188s wall).
 
-- **5d-next-3 — source-side verification for in-coins** ⏳ (heaviest).
-  Each in-coin requires recursively verifying its source proof
-  (another `StateTransitionCircuit` instance), then asserting SPEC §8:
-  `cp.output_coins_root` contains `coin.identifier` (SMT inclusion);
-  `cp.commitment_history_root` is a prefix of current `history_root`
-  (a CommitmentMerkleProofs (d)+(e) instance per in-coin);
-  `cp.output_coins_root == mp.commitment_out_coins_root`. Requires
-  multiple `conditionally_verify_cyclic_proof_or_dummy` calls — the
-  Plonky2 1.1.0 cyclic-recursion machinery accepts only one inner
-  proof per call, so we either iterate it `MAX_IN_COINS + 1` times
-  (once for prev_account, once per in-coin) or fold all inner proofs
-  through a recursive aggregator first. `common_data_for_recursion_c`
-  shape must match the outer circuit's actual verify_proof count;
-  scale the helper accordingly.
-- **5e — negative tests from SPEC §13** ✅ partial (subset of 11
-  covered against the current circuit). Four new in this revision:
-  `stage_5e_account_update_tampered_mmr_a_path_rejected`,
-  `stage_5e_account_update_tampered_mmr_b_path_rejected`,
-  `stage_5e_account_update_wrong_mmr_sibling_rejected`,
-  `stage_5e_account_update_wrong_history_root_rejected`. The
-  remaining §13 invariants (double-spend, identifier-mismatch,
-  overflow/underflow on amounts, wrong vk) **require** the deferred
-  5d+ machinery (source verification, apply_coin, out_coins) and land
-  with it. Already-covered SPEC §13 items via earlier stages:
-  Initial non-mint balance != 0 → rejected (5c+), Initial mint
-  accepted (5b/5c+), account-update mismatched state hash → rejected
-  (5c+), prev's commitment_history_root not in current MMR → rejected
-  (the four 5e tests above), input-coin double-spend or wrong
-  identifier — DEFERRED.
+- **5d-next-3 — out-coins processing** ✅ done in this revision.
+  `MAX_OUT_COINS = 1` slot reserved (mechanical bump to 8 later).
+  Per slot witnesses: `active`, `out_coin_identifier`,
+  `out_coin_amount_lo/hi`, `nip_path`. Per slot constraints (masked
+  by `active`):
+  - SMT non-inclusion + insert into `running_output_coins_root`
+    (mirroring the in-coins coin_history pattern, but for the new
+    `output_coins_root`).
+  - Balance subtraction with **underflow check** via
+    `split_le(diff, 64)` (vs. overflow check `split_le(sum, 33)` for
+    in-coins addition).
+  - `out_coin_identifier == Poseidon(interim_account_state_hash ||
+    u32(slot_index))` — mirrors off-circuit
+    [`crate::types::calculate_coin_identifier`].
+
+  Pubkey rotation: new `next_public_key_limbs` witness. The FINAL
+  `account_state_hash` (committed as `ProofData.account_state_hash`)
+  uses the NEW pubkey; the interim hash (used for identifier
+  derivation) uses the INITIAL pubkey, per SPEC §8 step 3 ordering.
+
+  API: new `prove_initial_with_in_and_out_coins` /
+  `prove_account_update_with_in_and_out_coins` for full caller
+  control. The existing `prove_initial` / `prove_account_update`
+  wrappers default `next_public_key = account_state.public_key`
+  (no rotation) and all-inactive out-coin slots.
+
+  Tests: positive `stage_5d_next_3_initial_with_one_active_out_coin`
+  (one out-coin emits, balance decreases by amount, pubkey rotates,
+  output_coins_root matches off-circuit insert); two negatives
+  (wrong identifier, underflow); two panic guards (nip-path length,
+  out-slot count).
+
+- **5d-next-4 — source-side verification for in-coins** ⏳ (heaviest
+  remaining). Each in-coin requires recursively verifying its source
+  proof (another `StateTransitionCircuit` instance), then asserting
+  SPEC §8: `cp.output_coins_root` contains `coin.identifier` (SMT
+  inclusion); `cp.commitment_history_root` is a prefix of current
+  `history_root` (a CommitmentMerkleProofs (d)+(e) instance per
+  in-coin); `cp.output_coins_root == mp.commitment_out_coins_root`.
+  Requires multiple `conditionally_verify_cyclic_proof_or_dummy`
+  calls — the Plonky2 1.1.0 cyclic-recursion machinery accepts only
+  one inner proof per call, so we either iterate it `MAX_IN_COINS +
+  1` times (once for prev_account, once per in-coin) or fold all
+  inner proofs through a recursive aggregator first.
+  `common_data_for_recursion_c` shape must match the outer circuit's
+  actual verify_proof count; scale the helper accordingly.
+- **5e — negative tests from SPEC §13** ✅ done for everything the
+  current circuit can express (1 of 11 still pending the deferred
+  5d-next-4 source verification). Covered:
+  - Initial non-mint balance ≠ 0 → rejected (`stage_5c_plus_initial_non_mint_nonzero_balance_rejected`).
+  - Initial mint accepted (`stage_5c_plus_initial_mint_with_balance_accepted`, returns coin_history_root = DEFAULT_HASHES[0]).
+  - Account update mismatched state hash → rejected (`stage_5c_plus_account_update_state_discontinuity_rejected`).
+  - Prev's commitment_history_root not in current MMR → 4 tests:
+    `stage_5e_account_update_tampered_mmr_a_path_rejected`,
+    `stage_5e_account_update_tampered_mmr_b_path_rejected`,
+    `stage_5e_account_update_wrong_mmr_sibling_rejected`,
+    `stage_5e_account_update_wrong_history_root_rejected`.
+  - Double-spend (same in-coin twice in coin_history) → rejected
+    (`stage_5e_double_spend_same_coin_twice_rejected`).
+  - Out-coin identifier mismatch → rejected
+    (`stage_5d_next_3_initial_out_coin_wrong_identifier_rejected`).
+  - Sum of outputs > balance (underflow) → rejected
+    (`stage_5d_next_3_initial_out_coin_underflow_rejected`).
+  - Sum of input amounts overflow → rejected
+    (`stage_5d_initial_in_coin_overflow_rejected`).
+  - Wrong recipient on in-coin → rejected
+    (`stage_5d_initial_in_coin_wrong_recipient_rejected`).
+
+  **Still deferred** (depends on 5d-next-4 source verification):
+  - Input coin whose source-proof is not in commitment history.
+  - Input coin whose identifier is not in source's `output_coins_root`.
+  - Wrong `vk` on recursive source proof.
 
   Original (pre-stage-5b) wording: Overflow, underflow,
   wrong vk, double-spend, wrong identifier, mismatched
