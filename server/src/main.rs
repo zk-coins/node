@@ -47,6 +47,26 @@ lazy_static::lazy_static! {
         EsploraConfig { url, is_mainnet, network_name }
     };
 
+    // Domain used by the client to render `<hex|username>@<domain>`. Distinct
+    // from `network_name` because the same Bitcoin network (e.g. Mutinynet)
+    // is served from two isolated test worlds (`dev.zkcoins.app`,
+    // `zkcoins.app`) — the client needs the stage's external hostname, not
+    // the chain identifier.
+    //
+    // Required (no default). A silent fallback would let a misconfigured
+    // DEV image report the PRD domain and reproduce the cross-network
+    // routing bug this whole envelope exists to fix (see issue #95). PRD
+    // must set `USERNAME_DOMAIN=zkcoins.app` explicitly; DEV sets
+    // `USERNAME_DOMAIN=dev.zkcoins.app`.
+    pub static ref USERNAME_DOMAIN: String = {
+        let domain = std::env::var("USERNAME_DOMAIN").expect(
+            "USERNAME_DOMAIN env var must be set (e.g. `zkcoins.app` on PRD, \
+             `dev.zkcoins.app` on DEV) — see #95 for the cross-network rationale",
+        );
+        println!("Username domain: {}", domain);
+        domain
+    };
+
     pub static ref PUBLISHER_KEY: String = {
         let key = std::env::var("PUBLISHER_KEY")
             .unwrap_or_else(|_| DEFAULT_PUBLISHER_KEY.to_string());

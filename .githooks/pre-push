@@ -22,6 +22,10 @@ set -euo pipefail
 # whatever the dev has in .envrc / direnv.
 export SP1_PROVER="${SP1_PROVER:-mock}"
 export ESPLORA_URL="${ESPLORA_URL:-http://127.0.0.1:1/api}"
+# `USERNAME_DOMAIN` is required by the server bootstrap (no default —
+# see main.rs and #95). The test value is irrelevant for the
+# `info_returns_*` assertions (they only check non-empty + shape).
+export USERNAME_DOMAIN="${USERNAME_DOMAIN:-test.zkcoins.local}"
 
 echo "[pre-push] cargo fmt --all --check"
 cargo fmt --all --check
