@@ -2186,6 +2186,43 @@ fn map_send_coins_error_insufficient_funds_is_422() {
 }
 
 #[test]
+fn map_send_coins_error_unable_to_get_merkle_proofs_is_422() {
+    // Reachable from send_coins via the prev_commitment_pubkey path
+    // (account_server::get_merkle_proofs:224). Caller supplied a
+    // public_key that has no associated commitment proof in state.
+    let (status, body) =
+        crate::server::map_send_coins_error("Unable to get merkle proofs for provided public key");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body, "Unable to get merkle proofs for provided public key");
+}
+
+#[test]
+fn map_send_coins_error_unable_to_get_mmr_inclusion_proof_is_422() {
+    // Reachable from send_coins via get_merkle_proofs (account_server::236).
+    // Caller's previous_proof references a history root the server's MMR
+    // hasn't observed yet — stale snapshot, caller-fixable.
+    let (status, body) = crate::server::map_send_coins_error(
+        "Unable to get mmr inclusion proof for the previous root",
+    );
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        body,
+        "Unable to get mmr inclusion proof for the previous root"
+    );
+}
+
+#[test]
+fn map_send_coins_error_proof_public_inputs_too_short_is_500() {
+    // Reachable from send_coins via get_merkle_proofs (account_server::232).
+    // The proof bytes stored against the account are too short to
+    // decode N_PROOF_DATA_PUBLIC_INPUTS field elements — server-side
+    // corruption or version mismatch, not caller-fixable.
+    let (status, body) = crate::server::map_send_coins_error("Proof public_inputs too short");
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body, "Proof public_inputs too short");
+}
+
+#[test]
 fn map_send_coins_error_phase_2b_shim_in_coin_not_in_source_ocr_is_422() {
     let (status, body) =
         crate::server::map_send_coins_error("In-coin not present in source's output_coins_root");

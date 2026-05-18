@@ -57,23 +57,31 @@ Tests, Analyze rust, Analyze actions, CodeQL, Coverage MVP scope).
 
 ## Active parallel work
 
-None as of the post-PR-#26-merge state. Stage 5d-next-5 + the Step 7
-in-circuit send_coins follow-up are both landed.
+None. PR #31 (Issue #28 housekeeping) addresses all four deferred
+follow-ups (HTTP error mapping + CI coverage exclusions + CI cyclic
+tests + doc fold). Once PR #31 merges into `feat/plonky2-migration`,
+this section reflects the post-merge state.
 
-Remaining MVP-adjacent follow-ups (open, not blocking the user loop):
+Closed follow-ups (all landed in PR #31):
 
-1. Drop the temporary CI coverage exclusions for `account_server.rs`
-   + `server.rs` now that the in-circuit `send_coins` wiring is in
-   and brings the previously-excluded surface back under the
-   coverage gate.
-2. Optional: include the Stage 5d-next-5 cyclic tests in CI by
-   removing `--skip stage_5d --skip stage_5e` and bumping the
-   `tests` job's `timeout-minutes` from 30 to ~120 (current local
-   wall is ~42 min on M3 with `--test-threads=2`, so single-threaded
-   on `ubuntu-latest` is ~80–120 min).
-3. ✅ done — aggregator-pattern write-up folded into
-   [`../MIGRATION_RESEARCH.md` §7.22](../MIGRATION_RESEARCH.md#722-stage-5d-next-5-source-side-verification-via-aggregator-pattern--codified-resolves-721)
-   in the Issue #28 housekeeping pass; standalone tracker file deleted.
+1. ✅ done — `/api/send` + `/api/mint` switched from `200 OK +
+   success:false` to `4xx/5xx + body.error` via the new
+   `map_send_coins_error` helper. 14 unit tests pin every documented
+   `send_coins` error string to its `(StatusCode, body)` pair.
+   See PR #31 commit `feat(api): replace 200+success:false ...`.
+2. ✅ done — the workflow's `--ignore-filename-regex` already drops
+   `account_server.rs` + `server.rs` (Issue #28's snapshot of the
+   exclusion list was stale at the file level). Local `cargo
+   llvm-cov` with the current exclusion list passes at 100% lines /
+   100% functions; no tactical `#[coverage(off)]` annotations
+   needed.
+3. ✅ done — `tests` job runs the full Stage 5c+/5d/5d-next-3/
+   5d-next-5/5e cyclic sweep (`--skip stage_5*` flags removed).
+   `timeout-minutes` bumped 75 → 180 to fit ~125–165 min worst-case
+   wall on `ubuntu-latest`.
+4. ✅ done — aggregator-pattern write-up folded into
+   [`../MIGRATION_RESEARCH.md` §7.22](../MIGRATION_RESEARCH.md#722-stage-5d-next-5-source-side-verification-via-aggregator-pattern--codified-resolves-721);
+   standalone tracker file deleted.
 
 ## What works end-to-end
 

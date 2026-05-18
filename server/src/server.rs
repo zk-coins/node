@@ -243,6 +243,26 @@ pub(crate) fn map_send_coins_error(err: &str) -> (StatusCode, &'static str) {
             "prev_commitment_pubkey required for account update",
         ),
         "Insufficient funds" => (StatusCode::UNPROCESSABLE_ENTITY, "Insufficient funds"),
+        // `get_merkle_proofs` failures — reachable from `send_coins`
+        // via the `prev_commitment_pubkey` path. The client supplied
+        // the wrong public key, or the previous proof references a
+        // history root the server hasn't seen yet (stale snapshot).
+        // Both are caller-fixable, hence 422 rather than 500.
+        "Unable to get merkle proofs for provided public key" => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Unable to get merkle proofs for provided public key",
+        ),
+        "Unable to get mmr inclusion proof for the previous root" => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Unable to get mmr inclusion proof for the previous root",
+        ),
+        // Truncated proof public-inputs vector — the proof stored on
+        // the account is corrupt or was produced by an incompatible
+        // build of the prover. Not caller-fixable; surfaces as 500.
+        "Proof public_inputs too short" => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Proof public_inputs too short",
+        ),
         "In-coin not present in source's output_coins_root" => (
             StatusCode::UNPROCESSABLE_ENTITY,
             "In-coin not present in source's output_coins_root",
