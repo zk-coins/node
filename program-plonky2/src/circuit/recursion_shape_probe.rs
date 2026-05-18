@@ -18,11 +18,15 @@
 use plonky2::field::types::Field;
 use plonky2::gates::constant::ConstantGate;
 use plonky2::gates::noop::NoopGate;
+use plonky2::hash::hash_types::HashOutTarget;
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::{CircuitConfig, CommonCircuitData};
 use plonky2::recursion::dummy_circuit::dummy_circuit;
 
-use crate::circuit::source_aggregator::build_source_aggregator_circuit;
+use crate::circuit::main::{MAX_IN_COINS, N_PROOF_DATA_PUBLIC_INPUTS};
+use crate::circuit::source_aggregator::{
+    build_source_aggregator_circuit, N_ST_VK_DIGEST_PIS, PER_SLOT_PIS,
+};
 use crate::{C, D, F};
 
 /// Inner-circuit pad-bits Stage 5d-next-3 ships with.
@@ -250,4 +254,221 @@ fn dump_pass_3_gates_lists_for_inspection() {
     println!(
         "\n=== summary === baseline_ok={ok_baseline}, 2v_14={ok_2v_14}, 2v_14_with_constant_gate={ok_2v_14_cg}"
     );
+}
+
+/// Minimal outer that mimics the Phase-2a structure WITHOUT the
+/// Stage 5d-next-3 constraint gates (SMT/CMP/in-coin/out-coin) — just
+/// the new bits: PI registration, `verify_proof(aggregator)`,
+/// `connect_hashes` for vk binding, explicit `ConstantGate` injection,
+/// and the cyclic `_or_dummy` at the end. Used by the diagnostic
+/// below to identify which `CommonCircuitData` axis diverges between
+/// helper-pass-3 and outer's actual built common.
+///
+/// `common_data` is the helper-pass-3 output that the `_or_dummy`
+/// call uses as its goal data. The test below extracts the actual
+/// outer.common via `try_build_with_options` and diffs against it.
+fn build_minimal_outer_for_diagnostic(
+    aggregator_data: &plonky2::plonk::circuit_data::CircuitData<F, C, D>,
+    mut common_data: CommonCircuitData<F, D>,
+) -> (CommonCircuitData<F, D>, CommonCircuitData<F, D>, bool) {
+    let config = CircuitConfig::standard_recursion_config();
+    let mut builder = CircuitBuilder::<F, D>::new(config);
+
+    // Register ProofData public inputs first.
+    for _ in 0..N_PROOF_DATA_PUBLIC_INPUTS {
+        builder.add_virtual_public_input();
+    }
+
+    // Cyclic verifier_data target (this also registers the cyclic vk PIs).
+    let verifier_data_target = builder.add_verifier_data_public_inputs();
+    common_data.num_public_inputs = builder.num_public_inputs();
+
+    // verify_proof(aggregator) + connect_hashes for vk binding.
+    let agg_proof = builder.add_virtual_proof_with_pis(&aggregator_data.common);
+    let agg_vd = builder.constant_verifier_data(&aggregator_data.verifier_only);
+    builder.verify_proof::<C>(&agg_proof, &agg_vd, &aggregator_data.common);
+
+    let st_vk_offset = MAX_IN_COINS * PER_SLOT_PIS;
+    let claimed_st_digest = HashOutTarget {
+        elements: [
+            agg_proof.public_inputs[st_vk_offset],
+            agg_proof.public_inputs[st_vk_offset + 1],
+            agg_proof.public_inputs[st_vk_offset + 2],
+            agg_proof.public_inputs[st_vk_offset + 3],
+        ],
+    };
+    builder.connect_hashes(claimed_st_digest, verifier_data_target.circuit_digest);
+
+    let sigmas_cap_offset = st_vk_offset + N_ST_VK_DIGEST_PIS;
+    for (i, cap_hash) in verifier_data_target
+        .constants_sigmas_cap
+        .0
+        .iter()
+        .enumerate()
+    {
+        let base = sigmas_cap_offset + 4 * i;
+        let claimed = HashOutTarget {
+            elements: [
+                agg_proof.public_inputs[base],
+                agg_proof.public_inputs[base + 1],
+                agg_proof.public_inputs[base + 2],
+                agg_proof.public_inputs[base + 3],
+            ],
+        };
+        builder.connect_hashes(claimed, *cap_hash);
+    }
+
+    // Explicit ConstantGate injection (matches helper-pass-3's
+    // injection so the gates list has ConstantGate).
+    builder.add_gate(ConstantGate::new(2), vec![F::ZERO, F::ZERO]);
+
+    // Cyclic verification — sets `goal_common_data = common_data`.
+    let condition = builder.add_virtual_bool_target_safe();
+    let inner_proof_target = builder.add_virtual_proof_with_pis(&common_data);
+    builder
+        .conditionally_verify_cyclic_proof_or_dummy::<C>(
+            condition,
+            &inner_proof_target,
+            &common_data,
+        )
+        .expect("conditionally_verify_cyclic_proof_or_dummy: well-formed");
+
+    // try_build returns (data, success). success=false signals the
+    // goal_data check failed — but the resulting data.common still
+    // tells us what the outer ACTUALLY built.
+    let (data, success) = builder.try_build_with_options::<C>(true);
+    (common_data, data.common, success)
+}
+
+fn print_field_diff<T: std::fmt::Debug + PartialEq>(name: &str, a: &T, b: &T) {
+    if a != b {
+        println!("    [DIFF] {name}:");
+        println!("        helper  = {a:?}");
+        println!("        outer   = {b:?}");
+    } else {
+        println!("    [ok  ] {name}: same");
+    }
+}
+
+/// Inner of the diagnostic: builds helper-pass-3 and minimal outer at
+/// the given pad_bits and reports if try_build succeeds + degree
+/// comparison. Returns (helper_degree, outer_degree, success).
+fn diag_at_pad_bits(pad_bits: usize) -> (usize, usize, bool) {
+    let mut bootstrap = pass_3_one_verify();
+    bootstrap.num_public_inputs = st_num_pis();
+    let _agg_v0 = build_source_aggregator_circuit(&bootstrap);
+
+    let helper_common = pass_3_two_verify(pad_bits, true);
+    let mut helper_for_agg = helper_common.clone();
+    helper_for_agg.num_public_inputs = st_num_pis();
+    let agg_v1 = build_source_aggregator_circuit(&helper_for_agg);
+
+    let (helper_common_final, outer_common, success) =
+        build_minimal_outer_for_diagnostic(&agg_v1.data, helper_for_agg.clone());
+
+    (
+        helper_common_final.fri_params.degree_bits,
+        outer_common.fri_params.degree_bits,
+        success,
+    )
+}
+
+#[test]
+#[ignore = "diagnostic only; rebuilds full outer + aggregator twice"]
+fn dump_phase_2a_outer_vs_helper_diff() {
+    // Step 1: bootstrap aggregator against Stage 5d-next-3 shape.
+    let mut bootstrap = pass_3_one_verify();
+    bootstrap.num_public_inputs = st_num_pis();
+    let _agg_v0 = build_source_aggregator_circuit(&bootstrap);
+
+    // Step 2: compute helper-pass-3 common with aggregator + ConstantGate.
+    let helper_common = pass_3_two_verify(16, true);
+
+    // Step 3: rebuild aggregator against the helper-pass-3 common so
+    // its source-proof targets are sized correctly.
+    let mut helper_for_agg = helper_common.clone();
+    helper_for_agg.num_public_inputs = st_num_pis();
+    let agg_v1 = build_source_aggregator_circuit(&helper_for_agg);
+
+    // Step 4: build the minimal outer with _or_dummy(helper-pass-3).
+    let (helper_common_final, outer_common, success) =
+        build_minimal_outer_for_diagnostic(&agg_v1.data, helper_for_agg.clone());
+
+    println!("\n=== Phase 2a outer-vs-helper diagnostic (try_build success = {success}) ===");
+
+    print_field_diff("config", &helper_common_final.config, &outer_common.config);
+    print_field_diff(
+        "fri_params.degree_bits",
+        &helper_common_final.fri_params.degree_bits,
+        &outer_common.fri_params.degree_bits,
+    );
+    print_field_diff(
+        "fri_params.hiding",
+        &helper_common_final.fri_params.hiding,
+        &outer_common.fri_params.hiding,
+    );
+    print_field_diff(
+        "fri_params.reduction_arity_bits",
+        &helper_common_final.fri_params.reduction_arity_bits,
+        &outer_common.fri_params.reduction_arity_bits,
+    );
+    let helper_gate_ids: Vec<String> = helper_common_final.gates.iter().map(|g| g.0.id()).collect();
+    let outer_gate_ids: Vec<String> = outer_common.gates.iter().map(|g| g.0.id()).collect();
+    print_field_diff("gates (by id)", &helper_gate_ids, &outer_gate_ids);
+    print_field_diff(
+        "selectors_info",
+        &format!("{:?}", helper_common_final.selectors_info),
+        &format!("{:?}", outer_common.selectors_info),
+    );
+    print_field_diff(
+        "quotient_degree_factor",
+        &helper_common_final.quotient_degree_factor,
+        &outer_common.quotient_degree_factor,
+    );
+    print_field_diff(
+        "num_gate_constraints",
+        &helper_common_final.num_gate_constraints,
+        &outer_common.num_gate_constraints,
+    );
+    print_field_diff(
+        "num_constants",
+        &helper_common_final.num_constants,
+        &outer_common.num_constants,
+    );
+    print_field_diff(
+        "num_public_inputs",
+        &helper_common_final.num_public_inputs,
+        &outer_common.num_public_inputs,
+    );
+    print_field_diff("k_is", &helper_common_final.k_is, &outer_common.k_is);
+    print_field_diff(
+        "num_partial_products",
+        &helper_common_final.num_partial_products,
+        &outer_common.num_partial_products,
+    );
+
+    assert!(
+        success,
+        "Phase 2a outer-vs-helper diagnostic: try_build success was false — \
+         a CommonCircuitData axis diverges. Check the [DIFF] lines above."
+    );
+}
+
+/// Sweep helper-pass-3's `INNER_PAD_BITS` across {14, 15, 16, 17}
+/// and report (helper_degree, outer_degree, success) for each. The
+/// goal: find the pad-bits value at which helper-degree == minimal-
+/// outer-degree (only condition `try_build` accepts). Once we know
+/// which pad-bits matches the minimal outer's natural degree, the
+/// FULL outer (with all Stage 5d-next-3 constraint gates) needs the
+/// same pad — possibly bumped by 1 to absorb the extra gate count.
+#[test]
+#[ignore = "diagnostic only; expensive — rebuilds aggregator + outer 4 times"]
+fn dump_phase_2a_pad_bits_sweep() {
+    println!("\n=== pad_bits sweep: helper-degree vs minimal-outer-degree ===");
+    for pad_bits in [14usize, 15, 16, 17] {
+        let (h, o, ok) = diag_at_pad_bits(pad_bits);
+        println!(
+            "  pad_bits = {pad_bits:<2}  helper_degree = {h}  minimal_outer_degree = {o}  success = {ok}"
+        );
+    }
 }

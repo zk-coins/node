@@ -68,6 +68,7 @@
 
 use anyhow::Result;
 use plonky2::field::types::Field;
+use plonky2::gates::constant::ConstantGate;
 use plonky2::gates::noop::NoopGate;
 use plonky2::hash::hash_types::{HashOut, HashOutTarget};
 use plonky2::hash::poseidon::PoseidonHash;
@@ -83,6 +84,10 @@ use plonky2::recursion::dummy_circuit::cyclic_base_proof;
 
 use crate::circuit::mmr::mmr_inclusion_root;
 use crate::circuit::smt::{hash_up_full_path, key_bits_msb_first, smt_inclusion_root};
+use crate::circuit::source_aggregator::{
+    build_source_aggregator_circuit, prove_aggregator, AggregatorSlotWitness,
+    SourceAggregatorCircuit, N_ST_VK_DIGEST_PIS, PER_SLOT_PIS,
+};
 use crate::hash::{digest_from_bytes, HashDigest, ZERO_HASH};
 use crate::inputs::CommitmentMerkleProofs;
 use crate::merkle::merkle_mountain_range::MMR_MAX_DEPTH;
@@ -156,38 +161,94 @@ pub const MAX_OUT_COINS: usize = 8;
 /// shape — one verify_proof + NoopGate padding to 2^12 — is what the
 /// library's own tests use.
 fn common_data_for_recursion_c() -> CommonCircuitData<F, D> {
+    common_data_for_recursion_c_inner(None, INNER_PAD_BITS_STAGE_5D_NEXT_3)
+}
+
+/// INNER_PAD_BITS used by the Stage 5d-next-3 1-verify helper. Outer
+/// gate count is ~8–10 k → 2^14 = 16384.
+const INNER_PAD_BITS_STAGE_5D_NEXT_3: usize = 14;
+
+/// INNER_PAD_BITS used by the Stage 5d-next-5 2-verify helper (cyclic
+/// `prev_account` + non-cyclic aggregator). Despite adding
+/// `verify_proof(agg)` to the outer, the helper-degree
+/// = `pad_bits + 1` relationship combined with the full outer's
+/// natural degree (Stage 5d-next-3 base ~10 k + `verify_proof(agg)`
+/// ~10 k + `_or_dummy` overhead → ~30 k, fitting at `degree_bits = 15`)
+/// means `pad_bits = 14` is what makes helper-degree (15) match
+/// outer-degree (15). The empirical relation was characterised by
+/// `recursion_shape_probe::dump_phase_2a_pad_bits_sweep`.
+const INNER_PAD_BITS_STAGE_5D_NEXT_5: usize = 14;
+
+/// Total public-input count exposed by the state-transition circuit:
+/// 16 `ProofData` elements + the cyclic verifier_data public inputs
+/// (4 elements for circuit_digest + 4 per cap entry). Used to
+/// pre-size `bootstrap_st_common.num_public_inputs` so the
+/// aggregator's virtual proof targets allocate the right-size PI
+/// vector before the outer is built.
+fn state_transition_num_pis() -> usize {
+    let cap_elements = CircuitConfig::standard_recursion_config()
+        .fri_config
+        .num_cap_elements();
+    N_PROOF_DATA_PUBLIC_INPUTS + 4 + 4 * cap_elements
+}
+
+/// Stage 5d-next-5 generalisation of [`common_data_for_recursion_c`].
+///
+/// `aggregator = Some(_)` makes pass 2 and 3 each add a second
+/// `verify_proof` against `agg.common` (with
+/// `constant_verifier_data(agg.verifier_only)` to pin the aggregator's
+/// vd as a circuit constant). Pass 3 also injects ONE explicit
+/// `ConstantGate{num_consts: 2}` instance before the NoopGate pad —
+/// without it, the helper's `gates` list lacks `ConstantGate` while
+/// `dummy_circuit`'s rebuild and the outer's own build both emit one
+/// (via the `ConstantGate::new(2)` injection in `build_circuit`),
+/// failing the cyclic fixed-point check. See
+/// `STAGE_5D_NEXT_5_AGGREGATOR.md` and `recursion_shape_probe` for the
+/// empirical derivation of both the ConstantGate-injection trick and
+/// the pad-bits → helper-degree relationship.
+fn common_data_for_recursion_c_inner(
+    aggregator: Option<&CircuitData<F, C, D>>,
+    inner_pad_bits: usize,
+) -> CommonCircuitData<F, D> {
     // Pass 1: empty seed circuit.
     let config = CircuitConfig::standard_recursion_config();
     let builder = CircuitBuilder::<F, D>::new(config);
     let data = builder.build::<C>();
 
-    // Pass 2: verify the seed circuit once.
+    // Pass 2: verify the seed circuit once (+ optionally verify the
+    // aggregator's shape once).
     let config = CircuitConfig::standard_recursion_config();
     let mut builder = CircuitBuilder::<F, D>::new(config);
     let proof = builder.add_virtual_proof_with_pis(&data.common);
     let verifier_data = builder.add_virtual_verifier_data(data.common.config.fri_config.cap_height);
     builder.verify_proof::<C>(&proof, &verifier_data, &data.common);
+    if let Some(agg) = aggregator {
+        let agg_proof = builder.add_virtual_proof_with_pis(&agg.common);
+        let agg_vd = builder.constant_verifier_data(&agg.verifier_only);
+        builder.verify_proof::<C>(&agg_proof, &agg_vd, &agg.common);
+    }
     let data = builder.build::<C>();
 
-    // Pass 3: verify once and pad to `INNER_PAD_BITS` gates with
-    // NoopGate. The padding fixes the inner circuit's `degree_bits`
-    // and MUST be ≥ ceil(log2(outer.num_gates)) for cyclic recursion
-    // to build. Outer circuit size as of stage 5d-next-3 (full
-    // production parameters):
-    //   - 8 in-coin slots × ~512 SMT hashes ≈ 4 k
-    //   - 8 out-coin slots × ~512 SMT hashes ≈ 4 k
-    //   - 5c+ commitment proofs (SMT 256 + 2× MMR 31) ≈ 0.3 k
-    //   - apply_coin + identifier derivation + 3 account-state hashes ≈ 0.2 k
-    //   - cyclic-verify shape + NoopGate padding to power of 2
-    // Total ≈ 8-10 k gates → `INNER_PAD_BITS = 14` (1 << 14 = 16384)
-    // gives generous headroom.
-    const INNER_PAD_BITS: usize = 14;
+    // Pass 3: verify pass-2's shape + optionally verify aggregator +
+    // ConstantGate injection (only when modelling the 2-verify outer)
+    // + NoopGate pad to `inner_pad_bits`.
     let config = CircuitConfig::standard_recursion_config();
     let mut builder = CircuitBuilder::<F, D>::new(config);
     let proof = builder.add_virtual_proof_with_pis(&data.common);
     let verifier_data = builder.add_virtual_verifier_data(data.common.config.fri_config.cap_height);
     builder.verify_proof::<C>(&proof, &verifier_data, &data.common);
-    while builder.num_gates() < 1 << INNER_PAD_BITS {
+    if let Some(agg) = aggregator {
+        let agg_proof = builder.add_virtual_proof_with_pis(&agg.common);
+        let agg_vd = builder.constant_verifier_data(&agg.verifier_only);
+        builder.verify_proof::<C>(&agg_proof, &agg_vd, &agg.common);
+        // Inject one `ConstantGate{num_consts:2}` so pass-3's gates
+        // list matches the outer's emitted shape (the outer's
+        // `build_circuit` adds the same instance right before
+        // `_or_dummy`). Zero constants — only the instance existence
+        // matters for the gate-set equality check.
+        builder.add_gate(ConstantGate::new(2), vec![F::ZERO, F::ZERO]);
+    }
+    while builder.num_gates() < 1 << inner_pad_bits {
         builder.add_gate(NoopGate, vec![]);
     }
     builder.build::<C>().common
@@ -371,6 +432,20 @@ pub struct StateTransitionCircuit {
     /// only for SPEC §8 (b)+(c) checks and for the interim hash
     /// driving out-coin identifier derivation.
     pub next_public_key_limbs: [Target; 5],
+
+    // ===== Stage 5d-next-5 additions =====
+    /// Source-proof aggregator circuit built against this circuit's
+    /// `common_data`. The outer verifies an aggregator proof via the
+    /// `aggregator_proof_target` slot below and `connect_hashes`-binds
+    /// the aggregator's claimed state-transition `verifier_data` to
+    /// its own.
+    pub aggregator: SourceAggregatorCircuit,
+    /// Witness target for the aggregator's proof. The outer verifies
+    /// this proof against the aggregator's fixed (constant-baked)
+    /// `verifier_data`. Its public inputs carry per-slot source
+    /// `ProofData` and the claimed state-transition `verifier_data`
+    /// that the outer `connect_hashes`-binds to its own.
+    pub aggregator_proof_target: ProofWithPublicInputsTarget<D>,
 }
 
 /// Build the Stage-5c+ state-transition circuit.
@@ -379,6 +454,35 @@ pub struct StateTransitionCircuit {
 /// against fixed-shape SMT + MMR inclusion proofs. See module docstring
 /// for the constraint breakdown and the masking pattern.
 pub fn build_circuit() -> StateTransitionCircuit {
+    // ===== Build aggregator + state-transition common via fixed-point =====
+    //
+    // Both shapes depend on each other: the aggregator's source-proof
+    // targets are sized by st_common; the outer's
+    // `verify_proof(aggregator_proof)` is sized by agg.common.
+    //
+    // Bootstrap with the Stage 5d-next-3 shape (`dummy_circuit`-safe
+    // by construction). Compute the Stage 5d-next-5 `common_data`
+    // (which embeds a `verify_proof(agg)` + a `ConstantGate`
+    // injection). Rebuild the aggregator against the final
+    // `common_data` so its source-proof targets fit the outer's
+    // actual cyclic shape, then verify the fixed point converged.
+    let outer_num_pis = state_transition_num_pis();
+    let mut bootstrap_st_common = common_data_for_recursion_c();
+    bootstrap_st_common.num_public_inputs = outer_num_pis;
+    let mut aggregator = build_source_aggregator_circuit(&bootstrap_st_common);
+    let mut common_data =
+        common_data_for_recursion_c_inner(Some(&aggregator.data), INNER_PAD_BITS_STAGE_5D_NEXT_5);
+    common_data.num_public_inputs = outer_num_pis;
+    aggregator = build_source_aggregator_circuit(&common_data);
+    let mut next_common_data =
+        common_data_for_recursion_c_inner(Some(&aggregator.data), INNER_PAD_BITS_STAGE_5D_NEXT_5);
+    next_common_data.num_public_inputs = outer_num_pis;
+    assert_eq!(
+        common_data, next_common_data,
+        "Stage 5d-next-5 fixed-point did not converge in 2 iterations — \
+         aggregator common shape unstable across rebuilds"
+    );
+
     let config = CircuitConfig::standard_recursion_config();
     let mut builder = CircuitBuilder::<F, D>::new(config);
 
@@ -387,8 +491,12 @@ pub fn build_circuit() -> StateTransitionCircuit {
     let proof_data_pis: [Target; N_PROOF_DATA_PUBLIC_INPUTS] =
         std::array::from_fn(|_| builder.add_virtual_public_input());
 
-    let mut common_data = common_data_for_recursion_c();
     let verifier_data_target = builder.add_verifier_data_public_inputs();
+    debug_assert_eq!(
+        builder.num_public_inputs(),
+        outer_num_pis,
+        "outer's PI count must match the value used to size st_common"
+    );
     common_data.num_public_inputs = builder.num_public_inputs();
 
     let condition = builder.add_virtual_bool_target_safe();
@@ -837,7 +945,73 @@ pub fn build_circuit() -> StateTransitionCircuit {
         builder.connect(proof_data_pis[12 + i], output_coin_history_root.elements[i]);
     }
 
-    // Cyclic verification.
+    // ===== Stage 5d-next-5: aggregator verify + vk binding =====
+    //
+    // Verify the aggregator proof against the aggregator's
+    // constant-baked verifier_data. The aggregator's PIs carry
+    // per-slot source `ProofData` (16 elements + 1 active bit each)
+    // followed by the claimed state-transition verifier_data (digest
+    // + sigmas_cap).
+    //
+    // `connect_hashes` binds the claimed st verifier_data to the
+    // outer's OWN `verifier_data_target`. A wrong-vk aggregator proof
+    // (one whose `conditionally_verify_proof` ran against a different
+    // state-transition circuit's `verifier_only`) carries a different
+    // claimed digest and fails this binding.
+    let aggregator_proof_target = builder.add_virtual_proof_with_pis(&aggregator.data.common);
+    let aggregator_vd_target = builder.constant_verifier_data(&aggregator.data.verifier_only);
+    builder.verify_proof::<C>(
+        &aggregator_proof_target,
+        &aggregator_vd_target,
+        &aggregator.data.common,
+    );
+
+    let st_vk_offset = MAX_IN_COINS * PER_SLOT_PIS;
+    let claimed_st_digest = HashOutTarget {
+        elements: [
+            aggregator_proof_target.public_inputs[st_vk_offset],
+            aggregator_proof_target.public_inputs[st_vk_offset + 1],
+            aggregator_proof_target.public_inputs[st_vk_offset + 2],
+            aggregator_proof_target.public_inputs[st_vk_offset + 3],
+        ],
+    };
+    builder.connect_hashes(claimed_st_digest, verifier_data_target.circuit_digest);
+
+    let sigmas_cap_offset = st_vk_offset + N_ST_VK_DIGEST_PIS;
+    for (i, cap_hash) in verifier_data_target
+        .constants_sigmas_cap
+        .0
+        .iter()
+        .enumerate()
+    {
+        let base = sigmas_cap_offset + 4 * i;
+        let claimed = HashOutTarget {
+            elements: [
+                aggregator_proof_target.public_inputs[base],
+                aggregator_proof_target.public_inputs[base + 1],
+                aggregator_proof_target.public_inputs[base + 2],
+                aggregator_proof_target.public_inputs[base + 3],
+            ],
+        };
+        builder.connect_hashes(claimed, *cap_hash);
+    }
+
+    // Shape lock — must match the helper's pass-3 injection (see
+    // `common_data_for_recursion_c_inner`). Without it, the outer's
+    // gates list lacks `ConstantGate` even though the helper's
+    // pass-3 has it (and `dummy_circuit`'s rebuild always emits one),
+    // failing the cyclic fixed-point check at
+    // `plonk/circuit_builder.rs:1067`.
+    builder.add_gate(ConstantGate::new(2), vec![F::ZERO, F::ZERO]);
+
+    // Cyclic verification (Stage 5d-next-3 + Stage 5d-next-5 shape:
+    // the cyclic fixed-point is reached because pass 3 of
+    // `common_data_for_recursion_c_inner` models exactly this
+    // `_or_dummy` (1 verify_proof internally) + the
+    // `verify_proof(aggregator)` + the `ConstantGate` injection
+    // above. Their gate-set, selectors_info, num_constants and
+    // degree_bits all coincide — see
+    // `STAGE_5D_NEXT_5_AGGREGATOR.md` for the empirical derivation.
     builder
         .conditionally_verify_cyclic_proof_or_dummy::<C>(
             condition,
@@ -863,6 +1037,8 @@ pub fn build_circuit() -> StateTransitionCircuit {
         in_coin_slots,
         out_coin_slots,
         next_public_key_limbs,
+        aggregator,
+        aggregator_proof_target,
     }
 }
 
@@ -1219,6 +1395,11 @@ pub fn prove_initial_with_in_and_out_coins(
     }
     set_next_public_key_witness(&mut pw, circuit, next_public_key);
 
+    // Stage 5d-next-5: witness the aggregator proof. Phase 2a always
+    // passes an all-inactive aggregator proof — Phase 2b will wire
+    // real per-slot source proofs through this call.
+    set_aggregator_proof_witness(&mut pw, circuit, &[])?;
+
     // Dummy inner proof for the cyclic-recursion slot.
     let inner_pis = std::iter::empty::<(usize, F)>().collect();
     pw.set_proof_with_pis_target::<C, D>(
@@ -1230,6 +1411,43 @@ pub fn prove_initial_with_in_and_out_coins(
         .unwrap();
 
     circuit.data.prove(pw)
+}
+
+/// Witness setter for the aggregator proof slot.
+///
+/// `source_proofs` is the list of `(slot_index, source_proof)` pairs
+/// for active in-coin slots that have a real source proof. Slots not
+/// mentioned default to inactive. Phase 2a callers pass an empty
+/// slice; Phase 2b will populate it from the per-slot in-coins.
+fn set_aggregator_proof_witness(
+    pw: &mut PartialWitness<F>,
+    circuit: &StateTransitionCircuit,
+    source_proofs: &[(usize, &ProofWithPublicInputs<F, C, D>)],
+) -> Result<()> {
+    let mut slot_witnesses: Vec<AggregatorSlotWitness> = (0..MAX_IN_COINS)
+        .map(|_| AggregatorSlotWitness {
+            active: false,
+            real_proof: None,
+        })
+        .collect();
+    for (idx, proof) in source_proofs {
+        assert!(
+            *idx < MAX_IN_COINS,
+            "set_aggregator_proof_witness: source slot index {idx} out of range"
+        );
+        slot_witnesses[*idx] = AggregatorSlotWitness {
+            active: true,
+            real_proof: Some(*proof),
+        };
+    }
+    let agg_proof = prove_aggregator(
+        &circuit.aggregator,
+        &circuit.data.verifier_only,
+        &slot_witnesses,
+    )?;
+    pw.set_proof_with_pis_target::<C, D>(&circuit.aggregator_proof_target, &agg_proof)
+        .unwrap();
+    Ok(())
 }
 
 /// Prove an AccountUpdate transition consuming `prev` as the recursive
@@ -1345,6 +1563,11 @@ pub fn prove_account_update_with_in_and_out_coins(
         set_out_coin_slot_witness(&mut pw, slot_targets, *active, *identifier, *amount, nip);
     }
     set_next_public_key_witness(&mut pw, circuit, next_public_key);
+
+    // Stage 5d-next-5: aggregator-proof witness (Phase 2a: all-inactive;
+    // Phase 2b will populate from per-slot source proofs).
+    set_aggregator_proof_witness(&mut pw, circuit, &[])?;
+
     pw.set_proof_with_pis_target::<C, D>(&circuit.inner_proof_target, prev)
         .unwrap();
     pw.set_verifier_data_target(&circuit.verifier_data_target, &circuit.data.verifier_only)
