@@ -112,6 +112,28 @@ async fn balance_unknown_address_returns_ok_with_zero() {
     assert!(resp.username.is_none());
 }
 
+#[cfg(feature = "usernames")]
+#[tokio::test]
+async fn balance_unknown_address_with_claimed_username_returns_username() {
+    let state = test_state();
+    let address = [0xABu8; 32];
+
+    // Claim a username for an address that has no on-chain activity yet.
+    {
+        let mut store = state.username_store.lock().unwrap();
+        store.claim("alice", address).expect("claim should succeed");
+    }
+
+    let uri = format!("/api/balance?address={}", hex::encode(address));
+    let req = Request::get(&uri).body(Body::empty()).unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(resp.balance, 0);
+    assert_eq!(resp.username, Some("alice".to_string()));
+}
+
 #[tokio::test]
 async fn balance_minting_address_returns_max() {
     let address_hex = hex::encode(zkcoins_program::MINTING_ADDRESS);
