@@ -8,19 +8,29 @@
 # only lint + build (see .github/workflows/ci.yaml). Rationale and
 # trade-offs: issue #30.
 #
-# Cache behaviour: this hook reuses the local target/ directory. The first
-# run after `cargo clean` is slow (~30 min on M3 Ultra); subsequent runs
-# are ~8 min.
+# What runs always: fmt, clippy (3 invocations), build (MVP + DEV),
+# server + shared tests (which exercise the Plonky2 prover end-to-end
+# via send_coins_*), and the 100% coverage gate.
+#
+# What runs only when `program-plonky2/` changed: the full cyclic-
+# recursion sweep of `program-plonky2 --lib` tests. That sweep can take
+# multiple hours at production parameters (MAX_IN_COINS = 8), so we skip
+# it when no circuit code has changed. The server-tests already prove
+# the integration is intact for non-circuit changes; the sweep is for
+# regressions in the circuit itself.
+#
+# Wall budgets (warm cache, M3 Ultra):
+#   - server-only change: ~10 min
+#   - circuit change: ~3 hours (server-tests + full sweep)
 #
 # Bypass: `git push --no-verify` works. Bypassing makes you personally on
 # the hook for any breakage in develop — DEV must be 100% green before
 # main-merge.
 set -euo pipefail
 
-# Match the test environment that CI used to provide. Keeping these
-# explicit means the hook works in a fresh shell without depending on
-# whatever the dev has in .envrc / direnv.
-export SP1_PROVER="${SP1_PROVER:-mock}"
+# Force Esplora broadcasts to fail fast. Some unit tests exercise the
+# commit pipeline that ends in a real HTTP broadcast; without this,
+# runs against the public Mutinynet API can take >60 s per test.
 export ESPLORA_URL="${ESPLORA_URL:-http://127.0.0.1:1/api}"
 
 echo "[pre-push] cargo fmt --all --check"
@@ -32,8 +42,8 @@ cargo clippy -p server -p shared -- -D warnings
 echo "[pre-push] cargo clippy -p server --all-features (DEV feature set)"
 cargo clippy -p server --all-features -- -D warnings
 
-echo "[pre-push] cargo clippy -p zkcoins-program --lib"
-cargo clippy -p zkcoins-program --lib -- -D warnings
+echo "[pre-push] cargo clippy -p zkcoins-program-plonky2 -p zkcoins-prover-plonky2 --lib"
+cargo clippy -p zkcoins-program-plonky2 -p zkcoins-prover-plonky2 --lib -- -D warnings
 
 echo "[pre-push] cargo build -p server --release (MVP / PRD image)"
 cargo build -p server --release
@@ -44,8 +54,40 @@ cargo build -p server --release --all-features
 echo "[pre-push] cargo test --release --all-features (server + shared, full suite incl. account_server)"
 cargo test -p server -p shared --release --all-features -- --test-threads=1
 
-echo "[pre-push] cargo test -p zkcoins-program --lib"
-cargo test -p zkcoins-program --lib -- --test-threads=1
+# Decide whether to run the multi-hour circuit sweep.
+#
+# Trigger: any new commit in this push touches program-plonky2/.
+# "New commit" = present in HEAD but not in origin/<branch>. Falls back
+# to origin/develop when the branch has never been pushed, and to
+# "run the sweep" if neither remote ref is available (conservative).
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+REF_BASE=""
+if git rev-parse --verify "origin/$CURRENT_BRANCH" >/dev/null 2>&1; then
+  REF_BASE="origin/$CURRENT_BRANCH"
+elif git rev-parse --verify origin/develop >/dev/null 2>&1; then
+  REF_BASE="origin/develop"
+elif git rev-parse --verify develop >/dev/null 2>&1; then
+  REF_BASE="develop"
+fi
+
+if [ -n "$REF_BASE" ]; then
+  CIRCUIT_CHANGED=$(git diff --name-only "$REF_BASE"...HEAD -- 'program-plonky2/' | wc -l | tr -d ' ')
+else
+  CIRCUIT_CHANGED="unknown"
+fi
+
+if [ "$CIRCUIT_CHANGED" = "0" ]; then
+  echo "[pre-push] skipping full cyclic-recursion sweep — no program-plonky2/ changes vs $REF_BASE."
+  echo "[pre-push] run manually before release-PR-to-main: cargo test -p zkcoins-program-plonky2 --release --lib -- --test-threads=1"
+else
+  if [ "$CIRCUIT_CHANGED" = "unknown" ]; then
+    echo "[pre-push] no base ref to diff against — running full cyclic-recursion sweep (conservative default)"
+  else
+    echo "[pre-push] $CIRCUIT_CHANGED file(s) under program-plonky2/ changed vs $REF_BASE — running full cyclic-recursion sweep"
+  fi
+  echo "[pre-push] cargo test -p zkcoins-program-plonky2 --release --lib (full cyclic-recursion sweep, can take hours)"
+  cargo test -p zkcoins-program-plonky2 --release --lib -- --test-threads=1
+fi
 
 echo "[pre-push] cargo llvm-cov --release (MVP scope, 100% line + function gate)"
 cargo llvm-cov --release -p server --show-missing-lines \

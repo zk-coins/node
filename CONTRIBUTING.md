@@ -157,19 +157,36 @@ SP1_PROVER=mock cargo run -p server
 
 ## Setup
 
-After cloning, enable the repo's pre-push hook. This runs the full local
-verification (fmt, clippy, build, test, 100% coverage gate) before every
-`git push`. CI itself only runs lint + build, because the full suite is
-~8 min on an M3 Ultra and was hitting the 75-min ubuntu-latest timeout
-(see issue #30).
+After cloning, enable the repo's pre-push hook. This runs local
+verification (fmt, clippy, build, server-tests, 100% coverage gate)
+before every `git push`. CI itself only runs lint + build, because the
+full suite was hitting the 75-min ubuntu-latest timeout (see issue #30).
 
 ```bash
 git config core.hooksPath .githooks
 ```
 
-You can bypass with `git push --no-verify` in genuine emergencies, but
-develop must be 100% green before any main-merge — if you bypass, you
-own the breakage.
+The hook is **conditional on the file scope of the push**:
+
+- **Server-only change** (nothing under `program-plonky2/` differs vs
+  `origin/<branch>`): the hook completes in ~10 min warm cache. The
+  server-tests already exercise the Plonky2 prover end-to-end via
+  `send_coins_*`, so circuit correctness is verified by integration.
+- **Circuit change** (any file under `program-plonky2/` differs): the
+  hook *additionally* runs `cargo test -p zkcoins-program-plonky2
+  --release --lib`, the full cyclic-recursion sweep at production
+  parameters (`MAX_IN_COINS = 8`). This can take **multiple hours**.
+
+When preparing a release PR to `main`, run the sweep manually to gate
+the merge regardless of branch scope:
+
+```bash
+cargo test -p zkcoins-program-plonky2 --release --lib -- --test-threads=1
+```
+
+You can bypass the hook with `git push --no-verify` in genuine
+emergencies, but develop must be 100% green before any main-merge — if
+you bypass, you own the breakage.
 
 ## Prerequisites
 

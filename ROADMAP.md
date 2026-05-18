@@ -35,11 +35,11 @@ person-days at full focus; multiply for part-time work.
 | 5 | Monolithic state-transition circuit (recursion, padding, vk-pin) | ✅ done (5a/5b/5c/5c+/5d/5d-next-3/5d-next-5). Stage 5d-next-5 source-side cyclic verify landed via PR [#23](https://github.com/zk-coins/server/pull/23) — aggregator pattern + Phase 2b per-slot SMT inclusion + SPEC §8 (c)(d)(e) chain + 3 §13 negatives. See [`MIGRATION_RESEARCH.md` §7.22](./MIGRATION_RESEARCH.md#722-stage-5d-next-5-source-side-verification-via-aggregator-pattern--codified-resolves-721) for the empirical insights (`ConstantGate::new(2)` injection + `helper_degree = pad_bits + 1` sweep). | — | — |
 | 6 | `script-plonky2/` host-side prover wrapper | ✅ done (`d96bb62`) | — | — |
 | 7 | Server: **replace** SP1 path with Plonky2 (no feature flag, no dual backend) | ✅ done — `send_coins` performs **in-circuit source-side validation via Stage 5d-next-5 Phase 2 aggregator** (PR [#23](https://github.com/zk-coins/server/pull/23)); off-circuit pre-checks retained as defense-in-depth (microsecond-level fast-fail before the minute-scale prove). Initial server cut (`c71c9fc`) ran off-circuit-only because Phase 2 was deferred; the in-circuit wiring landed via the Step-7 follow-up. Dockerfile re-introduced (`dac0179`). 106 server tests pass on the MVP build, 119 with `--all-features` (32 baseline + 10 inline error-path in `d6a3cb9` + 64 ported SP1-era fixtures re-enabled in `account_server_tests.rs` / `server_tests.rs` + 13 feature-gated). Smoke-test verified end-to-end (`cargo run` + `/health` + `/api/info`, block scanner connects). | — | — |
-| 8 | App / wallet: Schnorr-signing boundary, server-API integration | ⏳ todo | 1–2 d | low (server-side compute architecture — no wasm-crypto migration) |
-| 9 | DEV deployment + end-to-end roundtrip on signet | ⏳ todo | 3–5 d | medium |
+| 8 | App / wallet: Schnorr-signing boundary, server-API integration | ✅ done — `zk-coins/app` ships `wasm.createCommitment(xpriv, num_pubkeys, asth_hex, ocr_hex)` (in `app/rust/client/src/lib.rs`) signing `SHA256(asth ‖ ocr)` via BIP-340 Schnorr (D11). Two-phase send: `/api/send` (Phase 1, proof) → `/api/commit` (Phase 2, signature). API client in `app/src/lib/api/client.ts` covers `info` / `balance` / `send` / `commit` / `mint` / `username/*` endpoints exactly matching server routes registered at `server/src/server.rs:1261–1289`. WASM mock + Vitest coverage gate already enforced in app repo. | — | — |
+| 9 | DEV deployment + end-to-end roundtrip on signet | 🟡 infra ready — `Dockerfile` (`dac0179`) builds `zkcoin/server:beta` for `linux/arm64`; `.github/workflows/deploy-dev.yaml` auto-builds + pushes to Docker Hub on push to `develop`, then deploys via cloudflared-tunnel SSH to DEV. **Remaining:** ① merge PR [#17](https://github.com/zk-coins/server/pull/17) (user merges); ② verify auto-deploy lands on `dev-app.zkcoins.app`; ③ e2e roundtrip (create account → mint → send → receive) on signet; ④ real performance measurement on M3 Ultra (R2 budget: warm ≤ 5 s, ideal ≤ 1 s; cold ≤ 30 s; peak mem < 64 GB). | 3–5 d | medium |
 | — | Pre-mainnet blockers: D2/D10 (recipient hiding), D7 (reorg safety), D8 (per-coin nullifier-accum) | ⏳ todo | **+2–3 weeks** | high (real protocol redesign) |
 
-**MVP total (steps 1–9): ~2.5–4 weeks full-time** assuming no major surprises in step 5 (Plonky2 recursion vk-pinning).
+**MVP status:** Steps 1–8 ✅ done. Step 9 infra ready, gated on user-driven merge + DEV verification + performance measurement on M3 Ultra. **Remaining engineering effort: 0 d** for the migration itself; **remaining ops effort: ~3–5 d** for merge → auto-deploy → e2e probes → R2 budget check. If the R2 budget holds on first measurement, the migration is complete and the project moves to the pre-mainnet hardening track.
 
 ### Definition of "MVP"
 
@@ -351,30 +351,31 @@ Each stage carries the 100 % line coverage gate before commit.
 **Test plan (100% coverage gate applies):** the same `cargo llvm-cov -p server --fail-under-lines 100` gate that already enforces this on the SP1 build carries over. Every handler, every error path, every scanner state transition that lives in the PRD-feature-set must be covered. The current SP1 coverage baseline (see README.md table) is the floor to maintain.
 **Risk:** Low. Mechanical port, no compatibility surface area.
 
-### Step 8 — App / wallet
-**Effort:** 1–2 days.
-**Files:** `zk-coins/app` repo (separate). Mostly server-API integration.
-**Scope:** The wallet only needs:
-  - BIP-340 Schnorr signing over `SHA256(serialize(asth) ‖ serialize(ocr))` (WebCrypto's SHA256 + a secp256k1 library — no Poseidon).
-  - Display of balance / send-quotes / receive-confirmations from the server API.
-  - No in-app ZK proof generation, verification, or Merkle hashing.
-**Test plan (100% coverage gate applies):** same Jest/Vitest coverage gate that already applies to `zk-coins/app` (see that repo's README). Signing logic, message serialisation, API client, and error paths all covered. UI integration tests for the user loop (create account → send → receive).
-**Risk:** Low. The wallet trusts the server for ZK correctness — this is the
-explicit zkCoins architectural choice (server-side compute).
+### Step 8 — App / wallet — ✅ done
+**Status:** Pre-existing app-repo wiring already matches the new Plonky2 server contract — no code change required for the MVP.
+**Files in `zk-coins/app`:**
+  - `rust/client/src/lib.rs` — `create_commitment(xpriv, num_pubkeys, asth_hex, ocr_hex)` (BIP-340 Schnorr over `SHA256(asth ‖ ocr)`, returns `{public_key, signature, message}` JSON).
+  - `src/app/send/page.tsx` — Phase 1 (`/api/send`) + Phase 2 (`/api/commit`) two-step send flow with in-flight commit persistence + retry.
+  - `src/lib/api/client.ts` — typed client for every server route registered in `server/src/server.rs` (`info`, `balance`, `send`, `commit`, `mint`, `username/claim`, `username/resolve`, `address`).
+  - `src/__tests__/app/send-pipeline.test.tsx` — round-trip + retry + idempotency unit tests (mocked WASM).
+  - `src/__tests__/lib/api/contract.live.test.ts` — schema-conformance probes against a live server.
+**Why nothing changed in the wallet for the Plonky2 cutover:** the wallet operates strictly above the server-side ZK boundary. It signs `SHA256(asth ‖ ocr)` — both 32-byte hex blobs supplied by the server — with secp256k1. Whether the server computed `asth`/`ocr` via SP1+SHA256 or Plonky2+Poseidon is opaque to the wallet, and `digest_to_bytes` on the server side already serialises Poseidon `HashOut<F>` into the same 32-byte shape (see `program-plonky2/src/hash.rs:48`).
+**Test gate:** existing Vitest coverage gate in `zk-coins/app` (per that repo's CONTRIBUTING.md). No new gate.
+**Remaining open question for Step 9 verification:** that `signature_verifies_after_app_send` lands as an e2e probe against the live DEV server. This is part of Step 9, not Step 8.
 
-### Step 9 — DEV deployment + e2e
-**Effort:** 3–5 days.
-**Plan:**
-  - Build `zkcoin/server-plonky2:beta`, deploy to `dfxdev`.
-  - Wallet at `dev-app.zkcoins.app` points at it.
-  - Roundtrip: create account → mint → send → recipient receives.
-  - Measure: cold-start proof time, warm proof time, memory usage.
-**Test plan (100% coverage gate applies for code; e2e separately):**
-  - Coverage of all server endpoints exercised by the wallet during the e2e roundtrip must already be 100% from step 7's gate; this step verifies the integration, not the unit coverage.
-  - e2e success criteria: every endpoint round-trips under realistic conditions (one happy-path traversal per route plus at least one failure path per route).
-  - Performance budget on the M3 Ultra (96 GB, single-host): warm proof ≤ 5 s, ideally ≤ 1 s; cold-start (first-proof after server boot) ≤ 30 s including circuit-data load; memory peak < 64 GB during proving (leaves 32 GB for OS, scanner, REST, OS cache). Plonky2's current CPU-only execution on Apple Silicon is the operative baseline since there is no Metal backend.
-  - If the budget is missed: redesign per R2 (reduce MAX_IN_COINS, drop in-coin recursion, or switch to folding). **NOT** add external hardware or move to a cloud prover.
-**Risk:** Medium. First real exposure to the full stack under realistic load on the actual production hardware.
+### Step 9 — DEV deployment + e2e — 🟡 infra ready, waiting on merge + verification
+**Infrastructure status:**
+  - `Dockerfile` (`dac0179`) — multi-stage build, `linux/arm64`, optional `FEATURES` build-arg; DEV image bakes `address-list,faucet,usernames,lnurl`.
+  - `.github/workflows/deploy-dev.yaml` — on push to `develop`, builds + pushes `zkcoin/server:beta` to Docker Hub, then deploys to DEV host via cloudflared-tunnel SSH. Optional `reset_state` workflow_dispatch wipes blockchain state for a clean re-mint.
+  - Endpoint surface verified: every wallet call in `app/src/lib/api/client.ts` matches a route registered in `server/src/server.rs:1257–1289`.
+**Remaining (user-driven):**
+  1. Merge PR #17 (`feat/plonky2-migration` → `develop`). Per repo convention the user merges; CI/auto-deploy take over from there.
+  2. Auto-deploy lands `zkcoin/server:beta` on the DEV host; verify `/health` and `/api/info` return 200 and the new capabilities object.
+  3. e2e roundtrip on signet from `dev-app.zkcoins.app`: create account → mint → send → recipient receives. One happy-path + one failure-path per route per Step-9 success criteria.
+  4. Real performance measurement on the M3 Ultra. R2 budget: warm proof ≤ 5 s, ideally ≤ 1 s; cold-start (first-proof after boot) ≤ 30 s including circuit-data load; peak mem < 64 GB during proving. Plonky2 currently runs CPU-only on Apple Silicon (no Metal backend); that's the operative baseline.
+  5. If budget is missed: redesign per R2 (reduce `MAX_IN_COINS`, drop in-coin recursion, or switch to folding). **NOT** add external hardware or move to a cloud prover — the closed-environment + single-host constraint is non-negotiable.
+**Test plan:** existing `cargo llvm-cov` gate (run by the pre-push hook, `.githooks/pre-push`) is the unit-coverage authority; Step 9 verifies integration, not unit coverage. e2e success criterion: every endpoint round-trips under realistic conditions (one happy-path traversal per route plus at least one failure path per route).
+**Risk:** Medium. First real exposure of the cyclic-recursive prover to production hardware under realistic load. If the budget holds, MVP is done.
 
 ---
 
