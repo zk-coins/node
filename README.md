@@ -40,7 +40,7 @@ API endpoints, background services, their activation status, and the tests that 
 
 **Triage legend** (MVP testing decision): `mvp` = in MVP scope, must reach full test coverage before launch · `gate` = not in MVP scope; hidden behind a Cargo feature, default off, no test coverage required · `planned` = not in scope for MVP.
 
-**Coverage legend:** unit % refers to `cargo-llvm-cov` line coverage of the module that implements the function. Numbers in the table below are STALE — they were measured against the SP1-era build and have not yet been re-measured post-Plonky2 migration. The Step-7 migration left `account_server_tests` + `server_tests` modules disabled at their include-point because their fixtures rely on the SP1-era `ProgramInputsBuilder` / `Prover::{create,update}_account` API; porting them to the Plonky2 wrapper's per-slot tuple API is a focused follow-up task. See [`ROADMAP.md`](./ROADMAP.md) for the live status. `—` means no test exists.
+**Coverage legend:** unit % refers to `cargo-llvm-cov` line coverage of the module that implements the function. Numbers in the table below are STALE — they were measured against the SP1-era build and have not yet been re-measured post-Plonky2 migration. See [`ROADMAP.md`](./ROADMAP.md) for the live status. `—` means no test exists.
 
 | Function                             | Trigger                               | Status                   | Triage  | Tests                         |
 | ------------------------------------ | ------------------------------------- | ------------------------ | ------- | ----------------------------- |
