@@ -63,8 +63,8 @@ jobs:
       - name: Run clippy (server, all features)
         run: cargo clippy -p server --all-features -- -D warnings
 
-      - name: Run clippy (program lib)
-        run: cargo clippy -p zkcoins-program --lib -- -D warnings
+      - name: Run clippy (program + prover libs)
+        run: cargo clippy -p zkcoins-program-plonky2 -p zkcoins-prover-plonky2 --lib -- -D warnings
 
       - name: Build server (MVP feature set — the PRD image)
         run: cargo build -p server
