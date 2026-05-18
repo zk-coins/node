@@ -1,0 +1,13 @@
+[package]
+name = "zkcoins-program-plonky2"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+plonky2 = "1.1.0"
+anyhow = "1.0"
+serde = { workspace = true }
+bincode = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }

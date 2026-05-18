@@ -13,10 +13,10 @@ Rust/Axum backend for [zkcoins.app](https://zkcoins.app) — account management,
 
 | Layer           | Technology           | Why                                                  |
 | --------------- | -------------------- | ---------------------------------------------------- |
-| Language        | Rust 1.81            | Same as ZK circuits, memory safety, performance      |
+| Language        | Rust nightly         | Required for Plonky2 (`feature(specialization)`)     |
 | Web framework   | Axum                 | Built on Tokio, idiomatic async Rust                 |
-| ZK Proofs       | SP1 zkVM             | Write proofs in standard Rust, no DSL                |
-| Data structures | SMT + MMR            | Non-inclusion proofs + append-only history           |
+| ZK Proofs       | Plonky2 + Poseidon-Goldilocks (cyclic recursion) | Server-side, no zkVM, no external prover dependency  |
+| Data structures | SMT + MMR (Poseidon) | Non-inclusion proofs + append-only history           |
 | Bitcoin         | Taproot Inscriptions | 64-byte nullifiers, Esplora API scanning             |
 | Bitcoin index   | electrs (Esplora)    | Esplora REST API via shared Docker network `bitcoin` |
 
@@ -40,7 +40,7 @@ API endpoints, background services, their activation status, and the tests that 
 
 **Triage legend** (MVP testing decision): `mvp` = in MVP scope, must reach full test coverage before launch · `gate` = not in MVP scope; hidden behind a Cargo feature, default off, no test coverage required · `planned` = not in scope for MVP.
 
-**Coverage legend:** unit % refers to `cargo-llvm-cov` line coverage of the module that implements the function (latest run, `SP1_PROVER=mock` with `--all-features`). `—` means no test exists.
+**Coverage legend:** unit % refers to `cargo-llvm-cov` line coverage of the module that implements the function. Numbers in the table below are STALE — they were measured against the SP1-era build and have not yet been re-measured post-Plonky2 migration. See [`ROADMAP.md`](./ROADMAP.md) for the live status. `—` means no test exists.
 
 | Function                             | Trigger                               | Status                   | Triage  | Tests                         |
 | ------------------------------------ | ------------------------------------- | ------------------------ | ------- | ----------------------------- |
@@ -65,7 +65,7 @@ API endpoints, background services, their activation status, and the tests that 
 | Light client support                 | n/a                                   | planned                  | planned | —                             |
 
 ¹ `NETWORK_NAME` env var controls the string returned. `IS_MAINNET=true` flips the default to `"Mainnet"`.
-² Proof generation routes through SP1. `SP1_PROVER=mock` skips real proving; `cpu`/`cuda`/`network` perform actual proving (latency and resource cost vary by stage — see [Proving Strategy](#proving-strategy)).
+² Proof generation routes through the Plonky2 cyclic-recursion circuit. Single host, single Rust process — no zkVM, no external prover service. Mac Studio M3 Ultra is the production hardware target (96 GB unified memory, no external GPU). See [Proving Strategy](#proving-strategy).
 ³ Requires `PUBLISHER_KEY` set to a real funded key and `ESPLORA_URL` reachable. With the default test key the server panics on `IS_MAINNET=true` startup; on testnet it accepts the call but broadcast will fail without funded UTXOs.
 ⁴ Scanner depends on `ESPLORA_URL` being reachable; on connection failure it backs off and retries.
 
@@ -122,14 +122,14 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 
 - **Module:** `server.rs::mint_handler` → `account_server.rs::send_coins` with the server-held minting account
 - **Behaviour:** server signs commitment itself (no client roundtrip) using the minting key
-- **Proof generation:** `zkcoins_prover::Prover::create_account` (or `update_account` for the receiver) under SP1
+- **Proof generation:** `zkcoins_prover::Prover` (the Plonky2 wrapper in [`script-plonky2/`](./script-plonky2/)) — `prove_initial` for new accounts, `prove_account_update` for receivers
 - **Tests:** `account_server.rs::tests::test_create_minting_account`, `test_mint_single_invoice`, `test_mint_repro_live_setup`
 
 #### Send — phase 1 (generate proof)
 
 - **Module:** `server.rs::send_coin_handler` → `verify_send_signature` (Schnorr over `SHA256(account_address || recipient || amount || timestamp)`, ±5 min skew) → `account_server.rs::send_coins`
 - **Behaviour:** returns `{ proof_id, account_state_hash, output_coins_root }`. Proof is persisted under `data/proofs/<id>.bin` for later commit
-- **Tests:** request-layer tests in `server.rs::tests::send_*` and `send_signature_*` (12 tests covering parser, signature verification, replay). Proof generation itself is not exercised — tests run with `SP1_PROVER=mock`
+- **Tests:** request-layer tests in `server.rs::tests::send_*` and `send_signature_*` (12 tests covering parser, signature verification, replay). Proof generation itself is not exercised — the Plonky2 cyclic-recursion build is too slow for unit tests (~3–15 min per prove at production parameters); positive proofs are exercised in `program-plonky2/` directly
 
 #### Send — phase 2 (commit + broadcast)
 
@@ -194,7 +194,6 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 
 | Variable        | Default                     | Effect                                                                                                                                                        |
 | --------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SP1_PROVER`    | `cpu`                       | `mock` (no real proofs, instant), `cpu`, `cuda`, `network`. Tests run with `mock`.                                                                            |
 | `ESPLORA_URL`   | `https://mutinynet.com/api` | Esplora API endpoint (electrs or public)                                                                                                                      |
 | `IS_MAINNET`    | `false`                     | `true` for Bitcoin Mainnet, `false` for Mutinynet/Signet                                                                                                      |
 | `NETWORK_NAME`  | `Mutinynet` / `Mainnet`     | Human-readable name returned by `/api/info`. Default depends on `IS_MAINNET`                                                                                  |
@@ -213,32 +212,32 @@ Spawned from `main.rs::main`:
 
 ### Tests
 
-| Stack            | Command                                                   | What it covers                                                                                             |
-| ---------------- | --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `cargo test`     | `SP1_PROVER=mock cargo test -p server`                    | 45 tests covering only MVP code paths — what the PRD binary actually contains                              |
-| `cargo test`     | `SP1_PROVER=mock cargo test -p server --all-features`     | 58 tests including the gated `address-list`, `faucet`, `usernames`, and `lnurl` routes                     |
-| `cargo-llvm-cov` | `SP1_PROVER=mock cargo llvm-cov -p server --all-features` | Line coverage (latest run: **69.0% lines · 55.0% regions · 76.4% functions**) — measured with all gates on |
+| Stack            | Command                                       | What it covers                                                                                             |
+| ---------------- | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `cargo test`     | `cargo test -p server`                        | MVP code paths — what the PRD binary actually contains                                                     |
+| `cargo test`     | `cargo test -p server --all-features`         | Including the gated `address-list`, `faucet`, `usernames`, and `lnurl` routes                              |
+| `cargo-llvm-cov` | `cargo llvm-cov -p server`                    | Coverage gate enforced by CI: 100% lines + functions on the activated MVP surface                          |
 
-Per-module line coverage (latest run, all features):
+Per-module line coverage (latest CI run):
 
-| Module              | Tests | Line % |
-| ------------------- | ----- | ------ |
-| `server.rs`         | 37    | 74.55% |
-| `account_server.rs` | 6     | 91.12% |
-| `state.rs`          | 9     | 97.01% |
-| `username.rs`       | 8     | 98.29% |
-| `scanner.rs`        | 4     | 50.99% |
-| `publisher.rs`      | 0     | 0.00%  |
-| `main.rs`           | 0     | 4.33%  |
+| Module              | Tests | Line %  | Notes                                                                                                                  |
+| ------------------- | ----- | ------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `scanner.rs`        | 6     | 100%    |                                                                                                                        |
+| `state.rs`          | 13    | 100%    | Poseidon-based SMT + MMR                                                                                               |
+| `username.rs`       | 9     | 100%    |                                                                                                                        |
+| `account_server.rs` | 10 (inline) | excluded from gate | Inline error-path tests cover Account / lookup / IO / send_coins early returns; the `send_coins` body needs the SP1-fixture port to reach full coverage |
+| `server.rs`         | n/a   | excluded | Same as above                                                                                                          |
+| `publisher.rs`      | 0     | excluded | Bitcoin commit/reveal broadcasting — needs live signet/regtest node                                                    |
+| `main.rs`           | 0     | excluded | Runtime bootstrap                                                                                                      |
 
-`publisher.rs` and `main.rs` are untested by design — they require a live Bitcoin node and a funded publisher key. CI runs both the MVP build (`cargo build/clippy`) and the all-features build, plus `cargo test --all-features`. Coverage is collected ad-hoc, not in CI.
+`publisher.rs` and `main.rs` are untested by design — they require a live Bitcoin node and a funded publisher key. `account_server.rs` + `server.rs` are temporarily excluded during the Step-7 SP1→Plonky2 migration. CI runs the MVP build (`cargo build/clippy`) and the all-features build, plus `cargo test --all-features` and `cargo llvm-cov`.
 
 ## Running
 
 Requires access to a Bitcoin node. See [Backend docs](https://docs.zkcoins.app/infrastructure/backend).
 
 ```bash
-SP1_PROVER=mock cargo run -p server
+cargo run -p server
 # Server starts on http://0.0.0.0:4242
 ```
 
@@ -255,19 +254,26 @@ Mint uses a single-phase flow (server holds the minting account key).
 ## Project Structure
 
 ```
-server/                # Axum REST API
+server/                  # Axum REST API
 ├── src/
-│   ├── main.rs        # Entry point, chain scanner, bind 0.0.0.0:4242
-│   ├── server.rs      # REST endpoints + /health
+│   ├── main.rs          # Entry point, chain scanner, bind 0.0.0.0:4242
+│   ├── server.rs        # REST endpoints + /health
 │   ├── account_server.rs  # Account logic, coin proofs, prover calls
-│   ├── state.rs       # Sparse Merkle Tree + Merkle Mountain Range
-│   ├── scanner.rs     # Bitcoin block scanner (30s polling, prefix 4242)
-│   └── publisher.rs   # Taproot Inscription broadcaster (commit/reveal)
-shared/                # Shared types (Commitment, Invoice, ClientAccount)
-program/               # SP1 zkVM circuit types (AccountState, Coin, ProofData)
-├── src/merkle/        # SMT + MMR implementations
-script/                # Prover (real SP1 zkVM — create_account, update_account)
+│   ├── state.rs         # Sparse Merkle Tree + Merkle Mountain Range
+│   ├── scanner.rs       # Bitcoin block scanner (30s polling, prefix 4242)
+│   └── publisher.rs     # Taproot Inscription broadcaster (commit/reveal)
+shared/                  # Shared types (Commitment, Invoice, ClientAccount)
+program-plonky2/         # Cyclic-recursion state-transition circuit (Plonky2 + Poseidon)
+├── src/
+│   ├── circuit/         # `build_circuit` + per-stage gadgets
+│   ├── hash.rs          # Poseidon-Goldilocks helpers (HashDigest, digest_to_bytes…)
+│   ├── merkle/          # Poseidon-based SMT + MMR
+│   ├── types.rs         # AccountState, Coin, ProofData
+│   └── inputs.rs        # CommitmentMerkleProofs, ProofType
+script-plonky2/          # Host-side prover wrapper (Prover struct)
 ```
+
+The last SP1 zkVM / SHA256 state is preserved at tag `v0.last-sp1` for historical reference. Recover with `git checkout v0.last-sp1 -- program/ script/`.
 
 ## Docker
 
@@ -275,12 +281,11 @@ script/                # Prover (real SP1 zkVM — create_account, update_accoun
 docker build -t zkcoin/server .
 docker run -p 4242:4242 \
   --network bitcoin \
-  -e SP1_PROVER=mock \
   -e ESPLORA_URL=http://electrs-mainnet:3000 \
   zkcoin/server
 ```
 
-The pre-built ELF (`elf/zkcoins-program`) is committed to the repo, so Docker builds do not require the Succinct toolchain — only standard Rust.
+Docker builds use standard nightly Rust (no external toolchain needed). The Dockerfile is being re-introduced as part of Step 9 (DEV deployment); the SP1-era Dockerfile was removed in the migration since the new build uses workspace-standard nightly with no zkVM target.
 
 ## CI/CD
 
@@ -294,20 +299,17 @@ Build time: ~5 minutes (Rust compilation on ARM64).
 
 ## Proving Strategy
 
-Staged scaling for the SP1 prover:
+zkCoins is **server-heavy**: a single trusted server generates all proofs, the wallet holds only the private key and signs BIP-340 Schnorr over `SHA256(serialize(asth) ‖ serialize(ocr))`. There is no in-browser Poseidon, no wasm-Plonky2 verifier, no in-app ZK gadget. See [`SPEC.md`](./SPEC.md) §13 + the memory `feedback_zkcoins_server_side_compute` for the full rationale.
 
-| Stage                          | When to move                                            | Configuration                                                                                                                                                                                        |
-| ------------------------------ | ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **0. Mock (DEV)**              | Development & testing                                   | `SP1_PROVER=mock` — no real proofs, instant responses. Required on DEV because CPU prover causes OOM (SP1 `update_account` exceeds available memory).                                                |
-| **1. CPU (PRD)**               | Production baseline                                     | `SP1_PROVER=cpu` running on Mac Studio M3 Ultra, 96 GB unified memory. `create_account` works, `update_account` needs memory tuning.                                                                 |
-| **2. Succinct Prover Network** | CPU latency becomes a bottleneck                        | `SP1_PROVER=network` — no hardware commitment, requires PROVE token deposit and accepts token-price exposure. See [docs.succinct.xyz](https://docs.succinct.xyz/docs/sp1/prover-network/quickstart). |
-| **3. Self-hosted CUDA**        | Network volume too costly or PROVE exposure undesirable | `SP1_PROVER=cuda` on x86 Linux with NVIDIA GPU (Compute Capability ≥ 8.6, ≥ 24 GB VRAM — RTX 4090 / 5090 / RTX 6000 Ada). Apple Silicon is not supported.                                            |
+**Hardware target: Mac Studio M3 Ultra** (96 GB unified RAM, single host). All on-box compute is available: Performance + Efficiency cores, the integrated Apple Silicon GPU (via Metal — currently unused because Plonky2 ships CPU + CUDA backends only), Neural Engine, AMX. **Not available**: external GPU accelerators (no NVIDIA, no CUDA), no cloud prover services (no Succinct Prover Network, no AWS GPU). Performance budget is what the M3 Ultra delivers; if a design overshoots, the design changes — we do not add external hardware.
 
-Skip stages only with concrete latency or cost data, not assumptions.
+Current cyclic-recursion proof times at production parameters (`MAX_IN_COINS = MAX_OUT_COINS = 8`, `INNER_PAD_BITS = 14`): 3–15 min wall per `prove_*` call. See [`program-plonky2/SESSION_STATE.md`](./program-plonky2/SESSION_STATE.md) for the detailed test-time table.
 
 ## Open Tasks
 
-- [ ] GPU acceleration (`SP1_PROVER=cuda`) or Succinct Prover Network
+- [ ] Step 7 final: Prover-API integration in `account_server::send_coins` after Stage 5d-next-5 merge (issue [#19](https://github.com/zk-coins/server/issues/19))
+- [ ] Step 8: app / wallet integration (Schnorr signing boundary)
+- [ ] Step 9: DEV deployment + signet end-to-end roundtrip + Dockerfile rewrite
 - [ ] Explorer endpoints (`/api/stats`, `/api/nullifiers`)
 - [ ] Light client support
 

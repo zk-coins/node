@@ -61,7 +61,7 @@ pub async fn start_rest_server(
             .expect("Failed to create private key.");
         println!(
             "Set MINTING_ADDRESS to {:?}",
-            &zkcoins_program::MINTING_ADDRESS
+            *zkcoins_program::types::MINTING_ADDRESS
         );
         let mut minting_client = ClientAccount::new(private_key);
         // ClientAccount::new starts with num_pubkeys=0, but each successful
@@ -100,7 +100,7 @@ pub async fn start_rest_server(
         }
         assert_eq!(
             minting_client.address,
-            zkcoins_program::MINTING_ADDRESS,
+            *zkcoins_program::types::MINTING_ADDRESS,
             "Minting account address mismatch — minting_secret.bin or MINTING_ADDRESS constant is wrong"
         );
         Arc::new(Mutex::new(minting_client))
@@ -122,9 +122,19 @@ pub async fn start_rest_server(
         let mut account_server_guard = state.account_server.lock().unwrap();
         if account_server_guard.get_minting_account_address().is_err() {
             let mut minting_server_account = crate::account_server::Account::new();
-            minting_server_account.balance = u64::MAX;
-            account_server_guard
-                .import_account(zkcoins_program::MINTING_ADDRESS, minting_server_account);
+            // The Plonky2 state-transition circuit packs the running
+            // balance as a Goldilocks field element via
+            // `balance_hi * 2^32 + balance_lo`. Values >= p (the
+            // Goldilocks prime ≈ 2^64 - 2^32 + 1) reduce mod p inside
+            // the circuit but stay full-width in the witness setter,
+            // which trips a "wire set twice" partition error. Stay
+            // safely below 2^48 so the circuit-vs-witness sides agree
+            // even after many mint operations.
+            minting_server_account.balance = 1u64 << 48;
+            account_server_guard.import_account(
+                *zkcoins_program::types::MINTING_ADDRESS,
+                minting_server_account,
+            );
             if let Err(e) = account_server_guard.save_to_file(&state.accounts_path) {
                 eprintln!("Failed to save initial accounts file: {}", e);
             }
@@ -165,9 +175,9 @@ pub(crate) async fn broadcast_commit_and_deliver(
         // dry Mutinynet publisher still succeed. See the comment over
         // the matching branch in server.rs::mint_handler.
         if std::env::var("DEV_SKIP_BROADCAST_FAILURE").unwrap_or_default() != "true" {
-            return (
+            return crate::server::handler_error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(SendCoinResponse::default()),
+                "Failed to broadcast commitment inscription on-chain",
             );
         }
         eprintln!("DEV_SKIP_BROADCAST_FAILURE=true — continuing without on-chain commitment");
@@ -187,6 +197,7 @@ pub(crate) async fn broadcast_commit_and_deliver(
         StatusCode::OK,
         Json(SendCoinResponse {
             success: true,
+            error: None,
             proof_id: Some(proof_id),
             account_state_hash: None,
             output_coins_root: None,

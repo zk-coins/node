@@ -4,7 +4,11 @@ use bitcoin::secp256k1::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
-use zkcoins_program::merkle::HashDigest;
+
+// `get_account_state_hash` returns the raw 32-byte BIP-340 Schnorr
+// message digest. This is distinct from Poseidon's `HashDigest`
+// (= `HashOut<F>`); callers that need the field-element form
+// reinterpret via `zkcoins_program::hash::digest_from_bytes`.
 
 use crate::SECP256K1;
 
@@ -68,7 +72,7 @@ impl Commitment {
         }
     }
 
-    pub fn get_account_state_hash(&self) -> HashDigest {
+    pub fn get_account_state_hash(&self) -> [u8; 32] {
         let msg_hash = if self.message.len() != 32 {
             let mut hasher = Sha256::new();
             hasher.update(&self.message);

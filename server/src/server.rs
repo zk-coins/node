@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tower_http::cors::CorsLayer;
+use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes};
 use zkcoins_prover::Proof;
 
 use crate::account_server::{AccountServer, CoinProof};
@@ -90,6 +91,7 @@ pub struct BalanceResponse {
     username: Option<String>,
 }
 
+#[cfg(any(feature = "address-list", feature = "usernames", feature = "lnurl"))]
 #[derive(Serialize, Deserialize)]
 pub struct AddressesResponse {
     addresses: Vec<String>,
@@ -114,9 +116,13 @@ pub struct MintRequest {
     amount: u64,
 }
 
+// `ReceiveCoinRequest` was the SP1-era POST body shape for a coin
+// drop. It is currently unused — the receive flow is exercised via
+// scanner + state.update — but kept as a placeholder for the future
+// authenticated push endpoint. Mark `dead_code` to silence the lint.
+#[allow(dead_code)]
 #[derive(Deserialize)]
 pub struct ReceiveCoinRequest {
-    #[allow(dead_code)]
     coin_proof: Proof,
 }
 
@@ -191,9 +197,15 @@ impl ProofStore {
     }
 }
 
-#[derive(Serialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct SendCoinResponse {
     pub(crate) success: bool,
+    /// Structured error message on failure. `None` on success. Mirrors
+    /// the body string returned alongside a 4xx/5xx status code, so
+    /// clients deserialising a non-2xx response can branch on it without
+    /// re-reading the body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) proof_id: Option<u64>,
     /// Hex-encoded hash fields the client needs to create a commitment (only set for user sends).
@@ -201,6 +213,123 @@ pub struct SendCoinResponse {
     pub(crate) account_state_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) output_coins_root: Option<String>,
+}
+
+/// Map a `send_coins` error string to an HTTP status code plus a
+/// client-safe body message.
+///
+/// Threat model (memory `feedback_threat_model_over_checklist`):
+///
+/// - **422 UNPROCESSABLE_ENTITY** — the request is well-formed but the
+///   witness is invalid (insufficient balance, in-coin not in source's
+///   output_coins_root, source commitment not in history MMR, etc.).
+///   The defense-in-depth shim added in PR #26 (Stage 5d-next-5
+///   Phase 2b) produces two of these strings in microseconds before
+///   the minute-scale prove cost is paid; surfacing the specific
+///   string lets clients distinguish "fix your inclusion proof" from
+///   "fix your account selection".
+/// - **404 NOT_FOUND** — sender address is not known to the server.
+/// - **400 BAD_REQUEST** — request structure violates the API contract
+///   (e.g. AccountUpdate transition without `prev_commitment_pubkey`).
+/// - **500 INTERNAL_SERVER_ERROR** — the prover failed. Body collapses
+///   to a generic `"prove failed"` to avoid leaking prover-internal
+///   state to the caller. The full error string is logged via
+///   `eprintln!` in the handler.
+pub(crate) fn map_send_coins_error(err: &str) -> (StatusCode, &'static str) {
+    match err {
+        "Unknown account address" => (StatusCode::NOT_FOUND, "Unknown account address"),
+        "prev_commitment_pubkey required for account update" => (
+            StatusCode::BAD_REQUEST,
+            "prev_commitment_pubkey required for account update",
+        ),
+        "Insufficient funds" => (StatusCode::UNPROCESSABLE_ENTITY, "Insufficient funds"),
+        // `get_merkle_proofs` failures — reachable from `send_coins`
+        // via the `prev_commitment_pubkey` path. The client supplied
+        // the wrong public key, or the previous proof references a
+        // history root the server hasn't seen yet (stale snapshot).
+        // Both are caller-fixable, hence 422 rather than 500.
+        "Unable to get merkle proofs for provided public key" => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Unable to get merkle proofs for provided public key",
+        ),
+        "Unable to get mmr inclusion proof for the previous root" => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Unable to get mmr inclusion proof for the previous root",
+        ),
+        // Truncated proof public-inputs vector — the proof stored on
+        // the account is corrupt or was produced by an incompatible
+        // build of the prover. Not caller-fixable; surfaces as 500.
+        "Proof public_inputs too short" => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Proof public_inputs too short",
+        ),
+        "In-coin not present in source's output_coins_root" => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "In-coin not present in source's output_coins_root",
+        ),
+        "Source commitment not present in history MMR" => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Source commitment not present in history MMR",
+        ),
+        "Coin is missing commitment" => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Coin is missing commitment",
+        ),
+        "Should provide an inclusion proof" => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Should provide an inclusion proof",
+        ),
+        "Coin should not exist in coin history tree" => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Coin should not exist in coin history tree",
+        ),
+        "Coin should not exist in tree yet" => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Coin should not exist in tree yet",
+        ),
+        "Too many in-coins for one transition" => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Too many in-coins for one transition",
+        ),
+        "Too many out-coins for one transition" => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Too many out-coins for one transition",
+        ),
+        s if s.ends_with("failed") => (StatusCode::INTERNAL_SERVER_ERROR, "prove failed"),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
+    }
+}
+
+/// Build a `SendCoinResponse` for a failed `send_coins` call, paired
+/// with the appropriate HTTP status code.
+pub(crate) fn send_coins_error_response(err: &str) -> (StatusCode, Json<SendCoinResponse>) {
+    let (status, body) = map_send_coins_error(err);
+    (
+        status,
+        Json(SendCoinResponse {
+            success: false,
+            error: Some(body.to_string()),
+            ..SendCoinResponse::default()
+        }),
+    )
+}
+
+/// Build a `SendCoinResponse` for a request-level failure (signature
+/// verification, hex decode, address length mismatch, broadcast
+/// failure, etc.). Lets every handler failure carry a body.error
+/// string instead of an opaque empty body.
+pub(crate) fn handler_error_response(
+    status: StatusCode,
+    msg: &'static str,
+) -> (StatusCode, Json<SendCoinResponse>) {
+    (
+        status,
+        Json(SendCoinResponse {
+            success: false,
+            error: Some(msg.to_string()),
+            ..SendCoinResponse::default()
+        }),
+    )
 }
 
 #[derive(Deserialize)]
@@ -248,12 +377,14 @@ pub struct ClaimUsernameRequest {
     timestamp: u64,
 }
 
+#[cfg(any(feature = "usernames", feature = "lnurl"))]
 #[derive(Serialize, Deserialize)]
 pub struct UsernameResponse {
     username: String,
     address: String,
 }
 
+#[cfg(feature = "lnurl")]
 #[derive(Serialize, Deserialize)]
 pub struct LnurlpResponse {
     tag: String,
@@ -265,6 +396,7 @@ pub struct LnurlpResponse {
     metadata: String,
 }
 
+#[cfg(any(feature = "usernames", feature = "lnurl"))]
 #[derive(Serialize, Deserialize)]
 pub struct LnurlErrorResponse {
     status: String,
@@ -294,10 +426,10 @@ async fn get_balance_handler(
             }
         };
 
-        // Convert Vec<u8> to [u8; 32]
-        let mut address = [0u8; 32];
+        // Convert Vec<u8> to [u8; 32], then to Poseidon HashDigest.
+        let mut address_bytes = [0u8; 32];
         if address_vec.len() == 32 {
-            address.copy_from_slice(&address_vec);
+            address_bytes.copy_from_slice(&address_vec);
         } else {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -307,6 +439,7 @@ async fn get_balance_handler(
                 }),
             );
         }
+        let address = digest_from_bytes(&address_bytes);
 
         // Get balance for the specific account
         let username = {
@@ -346,7 +479,7 @@ async fn get_address_handler(State(state): State<AppState>) -> impl IntoResponse
     let hex_addresses: Vec<String> = account_server
         .get_addresses()
         .iter()
-        .map(|addr| format!("0x{}", hex::encode(addr)))
+        .map(|addr| format!("0x{}", hex::encode(digest_to_bytes(addr))))
         .collect();
 
     Json(AddressesResponse {
@@ -387,7 +520,10 @@ async fn send_coin_handler(
     if request.signature.is_some() {
         if let Err(e) = verify_send_signature(&request) {
             eprintln!("Signature verification failed: {}", e);
-            return (StatusCode::UNAUTHORIZED, Json(SendCoinResponse::default()));
+            return handler_error_response(
+                StatusCode::UNAUTHORIZED,
+                "Signature verification failed",
+            );
         }
     }
 
@@ -395,34 +531,36 @@ async fn send_coin_handler(
     let from_address_vec = match hex::decode(request.account_address.trim_start_matches("0x")) {
         Ok(addr) => addr,
         Err(_) => {
-            return (
+            return handler_error_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(SendCoinResponse::default()),
+                "account_address is not valid hex",
             )
         }
     };
     let to_address_vec = match hex::decode(request.recipient.trim_start_matches("0x")) {
         Ok(addr) => addr,
         Err(_) => {
-            return (
+            return handler_error_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(SendCoinResponse::default()),
+                "recipient is not valid hex",
             )
         }
     };
 
-    // Convert Vec<u8> to [u8; 32] for both addresses
-    let mut from_address = [0u8; 32];
-    let mut to_address = [0u8; 32];
+    // Convert Vec<u8> to [u8; 32], then to Poseidon HashDigest.
+    let mut from_address_bytes = [0u8; 32];
+    let mut to_address_bytes = [0u8; 32];
     if from_address_vec.len() == 32 && to_address_vec.len() == 32 {
-        from_address.copy_from_slice(&from_address_vec);
-        to_address.copy_from_slice(&to_address_vec);
+        from_address_bytes.copy_from_slice(&from_address_vec);
+        to_address_bytes.copy_from_slice(&to_address_vec);
     } else {
-        return (
+        return handler_error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(SendCoinResponse::default()),
+            "address must be 32 bytes (64 hex chars)",
         );
     }
+    let from_address = digest_from_bytes(&from_address_bytes);
+    let to_address = digest_from_bytes(&to_address_bytes);
 
     // TODO: Provide the correct public keys from the client
     // Acquire the account_server lock only for the duration of sending coins.
@@ -445,14 +583,18 @@ async fn send_coin_handler(
 
     match send_result {
         Ok(mut coin_proofs) => {
-            // Extract proof data so the client can create a commitment.
-            // The SP1 prover always emits a valid ProofData in public_values,
-            // so the deserialize cannot fail in practice.
-            let pd =
-                bincode::deserialize::<ProofData>(&coin_proofs[0].proof.public_values.to_vec())
-                    .expect("SP1 prover emits valid ProofData public_values");
-            let ash_hex = Some(hex::encode(pd.account_state_hash));
-            let ocr_hex = Some(hex::encode(pd.output_coins_root));
+            // PLONKY2 MIGRATION (Step 7): bridge from SP1's
+            // `public_values` byte stream to Plonky2's `public_inputs`
+            // field-element vector via `ProofData::from_field_elements`.
+            let pis: [zkcoins_program::F;
+                zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] = coin_proofs[0]
+                .proof
+                .public_inputs[..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
+                .try_into()
+                .expect("Plonky2 Proof emits N_PROOF_DATA_PUBLIC_INPUTS field elements");
+            let pd = ProofData::from_field_elements(&pis);
+            let ash_hex = Some(hex::encode(digest_to_bytes(&pd.account_state_hash)));
+            let ocr_hex = Some(hex::encode(digest_to_bytes(&pd.output_coins_root)));
 
             // Mint flow only — broadcasting a pre-set commitment is the
             // server-signed minting path. The mint endpoint is feature-
@@ -490,21 +632,17 @@ async fn send_coin_handler(
                 StatusCode::OK,
                 Json(SendCoinResponse {
                     success: true,
+                    error: None,
                     proof_id: Some(proof_id),
                     account_state_hash: ash_hex,
                     output_coins_root: ocr_hex,
                 }),
             )
         }
-        Err(_) => (
-            StatusCode::OK,
-            Json(SendCoinResponse {
-                success: false,
-                proof_id: None,
-                account_state_hash: None,
-                output_coins_root: None,
-            }),
-        ),
+        Err(e) => {
+            eprintln!("send_coins error: {}", e);
+            send_coins_error_response(e)
+        }
     }
 }
 
@@ -517,22 +655,23 @@ async fn mint_handler(
     let account_address_vec = match hex::decode(request.account_address.trim_start_matches("0x")) {
         Ok(addr) => addr,
         Err(_) => {
-            return (
+            return handler_error_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(SendCoinResponse::default()),
+                "account_address is not valid hex",
             )
         }
     };
 
-    let mut account_address = [0u8; 32];
+    let mut account_address_bytes = [0u8; 32];
     if account_address_vec.len() == 32 {
-        account_address.copy_from_slice(&account_address_vec);
+        account_address_bytes.copy_from_slice(&account_address_vec);
     } else {
-        return (
+        return handler_error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(SendCoinResponse::default()),
+            "account_address must be 32 bytes (64 hex chars)",
         );
     }
+    let account_address = digest_from_bytes(&account_address_bytes);
 
     // Generate keys and get necessary info while holding the minting_account lock briefly
     let (minting_pubkey, next_minting_pubkey, prev_commitment_pubkey, num_pubkeys_before_mint) = {
@@ -558,9 +697,9 @@ async fn mint_handler(
             Ok(addr) => addr,
             Err(e) => {
                 eprintln!("Minting account not found: {:?}", e);
-                return (
+                return handler_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(SendCoinResponse::default()),
+                    "Minting account not configured",
                 );
             }
         };
@@ -614,15 +753,20 @@ async fn mint_handler(
                     // Handle appropriately, maybe log an error or return a specific response.
                     eprintln!("WARNING: num_pubkeys changed unexpectedly during mint operation.");
                 }
-                let proof_data = match bincode::deserialize::<ProofData>(
-                    &coin_proofs[0].proof.public_values.to_vec(),
-                ) {
-                    Ok(data) => data,
+                let pis: Result<
+                    [zkcoins_program::F;
+                        zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS],
+                    _,
+                > = coin_proofs[0].proof.public_inputs
+                    [..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
+                    .try_into();
+                let proof_data = match pis {
+                    Ok(pis) => ProofData::from_field_elements(&pis),
                     Err(e) => {
-                        eprintln!("Failed to deserialize proof data: {}", e);
-                        return (
+                        eprintln!("Failed to deserialize proof public_inputs: {:?}", e);
+                        return handler_error_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(SendCoinResponse::default()),
+                            "prove failed",
                         );
                     }
                 };
@@ -663,9 +807,9 @@ async fn mint_handler(
             {
                 eprintln!("Error broadcasting mint inscription: {}", err);
                 if std::env::var("DEV_SKIP_BROADCAST_FAILURE").unwrap_or_default() != "true" {
-                    return (
+                    return handler_error_response(
                         StatusCode::SERVICE_UNAVAILABLE,
-                        Json(SendCoinResponse::default()),
+                        "Failed to broadcast mint inscription on-chain",
                     );
                 }
                 eprintln!(
@@ -687,9 +831,9 @@ async fn mint_handler(
             let proof_id = match coin_proofs.pop() {
                 Some(proof) => state.proof_store.add_proof(proof),
                 None => {
-                    return (
+                    return handler_error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(SendCoinResponse::default()),
+                        "prove failed",
                     );
                 }
             };
@@ -697,13 +841,17 @@ async fn mint_handler(
                 StatusCode::OK,
                 Json(SendCoinResponse {
                     success: true,
+                    error: None,
                     proof_id: Some(proof_id),
                     account_state_hash: None,
                     output_coins_root: None,
                 }),
             )
         }
-        Err(_) => (StatusCode::OK, Json(SendCoinResponse::default())),
+        Err(e) => {
+            eprintln!("mint send_coins error: {}", e);
+            send_coins_error_response(e)
+        }
     }
 }
 
@@ -748,15 +896,7 @@ async fn commit_handler(
     let coin_proof = match state.proof_store.get_proof(request.proof_id) {
         Some(p) => p,
         None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(SendCoinResponse {
-                    success: false,
-                    proof_id: None,
-                    account_state_hash: None,
-                    output_coins_root: None,
-                }),
-            );
+            return handler_error_response(StatusCode::NOT_FOUND, "Unknown proof_id");
         }
     };
 
@@ -764,42 +904,27 @@ async fn commit_handler(
     let message_bytes = match hex::decode(&request.message) {
         Ok(b) => b,
         Err(_) => {
-            return (
+            return handler_error_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(SendCoinResponse {
-                    success: false,
-                    proof_id: None,
-                    account_state_hash: None,
-                    output_coins_root: None,
-                }),
+                "message is not valid hex",
             );
         }
     };
     let sig_bytes = match hex::decode(&request.signature) {
         Ok(b) => b,
         Err(_) => {
-            return (
+            return handler_error_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(SendCoinResponse {
-                    success: false,
-                    proof_id: None,
-                    account_state_hash: None,
-                    output_coins_root: None,
-                }),
+                "signature is not valid hex",
             );
         }
     };
     let signature = match bitcoin::secp256k1::schnorr::Signature::from_slice(&sig_bytes) {
         Ok(s) => s,
         Err(_) => {
-            return (
+            return handler_error_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(SendCoinResponse {
-                    success: false,
-                    proof_id: None,
-                    account_state_hash: None,
-                    output_coins_root: None,
-                }),
+                "signature is not a valid Schnorr signature",
             );
         }
     };
@@ -812,15 +937,7 @@ async fn commit_handler(
 
     // Verify the commitment
     if !commitment.verify() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(SendCoinResponse {
-                success: false,
-                proof_id: None,
-                account_state_hash: None,
-                output_coins_root: None,
-            }),
-        );
+        return handler_error_response(StatusCode::UNAUTHORIZED, "Commitment signature invalid");
     }
 
     crate::server_runtime::broadcast_commit_and_deliver(
@@ -909,7 +1026,7 @@ async fn claim_username_handler(
                 .into_response()
         }
     };
-    let mut address = [0u8; 32];
+    let mut address_bytes = [0u8; 32];
     if address_vec.len() != 32 {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -920,11 +1037,12 @@ async fn claim_username_handler(
         )
             .into_response();
     }
-    address.copy_from_slice(&address_vec);
+    address_bytes.copy_from_slice(&address_vec);
+    let address = digest_from_bytes(&address_bytes);
 
     // Verify public key matches address: sha256(compressed_pubkey) == address
     let pk_hash: [u8; 32] = Sha256::digest(request.public_key.serialize()).into();
-    if pk_hash != address {
+    if pk_hash != address_bytes {
         return (
             StatusCode::UNAUTHORIZED,
             Json(LnurlErrorResponse {
@@ -1020,7 +1138,7 @@ async fn claim_username_handler(
         StatusCode::OK,
         Json(UsernameResponse {
             username: normalized,
-            address: format!("0x{}", hex::encode(address)),
+            address: format!("0x{}", hex::encode(digest_to_bytes(&address))),
         }),
     )
         .into_response()
@@ -1030,7 +1148,10 @@ async fn claim_username_handler(
 /// then falls back to hex-prefix matching against known account addresses.
 /// Only used by the gated username and LNURL handlers.
 #[cfg(any(feature = "usernames", feature = "lnurl"))]
-fn resolve_identifier(state: &AppState, identifier: &str) -> Option<([u8; 32], String)> {
+fn resolve_identifier(
+    state: &AppState,
+    identifier: &str,
+) -> Option<(zkcoins_program::hash::HashDigest, String)> {
     let normalized = identifier.to_lowercase();
 
     // 1. Check custom username
@@ -1045,7 +1166,7 @@ fn resolve_identifier(state: &AppState, identifier: &str) -> Option<([u8; 32], S
     account_server
         .get_addresses()
         .into_iter()
-        .find(|addr| hex::encode(addr).starts_with(&normalized))
+        .find(|addr| hex::encode(digest_to_bytes(addr)).starts_with(&normalized))
         .map(|addr| (addr, normalized))
 }
 
@@ -1059,7 +1180,7 @@ async fn resolve_username_handler(
             StatusCode::OK,
             Json(UsernameResponse {
                 username: resolved_name,
-                address: format!("0x{}", hex::encode(address)),
+                address: format!("0x{}", hex::encode(digest_to_bytes(&address))),
             }),
         )
             .into_response(),
