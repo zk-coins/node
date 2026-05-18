@@ -741,6 +741,244 @@ fn test_send_coins_rejects_tampered_source_proof_inclusion() {
     );
 }
 
+/// Slot-count guard: `invoices.len() > MAX_OUT_COINS` fires at the
+/// top of `send_coins` before the heavy in-coin loop and prove cost.
+/// Empty account + (`MAX_OUT_COINS + 1`) invoices triggers it
+/// without paying a prove.
+#[test]
+fn test_send_coins_rejects_too_many_invoices() {
+    use zkcoins_program::circuit::main::MAX_OUT_COINS;
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    let mut server = AccountServer::new(Arc::clone(&state_arc));
+    let minting = TestAccountData::new_minting_account();
+    server.import_account(
+        minting.address,
+        Account {
+            proof: None,
+            coin_queue: vec![],
+            coin_history: SparseMerkleTree::new(),
+            balance: 1_000_000,
+        },
+    );
+
+    let invoices: Vec<Invoice> = (0..(MAX_OUT_COINS + 1) as u8)
+        .map(|i| Invoice::new(1, digest_from_bytes(&[i; 32])))
+        .collect();
+
+    let current_pk = generate_test_public_key(&minting.xpriv, minting.num_pubkeys);
+    let next_pk = generate_test_public_key(&minting.xpriv, minting.num_pubkeys + 1);
+    let result = server.send_coins(invoices, minting.address, current_pk, next_pk, None);
+    assert_eq!(result.unwrap_err(), "Too many out-coins for one transition");
+}
+
+/// Slot-count guard: `account.coin_queue.len() > MAX_IN_COINS` fires
+/// at the top of `send_coins` before the heavy in-coin loop and
+/// prove cost. We mint one coin honestly (one Init prove), then
+/// clone it `MAX_IN_COINS + 1` times into the recipient's
+/// `coin_queue` and confirm send_coins fails fast.
+#[test]
+fn test_send_coins_rejects_too_many_coins_in_queue() {
+    use zkcoins_program::circuit::main::MAX_IN_COINS;
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    let mut server = AccountServer::new(Arc::clone(&state_arc));
+
+    let mut minting = TestAccountData::new_minting_account();
+    server.import_account(
+        minting.address,
+        Account {
+            proof: None,
+            coin_queue: vec![],
+            coin_history: SparseMerkleTree::new(),
+            balance: 10_000,
+        },
+    );
+    let recipient_data = TestAccountData::new_generic(&[20u8; 32], Network::Signet);
+    let recipient_addr = recipient_data.address;
+
+    // One honest mint produces one valid CoinProof we can clone.
+    let mut coin_proofs = minting
+        .execute_send_coins(&mut server, vec![Invoice::new(100, recipient_addr)])
+        .expect("mint send_coins");
+    state_arc
+        .lock()
+        .unwrap()
+        .update(
+            &coin_proofs
+                .iter()
+                .map(|x| x.commitment.clone().unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .expect("state.update");
+
+    let cp = coin_proofs.pop().expect("at least one coin");
+    server
+        .receive_coin(cp.clone())
+        .expect("recipient receive_coin");
+
+    // Force `coin_queue.len()` past the budget by cloning the single
+    // honest entry. The slot-count guard fires before any siblings
+    // are walked or any prove is attempted, so the clones being
+    // identical doesn't matter.
+    {
+        let account = server
+            .accounts
+            .get_mut(&recipient_addr)
+            .expect("recipient account present after receive_coin");
+        for _ in 0..MAX_IN_COINS {
+            account.coin_queue.push(cp.clone());
+        }
+        assert!(
+            account.coin_queue.len() > MAX_IN_COINS,
+            "test fixture must overflow the in-coin slot budget"
+        );
+    }
+
+    let current_pk = generate_test_public_key(&recipient_data.xpriv, 0);
+    let next_pk = generate_test_public_key(&recipient_data.xpriv, 1);
+    let result = server.send_coins(
+        vec![Invoice::new(1, digest_from_bytes(&[99u8; 32]))],
+        recipient_addr,
+        current_pk,
+        next_pk,
+        None,
+    );
+    assert_eq!(result.unwrap_err(), "Too many in-coins for one transition");
+}
+
+/// In-coin loop: a queued `CoinProof` whose `commitment.public_key`
+/// is not registered in `state.commitment_proofs` makes
+/// `get_merkle_proofs` return its "Unable to get merkle proofs..."
+/// error string. Set up by minting → receiving WITHOUT calling
+/// `state.update` first, so the recipient's queue entry references a
+/// commitment public_key the state never indexed.
+#[test]
+fn test_send_coins_errors_when_state_lacks_commitment_for_in_coin() {
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    let mut server = AccountServer::new(Arc::clone(&state_arc));
+
+    let mut minting = TestAccountData::new_minting_account();
+    server.import_account(
+        minting.address,
+        Account {
+            proof: None,
+            coin_queue: vec![],
+            coin_history: SparseMerkleTree::new(),
+            balance: 10_000,
+        },
+    );
+    let recipient_data = TestAccountData::new_generic(&[21u8; 32], Network::Signet);
+    let recipient_addr = recipient_data.address;
+
+    let mut coin_proofs = minting
+        .execute_send_coins(&mut server, vec![Invoice::new(75, recipient_addr)])
+        .expect("mint send_coins");
+    // Intentionally SKIP `state_arc.update(...)` — state never sees
+    // the minting account's commitment, so get_merkle_proofs cannot
+    // look up the commitment proof on the recipient's send_coins call.
+    server
+        .receive_coin(coin_proofs.pop().expect("at least one coin"))
+        .expect("recipient receive_coin");
+
+    let current_pk = generate_test_public_key(&recipient_data.xpriv, 0);
+    let next_pk = generate_test_public_key(&recipient_data.xpriv, 1);
+    let result = server.send_coins(
+        vec![Invoice::new(1, digest_from_bytes(&[99u8; 32]))],
+        recipient_addr,
+        current_pk,
+        next_pk,
+        None,
+    );
+    assert_eq!(
+        result.unwrap_err(),
+        "Unable to get merkle proofs for provided public key"
+    );
+}
+
+/// AccountUpdate branch: when `account.proof = Some(...)` and the
+/// caller passes a `prev_commitment_pubkey` that the state's
+/// commitment-proof index does not contain, the second call to
+/// `get_merkle_proofs` (inside the AccountUpdate-prove preparation)
+/// surfaces "Unable to get merkle proofs..." just like the in-coin
+/// loop's call. Set up via one honest mint + receive + state.update;
+/// then pass a fresh, never-indexed `prev_commitment_pubkey`.
+#[test]
+fn test_send_coins_errors_when_state_lacks_commitment_for_prev_account_proof() {
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    let mut server = AccountServer::new(Arc::clone(&state_arc));
+
+    let mut minting = TestAccountData::new_minting_account();
+    server.import_account(
+        minting.address,
+        Account {
+            proof: None,
+            coin_queue: vec![],
+            coin_history: SparseMerkleTree::new(),
+            balance: 10_000,
+        },
+    );
+    let recipient_data = TestAccountData::new_generic(&[22u8; 32], Network::Signet);
+    let recipient_addr = recipient_data.address;
+
+    let mut coin_proofs = minting
+        .execute_send_coins(&mut server, vec![Invoice::new(50, recipient_addr)])
+        .expect("mint send_coins");
+    state_arc
+        .lock()
+        .unwrap()
+        .update(
+            &coin_proofs
+                .iter()
+                .map(|x| x.commitment.clone().unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .expect("state.update");
+    server
+        .receive_coin(coin_proofs.pop().expect("at least one coin"))
+        .expect("recipient receive_coin");
+
+    // Forge an `account.proof = Some(...)` on the recipient by reusing
+    // the minting account's proof we just produced (signature
+    // verification doesn't happen on this path — `get_merkle_proofs`
+    // only consults state for the prev_commitment_pubkey lookup).
+    {
+        let mint_account = server
+            .accounts
+            .get_mut(&minting.address)
+            .expect("minting account present");
+        let proof = mint_account.proof.clone();
+        let recipient_account = server
+            .accounts
+            .get_mut(&recipient_addr)
+            .expect("recipient account present after receive_coin");
+        recipient_account.proof = proof;
+    }
+
+    // Pass a `prev_commitment_pubkey` that the state's commitment
+    // index has never seen — the lookup fails inside
+    // get_merkle_proofs and propagates "Unable to get merkle proofs...".
+    let stranger_seed = Xpriv::new_master(Network::Signet, &[99u8; 32]).expect("stranger xpriv");
+    let unknown_prev_pk = generate_test_public_key(&stranger_seed, 0);
+
+    let current_pk = generate_test_public_key(&recipient_data.xpriv, 0);
+    let next_pk = generate_test_public_key(&recipient_data.xpriv, 1);
+    let result = server.send_coins(
+        vec![Invoice::new(1, digest_from_bytes(&[99u8; 32]))],
+        recipient_addr,
+        current_pk,
+        next_pk,
+        Some(unknown_prev_pk),
+    );
+    // The AccountUpdate-branch get_merkle_proofs call uses
+    // `prev_commitment_pubkey`, which is not in state, so the lookup
+    // fails. The error string is identical to the in-coin loop's,
+    // which is fine — both signal the same caller-fixable malformed
+    // witness, and Item 1's HTTP mapping translates both to 422.
+    assert_eq!(
+        result.unwrap_err(),
+        "Unable to get merkle proofs for provided public key"
+    );
+}
+
 #[test]
 fn test_send_coins_rejects_coin_queue_entry_without_commitment() {
     let state_arc = Arc::new(Mutex::new(State::new()));
