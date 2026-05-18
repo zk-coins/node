@@ -15,7 +15,7 @@ use zkcoins_program::merkle::sparse_merkle_tree::{
 use zkcoins_program::types::{
     calculate_coin_identifier, AccountState, Amount, Coin, CoinTemplate, ProofData,
 };
-use zkcoins_prover::{Proof, Prover};
+use zkcoins_prover::{InCoinSourceWitness, Proof, Prover};
 
 /// Fixed in-circuit MMR proof depth. Must match
 /// [`zkcoins_program::circuit::main::MMR_PROOF_PATH_LEN`].
@@ -374,30 +374,15 @@ impl AccountServer {
             let _expected = non_inclusion_proof.insert(coin.identifier);
         }
 
-        // STEP 7 final: Off-circuit source-side validation. Stage
-        // 5d-next-5 Phase 2 (in-circuit source verification via the
-        // aggregator pattern) is documented as blocked on a Plonky2
-        // 1.1.0 `dummy_circuit` shape mismatch and deferred to
-        // post-MVP. The server-heavy MVP architecture (per memory
-        // `feedback_zkcoins_server_side_compute`) enforces these
-        // properties off-circuit before calling the Prover:
-        //   - the in-coin's identifier is in its source proof's
-        //     output_coins_root,
-        //   - the source's commitment is in `state.mmr`.
-        // The (c)(d)(e) chain bound to the prev_account proof IS
-        // in-circuit and locks the rest of the predicate.
-        for ((coin, source_cmp), source_inclusion) in in_coins
-            .iter()
-            .zip(coin_history_proofs.iter())
-            .zip(coin_inclusion_proofs.iter())
-        {
-            if !source_inclusion.verify(coin.identifier, source_cmp.commitment_out_coins_root) {
-                return Err("In-coin not present in source's output_coins_root");
-            }
-            if !source_cmp.verify_commitment(state.mmr.root_extended(MMR_PROOF_PATH_LEN)) {
-                return Err("Source commitment not present in history MMR");
-            }
-        }
+        // STAGE 5d-next-5 Phase 2b: source-side validation runs
+        // IN-CIRCUIT via the aggregator pattern. The off-circuit
+        // pre-checks introduced in `c71c9fc` are no longer needed —
+        // the cyclic circuit's per-slot `connect(slot.active,
+        // aggregator.slot[i].active_pi)` plus the masked SMT
+        // inclusion + SPEC §8 (c)(d)(e) chain on each source proof
+        // reject any tampered witness at proof time. See
+        // `program-plonky2/STAGE_5D_NEXT_5_AGGREGATOR.md` for the
+        // architecture.
 
         // Build the fixed-shape MAX_IN_COINS slot tuples. Active
         // slots come from account.coin_queue; inactive slots use the
@@ -419,6 +404,28 @@ impl AccountServer {
         }
         for _ in in_coins.len()..MAX_IN_COINS {
             in_coin_slots.push((false, &dummy_coin, &dummy_nip));
+        }
+
+        // Stage 5d-next-5 Phase 2b: per-slot source witnesses. Each
+        // active in-coin's source proof, SMT-inclusion path, and
+        // CommitmentMerkleProofs bundle (already built into
+        // `coin_history_proofs` / `coin_inclusion_proofs`) are
+        // threaded into the prover. Inactive slots get `None`.
+        let mut sources: Vec<Option<InCoinSourceWitness>> = Vec::with_capacity(MAX_IN_COINS);
+        for ((coin_proof, source_cmp), source_inclusion) in account
+            .coin_queue
+            .iter()
+            .zip(coin_history_proofs.iter())
+            .zip(coin_inclusion_proofs.iter())
+        {
+            sources.push(Some(InCoinSourceWitness {
+                source_proof: &coin_proof.proof,
+                source_inclusion,
+                source_cmp,
+            }));
+        }
+        for _ in account.coin_queue.len()..MAX_IN_COINS {
+            sources.push(None);
         }
 
         let mut out_coin_slots: Vec<(bool, HashDigest, u64, &NonInclusionProof)> =
@@ -453,7 +460,7 @@ impl AccountServer {
                     state,
                 )?;
                 self.prover
-                    .prove_account_update_with_in_and_out_coins(
+                    .prove_account_update_with_in_and_out_coins_and_sources(
                         &account_state_for_prove,
                         history_root_extended,
                         account_proof,
@@ -461,19 +468,21 @@ impl AccountServer {
                         &in_coin_slots,
                         &out_coin_slots,
                         &next_public_key_bytes,
+                        &sources,
                     )
-                    .map_err(|_| "prove_account_update_with_in_and_out_coins failed")?
+                    .map_err(|_| "prove_account_update_with_in_and_out_coins_and_sources failed")?
             }
             _ => self
                 .prover
-                .prove_initial_with_in_and_out_coins(
+                .prove_initial_with_in_and_out_coins_and_sources(
                     &account_state_for_prove,
                     history_root_extended,
                     &in_coin_slots,
                     &out_coin_slots,
                     &next_public_key_bytes,
+                    &sources,
                 )
-                .map_err(|_| "prove_initial_with_in_and_out_coins failed")?,
+                .map_err(|_| "prove_initial_with_in_and_out_coins_and_sources failed")?,
         };
 
         // Proof generation succeeded — commit the state changes.
