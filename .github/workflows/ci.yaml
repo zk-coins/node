@@ -103,14 +103,6 @@ jobs:
       # binaries each hold a built `StateTransitionCircuit` (~2 GB
       # resident) and running them in parallel on a 7 GB GitHub-hosted
       # runner OOM-kills the job (exit 143).
-      #
-      # Step 7 migration NOTE: `account_server_tests` and
-      # `server_tests` modules are currently disabled at the
-      # include-point in their parent files pending the Stage
-      # 5d-next-5 (aggregator pattern) merge from
-      # `feat/plonky2-5d-next-4-aggregator` (issue zk-coins/server#19).
-      # Once that branch lands they get re-enabled along with the
-      # `account_server::send_coins` Prover-API integration.
       - name: Run tests (server + shared, all features)
         run: cargo test -p server -p shared --all-features -- --test-threads=1
 
@@ -162,19 +154,10 @@ jobs:
       # reveal broadcasting that needs a signet/regtest node) are
       # genuinely not exercisable in unit tests and are excluded at the
       # file level via --ignore-filename-regex.
-      #
-      # STEP 7 MIGRATION (TEMPORARY): account_server.rs and server.rs
-      # are also excluded until Stage 5d-next-5 (issue
-      # zk-coins/server#19) merges, because their test modules
-      # (account_server_tests.rs + server_tests.rs) are gated off at
-      # the include-point pending the Prover-API integration. Once
-      # the aggregator pattern lands and `send_coins` is wired
-      # through, the tests come back and these two exclusions get
-      # dropped to restore 100% coverage on the full activated surface.
       - name: Run cargo-llvm-cov (MVP scope, regression guard)
         run: |
           cargo llvm-cov -p server --show-missing-lines \
-            --ignore-filename-regex 'main\.rs|publisher\.rs|server_runtime\.rs|scanner_runtime\.rs|account_server\.rs|server\.rs|_tests\.rs$' \
+            --ignore-filename-regex 'main\.rs|publisher\.rs|server_runtime\.rs|scanner_runtime\.rs|_tests\.rs$' \
             --fail-under-lines 100 \
             --fail-under-functions 100 \
             -- --test-threads=1
