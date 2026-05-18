@@ -24,7 +24,7 @@ fn test_update_with_single_commitment() {
     );
 
     // Update state with this commitment
-    let new_root = state.update(&[commitment.clone()]).unwrap();
+    let new_root = state.update(std::slice::from_ref(&commitment)).unwrap();
 
     // The SMT should now contain this commitment
     let key_bytes = commitment.public_key.serialize();
@@ -40,7 +40,7 @@ fn test_update_with_multiple_commitments() {
     let mut state = State::new();
 
     // Create test commitments with different keys
-    let commitments = vec![
+    let commitments = [
         create_test_commitment(
             b"message 1",
             "0000000000000000000000000000000000000000000000000000000000000001",
@@ -153,7 +153,7 @@ fn test_get_commitment_proof_with_mmr() {
     );
 
     // Update state with this commitment
-    let mmr_root = state.update(&[commitment.clone()]).unwrap();
+    let mmr_root = state.update(std::slice::from_ref(&commitment)).unwrap();
 
     // Get the complete proof (SMT + MMR)
     let proof_result = state.get_commitment_proof(&commitment.public_key);
@@ -196,7 +196,7 @@ fn test_reproduce_tree_verify() {
     let mut state = State::new();
 
     // Create test commitment
-    let commitment = create_test_commitment(
+    let _commitment = create_test_commitment(
         &[1; HASH_SIZE],
         "1000000000000000000000000000000000000000000000000000000000000000",
     );
@@ -350,7 +350,7 @@ fn test_get_commitment_proof_returns_err_when_smt_has_key_but_mmr_empty() {
         b"mismatched scenario",
         "0000000000000000000000000000000000000000000000000000000000000001",
     );
-    a.update(&[commitment.clone()]).unwrap();
+    a.update(std::slice::from_ref(&commitment)).unwrap();
     a.save_to_files(smt_a.to_str().unwrap(), mmr_a.to_str().unwrap())
         .unwrap();
 
