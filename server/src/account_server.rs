@@ -394,7 +394,7 @@ impl AccountServer {
             if !source_inclusion.verify(coin.identifier, source_cmp.commitment_out_coins_root) {
                 return Err("In-coin not present in source's output_coins_root");
             }
-            if !source_cmp.verify_commitment(state.mmr.root()) {
+            if !source_cmp.verify_commitment(state.mmr.root_extended(MMR_PROOF_PATH_LEN)) {
                 return Err("Source commitment not present in history MMR");
             }
         }
@@ -526,18 +526,12 @@ impl AccountServer {
 
 #[cfg(test)]
 mod inline_tests {
-    //! Inline error-path tests that don't require a full Plonky2
-    //! prove (which would take 3–15 min per test at production
-    //! parameters). The full SP1-era `account_server_tests.rs` is
-    //! gated off pending a separate test-fixture porting task — see
-    //! the disabled `mod tests;` line below for the rationale.
-    //!
-    //! These cover the early-return error paths in `send_coins` +
-    //! the file-IO failure path in `load_from_file` + the
-    //! single-line lookup paths in `get_minting_account_address` and
-    //! `get_account_balance`. Combined they bring the activated
-    //! account_server.rs surface coverage up to the 100 % MVP gate
-    //! requirement WITHOUT exercising any actual proof generation.
+    //! Inline error-path tests that don't require a full Plonky2 prove.
+    //! They cover the early-return error paths in `send_coins`, the
+    //! file-IO failure path in `load_from_file`, and the single-line
+    //! lookup paths in `get_minting_account_address` and
+    //! `get_account_balance`. The richer prover-driven fixtures live in
+    //! `account_server_tests.rs` (included as `mod tests;` below).
 
     use super::*;
 
@@ -678,14 +672,6 @@ mod inline_tests {
     }
 }
 
-// STEP 7 MIGRATION: account_server_tests.rs is disabled at the include-point
-// because its fixtures rely on SP1's `ProgramInputsBuilder` +
-// `Prover::create_account` / `update_account` API. Both are replaced in the
-// Plonky2 wrapper (Prover takes per-slot tuples directly) and porting the
-// fixtures is a focused follow-up task — see ROADMAP Step 7 status. The
-// `inline_tests` module above covers the activated error-path surface of
-// `account_server.rs` so the binary's MVP coverage gate stays green.
-//
-// #[cfg(test)]
-// #[path = "account_server_tests.rs"]
-// mod tests;
+#[cfg(test)]
+#[path = "account_server_tests.rs"]
+mod tests;
