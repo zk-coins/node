@@ -109,8 +109,8 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 #### Get balance
 
 - **Module:** `server.rs::get_balance_handler` → `account_server.rs::AccountServer::get_account_balance`
-- **Behaviour:** address parsed as hex pubkey, looks up the account. Returns `{ balance, username? }`. The minting address returns `u64::MAX`
-- **Tests:** `server.rs::tests::balance_*` (5 tests covering happy path, unknown address, invalid hex, missing param, wrong length)
+- **Behaviour:** address parsed as hex pubkey, looks up the account. Returns `{ balance, username? }`. A well-formed address with no on-chain activity yields `200 OK` with `balance: 0` (canonical zero state, not 404). The minting address returns `u64::MAX`. Malformed input — invalid hex, wrong length, or a missing `address` query parameter — returns `422`
+- **Tests:** `server.rs::tests::balance_*` (6 tests covering happy path, unknown address with and without a claimed username, invalid hex, missing param, wrong length)
 
 #### List all addresses
 
