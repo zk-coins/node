@@ -5,324 +5,28 @@ Tracking document for the per-in-coin recursive verification work
 in `MIGRATION_RESEARCH.md` §7.21 and the original design notes in
 `STAGE_5D_NEXT_4_DESIGN.md` (Option B / aggregator pattern).
 
-This document is intended to be **self-contained** so a fresh session
-can pick up Phase 2b without re-deriving anything from chat history.
+This document captures the **complete end state** of Stage 5d-next-5
+across Phase 1, Phase 2a, Phase 2b, and Phase 3 — useful both as a
+post-merge reference and as a self-contained pickup for follow-on
+work that extends the architecture (e.g. multi-source slots,
+production MMR fixtures, etc.).
 
 ## Status snapshot
 
 | Phase | Scope | Result |
 |------:|-------|--------|
 | 1 | Aggregator skeleton + smoke + active-slot test | **Done.** Merged via #22 onto `feat/plonky2-migration`. |
-| Phase-1 coverage gap | `should_panic` test for `prove_aggregator`'s invalid-witness arm | **Done in this PR** (fast — no circuit build needed). |
-| 2a probe | Empirical investigation of the Plonky2 1.1.0 `dummy_circuit` shape mismatch + cyclic fixed-point divergence | **Done in this PR.** `src/circuit/recursion_shape_probe.rs`. |
-| 2a | Outer-circuit integration (`verify_proof(agg)` + `connect_hashes` + ConstantGate-injection shape lock) | **DONE in this PR** (commit `b5be37a`). |
-| 2b | Per-slot source-side SMT inclusion + CMP (c)(d)(e) chain + coupling check | **Not started.** Plan in [§Phase 2b plan](#phase-2b-plan-self-contained-for-the-next-session). |
-| 3 | 4 cyclic positives + 3 new SPEC §13 negatives + 100 % line coverage | **Not started.** Plan in [§Phase 3 plan](#phase-3-plan). |
+| Phase-1 coverage gap | `should_panic` test for `prove_aggregator`'s invalid-witness arm | **Done in PR #23** (fast — no circuit build needed). |
+| 2a probe | Empirical investigation of the Plonky2 1.1.0 `dummy_circuit` shape mismatch + cyclic fixed-point divergence | **Done in PR #23.** `src/circuit/recursion_shape_probe.rs`. |
+| 2a | Outer-circuit integration (`verify_proof(agg)` + `connect_hashes` + ConstantGate-injection shape lock) | **Done in PR #23** (commit `b5be37a`). |
+| 2b | Per-slot source-side SMT inclusion + CMP (c)(d)(e) chain + coupling check + active-bit binding | **Done in PR #23** (this revision). |
+| 3 | Positive coverage (4 cases) + 3 SPEC §13 negatives | **Done in PR #23** (this revision). |
 
-### What's in this PR
-
-- `src/circuit/recursion_shape_probe.rs` — `#[cfg(test)]`
-  diagnostic module that empirically derived both fixes:
-  - `pass_3_two_verify(_, force_constant_gate = true)`: showed that
-    explicit `builder.add_gate(ConstantGate::new(2), …)` in pass-3
-    makes pass-3's gates list match `dummy_circuit`'s rebuild.
-  - `build_minimal_outer_for_diagnostic(_, _)` + `try_build_with_options`:
-    isolated the second divergence to `fri_params.degree_bits`.
-  - `dump_phase_2a_pad_bits_sweep` (`#[ignore]`d): showed the
-    empirical relation `helper_degree = pad_bits + 1`, pinning
-    `INNER_PAD_BITS_STAGE_5D_NEXT_5 = 14`.
-- `src/circuit/source_aggregator.rs` — factored
-  `assert_slot_witnesses_valid` out of `prove_aggregator`, replaced
-  the in-loop `panic!` with `unreachable!`, added two fast
-  `#[should_panic]` tests for the witness-contract violations.
-- `src/circuit/main.rs` — Phase 2a integration:
-  - `INNER_PAD_BITS_STAGE_5D_NEXT_3 = 14` (renamed; previously inline
-    `const INNER_PAD_BITS`)
-  - `INNER_PAD_BITS_STAGE_5D_NEXT_5 = 14` (deliberately same — the
-    cyclic fixed-point check requires
-    `outer_degree == helper_degree`, see [§Why pad bits 14](#why-pad-bits-14))
-  - `state_transition_num_pis()` (helper): `N_PROOF_DATA_PUBLIC_INPUTS
-    + 4 + 4 × cap_elements = 84` for the standard recursion config
-  - `common_data_for_recursion_c_inner(aggregator, inner_pad_bits)`:
-    generalised helper supporting the Stage 5d-next-5 2-verify shape
-  - `StateTransitionCircuit` gains `aggregator: SourceAggregatorCircuit`
-    and `aggregator_proof_target: ProofWithPublicInputsTarget<D>`
-  - `build_circuit()` runs a 2-iteration fixed-point on the
-    aggregator + outer common, asserts convergence, then builds the
-    outer with `verify_proof(aggregator_proof, …)` +
-    `connect_hashes` + explicit `ConstantGate::new(2)` injection +
-    the unchanged `_or_dummy` cyclic verify
-  - `set_aggregator_proof_witness(_, _, source_proofs)`: factored
-    witness setter, called by both leaf prove functions. Phase 2a
-    callers pass `&[]` for all-inactive aggregator proofs; Phase 2b
-    will populate.
-
-### What's NOT in this PR — and where to pick up
-
-- **Phase 2b**: per-slot SMT inclusion of `coin.identifier` in
-  `source.output_coins_root`, SPEC §8 (c)(d)(e) chain for the
-  source's commitment in `history_root`, coupling check. See
-  [§Phase 2b plan](#phase-2b-plan-self-contained-for-the-next-session).
-- **Phase 3**: 4 cyclic positives + 3 SPEC §13 negatives + 100 %
-  line coverage. See [§Phase 3 plan](#phase-3-plan).
-- **No `cargo llvm-cov --fail-under-lines 100`** on this branch.
-
-## The two empirical insights that make Phase 2a work
-
-### Insight 1: `ConstantGate::new(2)` injection (probe-verified)
-
-When `common_data_for_recursion_c_inner` is called with two
-`verify_proof` calls (one cyclic, one against the aggregator), pass-3's
-`ArithmeticGate` instances absorb every routed constant — no standalone
-`ConstantGate` ever gets allocated by `builder.build::<C>()`. But
-`dummy_circuit`'s rebuild ALWAYS emits one (its hard-coded `- 2`
-NoopGate reservation reserves a row for `PublicInputGate +
-ConstantGate`). The `assert_eq!(&circuit.common, common_data)` at
-`plonky2-1.1.0/src/recursion/dummy_circuit.rs:116` then panics.
-
-Probe data (`recursion_shape_probe::dump_pass_3_gates_lists_for_inspection`):
-
-| Helper variant | `gates.len()` | `ConstantGate`? | `dummy_circuit` |
-|---|---:|---|---|
-| Stage 5d-next-3 baseline (1 verify, pad 14) | 13 | ✓ | **OK** |
-| 2 verify, pad 14, no injection | 12 | ✗ | **PANIC** |
-| 2 verify + 1/4/16/64/256 forced constants via `mul(c, zero)` | 12 | ✗ | **PANIC** |
-| **2 verify + explicit `ConstantGate::new(2)` injection, pad 14** | **13** | **✓** | **OK** |
-
-The fix lives in `common_data_for_recursion_c_inner`'s pass 3:
-
-```rust
-if let Some(agg) = aggregator {
-    let agg_proof = builder.add_virtual_proof_with_pis(&agg.common);
-    let agg_vd = builder.constant_verifier_data(&agg.verifier_only);
-    builder.verify_proof::<C>(&agg_proof, &agg_vd, &agg.common);
-    // Inject one `ConstantGate{num_consts:2}` so pass-3's gates list
-    // matches `dummy_circuit`'s rebuild. Zero constants — only the
-    // gate-instance existence matters for the gate-set equality check.
-    builder.add_gate(ConstantGate::new(2), vec![F::ZERO, F::ZERO]);
-}
-```
-
-The OUTER must do the same right before its `_or_dummy` call:
-
-```rust
-// Shape lock — must match the helper's pass-3 injection.
-builder.add_gate(ConstantGate::new(2), vec![F::ZERO, F::ZERO]);
-
-builder
-    .conditionally_verify_cyclic_proof_or_dummy::<C>(condition, &inner_proof_target, &common_data)
-    .expect("…");
-```
-
-### Insight 2: `INNER_PAD_BITS_STAGE_5D_NEXT_5 = 14` (sweep-verified)
-
-Once `dummy_circuit` accepts the gate-set, the cyclic fixed-point
-check at `plonk/circuit_builder.rs:1067` (`goal_data != common`) is
-still strict: it requires `outer.common == helper-pass-3 common`
-field-by-field. The `build_minimal_outer_for_diagnostic` + field-diff
-exercise isolated the only diverging axis to `fri_params.degree_bits`.
-
-The pad-bits sweep then exposed the empirical relation:
-
-| `pad_bits` | `helper_degree` | minimal-outer-degree | success |
-|---:|---:|---:|---|
-| 14 | 15 | 14 | false |
-| 15 | 16 | 14 | false |
-| 16 | 17 | 14 | false |
-| 17 | 18 | 14 | false |
-
-So `helper_degree = pad_bits + 1`. The minimal outer (without Stage
-5d-next-3 constraint gates) sits at degree 14. The FULL outer adds
-the Stage 5d-next-3 base ~10 k gates + `_or_dummy`'s
-`conditionally_verify_proof` ~10 k → ~30 k gates → degree 15. So
-`pad_bits = 14` makes helper-degree (15) match full-outer-degree
-(15), passing the cyclic fixed-point check.
-
-### Why pad bits 14 (not 15+) for Stage 5d-next-5
-
-Phase 2b will add per-slot SMT + CMP gates that grow the outer's
-gate count. If outer crosses 2^15 = 32768 gates, its degree bumps
-to 16 and `pad_bits = 14` no longer matches. Estimated Phase-2b
-contribution: ~20 k gates (8 slots × ~2.5 k each). Outer at ~50 k
-total → degree 16. Then `pad_bits = 15` would be needed.
-
-**Action item for Phase 2b**: once the per-slot gates are wired,
-re-run `dump_phase_2a_pad_bits_sweep` to confirm whether the FULL
-outer's degree is still 15 (keep `pad_bits = 14`) or rolled to 16
-(bump to `pad_bits = 15`). If the latter, the helper's pad-bits
-constant needs updating.
-
-## Phase 2b plan (self-contained for the next session)
-
-### Goal
-
-Wire SPEC §8 step 2's per-in-coin source-side checks into the outer
-state-transition circuit, using the aggregator's PIs as the trusted
-source for `source.output_coins_root`, `source.commitment_history_root`,
-and `source.account_state_hash`.
-
-### Per-slot source-side constraints (all masked by `slot.active`)
-
-For slot `i` in `0..MAX_IN_COINS`:
-
-1. **Extract source `ProofData` from aggregator PIs** at offset
-   `i * PER_SLOT_PIS`:
-   - `source.account_state_hash` = PIs `[i*17 + 0..i*17 + 4]`
-   - `source.output_coins_root`   = PIs `[i*17 + 4..i*17 + 8]`
-   - `source.commitment_history_root` = PIs `[i*17 + 8..i*17 + 12]`
-   - `source.coin_history_root`   = PIs `[i*17 + 12..i*17 + 16]` (unused for §8 step 2)
-2. **Extract `claimed_active`** from PI `[i*17 + 16]` and assert
-   `claimed_active == slot.active.target` (no mask — both sides are
-   bits, agg's verify_proof already constrained it).
-3. **SMT inclusion** of `coin.identifier` in `source.output_coins_root`:
-   - leaf value = `h(coin.identifier || coin.identifier)` (matches the
-     set-membership SMT convention used by Stage 5d-next-3 in the
-     coin-history loop)
-   - SMT key bits via `key_bits_msb_first(coin.identifier)`
-   - `smt_inclusion_root(leaf, key, key_bits, source_smt_path)` →
-     computed_root
-   - `connect_hashes(computed_root, select_hash(slot.active,
-     source.output_coins_root, computed_root))` — masked
-4. **SPEC §8 (c)**: `source.account_state_hash == source_cmp.commitment_account_state_hash`:
-   - element-wise `builder.sub` → `mul(slot.active, diff)` →
-     `assert_zero` for each of the 4 elements (same pattern as
-     existing prev-account CMP (c) check)
-5. **SPEC §8 (d) first half**: SMT inclusion of `commitment =
-   h(asth || ocr)` in `source_cmp.commitment_root` (analogous to
-   existing prev-account (d), but with the source's CMP).
-6. **SPEC §8 (d) second half**: MMR inclusion of
-   `h(commitment_root || commitment_root_mmr_sibling)` in
-   `history_root`.
-7. **SPEC §8 (e)**: MMR inclusion of `h(prev_smt_in_mmr_leaf ||
-   source.commitment_history_root)` in `history_root`.
-8. **Coupling**: `source.output_coins_root ==
-   source_cmp.commitment_out_coins_root` element-wise masked check.
-
-### New witness targets per slot
-
-Extend `InCoinSlotTargets` in `src/circuit/main.rs`:
-
-```rust
-pub struct InCoinSlotTargets {
-    // ... existing fields (active, coin_identifier, coin_recipient,
-    //     coin_amount_lo, coin_amount_hi, nip_path) ...
-
-    /// 256 SMT siblings proving inclusion of `coin.identifier` in
-    /// `source.output_coins_root`. Masked by `active`.
-    pub source_inclusion_path: Vec<HashOutTarget>,
-    /// CMP bundle for the source's commitment chain in
-    /// `history_root`. Same shape as the existing `cmp:
-    /// CommitmentMerkleProofsTargets` field on the outer.
-    pub source_cmp: CommitmentMerkleProofsTargets,
-}
-```
-
-In `build_circuit`'s in-coin slot construction loop, add these
-target allocations.
-
-### New prove signatures
-
-The existing `prove_*_with_in_and_out_coins` functions are the leaf
-functions. Add a NEW variant for Phase 2b that takes source
-witnesses, e.g.:
-
-```rust
-pub fn prove_account_update_with_in_and_out_coins_and_sources(
-    circuit: &StateTransitionCircuit,
-    account_state: &AccountState,
-    history_root: HashDigest,
-    prev: &ProofWithPublicInputs<F, C, D>,
-    cmp: &CommitmentMerkleProofs,
-    in_coins: &[(bool, &Coin, &NonInclusionProof)],
-    out_coins: &[(bool, HashDigest, u64, &NonInclusionProof)],
-    next_public_key: &PublicKey,
-    // Per active in-coin slot:
-    //   (slot_index, source_proof, source_inclusion_proof, source_cmp)
-    source_witnesses: &[(usize, &ProofWithPublicInputs<F, C, D>,
-                          &InclusionProof, &CommitmentMerkleProofs)],
-) -> Result<ProofWithPublicInputs<F, C, D>> { … }
-```
-
-The existing `prove_*_with_in_and_out_coins` should delegate with
-`&[]` for `source_witnesses`. Phase 2a's `set_aggregator_proof_witness`
-already takes `source_proofs` — Phase 2b just wires those through
-from the new prove function.
-
-For inactive slots (`active = false`), witness with dummy values
-(`ZERO_HASH` for everything, dummy SMT path). The masked checks pass
-vacuously.
-
-### Witness setters to add
-
-- `set_source_inclusion_witness(&mut pw, &slot.source_inclusion_path,
-  &InclusionProof)`: writes the 256 siblings. Mirrors
-  `set_in_coin_slot_witness`'s NIP-path handling.
-- `set_source_cmp_witness(&mut pw, &slot.source_cmp,
-  &CommitmentMerkleProofs)`: mirrors the existing `set_cmp_witness`
-  for prev-account.
-
-### Gate-count budget for Phase 2b
-
-Per slot:
-- SMT inclusion (256 hashes): ~1 k gates
-- CMP chain (SMT 256 + MMR 31 × 2): ~1.5 k gates
-- Coupling + (c) check: ~10 gates
-- → ~2.5 k gates per slot × 8 slots = **~20 k gates added to outer**.
-
-Outer total: ~30 k (Phase 2a) + ~20 k (Phase 2b) = ~50 k → degree 16.
-
-Then `INNER_PAD_BITS_STAGE_5D_NEXT_5` must bump from 14 to 15
-(`helper_degree = pad_bits + 1 = 16` matching full outer's 16).
-
-### Order of operations for Phase 2b in `build_circuit`
-
-The per-slot source-side checks should be added AFTER the existing
-in-coin slot loop (which already wires coin-history-side check +
-apply_coin) and BEFORE the aggregator-verify call. The aggregator
-proof target's PIs need to be accessible inside the loop — easiest
-to hoist `aggregator_proof_target` construction and the `verify_proof(agg)`
-call BEFORE the in-coin loop, then add per-slot source checks
-inside the loop, and put `connect_hashes` + `ConstantGate` injection
-+ `_or_dummy` after as before.
-
-## Phase 3 plan
-
-### 4 cyclic positives
-
-1. Init with all-inactive in-coins (regression for Stage 5d-next-3
-   path).
-2. Init with 1 active in-coin + real source proof (smoke test for
-   Phase 2b active path).
-3. Update with all-inactive in-coins (Stage 5d-next-3 regression).
-4. Update with 1 active in-coin + real source proof (full Phase 2b
-   smoke + chain validation).
-
-### 3 SPEC §13 negatives
-
-1. **Source proof not in history**: tamper `source_cmp.mmr_b_path`
-   (the (e) MMR path) → MMR-(e) verification fails.
-2. **Coin identifier not in source's `output_coins_root`**: tamper
-   `source_inclusion_path` → SMT inclusion fails.
-3. **Wrong vk on aggregator**: build aggregator against an unrelated
-   state-transition circuit's verifier_only, feed its proof to outer
-   → `connect_hashes(claimed_st_digest, outer_vd.digest)` rejects.
-
-### Coverage
-
-Re-run `cargo llvm-cov --fail-under-lines 100 -- --test-threads=1`.
-Expect 3-5 hours wall on M3 Ultra. The Phase-1 coverage gap test
-(panic-path on `assert_slot_witnesses_valid`) is already at 0.00 s
-wall, so it doesn't bottleneck the run.
-
-## Architecture (target end state — per issue #19)
-
-Both boxes are now implemented as of this PR's Phase 2a (`b5be37a`).
-Phase 2b adds the per-slot source-side gates within the outer
-state-transition circuit (bottom box, "Per in-coin slot" section).
+### Final architecture (everything implemented as of this PR)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ SourceAggregatorCircuit (NON-CYCLIC)         [PHASE 1, MERGED]│
+│ SourceAggregatorCircuit (NON-CYCLIC)              [PHASE 1] │
 │                                                             │
 │   For each slot i in 0..MAX_IN_COINS:                       │
 │     active[i]: BoolTarget                                   │
@@ -345,13 +49,9 @@ state-transition circuit (bottom box, "Per in-coin slot" section).
                               │ aggregator_proof
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ Outer StateTransitionCircuit (CYCLIC)        [PHASE 2a, DONE] │
+│ Outer StateTransitionCircuit (CYCLIC)         [PHASE 2a+2b] │
 │                                                             │
-│   conditionally_verify_cyclic_proof_or_dummy(               │
-│     condition, prev_account_proof, common_data,             │
-│   )                                                         │
-│                                                             │
-│   verify_proof::<C>(                                        │
+│   verify_proof::<C>(  ← hoisted above in-coin loop          │
 │     aggregator_proof,                                       │
 │     aggregator_verifier_data,   ← constant_verifier_data    │
 │     aggregator_common,                                      │
@@ -360,70 +60,294 @@ state-transition circuit (bottom box, "Per in-coin slot" section).
 │   connect_hashes(claimed_st_digest, outer_vd.digest)        │
 │   connect_hashes(claimed_st_cap, outer_vd.cap)              │
 │                                                             │
-│   builder.add_gate(ConstantGate::new(2), [0, 0])  ← shape lock│
-│                                                             │
-│   Per in-coin slot                            [PHASE 2b]:   │
+│   Per in-coin slot i (Phase 2b):                            │
+│     connect(slot.active, aggregator.slot[i].active_pi)      │
 │     SMT inclusion of coin_identifier in                     │
-│       source.output_coins_root                              │
-│     SPEC §8 (c)(d)(e) chain for source.commitment in        │
-│       history_root                                          │
-│     source.output_coins_root ==                             │
+│       source.output_coins_root         (masked by .active)  │
+│     Coupling: source.output_coins_root ==                   │
 │       source_cmp.commitment_out_coins_root                  │
+│     SPEC §8 (c)(d)(e) chain for source.commitment in        │
+│       outer's history_root                                  │
+│                                                             │
+│   conditionally_verify_cyclic_proof_or_dummy(               │
+│     condition, prev_account_proof, common_data,             │
+│   )                                                         │
+│                                                             │
+│   builder.add_gate(ConstantGate::new(2), [0, 0])  ← shape   │
+│                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+## Two empirical insights pinned by `recursion_shape_probe`
+
+### Insight 1: `ConstantGate::new(2)` injection (probe-verified)
+
+`common_data_for_recursion_c_inner` calls two `verify_proof`s in pass 2
+and 3 (one cyclic, one against the aggregator). Pass-3's `ArithmeticGate`
+instances absorb every routed constant — no standalone `ConstantGate`
+ever gets allocated by `builder.build::<C>()`. But `dummy_circuit`'s
+rebuild ALWAYS emits one (its hard-coded `- 2` NoopGate reservation
+reserves a row for `PublicInputGate + ConstantGate`). The
+`assert_eq!(&circuit.common, common_data)` at
+`plonky2-1.1.0/src/recursion/dummy_circuit.rs:116` then panics.
+
+Probe data (`recursion_shape_probe::dump_pass_3_gates_lists_for_inspection`):
+
+| Helper variant | `gates.len()` | `ConstantGate`? | `dummy_circuit` |
+|---|---:|---|---|
+| Stage 5d-next-3 baseline (1 verify, pad 14) | 13 | ✓ | **OK** |
+| 2 verify, pad 14, no injection | 12 | ✗ | **PANIC** |
+| 2 verify + 1/4/16/64/256 forced constants via `mul(c, zero)` | 12 | ✗ | **PANIC** |
+| **2 verify + explicit `ConstantGate::new(2)` injection, pad 14** | **13** | **✓** | **OK** |
+
+Fix lives in `common_data_for_recursion_c_inner`'s pass 3 — see the
+function for the in-source comment.
+
+### Insight 2: `INNER_PAD_BITS_STAGE_5D_NEXT_5` (sweep-verified)
+
+Once `dummy_circuit` accepts the gate-set, the cyclic fixed-point
+check at `plonk/circuit_builder.rs:1067` (`goal_data != common`) is
+still strict: it requires `outer.common == helper-pass-3 common`
+field-by-field. The `build_minimal_outer_for_diagnostic` + field-diff
+exercise isolated the only diverging axis to `fri_params.degree_bits`,
+exposing the empirical relation:
+
+`helper_degree = pad_bits + 1`
+
+So the helper's pad-bits must match `outer_degree - 1` to converge.
+
+| Stage | outer gate count (approx) | outer_degree | required `pad_bits` |
+|---|---:|---:|---:|
+| 5d-next-3 (1 verify, no source-side) | ~10 k | 14 | 13 |
+| 5d-next-5 Phase 2a (2 verify, no source-side gates) | ~30 k | 15 | **14** |
+| 5d-next-5 Phase 2b (2 verify + 8 source slots × {SMT + CMP}) | ~50 k | 16 | **15** |
+| Hypothetical future stage crossing 2^16 | > 65 k | 17 | 16 |
+
+`INNER_PAD_BITS_STAGE_5D_NEXT_5 = 15` is what makes
+`helper_degree = 16` match the full outer's `degree_bits = 16`.
+
+### Re-running the sweep
+
+If any future change crosses a power-of-two gate-count threshold,
+rerun `dump_phase_2a_pad_bits_sweep` and bump `pad_bits`:
+
+```bash
+cd program-plonky2
+cargo test --release --lib circuit::recursion_shape_probe::dump_phase_2a_pad_bits_sweep \
+  -- --ignored --nocapture
+```
+
+Note: the sweep uses a MINIMAL outer (no real Stage 5d-next-3 / 5d-next-5
+constraints). It establishes the `helper_degree = pad_bits + 1`
+relation. The full outer's degree must then be measured directly via
+`circuit.data.common.fri_params.degree_bits` and compared.
+
+## Phase 2b implementation details
+
+### Per-slot source-side constraints (in `build_circuit`, inside the
+in-coin loop, after the existing 5d-next-3 coin-history + apply_coin
+checks)
+
+For slot `i ∈ 0..MAX_IN_COINS`:
+
+1. **Extract source `ProofData` from aggregator PIs** at offset
+   `i * PER_SLOT_PIS`:
+   - `source.account_state_hash`        = PIs `[i*17 + 0..i*17 + 4]`
+   - `source.output_coins_root`         = PIs `[i*17 + 4..i*17 + 8]`
+   - `source.commitment_history_root`   = PIs `[i*17 + 8..i*17 + 12]`
+   - (`source.coin_history_root` at PIs `[i*17 + 12..i*17 + 16]` —
+     unused for SPEC §8 step 2)
+2. **Active-bit binding**: `slot.active.target == aggregator.slot[i].active_pi`.
+   Strict `builder.connect` — both sides are bools, so this enforces
+   the in-coin loop and the aggregator stay in lockstep. There is no
+   way to consume an in-coin without a verified source proof.
+3. **SMT inclusion** of `coin.identifier` in `source.output_coins_root`:
+   leaf value = `h(coin.identifier || coin.identifier)` (set-membership
+   convention, matching the source's own out-coin SMT insertion at
+   `hash_up_full_path(new_leaf = h(id || id), id_bits, nip_path)`),
+   using `hash_up_full_path` directly (NOT `smt_inclusion_root`, which
+   would add an extra `smt_leaf_hash` step and break the binding).
+4. **Coupling**: `source.output_coins_root == source_cmp.commitment_out_coins_root`,
+   masked element-wise (`mul(active, diff) → assert_zero`).
+5. **SPEC §8 (c)**: `source.account_state_hash == source_cmp.commitment_account_state_hash`,
+   masked element-wise.
+6. **SPEC §8 (d), first half**: SMT inclusion of `commitment =
+   h(commitment_account_state_hash || commitment_out_coins_root)`
+   at `source_cmp.smt_key` in `source_cmp.commitment_root`, masked.
+7. **SPEC §8 (d), second half**: MMR inclusion of
+   `h(source_cmp.commitment_root || source_cmp.commitment_root_mmr_sibling)`
+   at `source_cmp.mmr_a_index` in the outer's `history_root`, masked.
+8. **SPEC §8 (e)**: MMR inclusion of
+   `h(source_cmp.prev_smt_in_mmr_leaf || source.commitment_history_root)`
+   at `source_cmp.mmr_b_index` in the outer's `history_root`, masked.
+
+### New public API
+
+```rust
+pub struct InCoinSourceWitness<'a> {
+    pub source_proof: &'a ProofWithPublicInputs<F, C, D>,
+    pub source_inclusion: &'a InclusionProof,
+    pub source_cmp: &'a CommitmentMerkleProofs,
+}
+
+pub fn prove_initial_with_in_and_out_coins_and_sources(
+    circuit, account_state, history_root,
+    in_coins, out_coins, next_public_key,
+    sources: &[Option<InCoinSourceWitness>],  // MAX_IN_COINS entries
+) -> Result<ProofWithPublicInputs<F, C, D>>;
+
+pub fn prove_account_update_with_in_and_out_coins_and_sources(
+    circuit, account_state, history_root, prev, cmp,
+    in_coins, out_coins, next_public_key,
+    sources: &[Option<InCoinSourceWitness>],
+) -> Result<ProofWithPublicInputs<F, C, D>>;
+```
+
+The existing all-inactive `prove_*_with_in_and_out_coins` entry points
+delegate with `&[None; MAX_IN_COINS]`. Callers with active in-coin
+slots **must** use the `_and_sources` variants — otherwise the
+`connect(slot.active, aggregator.slot.active_pi)` constraint fires.
+
+### Witness setters added
+
+- `set_source_inclusion_witness(pw, slot, &InclusionProof)`: writes
+  the 256 SMT siblings proving `coin.identifier ∈ source.output_coins_root`.
+- `set_cmp_targets_witness(pw, &CommitmentMerkleProofsTargets, &CommitmentMerkleProofs)`:
+  refactored out of the existing `set_cmp_witness` so it can be reused
+  for the per-slot `source_cmp` bundle.
+- `set_per_slot_source_witnesses`: walks `sources` and writes the
+  per-slot inclusion + cmp (dummies for `None` entries).
+- `set_aggregator_proof_witness_from_sources`: builds the aggregator
+  proof from `sources` (every `Some(_)` → active aggregator slot).
+
+### `dummy_inclusion_proof()`
+
+A new helper symmetrical to `dummy_cmp` / `dummy_non_inclusion_proof` —
+deterministic 256-sibling `ZERO_HASH` placeholder for inactive slots'
+`source_inclusion_path`.
+
+### Multi-leaf MMR test fixture insight
+
+Both `build_test_source_witness` (1-leaf MMR, Phase 2b Initial smoke)
+and `build_test_source_and_prev_witnesses` (2-leaf MMR, Phase 2b
+AccountUpdate smoke) ship with this PR. The 2-leaf MMR fixture is
+nontrivial: with BOTH the consumer-prev proof AND the source proof
+having `commitment_history_root = ZERO_HASH` (bootstrap), only ONE of
+them can use the bootstrap-shaped (e) leaf `h(? || ZERO_HASH)` at its
+own MMR index. The fixture resolves this by folding consumer-prev
+FIRST (so consumer's leaf is the unique `h(? || ZERO_HASH)`-shaped
+leaf at index 0) and source SECOND at index 1, then having source's
+(e) "borrow" consumer's bootstrap leaf at index 0 via
+`source_cmp.prev_smt_in_mmr_leaf = consumer_smt_root` and
+`source_cmp.previous_root_history_proof.1 = consumer_mmr_proof`.
+This is a TEST-FIXTURE peculiarity; production producers proving
+against a non-empty history don't hit it because they have richer
+non-bootstrap MMR shapes available.
+
+## Phase 3 — test coverage
+
+### Positives (4 cases, all covered)
+
+| Case | Test |
+|---|---|
+| Init, all-inactive in-coins | `stage_5c_plus_initial_non_mint_zero_balance_accepted` |
+| Init, 1 active in-coin + real source proof | `stage_5d_next_5_phase_2b_initial_with_one_active_in_coin_and_source` |
+| Update, all-inactive in-coins | `stage_5c_plus_initial_then_account_update_with_commitment_proofs` |
+| Update, 1 active in-coin + real source proof | `stage_5d_next_5_phase_2b_account_update_combined_in_and_out_coin_with_source` |
+
+A fifth integration test —
+`stage_5d_next_5_phase_2b_initial_combined_in_and_out_coin_with_source` —
+exercises Init + active in-coin + active out-coin + source in a
+single transition, validating the full §8 flow composes.
+
+### SPEC §13 negatives (3 cases, all covered)
+
+| Attack | Constraint that catches it | Test |
+|---|---|---|
+| Source's commitment not in `history_root` (tamper MMR-(e) path) | masked `connect_hashes(mmr_b_computed, history_root)` | `stage_5d_next_5_phase_3_source_not_in_history_rejected` |
+| Coin identifier not in source's `output_coins_root` (tamper SMT path) | masked `connect_hashes(source_inclusion_computed, source_output_coins_root)` | `stage_5d_next_5_phase_3_coin_not_in_source_ocr_rejected` |
+| Wrong `st_verifier_data` witnessed in aggregator | `connect_hashes(claimed_st_digest, outer_vd.circuit_digest)` | `stage_5d_next_5_phase_3_wrong_st_vk_on_aggregator_rejected` |
+
+The wrong-vk negative is non-trivial to construct because the
+aggregator's `conditionally_verify_proof` would normally reject a
+wrong-vk source proof at aggregator prove-time. The test exploits the
+all-inactive case: with no slot active, the aggregator never actually
+uses the witnessed `st_verifier_data` for verification (only the
+constant-baked `dummy_vd_target` for the dummy branch), so the
+aggregator can be proved with a LYING `st_verifier_data`. The lie
+then surfaces at the outer's `connect_hashes`.
 
 ## Open files / locations
 
 - `src/circuit/source_aggregator.rs` — aggregator circuit + 4 tests
   (smoke, active-slot, 2 panic-path).
-- `src/circuit/main.rs` — Stage 5d-next-5 outer (Phase 2a integrated).
+- `src/circuit/main.rs` — Stage 5d-next-5 outer (Phase 2a + 2b
+  integrated). The in-coin loop hosts the per-slot source-side gates;
+  the aggregator-verify is hoisted above the loop so its PIs are
+  accessible.
 - `src/circuit/recursion_shape_probe.rs` — diagnostic probe
-  (`#[cfg(test)]` only; not in production circuit graph).
+  (`#[cfg(test)]` only; not in production circuit graph). Includes
+  `dump_pass_3_gates_lists_for_inspection`,
+  `dump_phase_2a_outer_vs_helper_diff` (`#[ignore]`d), and
+  `dump_phase_2a_pad_bits_sweep` (`#[ignore]`d).
 - `src/circuit/mod.rs` — module declarations.
 - `MIGRATION_RESEARCH.md` §7.21 — original Plonky2 1.1.0 deferral
   context (now superseded by this document's empirical findings).
 - `STAGE_5D_NEXT_4_DESIGN.md` — original Option B architectural
   notes; the current implementation matches the "Aggregator built
-  against fixed shape, vk binding via connect_hashes" design but
-  with the additional ConstantGate + pad-bits constraints derived
-  empirically.
+  against fixed shape, vk binding via connect_hashes" design plus the
+  empirically-derived `ConstantGate` injection and pad-bits constraint.
 
 ## Benchmark
 
 `cargo test --release --lib …` on an Apple M3 (24 GB), single-threaded:
 
-- `stage_5c_plus_initial_non_mint_zero_balance_accepted` (Phase 2a
-  smoke regression): ~45 s wall.
+- `stage_5c_plus_initial_non_mint_zero_balance_accepted` (all-inactive
+  Phase 2b smoke): **~40 s** wall.
 - `stage_5c_plus_initial_then_account_update_with_commitment_proofs`
-  (init → update chain): ~40 s wall.
-- 4 aggregator tests combined (smoke + active-slot + 2 panic-path):
-  ~116 s wall.
+  (init → update chain, all-inactive in-coins): **~53 s** wall.
+- `stage_5d_next_5_phase_2b_initial_with_one_active_in_coin_and_source`
+  (Init + 1 active in-coin from source): **~99 s** wall (one extra
+  Init prove for source = ~40 s + consumer prove ~50 s).
+- `stage_5d_next_5_phase_2b_account_update_combined_in_and_out_coin_with_source`
+  (Update + in-coin + out-coin + source, 2-leaf MMR): **~154 s** wall
+  (source Init + consumer prev Init + consumer Update).
+- Phase 3 negatives: each ~50–55 s wall (one source Init + one
+  consumer prove, except the wrong-vk negative which skips the source
+  build entirely via the all-inactive shortcut).
 - `dump_phase_2a_pad_bits_sweep` (`#[ignore]`d diagnostic, 4 rebuilds
-  of aggregator + outer): ~6 min wall.
+  of aggregator + minimal outer): **~138 s** wall.
 
-Phase 2b will roughly DOUBLE per-test wall time because each prove
-adds 8 source-proof verifications inside the aggregator + 8 SMT/CMP
-witnesses on the outer side.
-
-## How to verify Phase 2a from scratch (smoke procedure for the next session)
+## How to verify Phase 2a + 2b + 3 from scratch
 
 ```bash
-# 1. Confirm the diagnostic + sweep still reproduce.
 cd program-plonky2
-cargo test --release --lib circuit::recursion_shape_probe::dump_pass_3_gates_lists_for_inspection -- --nocapture
+
+# 1. Phase 2a probe (no Phase 2b dependencies).
+cargo test --release --lib \
+  circuit::recursion_shape_probe::dump_pass_3_gates_lists_for_inspection \
+  -- --nocapture
 # Expect: baseline_ok=true, 2v_14=false, 2v_14_with_constant_gate=true
 
-cargo test --release --lib circuit::recursion_shape_probe::dump_phase_2a_pad_bits_sweep -- --ignored --nocapture
+cargo test --release --lib \
+  circuit::recursion_shape_probe::dump_phase_2a_pad_bits_sweep \
+  -- --ignored --nocapture
 # Expect: pad_bits=N → helper_degree=N+1 for all N in {14, 15, 16, 17}
 
-# 2. Confirm Phase 2a smokes (both Stage 5d-next-3 positives green).
-cargo test --release --lib stage_5c_plus_initial_non_mint_zero_balance_accepted -- --nocapture
-cargo test --release --lib stage_5c_plus_initial_then_account_update_with_commitment_proofs -- --nocapture
+# 2. Phase 2a smokes (all-inactive in-coins; Stage 5d-next-3 regression).
+cargo test --release --lib \
+  stage_5c_plus_initial_non_mint_zero_balance_accepted \
+  -- --nocapture
+cargo test --release --lib \
+  stage_5c_plus_initial_then_account_update_with_commitment_proofs \
+  -- --nocapture
 
-# 3. Confirm aggregator tests still green.
-cargo test --release --lib circuit::source_aggregator::tests:: -- --test-threads=1
+# 3. Phase 2b positives (active in-coin slots + real source proofs).
+cargo test --release --lib stage_5d_next_5_phase_2b -- --nocapture --test-threads=2
+
+# 4. Phase 3 negatives.
+cargo test --release --lib stage_5d_next_5_phase_3 -- --nocapture --test-threads=2
+
+# 5. Aggregator regression (Phase 1).
+cargo test --release --lib circuit::source_aggregator::tests::
 ```
-
-If any of the above fails, the Phase 2a integration regressed —
-check the commit log for `b5be37a` and the diff against the parent
-to see what changed.
