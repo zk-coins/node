@@ -2991,7 +2991,7 @@ mod tests {
     /// `prove_initial_with_in_and_out_coins`.
     #[test]
     #[should_panic(
-        expected = "prove_initial_with_in_and_out_coins: caller must supply exactly MAX_OUT_COINS out-coin slot witnesses"
+        expected = "prove_initial_with_in_and_out_coins_and_sources: caller must supply exactly MAX_OUT_COINS out-coin slot witnesses"
     )]
     fn stage_5d_next_3_prove_initial_panics_on_wrong_out_slot_count() {
         let circuit = build_circuit();
@@ -3015,7 +3015,7 @@ mod tests {
     /// `prove_initial_with_in_and_out_coins`.
     #[test]
     #[should_panic(
-        expected = "prove_initial_with_in_and_out_coins: caller must supply exactly MAX_IN_COINS in-coin slot witnesses"
+        expected = "prove_initial_with_in_and_out_coins_and_sources: caller must supply exactly MAX_IN_COINS in-coin slot witnesses"
     )]
     fn stage_5d_next_3_prove_initial_panics_on_wrong_in_slot_count() {
         let circuit = build_circuit();
@@ -3038,7 +3038,7 @@ mod tests {
     /// `prove_account_update_with_in_and_out_coins`.
     #[test]
     #[should_panic(
-        expected = "prove_account_update_with_in_and_out_coins: caller must supply exactly MAX_IN_COINS in-coin slot witnesses"
+        expected = "prove_account_update_with_in_and_out_coins_and_sources: caller must supply exactly MAX_IN_COINS in-coin slot witnesses"
     )]
     fn stage_5d_next_3_prove_account_update_panics_on_wrong_in_slot_count() {
         // The slot-count `assert_eq!` fires at the top of the function,
@@ -3075,7 +3075,7 @@ mod tests {
     /// `prove_account_update_with_in_and_out_coins`.
     #[test]
     #[should_panic(
-        expected = "prove_account_update_with_in_and_out_coins: caller must supply exactly MAX_OUT_COINS out-coin slot witnesses"
+        expected = "prove_account_update_with_in_and_out_coins_and_sources: caller must supply exactly MAX_OUT_COINS out-coin slot witnesses"
     )]
     fn stage_5d_next_3_prove_account_update_panics_on_wrong_out_slot_count() {
         // Same `cyclic_base_proof` short-circuit as the in-slot test.
