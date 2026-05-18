@@ -107,8 +107,15 @@ jobs:
       # binaries each hold a built `StateTransitionCircuit` (~2 GB
       # resident) and running them in parallel on a 7 GB GitHub-hosted
       # runner OOM-kills the job (exit 143).
+      #
+      # `--release` is mandatory: the server test set drives the
+      # Plonky2 prover end-to-end (account_server_tests.rs::test_wallet_operations
+      # and friends). In a debug build each prove takes ~10x longer
+      # than release, pushing the full sweep past 75 min on a
+      # GitHub-hosted runner. Local M3 Ultra: ~8 min release vs. ~70+
+      # min debug.
       - name: Run tests (server + shared, all features)
-        run: cargo test -p server -p shared --all-features -- --test-threads=1
+        run: cargo test -p server -p shared --release --all-features -- --test-threads=1
 
       # program-plonky2 test sweep runs in --release because the
       # cyclic-recursion prove path is ~10x slower in --debug. Skip
