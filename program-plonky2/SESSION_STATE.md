@@ -35,12 +35,14 @@ Tests, Analyze rust, Analyze actions, CodeQL, Coverage MVP scope).
   source-side validation** via `prove_*_and_sources` is wired
   through (Step 7 follow-up, addresses #25), with the off-circuit
   pre-check loop retained as **defense-in-depth fast-fail** before
-  the minute-scale prove. Dockerfile re-introduced (`dac0179`). 120
+  the minute-scale prove. Dockerfile re-introduced (`dac0179`). 138
   server tests pass with `--all-features` (32 baseline + 10 inline
   error-path in `d6a3cb9` + 64 ported SP1-era fixtures re-enabled
   via `account_server_tests.rs` + `server_tests.rs` + 13
-  feature-gated + 1 new Stage 5d-next-5 Phase 2b negative). All
-  surface verified end-to-end in release mode.
+  feature-gated + 1 new Stage 5d-next-5 Phase 2b negative + 17
+  `map_send_coins_error` unit tests landed in PR #31 + 1 new
+  handler-level 404 test landed in PR #31). All surface verified
+  end-to-end in release mode.
 - Steps 8–9: ⏳ todo (App/Wallet integration + DEV deployment).
   Both require work outside this repo (`zk-coins/app` + deploy
   pipelines + SSH access to dfxdev/dfxprd).
@@ -220,12 +222,15 @@ Kept for the wall-time reference points; the current branch is at
 | `stage_5d_next_3_initial_combined_in_and_out_coin` | ✅ | 781 s wall, both loops active |
 | `stage_5d_next_3_account_update_combined_in_and_out_coin` | ✅ | 926 s wall, both loops + cyclic recursion + CMP (b)(c)(d)(e) chain |
 
-**Current branch (Stage 5d-next-5 / Phase 2b landed).** Full
-`program-plonky2` lib sweep ~42 min wall on M3 with
-`--test-threads=2`, 115 cyclic-recursion tests green; full server
-sweep `cargo test -p server --release --all-features --
---test-threads=1` ~36 min wall, 120 tests green (including the
-Phase 2b negative `test_send_coins_rejects_tampered_source_proof_inclusion`).
+**Current branch (Stage 5d-next-5 / Phase 2b landed; PR #31
+housekeeping merged).** Full `program-plonky2` lib sweep ~42 min
+wall on M3 with `--test-threads=2`, 115 cyclic-recursion tests
+green; full server sweep `cargo test -p server --release
+--all-features -- --test-threads=1` ~36 min wall, 138 tests green
+(including the Phase 2b negative
+`test_send_coins_rejects_tampered_source_proof_inclusion` + the
+17 `map_send_coins_error_*` unit tests + 1 new handler-level 404
+test from PR #31).
 See [`../MIGRATION_RESEARCH.md` §7.22 "Benchmark"](../MIGRATION_RESEARCH.md#722-stage-5d-next-5-source-side-verification-via-aggregator-pattern--codified-resolves-721)
 for the per-test wall-time breakdown.
 
