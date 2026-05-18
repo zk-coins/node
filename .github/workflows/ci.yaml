@@ -78,11 +78,20 @@ jobs:
   tests:
     name: Tests
     runs-on: ubuntu-latest
-    # Plonky2 cyclic-recursion prove tests dominate the runtime: the
-    # full `cargo test -p server` set takes ~8 min on M3 Ultra and
-    # ~30–45 min on a 7 GB GitHub-hosted runner. Give it 75 min of
-    # headroom so a one-off cache miss doesn't trip the timeout.
-    timeout-minutes: 75
+    # Plonky2 cyclic-recursion prove tests dominate the runtime:
+    #
+    # - `cargo test -p server` (with the in-circuit send_coins path
+    #   landed in PR #26) takes ~8 min on M3 Ultra and ~30–45 min on a
+    #   7 GB GitHub-hosted runner.
+    # - `cargo test -p zkcoins-program-plonky2 --lib` (the full Stage
+    #   5c+/5d/5d-next-3/5d-next-5/5e cyclic sweep) takes ~42 min on M3
+    #   with `--test-threads=2` and ~80–120 min single-threaded on a
+    #   `ubuntu-latest` runner (per program-plonky2/SESSION_STATE.md).
+    #
+    # Total worst-case CI wall ≈ 125–165 min. 180 min cap gives
+    # headroom for a one-off cache miss without resorting to a
+    # larger-tier runner.
+    timeout-minutes: 180
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -118,13 +127,21 @@ jobs:
         run: cargo test -p server -p shared --release --all-features -- --test-threads=1
 
       # program-plonky2 test sweep runs in --release because the
-      # cyclic-recursion prove path is ~10x slower in --debug. Skip
-      # the long-running cyclic positives here — they are exercised
-      # explicitly in the coverage job below.
-      - name: Run tests (program-plonky2, off-circuit + non-cyclic gadgets)
-        run: |
-          cargo test -p zkcoins-program-plonky2 --release --lib -- --test-threads=1 \
-            --skip stage_5b --skip stage_5c --skip stage_5d --skip stage_5e
+      # cyclic-recursion prove path is ~10x slower in --debug. The
+      # full sweep — including Stage 5c+/5d/5d-next-3/5d-next-5/5e
+      # cyclic positives + SPEC §13 negatives — runs single-threaded
+      # so each `StateTransitionCircuit` build (~2 GB resident) fits
+      # under the 7 GB `ubuntu-latest` RAM ceiling without OOM-killing
+      # the job. Approximate wall on `ubuntu-latest`: ~80–120 min.
+      #
+      # If a future Plonky2 / Stage change crosses the per-test memory
+      # ceiling, the symptom is `exit code 143` (OOM-kill) on a
+      # specific test; mitigations: switch to a larger GH-hosted tier
+      # (`ubuntu-latest-large`, 16 GB), drop the heaviest cyclic
+      # positives behind `--ignored`, or shard the test list across
+      # multiple jobs.
+      - name: Run tests (program-plonky2, full cyclic-recursion sweep)
+        run: cargo test -p zkcoins-program-plonky2 --release --lib -- --test-threads=1
 
   coverage:
     name: Coverage (MVP scope)

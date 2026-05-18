@@ -175,9 +175,9 @@ pub(crate) async fn broadcast_commit_and_deliver(
         // dry Mutinynet publisher still succeed. See the comment over
         // the matching branch in server.rs::mint_handler.
         if std::env::var("DEV_SKIP_BROADCAST_FAILURE").unwrap_or_default() != "true" {
-            return (
+            return crate::server::handler_error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(SendCoinResponse::default()),
+                "Failed to broadcast commitment inscription on-chain",
             );
         }
         eprintln!("DEV_SKIP_BROADCAST_FAILURE=true — continuing without on-chain commitment");
@@ -197,6 +197,7 @@ pub(crate) async fn broadcast_commit_and_deliver(
         StatusCode::OK,
         Json(SendCoinResponse {
             success: true,
+            error: None,
             proof_id: Some(proof_id),
             account_state_hash: None,
             output_coins_root: None,

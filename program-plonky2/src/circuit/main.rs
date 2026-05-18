@@ -216,7 +216,7 @@ fn state_transition_num_pis() -> usize {
 /// `dummy_circuit`'s rebuild and the outer's own build both emit one
 /// (via the `ConstantGate::new(2)` injection in `build_circuit`),
 /// failing the cyclic fixed-point check. See
-/// `STAGE_5D_NEXT_5_AGGREGATOR.md` and `recursion_shape_probe` for the
+/// `MIGRATION_RESEARCH.md` §7.22 and `recursion_shape_probe` for the
 /// empirical derivation of both the ConstantGate-injection trick and
 /// the pad-bits → helper-degree relationship.
 fn common_data_for_recursion_c_inner(
@@ -1270,7 +1270,7 @@ pub fn build_circuit() -> StateTransitionCircuit {
     // `verify_proof(aggregator)` + the `ConstantGate` injection
     // above. Their gate-set, selectors_info, num_constants and
     // degree_bits all coincide — see
-    // `STAGE_5D_NEXT_5_AGGREGATOR.md` for the empirical derivation.
+    // `MIGRATION_RESEARCH.md` §7.22 for the empirical derivation.
     builder
         .conditionally_verify_cyclic_proof_or_dummy::<C>(
             condition,
