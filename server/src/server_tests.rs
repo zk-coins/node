@@ -148,11 +148,11 @@ async fn balance_minting_address_returns_max() {
 }
 
 #[tokio::test]
-async fn balance_missing_address_param_returns_not_found() {
+async fn balance_missing_address_param_returns_unprocessable() {
     let req = Request::get("/api/balance").body(Body::empty()).unwrap();
     let (status, body) = send_request(req).await;
 
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
     let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
     assert_eq!(resp.balance, 0);
