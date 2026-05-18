@@ -8,6 +8,8 @@
 
 pub mod main;
 pub mod mmr;
+#[cfg(test)]
+mod recursion_shape_probe;
 pub mod smt;
 pub mod source_aggregator;
 mod util;
