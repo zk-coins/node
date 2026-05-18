@@ -48,13 +48,17 @@ impl Account {
     }
     /// Uses the coin_template and next_public_key to create the next account_state and generates a
     /// Coin with filled in identifier (as it commits to the next account state hash).
+    ///
+    /// Total: caller (`send_coins`) is responsible for upstream balance + slot-count validation;
+    /// once that is done this function cannot fail. Returns `Vec<Coin>` directly so the call site
+    /// has no dead `?` propagation path.
     pub fn create_coins(
         &self,
         address: HashDigest,
         next_public_key: PublicKey,
         public_key: zkcoins_program::types::PublicKey,
         coin_templates: Vec<CoinTemplate>,
-    ) -> Result<Vec<Coin>, &'static str> {
+    ) -> Vec<Coin> {
         let mut next_account_state = AccountState {
             owner: address,
             balance: self.get_balance(),
@@ -85,7 +89,7 @@ impl Account {
         // Prover-API integration lands, this update + return will be
         // wired through.
         let _ = next_account_state;
-        Ok(coins.collect())
+        coins.collect()
     }
 
     pub fn get_balance(&self) -> Amount {
@@ -291,6 +295,22 @@ impl AccountServer {
             .accounts
             .get_mut(&account_address)
             .ok_or("Unknown account address")?;
+
+        // Slot-count guards. Done up-front before the expensive
+        // get_merkle_proofs / coin-history-SMT loop so a caller
+        // violating the per-transition slot budget fails fast (and
+        // doesn't pay state-mutation cost first). `out_coins.len() ==
+        // invoices.len()` by construction in `create_coins`, so the
+        // out-coin guard collapses to `invoices.len() > MAX_OUT_COINS`.
+        const MAX_IN_COINS: usize = zkcoins_program::circuit::main::MAX_IN_COINS;
+        const MAX_OUT_COINS: usize = zkcoins_program::circuit::main::MAX_OUT_COINS;
+        if account.coin_queue.len() > MAX_IN_COINS {
+            return Err("Too many in-coins for one transition");
+        }
+        if invoices.len() > MAX_OUT_COINS {
+            return Err("Too many out-coins for one transition");
+        }
+
         // Check if the account balance is enough
         let balance = account
             .coin_queue
@@ -355,7 +375,7 @@ impl AccountServer {
             next_public_key,
             public_key.serialize(),
             coin_templates,
-        )?;
+        );
         // SparseMerkleTree::new() always returns DEFAULT_HASHES[0] as
         // its root, and a non-inclusion-proof-driven update produces the
         // same root as a direct insert — both invariants are part of the
@@ -403,17 +423,12 @@ impl AccountServer {
 
         // Build the fixed-shape MAX_IN_COINS slot tuples. Active
         // slots come from account.coin_queue; inactive slots use the
-        // ZERO_HASH dummies.
+        // ZERO_HASH dummies. Slot-count guards live at the top of
+        // `send_coins`; by the time we reach this point both
+        // `in_coins.len() <= MAX_IN_COINS` and `out_coins.len() <=
+        // MAX_OUT_COINS` are invariants of the function.
         let dummy_nip = Self::dummy_nip();
         let dummy_coin = Self::dummy_coin();
-        const MAX_IN_COINS: usize = zkcoins_program::circuit::main::MAX_IN_COINS;
-        const MAX_OUT_COINS: usize = zkcoins_program::circuit::main::MAX_OUT_COINS;
-        if in_coins.len() > MAX_IN_COINS {
-            return Err("Too many in-coins for one transition");
-        }
-        if out_coins.len() > MAX_OUT_COINS {
-            return Err("Too many out-coins for one transition");
-        }
         let mut in_coin_slots: Vec<(bool, &Coin, &NonInclusionProof)> =
             Vec::with_capacity(MAX_IN_COINS);
         for (coin, nip) in in_coins.iter().zip(coin_non_inclusion_proofs.iter()) {
