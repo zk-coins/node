@@ -103,7 +103,7 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 #### Network info
 
 - **Module:** `server.rs::info_handler`
-- **Behaviour:** returns `{ network, capabilities: { address_list, faucet, usernames, lnurl }, username_domain }`. `network` defaults to `Mutinynet` when `IS_MAINNET=false`, `Mainnet` when `true`. Each `capabilities.*` bool reflects whether the corresponding Cargo feature was compiled into this binary, letting clients gate UI on a single server-side source of truth instead of parallel build-time env flags. `username_domain` is the external hostname this server serves; defaults to `zkcoins.app` (PRD) and DEV deploys override with `USERNAME_DOMAIN=dev.zkcoins.app` — distinct from `network` because the same chain can be served from two isolated external hostnames, and the client renders `<hex|username>@<domain>` from this field
+- **Behaviour:** returns `{ network, capabilities: { address_list, faucet, usernames, lnurl }, username_domain }`. `network` defaults to `Mutinynet` when `IS_MAINNET=false`, `Mainnet` when `true`. Each `capabilities.*` bool reflects whether the corresponding Cargo feature was compiled into this binary, letting clients gate UI on a single server-side source of truth instead of parallel build-time env flags. `username_domain` is the external hostname this server serves; **required env var** (server panics on startup if unset). PRD sets `USERNAME_DOMAIN=zkcoins.app`, DEV sets `USERNAME_DOMAIN=dev.zkcoins.app` — distinct from `network` because the same chain can be served from two isolated external hostnames, and the client renders `<hex|username>@<domain>` from this field
 - **Tests:** `server.rs::tests::info_returns_network_name_capabilities_and_username_domain`, `server.rs::tests::info_serialization_format_is_stable`
 
 #### Get balance
@@ -198,7 +198,7 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 | `ESPLORA_URL`   | `https://mutinynet.com/api` | Esplora API endpoint (electrs or public)                                                                                                                      |
 | `IS_MAINNET`    | `false`                     | `true` for Bitcoin Mainnet, `false` for Mutinynet/Signet                                                                                                      |
 | `NETWORK_NAME`  | `Mutinynet` / `Mainnet`     | Human-readable name returned by `/api/info`. Default depends on `IS_MAINNET`                                                                                  |
-| `USERNAME_DOMAIN` | `zkcoins.app`             | External hostname returned by `/api/info`. The client renders `<hex\|username>@<domain>` from this. DEV deploys must set `USERNAME_DOMAIN=dev.zkcoins.app`    |
+| `USERNAME_DOMAIN` | _(required, no default)_  | External hostname returned by `/api/info`. The client renders `<hex\|username>@<domain>` from this. **Server panics on startup if unset.** PRD sets `zkcoins.app`, DEV sets `dev.zkcoins.app` — silent fallback would let a misconfigured stage reproduce the cross-network routing bug (#95) |
 | `PUBLISHER_KEY` | test key                    | 32-byte hex private key for inscription publishing. **Required on mainnet** — server panics on startup if default test key is detected with `IS_MAINNET=true` |
 | `RUST_LOG`      | `info`                      | Log level                                                                                                                                                     |
 
