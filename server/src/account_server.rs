@@ -678,12 +678,13 @@ mod inline_tests {
     }
 }
 
-// STEP 7 MIGRATION: account_server_tests.rs disabled pending Prover-API
-// integration after Stage 5d-next-5 (aggregator pattern) merges from
-// branch `feat/plonky2-5d-next-4-aggregator` (issue zk-coins/server#19).
-// The tests construct ProgramInputsBuilder values + call Prover.create_account /
-// update_account — both replaced in the Plonky2 wrapper but the final
-// shape depends on the aggregator pattern.
+// STEP 7 MIGRATION: account_server_tests.rs is disabled at the include-point
+// because its fixtures rely on SP1's `ProgramInputsBuilder` +
+// `Prover::create_account` / `update_account` API. Both are replaced in the
+// Plonky2 wrapper (Prover takes per-slot tuples directly) and porting the
+// fixtures is a focused follow-up task — see ROADMAP Step 7 status. The
+// `inline_tests` module above covers the activated error-path surface of
+// `account_server.rs` so the binary's MVP coverage gate stays green.
 //
 // #[cfg(test)]
 // #[path = "account_server_tests.rs"]

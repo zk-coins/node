@@ -5,64 +5,76 @@ left off.
 
 ## Current branch + HEAD
 
-`feat/plonky2-migration`, latest commit: `00adbb4` (Step 7
-workspace + server-side migration; Prover-API integration in
-`send_coins` deferred to post-merge of Stage 5d-next-5). The full
-set of commits is enumerated in [`../ROADMAP.md`](../ROADMAP.md)
-under the **Done** section.
+`feat/plonky2-migration`, latest commit on `origin`: see `git log`.
+PR [#17](https://github.com/zk-coins/server/pull/17) is the
+mergeable migration PR with all 6 CI checks passing (Lint & Build,
+Tests, Analyze rust, Analyze actions, CodeQL, Coverage MVP scope).
 
-## Step status summary (end of 2026-05-17 session)
+## Step status summary
 
 - Steps 1–4: ✅ done
 - Step 5 (monolithic circuit, Stage 5d-next-3): ✅ done; 107 tests
-  total, all passing in 198 s wall
-- Step 5d-next-4 (source-side cyclic verify): 🚫 **deferred to
-  Stage 5d-next-5** — being worked on **in parallel** on branch
-  `feat/plonky2-5d-next-4-aggregator` per
-  [zk-coins/server#19](https://github.com/zk-coins/server/issues/19)
+  in `program-plonky2/`, all passing in ~198 s wall
+- Step 5d-next-4 (source-side cyclic verify): 🚫 deferred — see
+  [`STAGE_5D_NEXT_5_AGGREGATOR.md`](STAGE_5D_NEXT_5_AGGREGATOR.md)
 - Step 6 (script-plonky2 prover host wrapper): ✅ done (`d96bb62`)
-- Step 7 (server replacement): ✅ **done** (`c71c9fc`).
-  Workspace toolchain unified to nightly. `program/` + `script/`
-  deleted (recoverable via `git checkout v0.last-sp1 -- ...`).
-  shared + server fully migrated to Plonky2-era modules with the
-  HashDigest type-shift handled at all boundaries.
-  `account_server::send_coins` wired to the Plonky2 `Prover`
-  wrapper; source-side recursive verify is off-circuit per
-  server-heavy MVP architecture (Stage 5d-next-5 Phase 2 deferred
-  post-MVP, see `STAGE_5D_NEXT_5_AGGREGATOR.md`). 32 server tests
-  pass. `account_server_tests` + `server_tests` modules remain
-  disabled at include-point pending a separate test-fixture
-  porting task (~3–6 h, SP1's `ProgramInputsBuilder` test helpers
-  need replacing).
-- Stage 5d-next-5 (aggregator): Phase 1 ✅ merged (`cc9c4b6`);
-  Phase 2 (outer integration) blocked, fully documented in
-  `STAGE_5D_NEXT_5_AGGREGATOR.md`.
+- Step 7 (server replacement): ✅ done. Workspace toolchain unified
+  to nightly. `program/` + `script/` deleted (recoverable via
+  `git checkout v0.last-sp1 -- ...`). shared + server fully
+  migrated to Plonky2-era modules with the HashDigest type-shift
+  handled at all boundaries. `account_server::send_coins` wired to
+  the Plonky2 `Prover` wrapper (`c71c9fc`); source-side recursive
+  verify enforced off-circuit per server-heavy MVP architecture.
+  Dockerfile re-introduced (`dac0179`). 42 server tests pass
+  (10 inline error-path tests added in `d6a3cb9` on top of the 32
+  baseline). `account_server_tests` + `server_tests` modules
+  remain disabled at the include-point pending a separate
+  SP1-fixture-port task (~3–6 h: their `ProgramInputsBuilder` +
+  `Prover::{create,update}_account` calls need replacing with the
+  Plonky2 wrapper's per-slot tuple API).
+- Stage 5d-next-5 (aggregator): Phase 1 ✅ merged (`cc9c4b6` from
+  PR [#22](https://github.com/zk-coins/server/pull/22)). Phase 2
+  (outer integration) is blocked on a Plonky2 1.1.0 `dummy_circuit`
+  shape mismatch — PR [#23](https://github.com/zk-coins/server/pull/23)
+  added a `recursion_shape_probe` test proving no in-tree workaround
+  fixes it. Forward path: Plonky2 upstream patch (P1 gate-aware
+  NoopGate budget or P2 `debug_assert_eq!` downgrade), distributed
+  via `program-plonky2/Cargo.toml`'s `[dependencies] plonky2 = { git = "…" }`.
 - Steps 8–9: ⏳ todo (App/Wallet integration + DEV deployment).
   Both require work outside this repo (`zk-coins/app` + deploy
-  pipelines).
+  pipelines + SSH access to dfxdev/dfxprd).
+
+## Smoke test verified
+
+`cargo run --release -p server` boots cleanly:
+- `Prover::new()` builds the cyclic state-transition circuit
+- REST server binds `0.0.0.0:4242`
+- `GET /health` → `ok`
+- `GET /api/info` → `{"network":"Mutinynet"}`
+- Block scanner connects to Esplora + processes Mutinynet tip
+- No panics, no errors
 
 ## Active parallel work
 
-Stage 5d-next-5 (source-side verification via aggregator pattern)
-is being implemented in **another Claude session** on a separate
-branch `feat/plonky2-5d-next-4-aggregator` (issue
-[zk-coins/server#19](https://github.com/zk-coins/server/issues/19)).
+See PR [#23](https://github.com/zk-coins/server/pull/23) for the
+continued Stage 5d-next-5 work (Phase-2 probe + Phase-1 coverage
+gap). User indicated more commits will land on that PR — main
+session is on hold for that PR's evolution.
 
-That session's scope is hermetic to `program-plonky2/src/circuit/`
-+ new `source_aggregator.rs` + new `STAGE_5D_NEXT_5_AGGREGATOR.md`.
-It is forbidden from touching ROADMAP.md / SESSION_STATE.md /
-STEP7_PREP.md / MIGRATION_RESEARCH.md / server/ / shared/ /
-root Cargo.toml / rust-toolchain to avoid merge conflicts.
-
-After that branch lands, the main session integrates:
-1. Rebase parallel branch onto current HEAD.
+After PR #23 fully lands + a Plonky2 patch arrives, the integration
+sequence is:
+1. Rebase the patch + aggregator branch onto current HEAD.
 2. Update `script-plonky2/src/lib.rs` Prover wrapper to expose the
-   new aggregator construction API.
-3. Wire `account_server::send_coins` to the new Prover API
-   (replacing the `unimplemented!` block introduced in `00adbb4`).
-4. Re-enable `account_server_tests` + `server_tests` modules.
-5. Run `cargo llvm-cov --fail-under-lines 100 -- --test-threads=1`.
-6. Fold `STAGE_5D_NEXT_5_AGGREGATOR.md` into
+   aggregator construction API.
+3. Wire `account_server::send_coins` to consume the aggregator
+   (replacing the off-circuit source validation introduced in
+   `c71c9fc`).
+4. Port `account_server_tests.rs` + `server_tests.rs` fixtures to
+   the new API and re-enable both modules at the include-point.
+5. Drop the temporary coverage exclusions for
+   `account_server.rs` + `server.rs` in the CI workflow.
+6. Run full `cargo llvm-cov --fail-under-lines 100 --fail-under-functions 100 -- --test-threads=1`.
+7. Fold `STAGE_5D_NEXT_5_AGGREGATOR.md` content into
    `MIGRATION_RESEARCH.md §7.22`.
 
 ## What works end-to-end

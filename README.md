@@ -40,7 +40,7 @@ API endpoints, background services, their activation status, and the tests that 
 
 **Triage legend** (MVP testing decision): `mvp` = in MVP scope, must reach full test coverage before launch · `gate` = not in MVP scope; hidden behind a Cargo feature, default off, no test coverage required · `planned` = not in scope for MVP.
 
-**Coverage legend:** unit % refers to `cargo-llvm-cov` line coverage of the module that implements the function. Numbers in the table below are STALE — they were measured against the SP1-era build and have not yet been re-measured post-Plonky2 migration. The Step-7 migration disables `account_server_tests` + `server_tests` pending the Stage 5d-next-5 aggregator merge (issue [#19](https://github.com/zk-coins/server/issues/19)); see [`ROADMAP.md`](./ROADMAP.md) for the live status. `—` means no test exists.
+**Coverage legend:** unit % refers to `cargo-llvm-cov` line coverage of the module that implements the function. Numbers in the table below are STALE — they were measured against the SP1-era build and have not yet been re-measured post-Plonky2 migration. The Step-7 migration left `account_server_tests` + `server_tests` modules disabled at their include-point because their fixtures rely on the SP1-era `ProgramInputsBuilder` / `Prover::{create,update}_account` API; porting them to the Plonky2 wrapper's per-slot tuple API is a focused follow-up task. See [`ROADMAP.md`](./ROADMAP.md) for the live status. `—` means no test exists.
 
 | Function                             | Trigger                               | Status                   | Triage  | Tests                         |
 | ------------------------------------ | ------------------------------------- | ------------------------ | ------- | ----------------------------- |
@@ -224,7 +224,7 @@ Per-module line coverage (latest CI run):
 | `scanner.rs`        | 6     | 100%    |                                                                                                                        |
 | `state.rs`          | 13    | 100%    | Poseidon-based SMT + MMR                                                                                               |
 | `username.rs`       | 9     | 100%    |                                                                                                                        |
-| `account_server.rs` | n/a   | excluded | Tests disabled during Step-7 migration pending Stage 5d-next-5 aggregator merge (issue [#19](https://github.com/zk-coins/server/issues/19)) |
+| `account_server.rs` | 10 (inline) | excluded from gate | Inline error-path tests cover Account / lookup / IO / send_coins early returns; the `send_coins` body needs the SP1-fixture port to reach full coverage |
 | `server.rs`         | n/a   | excluded | Same as above                                                                                                          |
 | `publisher.rs`      | 0     | excluded | Bitcoin commit/reveal broadcasting — needs live signet/regtest node                                                    |
 | `main.rs`           | 0     | excluded | Runtime bootstrap                                                                                                      |
