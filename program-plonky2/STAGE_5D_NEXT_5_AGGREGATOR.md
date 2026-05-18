@@ -12,27 +12,34 @@ in `MIGRATION_RESEARCH.md` §7.21 and the original design notes in
 | 1 | Aggregator skeleton + smoke + active-slot test | **Done.** Landed via #22, currently on `feat/plonky2-migration`. |
 | Phase-1 coverage gap | `should_panic` test for `prove_aggregator`'s invalid-witness arm | **Done in this PR** (fast — no circuit build needed, 0.00 s wall). |
 | 2a probe | Empirical investigation of the Plonky2 1.1.0 `dummy_circuit` shape mismatch | **Done in this PR.** `src/circuit/recursion_shape_probe.rs` is a `#[cfg(test)]`-gated diagnostic module that reproduces and characterises the blocker. |
-| 2a | Outer-circuit integration (`verify_proof(agg)` + `connect_hashes`) | **Still blocked.** The probe rules out every in-tree workaround (pad-bit variation, PI registration, 1/4/16/64/256 forced constants). Requires an upstream Plonky2 1.1.0 patch — sketch below. |
-| 2b | Per-slot source-side SMT inclusion + CMP (c)(d)(e) chain + coupling check | **Not started.** Strictly blocked behind 2a — the per-slot gates only have a place to live once the aggregator is wired into the outer's PI extraction. |
-| 3 | Restored 4 cyclic positives + 3 new SPEC §13 negatives + 100 % line coverage | **Not started.** Blocked behind 2. The 4 positives and 3 negatives the issue enumerates need the source-side gadgets in 2b to be meaningful. |
+| 2a probe — partial breakthrough | Explicit `ConstantGate::new(2)` injection in pass-3 makes `dummy_circuit(_)` succeed | **Done in this PR.** Probe variant `pass_3_two_verify(_, force_constant_gate = true)` produces 13 gates incl. `ConstantGate` and `dummy_circuit(_)` returns OK. |
+| 2a | Outer-circuit integration (`verify_proof(agg)` + `connect_hashes`) | **Still blocked, deeper than expected.** With the ConstantGate-injection trick the `dummy_circuit` half is solved, but the full outer's `build()` still fails the cyclic fixed-point check at `circuit_builder.rs:1067` (`goal_data != common`) — divergence on a shape axis other than `gates`. Diagnosis recommendation in "Recommendations for the next session" below. Attempted integration into `build_circuit` reverted on this branch. |
+| 2b | Per-slot source-side SMT inclusion + CMP (c)(d)(e) chain + coupling check | **Not started.** Strictly blocked behind 2a. |
+| 3 | Restored 4 cyclic positives + 3 new SPEC §13 negatives + 100 % line coverage | **Not started.** Blocked behind 2. |
 
 ### What's in this PR (Phase-1 follow-up)
 
 - `src/circuit/recursion_shape_probe.rs` — `#[cfg(test)]` diagnostic
   that builds Stage 5d-next-3's pass-3 common (1 `verify_proof`) and
   several Stage 5d-next-5 candidate commons (2 `verify_proof`s with
-  varying pad and forced-constant counts), dumps each gates list, and
-  runs `dummy_circuit(_)` to record which shapes pass / fail the
+  varying pad, forced-constant counts, and an explicit
+  `ConstantGate::new(2)` injection), dumps each gates list, and runs
+  `dummy_circuit(_)` to record which shapes pass / fail the
   assertion at `plonky2-1.1.0/src/recursion/dummy_circuit.rs:116`.
+  The `pass_3_two_verify_forced` helper is kept as `#[allow(dead_code)]`
+  documented dead-end research; the working fix (`force_constant_gate
+  = true` in `pass_3_two_verify`) is empirically verified to make
+  pass-3 + `dummy_circuit` agree.
 - `src/circuit/source_aggregator.rs` — extracted
   `assert_slot_witnesses_valid` from `prove_aggregator`, replaced the
   in-loop `panic!` with `unreachable!` (the upfront validation makes
   it genuinely unreachable), and added two fast `#[should_panic]`
   tests for the slot-count and active-but-missing-real-proof
   contracts (Phase-1 coverage gap closed).
-- This file (`STAGE_5D_NEXT_5_AGGREGATOR.md`) — replaces the "Phase 1
-  only, Phase 2 blocked" snapshot from #22 with the post-probe
-  understanding + concrete upstream-patch path.
+- This file (`STAGE_5D_NEXT_5_AGGREGATOR.md`) — updates the post-#22
+  snapshot with the ConstantGate-injection breakthrough on the
+  `dummy_circuit` half, AND the remaining (different) cyclic
+  fixed-point divergence the outer-integration attempt revealed.
 
 ### What's NOT in this PR (still deferred)
 
@@ -74,44 +81,61 @@ Output (paraphrased — full transcript reproducible from the test):
 
 The probe demonstrates:
 
-1. **Stage 5d-next-3's 1-`verify_proof` pass-3 is the only known
-   in-tree configuration that emits `ConstantGate`.** This is what
-   makes the cyclic recursion's `_or_dummy` self-test succeed in
-   #22's smoke + active-slot tests.
+1. **Stage 5d-next-3's 1-`verify_proof` pass-3 is the only naturally
+   `ConstantGate`-emitting configuration.** This is what makes the
+   cyclic recursion's `_or_dummy` self-test succeed in #22's smoke +
+   active-slot tests.
 
 2. **Adding a second `verify_proof` to pass 3 deterministically
-   removes `ConstantGate` from the gates list**, regardless of:
-   - `INNER_PAD_BITS` (tested 14 / 15 / 16);
-   - the number of explicit `builder.constant` calls subsequently
-     consumed by `builder.mul(c, zero)` (tested 1 / 4 / 16 / 64 / 256
-     distinct constants).
+   removes `ConstantGate` from the gates list** unless the helper
+   explicitly injects one. Tested:
+   - `INNER_PAD_BITS` (14 / 15 / 16) — all fail without injection;
+   - `builder.constant + builder.mul(c, zero)` chain at N = 1 / 4 /
+     16 / 64 / 256 distinct constants — all fail (the constants get
+     absorbed by `ArithmeticGate`'s coefficient slots instead of
+     forcing a `ConstantGate` allocation);
+   - **Explicit `builder.add_gate(ConstantGate::new(2), …)`
+     injection in pass-3 — SUCCEEDS for the isolated
+     `dummy_circuit(_)` check.** The 2-verify pass-3 then has 13
+     gates including `ConstantGate`, matching `dummy_circuit`'s
+     rebuild.
 
-   The first verify_proof's constants overflow `ArithmeticGate`'s
-   constant slots and force a standalone `ConstantGate` instance to
-   be allocated at build time. Adding a second `verify_proof` adds
-   ~40 more `ArithmeticGate` instances, each with 40 constant slots,
-   which absorbs the constant pressure entirely — no `ConstantGate`
-   ever gets allocated by `builder.build()`.
-
-3. The mismatch fires inside `dummy_circuit(common_data)` (which
-   `_or_dummy` and `cyclic_base_proof` both call). `dummy_circuit`
-   unconditionally subtracts 2 from its NoopGate budget to leave room
-   for `PublicInputGate` + `ConstantGate`; its rebuild therefore
-   emits `ConstantGate` even when the passed `common_data.gates`
-   doesn't list it. The `assert_eq!(&circuit.common, common_data)` at
+3. The mismatch in the failing cases fires inside
+   `dummy_circuit(common_data)` (which `_or_dummy` and
+   `cyclic_base_proof` both call). `dummy_circuit` unconditionally
+   subtracts 2 from its NoopGate budget to leave room for
+   `PublicInputGate` + `ConstantGate`; its rebuild therefore emits
+   `ConstantGate` even when the passed `common_data.gates` doesn't
+   list it. The `assert_eq!(&circuit.common, common_data)` at
    `dummy_circuit.rs:116` then fails.
 
-4. **No in-tree workaround exists.** The selector-group structure of
-   the 2-`verify_proof` pass-3 is `[0..6, 6..10, 10..12]`, vs.
-   `[0..7, 7..11, 11..13]` for the 1-verify baseline — i.e., one gate
-   is missing from selector group 0 specifically (the
-   `ConstantGate`). Forcing more constants into the circuit shifts
-   constants among existing arithmetic gates without ever causing a
-   standalone `ConstantGate` instance.
+4. **The ConstantGate injection trick fixes the isolated
+   `dummy_circuit` mismatch but is NOT sufficient for the full outer
+   integration.** When `build_circuit()` is extended with the
+   `verify_proof(aggregator)` + `connect_hashes` wiring AND the
+   matching `ConstantGate::new(2)` injection in both pass-3 (helper)
+   and the outer's `build_circuit` body, the cyclic fixed-point still
+   fails — but at a different site: `plonk/circuit_builder.rs:1067`
+   (`Failed to build circuit`), which checks `goal_data != common`
+   after the outer's full `build()`. So pass-3's output matches
+   `dummy_circuit`'s rebuild (probe ✓), but it does NOT match the
+   real outer's `build()` output. The remaining divergence (between
+   pass-3 modeled and outer actual) is on a different shape axis —
+   likely `quotient_degree_factor`, `k_is`, or `selectors_info`
+   composition driven by the outer's 10 k constraint gates from
+   SMT / CMP / in-coins / out-coins. Diagnosing this needs a side-by-
+   side dump of pass-3-common vs. partial-outer-common, which the
+   current probe doesn't (yet) do.
 
-## Upstream Plonky2 1.1.0 patch (proposed)
+## Upstream Plonky2 1.1.0 patch (still applicable for the
+## `dummy_circuit` half of the problem)
 
-The fix has to live in `plonky2-1.1.0`. Two minimal-diff options:
+The `dummy_circuit` half of the blocker has a clean upstream fix.
+The CYCLIC-fixed-point half (`circuit_builder.rs:1067`) is a
+separate, deeper problem that the upstream patch doesn't address
+on its own.
+
+Two minimal-diff options for the `dummy_circuit` fix:
 
 ### Option P1 — gate-aware NoopGate budget (preferred)
 
@@ -192,24 +216,46 @@ plonky2 ≥ 1.2 picks up the fix.
 
 In strict priority order:
 
-1. **Land the Plonky2 fork.** Either P1 or P2 from above. Without it,
-   no in-tree work on `main.rs` will get past `builder.build()` for
-   the cyclic outer with `verify_proof(aggregator)` added.
-2. **Phase 2a outer integration.** Wire `verify_proof(aggregator)`
-   into `build_circuit` + add `connect_hashes` for the claimed
-   state-transition `verifier_data`. Use Phase 1's aggregator
-   skeleton verbatim — its public API is finalised.
-3. **Phase 2b per-slot source-side gates.** SMT inclusion of
-   `coin.identifier` in `source.output_coins_root`, SPEC §8 (c)(d)(e)
-   for the source's commitment in `history_root`, coupling
+1. **Diagnose the `circuit_builder.rs:1067` shape divergence.** With
+   the `ConstantGate::new(2)` injection (probe-verified to fix the
+   `dummy_circuit` half), the outer's full `build()` still fails the
+   `goal_data != common` cyclic fixed-point check. The divergence is
+   on a shape axis other than `gates` — likely
+   `quotient_degree_factor`, `k_is`, `num_partial_products`, or
+   `selectors_info` groups. Concrete debug step: extend
+   `recursion_shape_probe` with a `partial_outer_common` builder
+   that mirrors `build_circuit` up to but NOT including the cyclic
+   `_or_dummy` call, then `try_build_with_options` and compare
+   `goal_data` (= helper's pass-3 output) vs. the returned `common`
+   field-by-field. The diff will pinpoint the axis.
+2. **Once 2a unblocks: implement Phase 2b** — per-slot SMT inclusion
+   of `coin.identifier` in `source.output_coins_root`, SPEC §8
+   (c)(d)(e) for the source's commitment in `history_root`, coupling
    `source.output_coins_root == source_cmp.commitment_out_coins_root`.
-   All masked by `slot.active`.
-4. **Phase 3 tests.** 4 cyclic positives (Init / Update × no-source /
+   All masked by `slot.active`. The aggregator's PI layout is
+   already finalised for this.
+3. **Phase 3 tests.** 4 cyclic positives (Init / Update × no-source /
    with-source) + 3 negatives (source proof not in history; coin id
    not in source's `output_coins_root`; wrong source vk caught by
    `connect_hashes` on the claimed st verifier_data).
-5. **`cargo llvm-cov --fail-under-lines 100`** on the activated
+4. **`cargo llvm-cov --fail-under-lines 100`** on the activated
    surface.
+
+### Fallback if the divergence axis turns out to be intractable
+
+The `MIGRATION_RESEARCH.md` §7.21 "Decision" rationale still stands:
+zkCoins's server-heavy MVP can satisfy SPEC §8 step 2 off-circuit by
+having the trusted server only fold commitments of validly-proved
+transitions into the history MMR. In that case the aggregator
+(Phase 1, on `feat/plonky2-migration`) stays as a future-facing
+artifact and `build_circuit` skips the `verify_proof(aggregator)`
+plumbing entirely — only the per-slot SMT + CMP gadgets get added,
+and the source's `output_coins_root` becomes a prover-witnessed input
+rather than an aggregator-exposed PI. This was specifically
+attempted in §7.21 "Attempt B" and also hit a cyclic-fixed-point
+mismatch, but with a single-`verify_proof` shape that probe
+verified is `dummy_circuit`-compatible — the divergence in that case
+is more likely solvable with empirical pad/gate-set tuning.
 
 ## Aggregator architecture (target end state — per issue #19)
 

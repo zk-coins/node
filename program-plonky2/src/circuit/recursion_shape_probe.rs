@@ -16,6 +16,7 @@
 #![cfg_attr(coverage_nightly, coverage(off))]
 
 use plonky2::field::types::Field;
+use plonky2::gates::constant::ConstantGate;
 use plonky2::gates::noop::NoopGate;
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::{CircuitConfig, CommonCircuitData};
@@ -73,6 +74,15 @@ fn pass_3_one_verify() -> CommonCircuitData<F, D> {
 /// operations. Used to probe whether explicit constant pressure
 /// forces `ConstantGate` emission. `0` means no forced constants
 /// (equivalent to [`pass_3_two_verify`]).
+///
+/// **Conclusion from the first probe run:** this approach does NOT
+/// work — every value of `num_forced_constants` from 1 up to 256 has
+/// pass-3 absorbing the constants into existing `ArithmeticGate`
+/// instances without ever emitting a standalone `ConstantGate`. The
+/// function is kept as documented dead-end research; the working fix
+/// is the explicit `ConstantGate::new(2)` injection in
+/// [`pass_3_two_verify`]`(_, force_constant_gate = true)`.
+#[allow(dead_code)]
 fn pass_3_two_verify_forced(
     pad_bits: usize,
     num_forced_constants: usize,
@@ -129,7 +139,15 @@ fn pass_3_two_verify_forced(
 /// Stage 5d-next-5 candidate pass-3: two `verify_proof`s (one cyclic,
 /// one against the aggregator's common). Returns common with
 /// `num_public_inputs` overridden to 84.
-fn pass_3_two_verify(pad_bits: usize) -> CommonCircuitData<F, D> {
+///
+/// `force_constant_gate = true` adds one explicit `ConstantGate{num_consts: 2}`
+/// instance in pass-3 just before the noop pad. The purpose is to
+/// ensure pass-3's `gates` list includes `ConstantGate` even when the
+/// caller's two `verify_proof` calls have produced enough
+/// `ArithmeticGate` instances to absorb all constant pressure (the
+/// 1-verify baseline naturally emits one; the 2-verify candidate
+/// doesn't — see the probe summary).
+fn pass_3_two_verify(pad_bits: usize, force_constant_gate: bool) -> CommonCircuitData<F, D> {
     // Bootstrap aggregator against pass-3-one-verify shape (the
     // working Stage 5d-next-3 baseline). The aggregator's
     // `dummy_circuit(st_common)` succeeds for this baseline shape, so
@@ -154,7 +172,7 @@ fn pass_3_two_verify(pad_bits: usize) -> CommonCircuitData<F, D> {
     builder.verify_proof::<C>(&agg_proof, &agg_vd, &aggregator.data.common);
     let data = builder.build::<C>();
 
-    // Pass 3: same shape + pad
+    // Pass 3: same shape + optional explicit ConstantGate + pad
     let config = CircuitConfig::standard_recursion_config();
     let mut builder = CircuitBuilder::<F, D>::new(config);
     let proof = builder.add_virtual_proof_with_pis(&data.common);
@@ -164,6 +182,14 @@ fn pass_3_two_verify(pad_bits: usize) -> CommonCircuitData<F, D> {
     let agg_vd =
         builder.add_virtual_verifier_data(aggregator.data.common.config.fri_config.cap_height);
     builder.verify_proof::<C>(&agg_proof, &agg_vd, &aggregator.data.common);
+    if force_constant_gate {
+        // Inject one ConstantGate{num_consts:2} instance so the gates
+        // list mirrors what `dummy_circuit`'s rebuild produces (the
+        // rebuild always allocates a ConstantGate for its PI-handling
+        // constants). The two slots hold trivial zeros — the gate
+        // instance is the point, not the constants themselves.
+        builder.add_gate(ConstantGate::new(2), vec![F::ZERO, F::ZERO]);
+    }
     while builder.num_gates() < 1 << pad_bits {
         builder.add_gate(NoopGate, vec![]);
     }
@@ -204,19 +230,24 @@ fn dump_pass_3_gates_lists_for_inspection() {
     dump_summary("Stage 5d-next-3 baseline (1 verify, pad 14)", &baseline);
     let ok_baseline = try_dummy_circuit("baseline", &baseline);
 
-    let two_verify_pad14 = pass_3_two_verify(14);
-    dump_summary("Phase 2a candidate (2 verify, pad 14)", &two_verify_pad14);
+    let two_verify_pad14 = pass_3_two_verify(14, false);
+    dump_summary(
+        "Phase 2a candidate (2 verify, pad 14, no forced ConstantGate)",
+        &two_verify_pad14,
+    );
     let ok_2v_14 = try_dummy_circuit("2-verify pad 14", &two_verify_pad14);
 
-    println!("\n=== summary so far === baseline_ok={ok_baseline}, 2v_14={ok_2v_14}");
+    // The decisive test: same shape, but with one explicit
+    // `ConstantGate` instance injected into pass-3 so its gates list
+    // matches `dummy_circuit`'s rebuild.
+    let two_verify_pad14_cg = pass_3_two_verify(14, true);
+    dump_summary(
+        "Phase 2a candidate (2 verify, pad 14, +ConstantGate)",
+        &two_verify_pad14_cg,
+    );
+    let ok_2v_14_cg = try_dummy_circuit("2-verify pad 14 +CG", &two_verify_pad14_cg);
 
-    // Force-constants probe: how many distinct constants forced
-    // through a `mul(c, zero)` chain trigger ConstantGate emission?
-    for n in [1usize, 4, 16, 64, 256] {
-        let candidate = pass_3_two_verify_forced(14, n);
-        let label = format!("2 verify + {n} forced constants (pad 14)");
-        dump_summary(&label, &candidate);
-        let ok = try_dummy_circuit(&label, &candidate);
-        println!("\n  →→→ forced_n={n}: ok={ok}");
-    }
+    println!(
+        "\n=== summary === baseline_ok={ok_baseline}, 2v_14={ok_2v_14}, 2v_14_with_constant_gate={ok_2v_14_cg}"
+    );
 }
