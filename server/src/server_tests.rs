@@ -116,7 +116,8 @@ async fn balance_unknown_address_returns_ok_with_zero() {
 #[tokio::test]
 async fn balance_unknown_address_with_claimed_username_returns_username() {
     let state = test_state();
-    let address = [0xABu8; 32];
+    let address_bytes = [0xABu8; 32];
+    let address = zkcoins_program::hash::digest_from_bytes(&address_bytes);
 
     // Claim a username for an address that has no on-chain activity yet.
     {
@@ -124,7 +125,7 @@ async fn balance_unknown_address_with_claimed_username_returns_username() {
         store.claim("alice", address).expect("claim should succeed");
     }
 
-    let uri = format!("/api/balance?address={}", hex::encode(address));
+    let uri = format!("/api/balance?address={}", hex::encode(address_bytes));
     let req = Request::get(&uri).body(Body::empty()).unwrap();
     let (status, body) = send_request_with_state(state, req).await;
 
