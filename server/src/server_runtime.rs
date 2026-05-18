@@ -197,6 +197,7 @@ pub(crate) async fn broadcast_commit_and_deliver(
         StatusCode::OK,
         Json(SendCoinResponse {
             success: true,
+            error: None,
             proof_id: Some(proof_id),
             account_state_hash: None,
             output_coins_root: None,

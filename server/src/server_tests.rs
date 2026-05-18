@@ -1432,7 +1432,7 @@ async fn send_with_wrong_length_address_returns_422() {
 }
 
 #[tokio::test]
-async fn send_with_insufficient_funds_returns_ok_with_success_false() {
+async fn send_with_insufficient_funds_returns_422_with_error_string() {
     use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
     use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
 
@@ -1510,9 +1510,13 @@ async fn send_with_insufficient_funds_returns_ok_with_success_false() {
         .body(Body::from(body.to_string()))
         .unwrap();
     let (status, body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::OK);
+    // After the Item 1 HTTP error-mapping landed (see PR following #28),
+    // send_coins failures surface as 4xx with body.error rather than
+    // 200 + success:false. Insufficient funds maps to 422.
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(resp["success"], false);
+    assert_eq!(resp["error"], "Insufficient funds");
 }
 
 #[tokio::test]
@@ -2147,4 +2151,193 @@ fn lock_or_recover_username_store_poisoned() {
 
     assert!(store.is_poisoned());
     let _guard = lock_or_recover(&store);
+}
+
+// --- Item 1 (Issue #28) — HTTP error mapping for /api/send + /api/mint ---
+//
+// `map_send_coins_error` is the single source of truth for translating
+// `account_server::send_coins` failure strings into a `(StatusCode,
+// body)` pair. These unit tests pin every documented error string to
+// its mapped pair so adding a new error string anywhere in `send_coins`
+// will silently fall through the `_ => INTERNAL_SERVER_ERROR` arm of
+// the helper but loudly break one of these tests if the new string was
+// supposed to be mapped to a 4xx.
+
+#[test]
+fn map_send_coins_error_unknown_account_address_is_404() {
+    let (status, body) = crate::server::map_send_coins_error("Unknown account address");
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, "Unknown account address");
+}
+
+#[test]
+fn map_send_coins_error_prev_commitment_pubkey_required_is_400() {
+    let (status, body) =
+        crate::server::map_send_coins_error("prev_commitment_pubkey required for account update");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, "prev_commitment_pubkey required for account update");
+}
+
+#[test]
+fn map_send_coins_error_insufficient_funds_is_422() {
+    let (status, body) = crate::server::map_send_coins_error("Insufficient funds");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body, "Insufficient funds");
+}
+
+#[test]
+fn map_send_coins_error_phase_2b_shim_in_coin_not_in_source_ocr_is_422() {
+    let (status, body) =
+        crate::server::map_send_coins_error("In-coin not present in source's output_coins_root");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body, "In-coin not present in source's output_coins_root");
+}
+
+#[test]
+fn map_send_coins_error_phase_2b_shim_source_not_in_history_is_422() {
+    let (status, body) =
+        crate::server::map_send_coins_error("Source commitment not present in history MMR");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body, "Source commitment not present in history MMR");
+}
+
+#[test]
+fn map_send_coins_error_coin_missing_commitment_is_422() {
+    let (status, body) = crate::server::map_send_coins_error("Coin is missing commitment");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body, "Coin is missing commitment");
+}
+
+#[test]
+fn map_send_coins_error_missing_inclusion_proof_is_422() {
+    let (status, body) = crate::server::map_send_coins_error("Should provide an inclusion proof");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body, "Should provide an inclusion proof");
+}
+
+#[test]
+fn map_send_coins_error_coin_already_in_coin_history_is_422() {
+    let (status, body) =
+        crate::server::map_send_coins_error("Coin should not exist in coin history tree");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body, "Coin should not exist in coin history tree");
+}
+
+#[test]
+fn map_send_coins_error_coin_already_in_output_smt_is_422() {
+    let (status, body) = crate::server::map_send_coins_error("Coin should not exist in tree yet");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body, "Coin should not exist in tree yet");
+}
+
+#[test]
+fn map_send_coins_error_too_many_in_coins_is_422() {
+    let (status, body) =
+        crate::server::map_send_coins_error("Too many in-coins for one transition");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body, "Too many in-coins for one transition");
+}
+
+#[test]
+fn map_send_coins_error_too_many_out_coins_is_422() {
+    let (status, body) =
+        crate::server::map_send_coins_error("Too many out-coins for one transition");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body, "Too many out-coins for one transition");
+}
+
+#[test]
+fn map_send_coins_error_prove_failed_initial_collapses_to_500_prove_failed() {
+    // Per the threat-model note in map_send_coins_error, the prover-internal
+    // error string is intentionally collapsed to a generic "prove failed"
+    // body so 5xx responses don't leak prover state to callers.
+    let (status, body) = crate::server::map_send_coins_error(
+        "prove_initial_with_in_and_out_coins_and_sources failed",
+    );
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body, "prove failed");
+}
+
+#[test]
+fn map_send_coins_error_prove_failed_account_update_collapses_to_500_prove_failed() {
+    let (status, body) = crate::server::map_send_coins_error(
+        "prove_account_update_with_in_and_out_coins_and_sources failed",
+    );
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body, "prove failed");
+}
+
+#[test]
+fn map_send_coins_error_unknown_string_is_500_internal_error() {
+    // A new `send_coins` error string we haven't mapped yet must NOT
+    // accidentally surface as 200 OK / 4xx. The default arm is 500 with
+    // a generic "internal error" body so the wallet treats it as a
+    // server problem and the operator finds the unmapped string in the
+    // `eprintln!` log.
+    let (status, body) = crate::server::map_send_coins_error("a string we never added");
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body, "internal error");
+}
+
+#[tokio::test]
+async fn send_with_unknown_account_returns_404_with_error_string() {
+    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
+    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
+
+    // test_state() only seeds the minting account. Any other 32-byte
+    // address is unknown to the account_server, so send_coins returns
+    // "Unknown account address" which the handler maps to 404.
+    let secret_bytes = include_bytes!("../minting_secret.bin");
+    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
+    let secp = secp::Secp256k1::new();
+    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .public_key;
+    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
+        .unwrap()
+        .public_key;
+    let sk_0: SecretKey = xpriv
+        .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .private_key;
+
+    // An address that is well-formed (hex, 32 bytes) but never claimed
+    // an account on the server.
+    let account_address = "0x".to_string() + &hex::encode([0xAAu8; 32]);
+    let recipient = "0x".to_string() + &hex::encode([1u8; 32]);
+    let amount: u64 = 50;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut hasher = Sha256::new();
+    hasher.update(account_address.as_bytes());
+    hasher.update(recipient.as_bytes());
+    hasher.update(amount.to_le_bytes());
+    hasher.update(now.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    let msg = Message::from_digest(hash);
+    let kp = Keypair::from_secret_key(&secp, &sk_0);
+    let sig = secp.sign_schnorr(&msg, &kp);
+
+    let body = serde_json::json!({
+        "account_address": account_address,
+        "recipient": recipient,
+        "amount": amount,
+        "public_key": hex::encode(pk_0.serialize()),
+        "next_public_key": hex::encode(pk_1.serialize()),
+        "signature": hex::encode(sig.serialize()),
+        "timestamp": now,
+    });
+    let req = Request::post("/api/send")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(resp["success"], false);
+    assert_eq!(resp["error"], "Unknown account address");
 }
