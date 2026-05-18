@@ -169,9 +169,13 @@ jobs:
       # reveal broadcasting that needs a signet/regtest node) are
       # genuinely not exercisable in unit tests and are excluded at the
       # file level via --ignore-filename-regex.
+      # `--release` for the same Plonky2-prove-cost reason as the Tests
+      # job above. cargo-llvm-cov gathers line/function coverage data
+      # regardless of opt level, so release builds give us the same
+      # accuracy at a fraction of the wall time.
       - name: Run cargo-llvm-cov (MVP scope, regression guard)
         run: |
-          cargo llvm-cov -p server --show-missing-lines \
+          cargo llvm-cov --release -p server --show-missing-lines \
             --ignore-filename-regex 'main\.rs|publisher\.rs|server_runtime\.rs|scanner_runtime\.rs|_tests\.rs$' \
             --fail-under-lines 100 \
             --fail-under-functions 100 \
