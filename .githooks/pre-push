@@ -22,10 +22,11 @@
 #     already exercise the prover end-to-end via send_coins_*, so the
 #     sweep is only worth its cost when the circuit itself changed.
 #
-# Wall budgets (warm cache, M3 Ultra):
+# Wall budgets (warm cache, M3 Ultra) — kept in sync with the matching
+# table in CONTRIBUTING.md § Setup:
 #   - YAML / MD / githooks only:          seconds
-#   - Rust change, no circuit code:       ~70 min (server tests + cov)
-#   - Circuit change:                     ~3 hours (above + full sweep)
+#   - Rust change, no circuit code:       ~100 min (server tests + cov)
+#   - Circuit change:                     ~hours (above + full sweep)
 #
 # Bypass: `git push --no-verify` works. Bypassing makes you personally
 # on the hook for any breakage in develop — DEV must be 100% green
@@ -59,12 +60,8 @@ fi
 # Files changed in this push (vs the chosen base), used for the two
 # conditional gates below. Both gates fall through to "run" when we
 # couldn't resolve a base ref — safest default.
-CHANGED_FILES=""
 if [ -n "$REF_BASE" ]; then
   CHANGED_FILES=$(git diff --name-only "$REF_BASE"...HEAD)
-fi
-
-if [ -n "$REF_BASE" ]; then
   # `grep` exits non-zero on no-match; under `set -e` that would kill
   # the hook. Wrap each counter to coerce no-match → 0 explicitly.
   RUST_CHANGED=$(printf '%s\n' "$CHANGED_FILES" | { grep -E '\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$' || true; } | grep -c '.' || true)

@@ -25,9 +25,12 @@ env:
 
 # Authoritative test + coverage verification runs in the enforced
 # pre-push git hook (.githooks/pre-push), not in CI. On M3 Ultra the
-# full suite is ~8 min; on GitHub-hosted ubuntu-latest it was 75+ min
-# and repeatedly hit the timeout. CI now only catches what the dev
-# environment cannot: cross-platform compile bitrot. See issue #30.
+# full suite (server tests + coverage) is ~100 min on a Rust change
+# and multiple hours when circuit code under program-plonky2/ changed;
+# on GitHub-hosted ubuntu-latest it was 75+ min and repeatedly hit the
+# timeout. CI now only catches what the dev environment cannot:
+# cross-platform compile bitrot. See issue #30 and CONTRIBUTING.md §
+# Setup for the per-scope wall-budget table.
 jobs:
   lint-and-build:
     name: Lint & Build
