@@ -2,6 +2,7 @@ use super::*;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
 use std::str::FromStr;
+use zkcoins_program::circuit::main::MMR_PROOF_PATH_LEN;
 use zkcoins_program::hash::hash_concat;
 
 const HASH_SIZE: usize = 32;
@@ -308,20 +309,25 @@ fn test_get_mmr_inclusion_proof_known_root_returns_ok() {
     // After update(), root_indices maps the pre-update MMR root to a
     // (smt_root, leaf_index) tuple — feeding that root back must
     // return Ok and the leaf must verify against the post-update MMR
-    // root via the returned proof.
+    // root via the returned proof. The recorded root is the *extended*
+    // form (`root_extended(MMR_PROOF_PATH_LEN)`) so it matches what a
+    // Plonky2 proof commits as `commitment_history_root`.
     let mut state = State::new();
-    let pre_root = state.mmr.root();
+    let pre_root = state.mmr.root_extended(MMR_PROOF_PATH_LEN);
 
     let commitment = create_test_commitment(
         b"known-root test",
         "0000000000000000000000000000000000000000000000000000000000000007",
     );
-    let post_root = state.update(&[commitment]).expect("update");
+    let _post_root = state.update(&[commitment]).expect("update");
+    let post_root_extended = state.mmr.root_extended(MMR_PROOF_PATH_LEN);
 
     let (smt_root, proof) = state
         .get_mmr_inclusion_proof(pre_root)
         .expect("inclusion proof for known prev_mmr_root");
-    assert!(proof.verify(hash_concat(&smt_root, &pre_root), post_root));
+    let leaf = hash_concat(&smt_root, &pre_root);
+    let proof_extended = proof.extend_to(MMR_PROOF_PATH_LEN);
+    assert!(proof_extended.verify(leaf, post_root_extended));
 }
 
 #[test]

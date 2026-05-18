@@ -122,7 +122,15 @@ pub async fn start_rest_server(
         let mut account_server_guard = state.account_server.lock().unwrap();
         if account_server_guard.get_minting_account_address().is_err() {
             let mut minting_server_account = crate::account_server::Account::new();
-            minting_server_account.balance = u64::MAX;
+            // The Plonky2 state-transition circuit packs the running
+            // balance as a Goldilocks field element via
+            // `balance_hi * 2^32 + balance_lo`. Values >= p (the
+            // Goldilocks prime ≈ 2^64 - 2^32 + 1) reduce mod p inside
+            // the circuit but stay full-width in the witness setter,
+            // which trips a "wire set twice" partition error. Stay
+            // safely below 2^48 so the circuit-vs-witness sides agree
+            // even after many mint operations.
+            minting_server_account.balance = 1u64 << 48;
             account_server_guard.import_account(
                 *zkcoins_program::types::MINTING_ADDRESS,
                 minting_server_account,

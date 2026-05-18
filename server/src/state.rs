@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use shared::commitment::Commitment;
 use std::collections::HashMap;
 use std::io;
+use zkcoins_program::circuit::main::MMR_PROOF_PATH_LEN;
 use zkcoins_program::hash::{
     digest_from_bytes, digest_to_bytes, hash_concat, HashDigest, ZERO_HASH,
 };
@@ -64,15 +65,27 @@ impl State {
         // 2. Get the current SMT root
         let smt_root = self.smt.root();
 
-        // 3. Create a new leaf that combines the SMT root and previous MMR root.
-        // Uses Poseidon `hash_concat` (architectural invariant: Poseidon
-        // everywhere in Merkle structures). Replaces the SP1-era SHA256.
-        let prev_mmr_root = self.mmr.root();
+        // 3. Create a new leaf that combines the SMT root and previous MMR
+        // root. Uses Poseidon `hash_concat` (architectural invariant:
+        // Poseidon everywhere in Merkle structures). Replaces the
+        // SP1-era SHA256.
+        //
+        // The previous MMR root is recorded in its *extended* form
+        // (`mmr.root_extended(MMR_PROOF_PATH_LEN)`) because every
+        // downstream consumer — the public output of a Plonky2 proof
+        // (`commitment_history_root` in `ProofData`), the in-circuit
+        // CMP sibling (`commitment_root_mmr_sibling`), and the
+        // `root_indices` lookup at the next AccountUpdate — works in
+        // the extended representation that the circuit's fixed-depth
+        // invariant demands. Using the natural root anywhere along
+        // that chain produces a hash that the circuit can't reconcile
+        // with the public input, surfacing as a witness-partition
+        // conflict at prove time.
+        let prev_mmr_root = self.mmr.root_extended(MMR_PROOF_PATH_LEN);
         self.prev_mmr_root = prev_mmr_root;
 
         let leaf = hash_concat(&smt_root, &prev_mmr_root);
 
-        // Store the mapping of previous MMR root to (SMT root, leaf index)
         let leaf_index = self.mmr.leaf_count();
         self.root_indices
             .insert(prev_mmr_root, (smt_root, leaf_index));
