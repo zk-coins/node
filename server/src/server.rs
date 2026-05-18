@@ -308,8 +308,11 @@ async fn get_balance_handler(
             ),
         }
     } else {
+        // Missing required `address` query parameter — malformed request,
+        // not a routing miss. Matches the 422 returned by the invalid-hex
+        // and wrong-length branches above.
         (
-            StatusCode::NOT_FOUND,
+            StatusCode::UNPROCESSABLE_ENTITY,
             Json(BalanceResponse {
                 balance: 0,
                 username: None,
