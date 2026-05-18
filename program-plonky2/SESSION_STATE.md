@@ -25,13 +25,12 @@ Tests, Analyze rust, Analyze actions, CodeQL, Coverage MVP scope).
   handled at all boundaries. `account_server::send_coins` wired to
   the Plonky2 `Prover` wrapper (`c71c9fc`); source-side recursive
   verify enforced off-circuit per server-heavy MVP architecture.
-  Dockerfile re-introduced (`dac0179`). 42 server tests pass
-  (10 inline error-path tests added in `d6a3cb9` on top of the 32
-  baseline). `account_server_tests` + `server_tests` modules
-  remain disabled at the include-point pending a separate
-  SP1-fixture-port task (~3–6 h: their `ProgramInputsBuilder` +
-  `Prover::{create,update}_account` calls need replacing with the
-  Plonky2 wrapper's per-slot tuple API).
+  Dockerfile re-introduced (`dac0179`). 106 server tests pass
+  (10 inline error-path tests in `d6a3cb9`, 64 ported SP1-era
+  fixtures re-enabled via `account_server_tests.rs` +
+  `server_tests.rs` after rewriting the `proof.public_values` →
+  `proof.public_inputs` bridge and the `[u8;32]` → `HashOut<F>`
+  address casts).
 - Stage 5d-next-5 (aggregator): Phase 1 ✅ merged (`cc9c4b6` from
   PR [#22](https://github.com/zk-coins/server/pull/22)). Phase 2
   (outer integration) is blocked on a Plonky2 1.1.0 `dummy_circuit`
