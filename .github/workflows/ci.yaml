@@ -78,7 +78,11 @@ jobs:
   tests:
     name: Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Plonky2 cyclic-recursion prove tests dominate the runtime: the
+    # full `cargo test -p server` set takes ~8 min on M3 Ultra and
+    # ~30–45 min on a 7 GB GitHub-hosted runner. Give it 75 min of
+    # headroom so a one-off cache miss doesn't trip the timeout.
+    timeout-minutes: 75
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -118,7 +122,11 @@ jobs:
   coverage:
     name: Coverage (MVP scope)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # llvm-cov instrumentation slows the prove-bound test set further
+    # (roughly 2x vs. the uninstrumented Tests job above). 90 min keeps
+    # headroom over the ~60–70 min the full sweep takes on a
+    # GitHub-hosted runner.
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
