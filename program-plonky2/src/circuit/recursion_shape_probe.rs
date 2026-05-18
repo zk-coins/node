@@ -1,6 +1,5 @@
 //! Diagnostic probes for the Plonky2 1.1.0 `dummy_circuit` shape
-//! mismatch (`MIGRATION_RESEARCH.md` §7.21,
-//! `STAGE_5D_NEXT_5_AGGREGATOR.md`).
+//! mismatch (`MIGRATION_RESEARCH.md` §7.21 + §7.22).
 //!
 //! Builds Stage 5d-next-3's pass-3 common (1 `verify_proof`, no
 //! aggregator) and a Stage 5d-next-5 candidate pass-3 common (2

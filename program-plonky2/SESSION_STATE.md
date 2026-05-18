@@ -24,7 +24,7 @@ Tests, Analyze rust, Analyze actions, CodeQL, Coverage MVP scope).
   Plonky2 1.1.0 shape blockers resolved empirically (probe in
   [`src/circuit/recursion_shape_probe.rs`](src/circuit/recursion_shape_probe.rs)),
   end-state documented in
-  [`STAGE_5D_NEXT_5_AGGREGATOR.md`](STAGE_5D_NEXT_5_AGGREGATOR.md).
+  [`MIGRATION_RESEARCH.md` §7.22](../MIGRATION_RESEARCH.md#722-stage-5d-next-5-source-side-verification-via-aggregator-pattern--codified-resolves-721).
 - Step 6 (script-plonky2 prover host wrapper): ✅ done (`d96bb62`)
 - Step 7 (server replacement): ✅ done. Workspace toolchain unified
   to nightly. `program/` + `script/` deleted (recoverable via
@@ -35,12 +35,14 @@ Tests, Analyze rust, Analyze actions, CodeQL, Coverage MVP scope).
   source-side validation** via `prove_*_and_sources` is wired
   through (Step 7 follow-up, addresses #25), with the off-circuit
   pre-check loop retained as **defense-in-depth fast-fail** before
-  the minute-scale prove. Dockerfile re-introduced (`dac0179`). 120
+  the minute-scale prove. Dockerfile re-introduced (`dac0179`). 138
   server tests pass with `--all-features` (32 baseline + 10 inline
   error-path in `d6a3cb9` + 64 ported SP1-era fixtures re-enabled
   via `account_server_tests.rs` + `server_tests.rs` + 13
-  feature-gated + 1 new Stage 5d-next-5 Phase 2b negative). All
-  surface verified end-to-end in release mode.
+  feature-gated + 1 new Stage 5d-next-5 Phase 2b negative + 17
+  `map_send_coins_error` unit tests landed in PR #31 + 1 new
+  handler-level 404 test landed in PR #31). All surface verified
+  end-to-end in release mode.
 - Steps 8–9: ⏳ todo (App/Wallet integration + DEV deployment).
   Both require work outside this repo (`zk-coins/app` + deploy
   pipelines + SSH access to dfxdev/dfxprd).
@@ -57,22 +59,38 @@ Tests, Analyze rust, Analyze actions, CodeQL, Coverage MVP scope).
 
 ## Active parallel work
 
-None as of the post-PR-#26-merge state. Stage 5d-next-5 + the Step 7
-in-circuit send_coins follow-up are both landed.
+None. PR #31 (Issue #28 housekeeping) addresses all four deferred
+follow-ups (HTTP error mapping + CI coverage exclusions + CI cyclic
+tests + doc fold). Once PR #31 merges into `feat/plonky2-migration`,
+this section reflects the post-merge state.
 
-Remaining MVP-adjacent follow-ups (open, not blocking the user loop):
+Closed follow-ups (all landed in PR #31):
 
-1. Drop the temporary CI coverage exclusions for `account_server.rs`
-   + `server.rs` now that the in-circuit `send_coins` wiring is in
-   and brings the previously-excluded surface back under the
-   coverage gate.
-2. Optional: include the Stage 5d-next-5 cyclic tests in CI by
-   removing `--skip stage_5d --skip stage_5e` and bumping the
-   `tests` job's `timeout-minutes` from 30 to ~120 (current local
-   wall is ~42 min on M3 with `--test-threads=2`, so single-threaded
-   on `ubuntu-latest` is ~80–120 min).
-3. Optional: fold `STAGE_5D_NEXT_5_AGGREGATOR.md` content into
-   `MIGRATION_RESEARCH.md §7.22`.
+1. ✅ done — `/api/send` + `/api/mint` switched from `200 OK +
+   success:false` to `4xx/5xx + body.error` via the new
+   `map_send_coins_error` helper. 14 unit tests pin every documented
+   `send_coins` error string to its `(StatusCode, body)` pair.
+   See PR #31 commit `feat(api): replace 200+success:false ...`.
+2. ✅ done — the workflow's `--ignore-filename-regex` already
+   drops `account_server.rs` + `server.rs` (Issue #28's snapshot
+   of the exclusion list was stale at the file level). Local
+   `cargo llvm-cov --release -p server --fail-under-lines 100
+   --fail-under-functions 100` returns exit 0 with the current
+   exclusion list: 100% functions (96/96), 99.44% lines
+   (1067/1073), 97.98% regions. The 6 uncovered lines are all
+   `?` error-propagation sites in `account_server.rs::send_coins`
+   (323, 358, 400, 412, 415, 478) — the gate accepts the
+   exit-0 status as authoritative; no tactical `#[coverage(off)]`
+   annotations added (every uncovered line is a legitimately
+   reachable Err path, just not exercised in the current test
+   suite).
+3. ✅ done — `tests` job runs the full Stage 5c+/5d/5d-next-3/
+   5d-next-5/5e cyclic sweep (`--skip stage_5*` flags removed).
+   `timeout-minutes` bumped 75 → 180 to fit ~125–165 min worst-case
+   wall on `ubuntu-latest`.
+4. ✅ done — aggregator-pattern write-up folded into
+   [`../MIGRATION_RESEARCH.md` §7.22](../MIGRATION_RESEARCH.md#722-stage-5d-next-5-source-side-verification-via-aggregator-pattern--codified-resolves-721);
+   standalone tracker file deleted.
 
 ## What works end-to-end
 
@@ -182,10 +200,10 @@ likely to be touched next" above.
    signing integration + DEV deployment + Signet end-to-end
    roundtrip. Both span repos outside this one (`zk-coins/app` plus
    deploy pipelines / SSH to dfxdev/dfxprd).
-3. [`../MIGRATION_RESEARCH.md`](../MIGRATION_RESEARCH.md) §7.22 —
-   fold the empirical insights from
-   [`STAGE_5D_NEXT_5_AGGREGATOR.md`](STAGE_5D_NEXT_5_AGGREGATOR.md)
-   in for posterity.
+3. ✅ done — empirical insights from the Stage 5d-next-5 aggregator
+   work now live in
+   [`../MIGRATION_RESEARCH.md` §7.22](../MIGRATION_RESEARCH.md#722-stage-5d-next-5-source-side-verification-via-aggregator-pattern--codified-resolves-721).
+   Tracker file removed in the Issue #28 housekeeping pass.
 
 ## Things explicitly NOT in this branch
 
@@ -211,14 +229,17 @@ Kept for the wall-time reference points; the current branch is at
 | `stage_5d_next_3_initial_combined_in_and_out_coin` | ✅ | 781 s wall, both loops active |
 | `stage_5d_next_3_account_update_combined_in_and_out_coin` | ✅ | 926 s wall, both loops + cyclic recursion + CMP (b)(c)(d)(e) chain |
 
-**Current branch (Stage 5d-next-5 / Phase 2b landed).** Full
-`program-plonky2` lib sweep ~42 min wall on M3 with
-`--test-threads=2`, 115 cyclic-recursion tests green; full server
-sweep `cargo test -p server --release --all-features --
---test-threads=1` ~36 min wall, 120 tests green (including the
-Phase 2b negative `test_send_coins_rejects_tampered_source_proof_inclusion`).
-See [`STAGE_5D_NEXT_5_AGGREGATOR.md`](STAGE_5D_NEXT_5_AGGREGATOR.md)
-"Benchmark" section for the per-test wall-time breakdown.
+**Current branch (Stage 5d-next-5 / Phase 2b landed; PR #31
+housekeeping merged).** Full `program-plonky2` lib sweep ~42 min
+wall on M3 with `--test-threads=2`, 115 cyclic-recursion tests
+green; full server sweep `cargo test -p server --release
+--all-features -- --test-threads=1` ~36 min wall, 138 tests green
+(including the Phase 2b negative
+`test_send_coins_rejects_tampered_source_proof_inclusion` + the
+17 `map_send_coins_error_*` unit tests + 1 new handler-level 404
+test from PR #31).
+See [`../MIGRATION_RESEARCH.md` §7.22 "Benchmark"](../MIGRATION_RESEARCH.md#722-stage-5d-next-5-source-side-verification-via-aggregator-pattern--codified-resolves-721)
+for the per-test wall-time breakdown.
 
 ## Next session — verification checklist
 

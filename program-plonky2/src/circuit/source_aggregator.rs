@@ -13,7 +13,7 @@
 //! (outer-side `verify_proof(aggregator)` + `connect_hashes`) and
 //! Phase 2b (per-in-coin SMT + CMP source-side gates) are blocked on
 //! a Plonky2 1.1.0 `dummy_circuit` shape mismatch documented in
-//! [`STAGE_5D_NEXT_5_AGGREGATOR.md`] at the crate root. Do not assume
+//! `MIGRATION_RESEARCH.md` §7.22 at the workspace root. Do not assume
 //! adding `verify_proof(aggregator)` to the outer will Just Work —
 //! the attempt was made and reverted in this PR; the doc explains why.
 //!
@@ -51,7 +51,7 @@
 //! The aggregator verifies proofs of the state-transition circuit. But
 //! the state-transition's `verifier_only.circuit_digest` cannot be
 //! pinned at aggregator build time without a chicken-and-egg fixed-point.
-//! Resolution per [`STAGE_5D_NEXT_5_AGGREGATOR.md`]:
+//! Resolution per `MIGRATION_RESEARCH.md` §7.22:
 //!
 //! - At aggregator build time, the state-transition verifier_data is a
 //!   `add_virtual_verifier_data` target with NO constant pin.
