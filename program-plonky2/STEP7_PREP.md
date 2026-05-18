@@ -1,5 +1,29 @@
 # Step 7 Prep — SP1 → Plonky2 Server Cutover Inventory
 
+> **✅ STATUS — Step 7 is DONE.** This file is kept as the historical
+> planning record. The actual cutover landed across commits `00adbb4`
+> (workspace + server imports), `c71c9fc` (send_coins wired to the
+> Plonky2 Prover), `dac0179` (Dockerfile), and `d6a3cb9` (inline
+> error-path tests). See [`../ROADMAP.md`](../ROADMAP.md) "Done"
+> section for the full per-commit timeline.
+>
+> The "Semantic mismatches that the original inventory missed"
+> section below remains useful as a record of what the cutover
+> actually surfaced (the original inventory underestimated four
+> items — HashDigest type shift, proof.public_values vs
+> public_inputs, ProgramInputsBuilder absence, Prover method
+> renames). Future migrations can read it for the lesson on
+> "mechanical renames" turning out non-mechanical.
+>
+> Still outstanding (not blocking Step 7 closure, scheduled as a
+> separate follow-up): port `account_server_tests.rs` +
+> `server_tests.rs` fixtures from SP1's `ProgramInputsBuilder` /
+> `Prover::{create,update}_account` API to the Plonky2 wrapper's
+> per-slot tuple API. ~3–6 h. Then drop the CI coverage exclusions
+> for `account_server.rs` + `server.rs`.
+
+---
+
 Read-only inventory of every place in the existing SP1-era server code
 that must change for **Step 7** (replace SP1 with Plonky2; no Cargo
 feature flag, no dual backend, no migration — see
@@ -7,9 +31,7 @@ feature flag, no dual backend, no migration — see
 Migration" / closed-test-env invariant).
 
 Produced alongside the parallel Step 5 (monolithic circuit) work to
-avoid editing files Step 5 is also touching. Pure reference; once Step
-5 + Step 6 land, this file should be folded into the actual Step 7 PR
-and deleted.
+avoid editing files Step 5 is also touching.
 
 ---
 
