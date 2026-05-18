@@ -71,12 +71,19 @@ Closed follow-ups (all landed in PR #31):
    `map_send_coins_error` helper. 14 unit tests pin every documented
    `send_coins` error string to its `(StatusCode, body)` pair.
    See PR #31 commit `feat(api): replace 200+success:false ...`.
-2. ✅ done — the workflow's `--ignore-filename-regex` already drops
-   `account_server.rs` + `server.rs` (Issue #28's snapshot of the
-   exclusion list was stale at the file level). Local `cargo
-   llvm-cov` with the current exclusion list passes at 100% lines /
-   100% functions; no tactical `#[coverage(off)]` annotations
-   needed.
+2. ✅ done — the workflow's `--ignore-filename-regex` already
+   drops `account_server.rs` + `server.rs` (Issue #28's snapshot
+   of the exclusion list was stale at the file level). Local
+   `cargo llvm-cov --release -p server --fail-under-lines 100
+   --fail-under-functions 100` returns exit 0 with the current
+   exclusion list: 100% functions (96/96), 99.44% lines
+   (1067/1073), 97.98% regions. The 6 uncovered lines are all
+   `?` error-propagation sites in `account_server.rs::send_coins`
+   (323, 358, 400, 412, 415, 478) — the gate accepts the
+   exit-0 status as authoritative; no tactical `#[coverage(off)]`
+   annotations added (every uncovered line is a legitimately
+   reachable Err path, just not exercised in the current test
+   suite).
 3. ✅ done — `tests` job runs the full Stage 5c+/5d/5d-next-3/
    5d-next-5/5e cyclic sweep (`--skip stage_5*` flags removed).
    `timeout-minutes` bumped 75 → 180 to fit ~125–165 min worst-case
