@@ -649,6 +649,98 @@ fn test_receive_coin_rejects_replay_via_coin_history() {
     assert_eq!(result.unwrap_err(), "Coin already spent (replay)");
 }
 
+/// Stage 5d-next-5 Phase 2b negative regression: an in-coin whose
+/// off-circuit `source_inclusion` siblings have been tampered with
+/// must NOT make it to the prover. The defense-in-depth shim in
+/// `send_coins` fast-fails with the documented error string;
+/// without the shim the in-circuit SMT-inclusion check would still
+/// reject, but only after a minute-scale prove.
+///
+/// Construction: do a real mint → recipient receive flow so that
+/// the recipient's `account.coin_queue[0]` carries an HONEST
+/// `inclusion_proof` produced by `out_coins_tree.generate_inclusion_proof`.
+/// Then reach into the server's internal `accounts` map and flip
+/// one sibling on the queued entry's `inclusion_proof`. The next
+/// `send_coins` call from that recipient must surface the
+/// "In-coin not present in source's output_coins_root" error.
+#[test]
+fn test_send_coins_rejects_tampered_source_proof_inclusion() {
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    let mut server = AccountServer::new(Arc::clone(&state_arc));
+
+    let mut minting = TestAccountData::new_minting_account();
+    server.import_account(
+        minting.address,
+        Account {
+            proof: None,
+            coin_queue: vec![],
+            coin_history: SparseMerkleTree::new(),
+            balance: 10_000,
+        },
+    );
+
+    // Real recipient with a deterministic seed; pin the address so
+    // we can reach back into `server.accounts` after `receive_coin`.
+    let recipient_data = TestAccountData::new_generic(&[42u8; 32], Network::Signet);
+    let recipient_addr = recipient_data.address;
+
+    // Mint emits one coin to the recipient — honest end-to-end flow,
+    // so the `inclusion_proof` returned in `CoinProof` is well-formed
+    // by construction.
+    let mut coin_proofs = minting
+        .execute_send_coins(&mut server, vec![Invoice::new(100, recipient_addr)])
+        .expect("mint send_coins");
+    state_arc
+        .lock()
+        .unwrap()
+        .update(
+            &coin_proofs
+                .iter()
+                .map(|x| x.commitment.clone().unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .expect("state.update");
+
+    server
+        .receive_coin(coin_proofs.pop().expect("at least one coin"))
+        .expect("recipient receive_coin");
+
+    // Tamper the queued `inclusion_proof.siblings[0]` directly on the
+    // server's internal `accounts` map. The honest off-circuit
+    // `source_inclusion.verify` walks the path siblings; flipping
+    // the topmost sibling produces a recomputed root that doesn't
+    // match the source's committed `output_coins_root`.
+    {
+        let account = server
+            .accounts
+            .get_mut(&recipient_addr)
+            .expect("recipient account present after receive_coin");
+        assert_eq!(
+            account.coin_queue.len(),
+            1,
+            "recipient has exactly one queued in-coin after a single mint"
+        );
+        account.coin_queue[0].inclusion_proof.siblings[0] = hash_bytes(b"tampered-sibling");
+    }
+
+    // The defense-in-depth off-circuit pre-check fires before the
+    // expensive prove and surfaces the specific rejection string.
+    let current_pk = generate_test_public_key(&recipient_data.xpriv, 0);
+    let next_pk = generate_test_public_key(&recipient_data.xpriv, 1);
+    let result = server.send_coins(
+        vec![Invoice::new(1, digest_from_bytes(&[99u8; 32]))],
+        recipient_addr,
+        current_pk,
+        next_pk,
+        None,
+    );
+    assert_eq!(
+        result.unwrap_err(),
+        "In-coin not present in source's output_coins_root",
+        "tampered source-inclusion siblings must surface the off-circuit defense-in-depth rejection"
+    );
+}
+
 #[test]
 fn test_send_coins_rejects_coin_queue_entry_without_commitment() {
     let state_arc = Arc::new(Mutex::new(State::new()));

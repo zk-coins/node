@@ -13,34 +13,34 @@ Tests, Analyze rust, Analyze actions, CodeQL, Coverage MVP scope).
 ## Step status summary
 
 - Steps 1–4: ✅ done
-- Step 5 (monolithic circuit, Stage 5d-next-3): ✅ done; 107 tests
-  in `program-plonky2/`, all passing in ~198 s wall
-- Step 5d-next-4 (source-side cyclic verify): 🚫 deferred — see
-  [`STAGE_5D_NEXT_5_AGGREGATOR.md`](STAGE_5D_NEXT_5_AGGREGATOR.md)
+- Step 5 (monolithic circuit, all stages through 5d-next-5): ✅
+  done. Stage 5d-next-5 source-side verification via aggregator
+  pattern landed via PR [#23](https://github.com/zk-coins/server/pull/23)
+  — Phase 1 (aggregator skeleton, `cc9c4b6` from PR #22) + Phase 2a
+  (outer `verify_proof(aggregator)` + `connect_hashes` vk binding +
+  `ConstantGate::new(2)` shape lock) + Phase 2b (per-slot SMT
+  inclusion + SPEC §8 (c)(d)(e) chain + OCR coupling + active-bit
+  binding) + Phase 3 (3 SPEC §13 source-side negatives). Two
+  Plonky2 1.1.0 shape blockers resolved empirically (probe in
+  [`src/circuit/recursion_shape_probe.rs`](src/circuit/recursion_shape_probe.rs)),
+  end-state documented in
+  [`STAGE_5D_NEXT_5_AGGREGATOR.md`](STAGE_5D_NEXT_5_AGGREGATOR.md).
 - Step 6 (script-plonky2 prover host wrapper): ✅ done (`d96bb62`)
 - Step 7 (server replacement): ✅ done. Workspace toolchain unified
   to nightly. `program/` + `script/` deleted (recoverable via
   `git checkout v0.last-sp1 -- ...`). shared + server fully
   migrated to Plonky2-era modules with the HashDigest type-shift
   handled at all boundaries. `account_server::send_coins` wired to
-  the Plonky2 `Prover` wrapper (`c71c9fc`); source-side recursive
-  verify enforced off-circuit per server-heavy MVP architecture.
-  Dockerfile re-introduced (`dac0179`). 106 server tests pass on
-  the MVP build, 119 with `--all-features` (10 inline error-path
-  tests in `d6a3cb9`, 64 ported SP1-era fixtures re-enabled via
-  `account_server_tests.rs` + `server_tests.rs` after rewriting
-  the `proof.public_values` → `proof.public_inputs` bridge and
-  the `[u8;32]` → `HashOut<F>` address casts, plus the
-  state-side fix to record MMR roots in their extended form to
-  match the Plonky2 circuit invariant).
-- Stage 5d-next-5 (aggregator): Phase 1 ✅ merged (`cc9c4b6` from
-  PR [#22](https://github.com/zk-coins/server/pull/22)). Phase 2
-  (outer integration) is blocked on a Plonky2 1.1.0 `dummy_circuit`
-  shape mismatch — PR [#23](https://github.com/zk-coins/server/pull/23)
-  added a `recursion_shape_probe` test proving no in-tree workaround
-  fixes it. Forward path: Plonky2 upstream patch (P1 gate-aware
-  NoopGate budget or P2 `debug_assert_eq!` downgrade), distributed
-  via `program-plonky2/Cargo.toml`'s `[dependencies] plonky2 = { git = "…" }`.
+  the Plonky2 `Prover` wrapper (`c71c9fc`); the **in-circuit
+  source-side validation** via `prove_*_and_sources` is wired
+  through (Step 7 follow-up, addresses #25), with the off-circuit
+  pre-check loop retained as **defense-in-depth fast-fail** before
+  the minute-scale prove. Dockerfile re-introduced (`dac0179`). 120
+  server tests pass with `--all-features` (32 baseline + 10 inline
+  error-path in `d6a3cb9` + 64 ported SP1-era fixtures re-enabled
+  via `account_server_tests.rs` + `server_tests.rs` + 13
+  feature-gated + 1 new Stage 5d-next-5 Phase 2b negative). All
+  surface verified end-to-end in release mode.
 - Steps 8–9: ⏳ todo (App/Wallet integration + DEV deployment).
   Both require work outside this repo (`zk-coins/app` + deploy
   pipelines + SSH access to dfxdev/dfxprd).
@@ -57,94 +57,94 @@ Tests, Analyze rust, Analyze actions, CodeQL, Coverage MVP scope).
 
 ## Active parallel work
 
-See PR [#23](https://github.com/zk-coins/server/pull/23) for the
-continued Stage 5d-next-5 work (Phase-2 probe + Phase-1 coverage
-gap). User indicated more commits will land on that PR — main
-session is on hold for that PR's evolution.
+None as of the post-PR-#26-merge state. Stage 5d-next-5 + the Step 7
+in-circuit send_coins follow-up are both landed.
 
-After PR #23 fully lands + a Plonky2 patch arrives, the integration
-sequence is:
-1. Rebase the patch + aggregator branch onto current HEAD.
-2. Update `script-plonky2/src/lib.rs` Prover wrapper to expose the
-   aggregator construction API.
-3. Wire `account_server::send_coins` to consume the aggregator
-   (replacing the off-circuit source validation introduced in
-   `c71c9fc`).
-4. Port `account_server_tests.rs` + `server_tests.rs` fixtures to
-   the new API and re-enable both modules at the include-point.
-5. Drop the temporary coverage exclusions for
-   `account_server.rs` + `server.rs` in the CI workflow.
-6. Run full `cargo llvm-cov --fail-under-lines 100 --fail-under-functions 100 -- --test-threads=1`.
-7. Fold `STAGE_5D_NEXT_5_AGGREGATOR.md` content into
+Remaining MVP-adjacent follow-ups (open, not blocking the user loop):
+
+1. Drop the temporary CI coverage exclusions for `account_server.rs`
+   + `server.rs` now that the in-circuit `send_coins` wiring is in
+   and brings the previously-excluded surface back under the
+   coverage gate.
+2. Optional: include the Stage 5d-next-5 cyclic tests in CI by
+   removing `--skip stage_5d --skip stage_5e` and bumping the
+   `tests` job's `timeout-minutes` from 30 to ~120 (current local
+   wall is ~42 min on M3 with `--test-threads=2`, so single-threaded
+   on `ubuntu-latest` is ~80–120 min).
+3. Optional: fold `STAGE_5D_NEXT_5_AGGREGATOR.md` content into
    `MIGRATION_RESEARCH.md §7.22`.
 
 ## What works end-to-end
 
 The monolithic state-transition circuit at
-[`src/circuit/main.rs`](src/circuit/main.rs) implements SPEC §8
-with **everything except source-side verification of in-coins**:
+[`src/circuit/main.rs`](src/circuit/main.rs) implements **the full
+SPEC §8 predicate including source-side verification of in-coins**
+(Stage 5d-next-5):
 
 - Initial-branch predicate (mint exception, empty SMT roots).
 - AccountUpdate branch with cyclic recursion, SPEC §8 (a)+(b).
-- `CommitmentMerkleProofs` (c)+(d)+(e) via fixed-shape SMT + 2× MMR
-  inclusion gadgets.
+- Prev-account `CommitmentMerkleProofs` (c)+(d)+(e) via fixed-shape
+  SMT + 2× MMR inclusion gadgets.
 - `MAX_IN_COINS = 8` in-coin slots with SMT non-inclusion + insert
   into `coin_history_root` and full `apply_coin` semantics
   (recipient check + balance overflow check via `split_le(sum, 33)`).
+- **Per in-coin slot — Stage 5d-next-5 Phase 2b — source-side**:
+  - Strict `connect(slot.active, aggregator.slot[i].active_pi)` —
+    no in-coin can be consumed without a verified source proof.
+  - SMT inclusion of `coin.identifier` in
+    `source.output_coins_root`.
+  - OCR coupling: `source.output_coins_root ==
+    source_cmp.commitment_out_coins_root`.
+  - SPEC §8 (c)(d)(e) chain for source's commitment in the outer's
+    `history_root` (mirrors the prev-account CMP gates).
 - `MAX_OUT_COINS = 8` out-coin slots with SMT non-inclusion + insert
   into `output_coins_root`, balance subtraction with underflow check
   via `split_le(diff, 64)`, identifier derivation
   (`out_coin.identifier == Poseidon(interim_asth || u32(index))`)
   and pubkey rotation.
-- `INNER_PAD_BITS = 14` (1 << 14 = 16 384 gates) covers the
-  ~10 k outer circuit gates with margin.
+- `INNER_PAD_BITS_STAGE_5D_NEXT_5 = 15` (1 << 15 = 32 768 gates in
+  the helper, matching the ~50 k outer circuit gates' degree 16 via
+  `helper_degree = pad_bits + 1`).
 
-## What's deferred to post-MVP / Stage 5d-next-5
+## What's deferred to post-MVP
 
-**Stage 5d-next-4 — source-side in-coin verification.** Design doc
-at [`STAGE_5D_NEXT_4_DESIGN.md`](STAGE_5D_NEXT_4_DESIGN.md).
-**Attempted in commit `c1df545` (subsequently reverted)** — see
-[`../MIGRATION_RESEARCH.md` §7.21](../MIGRATION_RESEARCH.md) for the
-two Plonky2 1.1.0 blockers (multi-`_or_dummy` ConstantGate mismatch +
-in-circuit data-only common_data shape mismatch).
+Nothing in the state-transition circuit itself is deferred — Stage
+5d-next-5 landed (PR [#23](https://github.com/zk-coins/server/pull/23))
+and all three previously-off-circuit SPEC §13 source-side negatives
+are now covered in-circuit (`stage_5d_next_5_phase_3_*` tests).
 
-For zkCoins server-heavy MVP, source-side verification is enforced
-**off-circuit**: the trusted server only folds validly-proved
-commitments into the history MMR. Stage 5d-next-3's prev_account
-CMP + the SPEC §8 (c)(d)(e) chain still provides the
-"prev-account-state is in history" guarantee for the AccountUpdate
-branch.
-
-Three SPEC §13 negatives remain off-circuit-only:
-- Input coin whose source proof is NOT in commitment history.
-- Input coin whose identifier is NOT in source's `output_coins_root`.
-- Wrong `vk` on a recursive source proof.
-
-These are enforced by server-side input validation before proving;
-they cannot bypass the trusted server's history-MMR folding step.
-
-Stage 5d-next-5 paths forward (post-MVP):
-1. Aggregator pattern (separate non-cyclic sub-circuit).
-2. Plonky2 upstream patch for multi-instance `_or_dummy`.
-3. Per-slot common_data shape matching via iterative bisection.
+Pre-mainnet protocol redesigns remain (see ROADMAP "Pre-mainnet
+blockers"): D2/D10 (recipient hiding), D7 (reorg safety), D8
+(per-coin nullifier-accum). These are real protocol changes, not
+implementation gaps.
 
 ## Test count + budget
 
-103 tests total (see [`../ROADMAP.md`](../ROADMAP.md) for the
-breakdown). At production parameters:
+At Stage 5d-next-5 / Phase 2b production parameters
+(`MAX_IN_COINS = MAX_OUT_COINS = 8`,
+`INNER_PAD_BITS_STAGE_5D_NEXT_5 = 15`):
 
-- ~70 off-circuit tests: complete in seconds.
-- ~24 `circuit::main` cyclic tests at 5–15 min wall each.
-- ~7 `circuit::*` non-cyclic tests at 30 s–2 min wall each.
+- `program-plonky2` lib: 117 tests total (115 default-run + 2
+  `#[ignore]`d `recursion_shape_probe` diagnostics). Of the 115
+  default-run, ~39 are cyclic-recursion tests (build the
+  state-transition + aggregator circuits and prove), the remainder
+  exercise off-circuit gadgets (Poseidon / SMT / MMR / types /
+  inputs). `cargo test --release --lib -- --test-threads=2` wall
+  ~42 min on M3. Single-threaded ~80–120 min on `ubuntu-latest`.
+- `server` crate: 120 tests with `--all-features` (32 baseline + 10
+  inline error-path + 64 ported SP1-era fixtures + 13 feature-gated
+  + 1 Stage 5d-next-5 Phase 2b negative). `cargo test -p server
+  --release --all-features -- --test-threads=1` wall ~36 min on M3.
 
-A serial `cargo test` sweep at `--test-threads=1` is several hours.
+A serial workspace sweep at `--test-threads=1` is several hours.
 Default multi-thread is bounded by RAM (~2 GB per test).
 
 `cargo llvm-cov --fail-under-lines 100 -- --test-threads=1` is the
-coverage gate. Last verified at 100 % lines / 99.70 % regions on
-the pre-5d state; the 5d work was line-by-line audited to stay at
-100 % via per-assertion panic tests. **A fresh full coverage sweep
-post-`50a1bd9` is the next session's first task.**
+coverage gate. The CI workflow currently excludes
+`account_server.rs` + `server.rs` from the gate while the in-circuit
+`send_coins` refactor was in progress; with the refactor landed
+(this branch), the exclusions can be dropped — see "Files most
+likely to be touched next" above.
 
 ## Per-stage commit map
 
@@ -163,35 +163,46 @@ post-`50a1bd9` is the next session's first task.**
 | 5d-next-4 design | `1943316` | Design doc for source verification |
 | 5d-next-3-bump | `56f3a05` | Bump `MAX_OUT_COINS = 8` |
 | 5d-next-3 combined | `d292855`, `8fab78a` | Init / Update with both loops active |
-| 5e | `7db3c29`, …, `50a1bd9` | 10-of-11 SPEC §13 negatives |
+| 5e | `7db3c29`, …, `50a1bd9` | 10-of-11 SPEC §13 negatives (pre-5d-next-5) |
 | docs / cleanup | `508ec9c`, `a502b8f`, `05c17f8`, `50a1bd9` | ROADMAP + SPEC + panic-test refactor |
+| 5d-next-5 Phase 1 | `cc6e60e`-era from PR [#22](https://github.com/zk-coins/server/pull/22) (`cc9c4b6`) | Aggregator skeleton + per-slot `conditionally_verify_proof` |
+| 5d-next-5 Phase 2a | PR [#23](https://github.com/zk-coins/server/pull/23) (`b5be37a`) | Outer `verify_proof(aggregator)` + `connect_hashes` vk binding + `ConstantGate::new(2)` shape lock |
+| 5d-next-5 Phase 2b | PR #23 (`f9fa75a`) | Per-slot SMT inclusion + SPEC §8 (c)(d)(e) chain + OCR coupling + active-bit binding |
+| 5d-next-5 Phase 3 | PR #23 (`f9fa75a` + `e09fe5f`) | 3 SPEC §13 source-side negatives + 4 positives; fixes the previously-3-of-11 §13 gap |
+| Step 7 follow-up | this branch (`7ff3f7b`, `cc6e60e`) | `send_coins` switched to in-circuit `prove_*_and_sources`; off-circuit shim retained as defense-in-depth fast-fail |
 
 ## Files most likely to be touched next
 
-1. [`src/circuit/main.rs`](src/circuit/main.rs) — adding source
-   verification (Stage 5d-next-4) means new witnesses + a second
-   `conditionally_verify_cyclic_proof_or_dummy::<C>` call per slot
-   + matching `common_data_for_recursion_c` extension.
-2. [`STAGE_5D_NEXT_4_DESIGN.md`](STAGE_5D_NEXT_4_DESIGN.md) — fold
-   into actual 5d-next-4 PR and delete once that work lands.
-3. [`../MIGRATION_RESEARCH.md`](../MIGRATION_RESEARCH.md) — append
-   §7.20+ with the multi-recursive-verify lessons when 5d-next-4
-   lands.
+1. [`../.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) —
+   drop the temporary coverage exclusions for `account_server.rs` +
+   `server.rs`; optionally include the Stage 5d-next-5 cyclic tests
+   by removing `--skip stage_5d --skip stage_5e` and bumping the
+   `tests` job's `timeout-minutes` from 30 to ~120.
+2. Steps 8–9 in [`../ROADMAP.md`](../ROADMAP.md): App/wallet Schnorr
+   signing integration + DEV deployment + Signet end-to-end
+   roundtrip. Both span repos outside this one (`zk-coins/app` plus
+   deploy pipelines / SSH to dfxdev/dfxprd).
+3. [`../MIGRATION_RESEARCH.md`](../MIGRATION_RESEARCH.md) §7.22 —
+   fold the empirical insights from
+   [`STAGE_5D_NEXT_5_AGGREGATOR.md`](STAGE_5D_NEXT_5_AGGREGATOR.md)
+   in for posterity.
 
 ## Things explicitly NOT in this branch
 
-- `script-plonky2/` prover host (Step 6 in ROADMAP).
-- Server-side replacement of SP1 with Plonky2 (Step 7).
 - App / wallet integration (Step 8).
 - DEV deployment (Step 9).
+- Pre-mainnet protocol redesigns (D2/D10 / D7 / D8 — see
+  ROADMAP "Pre-mainnet blockers").
 
-Those are sequential after Step 5 lands.
+Step 6 (`script-plonky2/` prover host) and Step 7 (server-side
+replacement + in-circuit `send_coins` follow-up) have BOTH landed
+on this branch.
 
-## Test confirmation status (end of session)
+## Test confirmation status
 
-What was **explicitly proved to pass** on this session's machine,
-at the current production parameters (`MAX_IN_COINS = MAX_OUT_COINS
-= 8`, `INNER_PAD_BITS = 14`):
+**Historical snapshot (Stage 5d-next-3 era, `INNER_PAD_BITS = 14`).**
+Kept for the wall-time reference points; the current branch is at
+`INNER_PAD_BITS_STAGE_5D_NEXT_5 = 15` for the Phase 2b outer.
 
 | Test | Confirmed | Run notes |
 | --- | --- | --- |
@@ -200,42 +211,39 @@ at the current production parameters (`MAX_IN_COINS = MAX_OUT_COINS
 | `stage_5d_next_3_initial_combined_in_and_out_coin` | ✅ | 781 s wall, both loops active |
 | `stage_5d_next_3_account_update_combined_in_and_out_coin` | ✅ | 926 s wall, both loops + cyclic recursion + CMP (b)(c)(d)(e) chain |
 
-What was **left running at session end** (not in this snapshot):
-- `cargo test -- stage_5d_next_3_prove` (commit `a502b8f`, slow
-  panic tests; superseded by `50a1bd9` which speeds them up).
-
-What is **high-confidence but unrun** at MAX=8:
-- All 5b / 5c / 5c+ tests (existed at smaller MAX, behave identically
-  when the active-slot count is unchanged; the wrappers pad with
-  inactive dummies).
-- All 5e negative tests (same pattern as previously verified at
-  MAX_IN_COINS=1).
-- The remaining 4 stage_5d panic tests.
+**Current branch (Stage 5d-next-5 / Phase 2b landed).** Full
+`program-plonky2` lib sweep ~42 min wall on M3 with
+`--test-threads=2`, 115 cyclic-recursion tests green; full server
+sweep `cargo test -p server --release --all-features --
+--test-threads=1` ~36 min wall, 120 tests green (including the
+Phase 2b negative `test_send_coins_rejects_tampered_source_proof_inclusion`).
+See [`STAGE_5D_NEXT_5_AGGREGATOR.md`](STAGE_5D_NEXT_5_AGGREGATOR.md)
+"Benchmark" section for the per-test wall-time breakdown.
 
 ## Next session — verification checklist
 
 Before adding new features:
 
-1. `cd ~/Documents/GitHub/zkcoins/server-claude && git fetch && git
-   pull --ff-only origin feat/plonky2-migration` — pull any
-   parallel work since `7db536d`.
-2. `cd program-plonky2 && cargo check` — should be a no-op build.
-3. `cargo test --lib` — full sweep at MAX=8. Expect ~1-2 hours
-   multi-threaded.
-4. `cargo llvm-cov --fail-under-lines 100 -- --test-threads=1` —
-   the coverage gate. Expect ~3-5 hours sequential. Critical to
-   re-confirm the 100% lines metric on the current source state —
-   it was 99.70% before the 5d work and was line-by-line audited
-   to stay at 100% via per-assertion panic tests, but a fresh run
-   is the authoritative check.
+1. `git fetch && git pull --ff-only origin feat/plonky2-migration`
+   — pull any parallel work.
+2. `cargo check --workspace --all-targets` — should be a no-op
+   build after the cache warms.
+3. `cargo fmt --all --check` and `cargo clippy --workspace
+   --all-targets --all-features -- -D warnings`.
+4. `cargo test -p server --release --all-features -- --test-threads=1`
+   — 120 tests, ~36 min wall on M3.
+5. `cargo test -p zkcoins-program-plonky2 --release --lib --
+   --test-threads=2` — 115 cyclic tests, ~42 min wall on M3.
+6. `cargo llvm-cov --fail-under-lines 100 --
+   --test-threads=1` — coverage gate (after dropping the temporary
+   `account_server.rs` + `server.rs` exclusions from
+   `.github/workflows/ci.yaml`).
 
 If any test fails: bisect against the commit list in
 [`../ROADMAP.md`](../ROADMAP.md) Done section.
 
-After confirmation: tackle stage 5d-next-4 source verification per
-[`STAGE_5D_NEXT_4_DESIGN.md`](STAGE_5D_NEXT_4_DESIGN.md). Read the
-design first — the multi-cyclic-verify architectural decision
-(Option A vs B vs C) matters.
+After confirmation: Steps 8–9 (App/wallet Schnorr signing
+integration + DEV deployment + Signet end-to-end roundtrip).
 
 ## Lesson index in MIGRATION_RESEARCH §7
 

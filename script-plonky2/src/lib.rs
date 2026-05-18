@@ -31,14 +31,20 @@ use plonky2::plonk::proof::ProofWithPublicInputs;
 
 use zkcoins_program_plonky2::circuit::main::{
     build_circuit, prove_account_update, prove_account_update_with_in_and_out_coins,
-    prove_account_update_with_in_coins, prove_initial, prove_initial_with_in_and_out_coins,
-    prove_initial_with_in_coins, verify, StateTransitionCircuit,
+    prove_account_update_with_in_and_out_coins_and_sources, prove_account_update_with_in_coins,
+    prove_initial, prove_initial_with_in_and_out_coins,
+    prove_initial_with_in_and_out_coins_and_sources, prove_initial_with_in_coins, verify,
+    StateTransitionCircuit,
 };
 use zkcoins_program_plonky2::hash::HashDigest;
 use zkcoins_program_plonky2::inputs::CommitmentMerkleProofs;
 use zkcoins_program_plonky2::merkle::sparse_merkle_tree::NonInclusionProof;
 use zkcoins_program_plonky2::types::{AccountState, Coin, PublicKey};
 use zkcoins_program_plonky2::{C, D, F};
+
+// Re-export so server callers don't have to depend on
+// `zkcoins-program-plonky2` directly for the source-witness type.
+pub use zkcoins_program_plonky2::circuit::main::InCoinSourceWitness;
 
 /// Type alias: a single state-transition proof carrying the
 /// `ProofData` public inputs plus the cyclic verifier-data digest.
@@ -64,8 +70,11 @@ impl Default for Prover {
 impl Prover {
     /// Build the state-transition circuit. Expensive (~10 s wall on
     /// the M3 Ultra at production parameters: `MAX_IN_COINS` =
-    /// `MAX_OUT_COINS` = 8, `INNER_PAD_BITS` = 14). Call once per
-    /// process and share via `Arc<Prover>` across request handlers.
+    /// `MAX_OUT_COINS` = 8, `INNER_PAD_BITS_STAGE_5D_NEXT_5 = 15`
+    /// — Phase 2b outer at degree 16). Call once per process and
+    /// share via `Arc<Prover>` across request handlers; the
+    /// fixed-point loop that converges aggregator + outer common
+    /// inside `build_circuit` runs on each instantiation.
     pub fn new() -> Self {
         Self {
             circuit: build_circuit(),
@@ -86,6 +95,12 @@ impl Prover {
     /// in-coin slot witnesses. Each tuple is
     /// `(active, &coin, &non_inclusion_proof)`. The caller MUST
     /// supply exactly `MAX_IN_COINS` tuples.
+    ///
+    /// Delegates through to the `_and_sources` core with all-`None`
+    /// sources — only suitable for transitions whose `in_coins` are
+    /// ALL inactive. Active in-coin slots require the
+    /// [`Self::prove_initial_with_in_and_out_coins_and_sources`]
+    /// variant.
     pub fn prove_initial_with_in_coins(
         &self,
         account_state: &AccountState,
@@ -99,6 +114,11 @@ impl Prover {
     /// tuples, and explicit `next_public_key` rotation. Each
     /// `out_coins` tuple is
     /// `(active, out_coin_identifier, amount, &non_inclusion_proof)`.
+    /// Delegates to the `_and_sources` variant with all-`None`
+    /// sources — only suitable for transitions whose `in_coins` are
+    /// ALL inactive. Active in-coin slots require the
+    /// [`Self::prove_initial_with_in_and_out_coins_and_sources`]
+    /// variant.
     pub fn prove_initial_with_in_and_out_coins(
         &self,
         account_state: &AccountState,
@@ -131,6 +151,12 @@ impl Prover {
 
     /// Prove an AccountUpdate transition with caller-supplied
     /// in-coin slot witnesses.
+    ///
+    /// Delegates through to the `_and_sources` core with all-`None`
+    /// sources — only suitable for transitions whose `in_coins` are
+    /// ALL inactive. Active in-coin slots require the
+    /// [`Self::prove_account_update_with_in_and_out_coins_and_sources`]
+    /// variant.
     pub fn prove_account_update_with_in_coins(
         &self,
         account_state: &AccountState,
@@ -150,7 +176,12 @@ impl Prover {
     }
 
     /// Full-control AccountUpdate prove: in-coin tuples, out-coin
-    /// tuples, and explicit `next_public_key` rotation.
+    /// tuples, and explicit `next_public_key` rotation. Delegates to
+    /// the `_and_sources` variant with all-`None` sources — only
+    /// suitable for transitions whose `in_coins` are ALL inactive.
+    /// Active in-coin slots require the
+    /// [`Self::prove_account_update_with_in_and_out_coins_and_sources`]
+    /// variant.
     #[allow(clippy::too_many_arguments)]
     pub fn prove_account_update_with_in_and_out_coins(
         &self,
@@ -171,6 +202,59 @@ impl Prover {
             in_coins,
             out_coins,
             next_public_key,
+        )
+    }
+
+    /// Stage 5d-next-5 Phase 2b Initial-branch prove with per-slot
+    /// source witnesses for active in-coins. `sources.len()` must
+    /// equal `MAX_IN_COINS`; `Some(_)` ↔ active source proof,
+    /// `None` ↔ inactive slot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prove_initial_with_in_and_out_coins_and_sources(
+        &self,
+        account_state: &AccountState,
+        history_root: HashDigest,
+        in_coins: &[(bool, &Coin, &NonInclusionProof)],
+        out_coins: &[(bool, HashDigest, u64, &NonInclusionProof)],
+        next_public_key: &PublicKey,
+        sources: &[Option<InCoinSourceWitness>],
+    ) -> Result<Proof> {
+        prove_initial_with_in_and_out_coins_and_sources(
+            &self.circuit,
+            account_state,
+            history_root,
+            in_coins,
+            out_coins,
+            next_public_key,
+            sources,
+        )
+    }
+
+    /// Stage 5d-next-5 Phase 2b AccountUpdate-branch prove with
+    /// per-slot source witnesses for active in-coins. Symmetric
+    /// shape with [`Self::prove_initial_with_in_and_out_coins_and_sources`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn prove_account_update_with_in_and_out_coins_and_sources(
+        &self,
+        account_state: &AccountState,
+        history_root: HashDigest,
+        prev: &Proof,
+        cmp: &CommitmentMerkleProofs,
+        in_coins: &[(bool, &Coin, &NonInclusionProof)],
+        out_coins: &[(bool, HashDigest, u64, &NonInclusionProof)],
+        next_public_key: &PublicKey,
+        sources: &[Option<InCoinSourceWitness>],
+    ) -> Result<Proof> {
+        prove_account_update_with_in_and_out_coins_and_sources(
+            &self.circuit,
+            account_state,
+            history_root,
+            prev,
+            cmp,
+            in_coins,
+            out_coins,
+            next_public_key,
+            sources,
         )
     }
 

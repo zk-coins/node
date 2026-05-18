@@ -2370,10 +2370,24 @@ mod tests {
         };
 
         // 8. Build source's inclusion proof for coin_id in
-        //    source.output_coins_root. After the source's out-coin
-        //    inserts coin_id into the empty SMT, the inclusion-proof
-        //    siblings equal the non-inclusion-proof siblings (empty
-        //    tree path is unchanged outside the leaf's position).
+        //    source.output_coins_root.
+        //
+        // **Slot-0 / single-out-coin fixture only.** This helper
+        // emits exactly one out-coin (slot 0) into an empty SMT, so
+        // the inclusion-proof siblings equal the non-inclusion-proof
+        // siblings (the empty-tree path is unchanged outside the
+        // leaf's position). If this fixture is ever extended to
+        // produce multi-out-coin sources (slots > 0), the inclusion
+        // siblings MUST be re-derived from the SMT *after* each
+        // prior-slot insert — see
+        // [`SparseMerkleTree::generate_inclusion_proof`] which
+        // returns the correct siblings against the tree's current
+        // state. Production [`account_server::send_coins`] already
+        // does this correctly via `out_coins_tree.generate_inclusion_proof`
+        // on the final tree; this restriction is fixture-only.
+        //
+        // TODO(stage-5d-next-5-followup): extend this fixture for
+        // multi-out-coin sources once a test scenario requires it.
         let coin_key = digest_to_bytes(&coin_id);
         let source_inclusion = InclusionProof {
             key: coin_key,
