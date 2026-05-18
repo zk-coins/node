@@ -374,15 +374,31 @@ impl AccountServer {
             let _expected = non_inclusion_proof.insert(coin.identifier);
         }
 
-        // STAGE 5d-next-5 Phase 2b: source-side validation runs
-        // IN-CIRCUIT via the aggregator pattern. The off-circuit
-        // pre-checks introduced in `c71c9fc` are no longer needed —
-        // the cyclic circuit's per-slot `connect(slot.active,
-        // aggregator.slot[i].active_pi)` plus the masked SMT
-        // inclusion + SPEC §8 (c)(d)(e) chain on each source proof
-        // reject any tampered witness at proof time. See
-        // `program-plonky2/STAGE_5D_NEXT_5_AGGREGATOR.md` for the
-        // architecture.
+        // Defense-in-depth: validate the source-side properties
+        // off-circuit before paying the prove cost. The in-circuit
+        // gate-set (Stage 5d-next-5 Phase 2b — merged in PR #23) is
+        // the authoritative enforcement; this off-circuit pass exists
+        // to (a) reject malformed requests with a specific HTTP error
+        // string within microseconds instead of an opaque
+        // `prove failed` after minute-scale prove cost, and (b) catch
+        // any future drift between off-circuit witness construction
+        // and the in-circuit predicate. Memory
+        // `feedback_threat_model_over_checklist`: the cost is
+        // microseconds vs minute-scale prove, so the defense-in-depth
+        // wins. See `program-plonky2/STAGE_5D_NEXT_5_AGGREGATOR.md`
+        // for the in-circuit architecture.
+        for ((coin, source_cmp), source_inclusion) in in_coins
+            .iter()
+            .zip(coin_history_proofs.iter())
+            .zip(coin_inclusion_proofs.iter())
+        {
+            if !source_inclusion.verify(coin.identifier, source_cmp.commitment_out_coins_root) {
+                return Err("In-coin not present in source's output_coins_root");
+            }
+            if !source_cmp.verify_commitment(state.mmr.root_extended(MMR_PROOF_PATH_LEN)) {
+                return Err("Source commitment not present in history MMR");
+            }
+        }
 
         // Build the fixed-shape MAX_IN_COINS slot tuples. Active
         // slots come from account.coin_queue; inactive slots use the
@@ -491,6 +507,18 @@ impl AccountServer {
         account.proof = Some(proof.clone());
 
         // Build CoinProof entries for distribution to recipients.
+        //
+        // Multi-out-coin correctness: `generate_inclusion_proof` runs
+        // against the FINAL `out_coins_tree` (after every slot has
+        // been inserted), so each recipient's `InclusionProof`
+        // siblings are valid against the SAME `output_coins_root`
+        // that the source proof committed to — regardless of which
+        // slot the recipient's coin landed in. This is the production
+        // invariant that the in-circuit Phase 2b SMT-inclusion check
+        // relies on. (The test fixture
+        // `build_test_source_witness` in
+        // `program-plonky2/src/circuit/main.rs` is single-out-coin /
+        // slot-0 only by construction — see its docstring.)
         let mut coin_proofs = vec![];
         for coin in out_coins {
             let coin_id_bytes = zkcoins_program::hash::digest_to_bytes(&coin.identifier);

@@ -3,12 +3,18 @@
 > **✅ STATUS — Step 7 is DONE.** This file is kept as the historical
 > planning record. The actual cutover landed across commits `00adbb4`
 > (workspace + server imports), `c71c9fc` (send_coins wired to the
-> Plonky2 Prover), `dac0179` (Dockerfile), `d6a3cb9` (inline
-> error-path tests), and the test-fixtures port that re-enabled
-> `account_server_tests.rs` + `server_tests.rs` (proof.public_values
-> → proof.public_inputs bridge + `[u8;32]` → `HashOut<F>` casts). See
-> [`../ROADMAP.md`](../ROADMAP.md) "Done" section for the full
-> per-commit timeline.
+> Plonky2 Prover, **off-circuit source-side validation as a
+> placeholder while Stage 5d-next-5 Phase 2 was deferred**),
+> `dac0179` (Dockerfile), `d6a3cb9` (inline error-path tests), the
+> test-fixtures port that re-enabled `account_server_tests.rs` +
+> `server_tests.rs` (proof.public_values → proof.public_inputs
+> bridge + `[u8;32]` → `HashOut<F>` casts), and the **Step-7
+> follow-up that switched `send_coins` to in-circuit source-side
+> validation** via `prove_*_and_sources` (Stage 5d-next-5 Phase 2b
+> from PR [#23](https://github.com/zk-coins/server/pull/23); the
+> off-circuit pre-check loop is retained as defense-in-depth fast-
+> fail before the prove). See [`../ROADMAP.md`](../ROADMAP.md) "Done"
+> section for the full per-commit timeline.
 >
 > The "Semantic mismatches that the original inventory missed"
 > section below remains useful as a record of what the cutover
