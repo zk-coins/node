@@ -24,7 +24,7 @@ Tests, Analyze rust, Analyze actions, CodeQL, Coverage MVP scope).
   Plonky2 1.1.0 shape blockers resolved empirically (probe in
   [`src/circuit/recursion_shape_probe.rs`](src/circuit/recursion_shape_probe.rs)),
   end-state documented in
-  [`STAGE_5D_NEXT_5_AGGREGATOR.md`](STAGE_5D_NEXT_5_AGGREGATOR.md).
+  [`MIGRATION_RESEARCH.md` §7.22](../MIGRATION_RESEARCH.md#722-stage-5d-next-5-source-side-verification-via-aggregator-pattern--codified-resolves-721).
 - Step 6 (script-plonky2 prover host wrapper): ✅ done (`d96bb62`)
 - Step 7 (server replacement): ✅ done. Workspace toolchain unified
   to nightly. `program/` + `script/` deleted (recoverable via
@@ -71,8 +71,9 @@ Remaining MVP-adjacent follow-ups (open, not blocking the user loop):
    `tests` job's `timeout-minutes` from 30 to ~120 (current local
    wall is ~42 min on M3 with `--test-threads=2`, so single-threaded
    on `ubuntu-latest` is ~80–120 min).
-3. Optional: fold `STAGE_5D_NEXT_5_AGGREGATOR.md` content into
-   `MIGRATION_RESEARCH.md §7.22`.
+3. ✅ done — aggregator-pattern write-up folded into
+   [`../MIGRATION_RESEARCH.md` §7.22](../MIGRATION_RESEARCH.md#722-stage-5d-next-5-source-side-verification-via-aggregator-pattern--codified-resolves-721)
+   in the Issue #28 housekeeping pass; standalone tracker file deleted.
 
 ## What works end-to-end
 
@@ -182,10 +183,10 @@ likely to be touched next" above.
    signing integration + DEV deployment + Signet end-to-end
    roundtrip. Both span repos outside this one (`zk-coins/app` plus
    deploy pipelines / SSH to dfxdev/dfxprd).
-3. [`../MIGRATION_RESEARCH.md`](../MIGRATION_RESEARCH.md) §7.22 —
-   fold the empirical insights from
-   [`STAGE_5D_NEXT_5_AGGREGATOR.md`](STAGE_5D_NEXT_5_AGGREGATOR.md)
-   in for posterity.
+3. ✅ done — empirical insights from the Stage 5d-next-5 aggregator
+   work now live in
+   [`../MIGRATION_RESEARCH.md` §7.22](../MIGRATION_RESEARCH.md#722-stage-5d-next-5-source-side-verification-via-aggregator-pattern--codified-resolves-721).
+   Tracker file removed in the Issue #28 housekeeping pass.
 
 ## Things explicitly NOT in this branch
 
@@ -217,8 +218,8 @@ Kept for the wall-time reference points; the current branch is at
 sweep `cargo test -p server --release --all-features --
 --test-threads=1` ~36 min wall, 120 tests green (including the
 Phase 2b negative `test_send_coins_rejects_tampered_source_proof_inclusion`).
-See [`STAGE_5D_NEXT_5_AGGREGATOR.md`](STAGE_5D_NEXT_5_AGGREGATOR.md)
-"Benchmark" section for the per-test wall-time breakdown.
+See [`../MIGRATION_RESEARCH.md` §7.22 "Benchmark"](../MIGRATION_RESEARCH.md#722-stage-5d-next-5-source-side-verification-via-aggregator-pattern--codified-resolves-721)
+for the per-test wall-time breakdown.
 
 ## Next session — verification checklist
 

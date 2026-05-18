@@ -385,8 +385,9 @@ impl AccountServer {
         // and the in-circuit predicate. Memory
         // `feedback_threat_model_over_checklist`: the cost is
         // microseconds vs minute-scale prove, so the defense-in-depth
-        // wins. See `program-plonky2/STAGE_5D_NEXT_5_AGGREGATOR.md`
-        // for the in-circuit architecture.
+        // wins. See `MIGRATION_RESEARCH.md` §7.22 for the in-circuit
+        // architecture (aggregator pattern + Phase 2b per-slot SMT
+        // inclusion + SPEC §8 (c)(d)(e) chain).
         for ((coin, source_cmp), source_inclusion) in in_coins
             .iter()
             .zip(coin_history_proofs.iter())
