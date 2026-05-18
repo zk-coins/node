@@ -166,16 +166,28 @@ full suite was hitting the 75-min ubuntu-latest timeout (see issue #30).
 git config core.hooksPath .githooks
 ```
 
-The hook is **conditional on the file scope of the push**:
+The hook is **conditional on the file scope of the push**, diffed vs
+`origin/<branch>`:
 
-- **Server-only change** (nothing under `program-plonky2/` differs vs
-  `origin/<branch>`): the hook completes in ~10 min warm cache. The
-  server-tests already exercise the Plonky2 prover end-to-end via
-  `send_coins_*`, so circuit correctness is verified by integration.
-- **Circuit change** (any file under `program-plonky2/` differs): the
-  hook *additionally* runs `cargo test -p zkcoins-program-plonky2
-  --release --lib`, the full cyclic-recursion sweep at production
-  parameters (`MAX_IN_COINS = 8`). This can take **multiple hours**.
+- **fmt / clippy / build** — always run. Seconds with a warm cache.
+  Catches lint regressions even in YAML-only or doc-only pushes.
+- **server + shared tests + 100% coverage gate** — run only when Rust
+  or Cargo files (`.rs`, `Cargo.toml/lock`, `rust-toolchain`) changed.
+  YAML / MD / githooks pushes skip this entirely.
+- **`program-plonky2` cyclic-recursion sweep** — run only when files
+  under `program-plonky2/` changed. At production parameters
+  (`MAX_IN_COINS = 8`) the sweep can take multiple hours; the server-
+  tests above already exercise the prover end-to-end via
+  `send_coins_*`, so the sweep is only worth its cost when the circuit
+  itself changed.
+
+Wall budgets on warm cache, M3 Ultra:
+
+| Push scope                          | Wall      |
+|-------------------------------------|-----------|
+| YAML / MD / githooks only           | seconds   |
+| Rust change, no circuit code        | ~100 min  |
+| Circuit change                      | ~hours    |
 
 When preparing a release PR to `main`, run the sweep manually to gate
 the merge regardless of branch scope:

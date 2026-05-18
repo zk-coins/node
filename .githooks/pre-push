@@ -8,24 +8,29 @@
 # only lint + build (see .github/workflows/ci.yaml). Rationale and
 # trade-offs: issue #30.
 #
-# What runs always: fmt, clippy (3 invocations), build (MVP + DEV),
-# server + shared tests (which exercise the Plonky2 prover end-to-end
-# via send_coins_*), and the 100% coverage gate.
+# The hook is scoped to the actual file changes being pushed:
 #
-# What runs only when `program-plonky2/` changed: the full cyclic-
-# recursion sweep of `program-plonky2 --lib` tests. That sweep can take
-# multiple hours at production parameters (MAX_IN_COINS = 8), so we skip
-# it when no circuit code has changed. The server-tests already prove
-# the integration is intact for non-circuit changes; the sweep is for
-# regressions in the circuit itself.
+#   - fmt + clippy + build: ALWAYS run. They are seconds with a warm
+#     cache and catch lint regressions even in pure-config commits.
+#   - server + shared tests + coverage gate: run only when Rust/Cargo
+#     code changed vs origin/<branch> (.rs, Cargo.toml/lock, rust-
+#     toolchain). Pure YAML/MD/githooks pushes skip this — there is no
+#     Rust code path that those changes could break.
+#   - program-plonky2 cyclic-recursion sweep: run only when files under
+#     program-plonky2/ changed. At production parameters (MAX_IN_COINS
+#     = 8) the sweep can take multiple hours; the server-tests above
+#     already exercise the prover end-to-end via send_coins_*, so the
+#     sweep is only worth its cost when the circuit itself changed.
 #
-# Wall budgets (warm cache, M3 Ultra):
-#   - server-only change: ~10 min
-#   - circuit change: ~3 hours (server-tests + full sweep)
+# Wall budgets (warm cache, M3 Ultra) — kept in sync with the matching
+# table in CONTRIBUTING.md § Setup:
+#   - YAML / MD / githooks only:          seconds
+#   - Rust change, no circuit code:       ~100 min (server tests + cov)
+#   - Circuit change:                     ~hours (above + full sweep)
 #
-# Bypass: `git push --no-verify` works. Bypassing makes you personally on
-# the hook for any breakage in develop — DEV must be 100% green before
-# main-merge.
+# Bypass: `git push --no-verify` works. Bypassing makes you personally
+# on the hook for any breakage in develop — DEV must be 100% green
+# before main-merge.
 set -euo pipefail
 
 # Force Esplora broadcasts to fail fast. Some unit tests exercise the
@@ -36,6 +41,37 @@ export ESPLORA_URL="${ESPLORA_URL:-http://127.0.0.1:1/api}"
 # see main.rs and #95). The test value is irrelevant for the
 # `info_returns_*` assertions (they only check non-empty + shape).
 export USERNAME_DOMAIN="${USERNAME_DOMAIN:-test.zkcoins.local}"
+
+# Resolve the base ref we diff against to decide what changed in *this*
+# push. Prefer the remote head of the current branch (these are the
+# commits we are about to publish). Fall back to origin/develop for
+# brand-new branches, then to local develop, then to the conservative
+# "run everything" default.
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+REF_BASE=""
+if git rev-parse --verify "origin/$CURRENT_BRANCH" >/dev/null 2>&1; then
+  REF_BASE="origin/$CURRENT_BRANCH"
+elif git rev-parse --verify origin/develop >/dev/null 2>&1; then
+  REF_BASE="origin/develop"
+elif git rev-parse --verify develop >/dev/null 2>&1; then
+  REF_BASE="develop"
+fi
+
+# Files changed in this push (vs the chosen base), used for the two
+# conditional gates below. Both gates fall through to "run" when we
+# couldn't resolve a base ref — safest default.
+if [ -n "$REF_BASE" ]; then
+  CHANGED_FILES=$(git diff --name-only "$REF_BASE"...HEAD)
+  # `grep` exits non-zero on no-match; under `set -e` that would kill
+  # the hook. Wrap each counter to coerce no-match → 0 explicitly.
+  RUST_CHANGED=$(printf '%s\n' "$CHANGED_FILES" | { grep -E '\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$' || true; } | grep -c '.' || true)
+  CIRCUIT_CHANGED=$(printf '%s\n' "$CHANGED_FILES" | { grep -E '^program-plonky2/' || true; } | grep -c '.' || true)
+  RUST_CHANGED=${RUST_CHANGED:-0}
+  CIRCUIT_CHANGED=${CIRCUIT_CHANGED:-0}
+else
+  RUST_CHANGED="unknown"
+  CIRCUIT_CHANGED="unknown"
+fi
 
 echo "[pre-push] cargo fmt --all --check"
 cargo fmt --all --check
@@ -55,29 +91,16 @@ cargo build -p server --release
 echo "[pre-push] cargo build -p server --release --all-features (DEV image)"
 cargo build -p server --release --all-features
 
-echo "[pre-push] cargo test --release --all-features (server + shared, full suite incl. account_server)"
-cargo test -p server -p shared --release --all-features -- --test-threads=1
-
-# Decide whether to run the multi-hour circuit sweep.
-#
-# Trigger: any new commit in this push touches program-plonky2/.
-# "New commit" = present in HEAD but not in origin/<branch>. Falls back
-# to origin/develop when the branch has never been pushed, and to
-# "run the sweep" if neither remote ref is available (conservative).
-CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-REF_BASE=""
-if git rev-parse --verify "origin/$CURRENT_BRANCH" >/dev/null 2>&1; then
-  REF_BASE="origin/$CURRENT_BRANCH"
-elif git rev-parse --verify origin/develop >/dev/null 2>&1; then
-  REF_BASE="origin/develop"
-elif git rev-parse --verify develop >/dev/null 2>&1; then
-  REF_BASE="develop"
-fi
-
-if [ -n "$REF_BASE" ]; then
-  CIRCUIT_CHANGED=$(git diff --name-only "$REF_BASE"...HEAD -- 'program-plonky2/' | wc -l | tr -d ' ')
+if [ "$RUST_CHANGED" = "0" ]; then
+  echo "[pre-push] skipping server + shared tests — no Rust/Cargo changes vs $REF_BASE."
 else
-  CIRCUIT_CHANGED="unknown"
+  if [ "$RUST_CHANGED" = "unknown" ]; then
+    echo "[pre-push] no base ref to diff against — running server + shared tests (conservative default)"
+  else
+    echo "[pre-push] $RUST_CHANGED Rust/Cargo file(s) changed vs $REF_BASE — running server + shared tests"
+  fi
+  echo "[pre-push] cargo test --release --all-features (server + shared, full suite incl. account_server)"
+  cargo test -p server -p shared --release --all-features -- --test-threads=1
 fi
 
 if [ "$CIRCUIT_CHANGED" = "0" ]; then
@@ -93,11 +116,15 @@ else
   cargo test -p zkcoins-program-plonky2 --release --lib -- --test-threads=1
 fi
 
-echo "[pre-push] cargo llvm-cov --release (MVP scope, 100% line + function gate)"
-cargo llvm-cov --release -p server --show-missing-lines \
-  --ignore-filename-regex 'main\.rs|publisher\.rs|server_runtime\.rs|scanner_runtime\.rs|_tests\.rs$' \
-  --fail-under-lines 100 \
-  --fail-under-functions 100 \
-  -- --test-threads=1
+if [ "$RUST_CHANGED" = "0" ]; then
+  echo "[pre-push] skipping coverage gate — no Rust/Cargo changes vs $REF_BASE."
+else
+  echo "[pre-push] cargo llvm-cov --release (MVP scope, 100% line + function gate)"
+  cargo llvm-cov --release -p server --show-missing-lines \
+    --ignore-filename-regex 'main\.rs|publisher\.rs|server_runtime\.rs|scanner_runtime\.rs|_tests\.rs$' \
+    --fail-under-lines 100 \
+    --fail-under-functions 100 \
+    -- --test-threads=1
+fi
 
 echo "[pre-push] all checks passed."
