@@ -84,7 +84,7 @@ async fn root_returns_service_metadata() {
 // --- GET /api/info ---
 
 #[tokio::test]
-async fn info_returns_network_name_and_capabilities() {
+async fn info_returns_network_name_capabilities_and_username_domain() {
     let req = Request::get("/api/info").body(Body::empty()).unwrap();
     let (status, body) = send_request(req).await;
 
@@ -104,6 +104,12 @@ async fn info_returns_network_name_and_capabilities() {
     assert_eq!(info.capabilities.faucet, cfg!(feature = "faucet"));
     assert_eq!(info.capabilities.usernames, cfg!(feature = "usernames"));
     assert_eq!(info.capabilities.lnurl, cfg!(feature = "lnurl"));
+
+    // The lazy_static defaults to "zkcoins.app" (PRD) when USERNAME_DOMAIN is unset
+    assert!(
+        !info.username_domain.is_empty(),
+        "username_domain must not be empty"
+    );
 }
 
 #[tokio::test]
@@ -115,6 +121,7 @@ async fn info_serialization_format_is_stable() {
     // Top-level fields the app contract relies on.
     assert!(v["network"].is_string());
     assert!(v["capabilities"].is_object());
+    assert!(v["username_domain"].is_string());
 
     let caps = &v["capabilities"];
     for key in ["address_list", "faucet", "usernames", "lnurl"] {

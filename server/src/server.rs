@@ -23,7 +23,7 @@ use crate::account_server::{AccountServer, CoinProof};
 #[cfg(feature = "faucet")]
 use crate::publisher::create_and_broadcast_inscription;
 use crate::username::UsernameStore;
-use crate::NETWORK_CONFIG;
+use crate::{NETWORK_CONFIG, USERNAME_DOMAIN};
 
 /// Verify a Schnorr signature over send request fields.
 /// Message = SHA256(account_address || recipient || amount || timestamp)
@@ -218,6 +218,11 @@ pub struct CommitRequest {
 pub struct InfoResponse {
     network: String,
     capabilities: Capabilities,
+    /// External hostname this server serves, used by the client to render
+    /// `<hex|username>@<domain>`. DEV and PRD share the chain identifier
+    /// but live behind different external hostnames, so the client cannot
+    /// derive this from `network` alone — the server reports it directly.
+    username_domain: String,
 }
 
 /// Server-side feature gates exposed to clients so the app can render
@@ -836,6 +841,7 @@ async fn info_handler() -> impl IntoResponse {
             usernames: cfg!(feature = "usernames"),
             lnurl: cfg!(feature = "lnurl"),
         },
+        username_domain: USERNAME_DOMAIN.clone(),
     })
 }
 
