@@ -11,6 +11,22 @@ SP1_PROVER=mock cargo run -p server
 # Server starts on http://0.0.0.0:4242
 ```
 
+## Setup
+
+After cloning, enable the repo's pre-push hook. This runs the full local
+verification (fmt, clippy, build, test, 100% coverage gate) before every
+`git push`. CI itself only runs lint + build, because the full suite is
+~8 min on an M3 Ultra and was hitting the 75-min ubuntu-latest timeout
+(see issue #30).
+
+```bash
+git config core.hooksPath .githooks
+```
+
+You can bypass with `git push --no-verify` in genuine emergencies, but
+develop must be 100% green before any main-merge — if you bypass, you
+own the breakage.
+
 ## Prerequisites
 
 | Tool | Version | Purpose |
@@ -234,6 +250,7 @@ See [docs.zkcoins.app/infrastructure/backend](https://docs.zkcoins.app/infrastru
 
 | Workflow | Trigger | Action |
 |---|---|---|
+| `ci.yaml` | PR → develop, push to develop | `cargo fmt --check`, clippy (MVP + all-features + program lib), build (MVP + all-features). **Tests and coverage are NOT in CI** — see Setup above and issue #30. |
 | `deploy-dev.yaml` | Push to develop | Docker build (ARM64) → push `zkcoin/server:beta` → deploy to DEV |
 | `deploy-prd.yaml` | Push to main | Docker build (ARM64) → push `zkcoin/server:latest` → deploy to PRD |
 | `auto-release-pr.yaml` | Push to develop | Creates Release PR (develop → main) |

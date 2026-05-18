@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Pre-push gate for zk-coins/server.
+#
+# Activation (one-time per clone):
+#   git config core.hooksPath .githooks
+#
+# This hook is the authoritative test + coverage verification — CI runs
+# only lint + build (see .github/workflows/ci.yaml). Rationale and
+# trade-offs: issue #30.
+#
+# Cache behaviour: this hook reuses the local target/ directory. The first
+# run after `cargo clean` is slow (~30 min on M3 Ultra); subsequent runs
+# are ~8 min.
+#
+# Bypass: `git push --no-verify` works. Bypassing makes you personally on
+# the hook for any breakage in develop — DEV must be 100% green before
+# main-merge.
+set -euo pipefail
+
+# Match the test environment that CI used to provide. Keeping these
+# explicit means the hook works in a fresh shell without depending on
+# whatever the dev has in .envrc / direnv.
+export SP1_PROVER="${SP1_PROVER:-mock}"
+export ESPLORA_URL="${ESPLORA_URL:-http://127.0.0.1:1/api}"
+
+echo "[pre-push] cargo fmt --all --check"
+cargo fmt --all --check
+
+echo "[pre-push] cargo clippy -p server -p shared (MVP feature set)"
+cargo clippy -p server -p shared -- -D warnings
+
+echo "[pre-push] cargo clippy -p server --all-features (DEV feature set)"
+cargo clippy -p server --all-features -- -D warnings
+
+echo "[pre-push] cargo clippy -p zkcoins-program --lib"
+cargo clippy -p zkcoins-program --lib -- -D warnings
+
+echo "[pre-push] cargo build -p server --release (MVP / PRD image)"
+cargo build -p server --release
+
+echo "[pre-push] cargo build -p server --release --all-features (DEV image)"
+cargo build -p server --release --all-features
+
+echo "[pre-push] cargo test --release --all-features (server + shared, full suite incl. account_server)"
+cargo test -p server -p shared --release --all-features -- --test-threads=1
+
+echo "[pre-push] cargo test -p zkcoins-program --lib"
+cargo test -p zkcoins-program --lib -- --test-threads=1
+
+echo "[pre-push] cargo llvm-cov --release (MVP scope, 100% line + function gate)"
+cargo llvm-cov --release -p server --show-missing-lines \
+  --ignore-filename-regex 'main\.rs|publisher\.rs|server_runtime\.rs|scanner_runtime\.rs|_tests\.rs$' \
+  --fail-under-lines 100 \
+  --fail-under-functions 100 \
+  -- --test-threads=1
+
+echo "[pre-push] all checks passed."
