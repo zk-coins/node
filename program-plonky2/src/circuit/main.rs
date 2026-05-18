@@ -91,7 +91,9 @@ use crate::circuit::source_aggregator::{
 use crate::hash::{digest_from_bytes, HashDigest, ZERO_HASH};
 use crate::inputs::CommitmentMerkleProofs;
 use crate::merkle::merkle_mountain_range::MMR_MAX_DEPTH;
-use crate::merkle::sparse_merkle_tree::{InclusionProof, NonInclusionProof, DEFAULT_HASHES, TREE_DEPTH};
+use crate::merkle::sparse_merkle_tree::{
+    InclusionProof, NonInclusionProof, DEFAULT_HASHES, TREE_DEPTH,
+};
 use crate::types::{AccountState, Coin, PublicKey, MINTING_ADDRESS};
 use crate::{C, D, F};
 
@@ -973,8 +975,7 @@ pub fn build_circuit() -> StateTransitionCircuit {
         let mut source_set_leaf_input = Vec::with_capacity(8);
         source_set_leaf_input.extend_from_slice(&slot.coin_identifier.elements);
         source_set_leaf_input.extend_from_slice(&slot.coin_identifier.elements);
-        let source_set_leaf =
-            builder.hash_n_to_hash_no_pad::<PoseidonHash>(source_set_leaf_input);
+        let source_set_leaf = builder.hash_n_to_hash_no_pad::<PoseidonHash>(source_set_leaf_input);
         let source_inclusion_computed = hash_up_full_path(
             &mut builder,
             source_set_leaf,
@@ -1059,8 +1060,12 @@ pub fn build_circuit() -> StateTransitionCircuit {
             &source_mmr_a_index_bits,
             &slot.source_cmp.mmr_a_path,
         );
-        let source_mmr_a_target =
-            select_hash(&mut builder, slot.active, history_root, source_mmr_a_computed);
+        let source_mmr_a_target = select_hash(
+            &mut builder,
+            slot.active,
+            history_root,
+            source_mmr_a_computed,
+        );
         builder.connect_hashes(source_mmr_a_computed, source_mmr_a_target);
 
         // --- SPEC §8 (e): MMR inclusion of source's prior history root ---
@@ -1070,8 +1075,7 @@ pub fn build_circuit() -> StateTransitionCircuit {
         // aggregator's slot-`i` PIs (the source's prior view of
         // history at the time it was proved).
         let mut source_mmr_b_leaf_input = Vec::with_capacity(8);
-        source_mmr_b_leaf_input
-            .extend_from_slice(&slot.source_cmp.prev_smt_in_mmr_leaf.elements);
+        source_mmr_b_leaf_input.extend_from_slice(&slot.source_cmp.prev_smt_in_mmr_leaf.elements);
         source_mmr_b_leaf_input.extend_from_slice(&source_commitment_history_root.elements);
         let source_mmr_b_leaf =
             builder.hash_n_to_hash_no_pad::<PoseidonHash>(source_mmr_b_leaf_input);
@@ -1083,8 +1087,12 @@ pub fn build_circuit() -> StateTransitionCircuit {
             &source_mmr_b_index_bits,
             &slot.source_cmp.mmr_b_path,
         );
-        let source_mmr_b_target =
-            select_hash(&mut builder, slot.active, history_root, source_mmr_b_computed);
+        let source_mmr_b_target = select_hash(
+            &mut builder,
+            slot.active,
+            history_root,
+            source_mmr_b_computed,
+        );
         builder.connect_hashes(source_mmr_b_computed, source_mmr_b_target);
     }
 
@@ -1341,8 +1349,11 @@ fn set_cmp_targets_witness(
 ) {
     pw.set_hash_target(targets.commitment_root, cmp.commitment_root)
         .unwrap();
-    pw.set_hash_target(targets.smt_key, digest_from_bytes(&cmp.commitment_proof.key))
-        .unwrap();
+    pw.set_hash_target(
+        targets.smt_key,
+        digest_from_bytes(&cmp.commitment_proof.key),
+    )
+    .unwrap();
     assert_eq!(
         cmp.commitment_proof.siblings.len(),
         TREE_DEPTH,
@@ -2132,8 +2143,7 @@ mod tests {
         let in_coins_inactive: Vec<(bool, &Coin, &NonInclusionProof)> = (0..MAX_IN_COINS)
             .map(|_| (false, &dummy_c, &dummy_nip))
             .collect();
-        let out_coins_source =
-            out_slots_first_active(coin_id, out_amount, &out_nip, &dummy_nip);
+        let out_coins_source = out_slots_first_active(coin_id, out_amount, &out_nip, &dummy_nip);
         let source_proof = prove_initial_with_in_and_out_coins(
             circuit,
             &source_account,
@@ -2160,8 +2170,7 @@ mod tests {
         let mut source_smt = SparseMerkleTree::new();
         source_smt.insert(source_pk_key, source_commitment).unwrap();
         let source_smt_root = source_smt.root();
-        let (source_smt_incl, _) =
-            source_smt.generate_inclusion_proof(&source_pk_key).unwrap();
+        let (source_smt_incl, _) = source_smt.generate_inclusion_proof(&source_pk_key).unwrap();
 
         // 4. Consumer prev's commitment SMT.
         let prev_pd = pis_as_proof_data(&prev_proof);
@@ -2175,8 +2184,9 @@ mod tests {
             .insert(consumer_pk_key, consumer_commitment)
             .unwrap();
         let consumer_smt_root = consumer_smt.root();
-        let (consumer_smt_incl, _) =
-            consumer_smt.generate_inclusion_proof(&consumer_pk_key).unwrap();
+        let (consumer_smt_incl, _) = consumer_smt
+            .generate_inclusion_proof(&consumer_pk_key)
+            .unwrap();
 
         // 5. Two-leaf MMR. Both source and consumer prev proved against
         //    ZERO_HASH (empty history) — bootstrap pattern. The (e)
@@ -2684,7 +2694,8 @@ mod tests {
         let dummy_nip = dummy_non_inclusion_proof();
         let dummy_c = dummy_coin();
         let in_coins = slots_first_active(&coin, &nip, &dummy_c, &dummy_nip);
-        let inactive_out_coins: Vec<(bool, HashDigest, u64, &NonInclusionProof)> = (0..MAX_OUT_COINS)
+        let inactive_out_coins: Vec<(bool, HashDigest, u64, &NonInclusionProof)> = (0
+            ..MAX_OUT_COINS)
             .map(|_| (false, ZERO_HASH, 0u64, &dummy_nip))
             .collect();
         let source_witness = InCoinSourceWitness {
@@ -3313,8 +3324,7 @@ mod tests {
         // 80 + INITIAL pubkey.
         let out_coin_amount: u64 = 50;
         let mut interim_account_state = account_state.clone();
-        interim_account_state.balance =
-            account_state.balance + in_coin.amount - out_coin_amount;
+        interim_account_state.balance = account_state.balance + in_coin.amount - out_coin_amount;
         let interim_asth = interim_account_state.hash();
         let expected_out_id = crate::types::calculate_coin_identifier(interim_asth, 0);
 
@@ -3401,8 +3411,7 @@ mod tests {
         // ===== Consumer's out-coin side =====
         let out_coin_amount: u64 = 50;
         let mut interim_account_state = account_state.clone();
-        interim_account_state.balance =
-            account_state.balance + in_coin.amount - out_coin_amount;
+        interim_account_state.balance = account_state.balance + in_coin.amount - out_coin_amount;
         let interim_asth = interim_account_state.hash();
         let expected_out_id = crate::types::calculate_coin_identifier(interim_asth, 0);
         let out_id_key = digest_to_bytes(&expected_out_id);
@@ -3553,14 +3562,8 @@ mod tests {
         let circuit = build_circuit();
 
         let in_coin_amount: u64 = 7;
-        let (
-            source_proof,
-            in_coin_id,
-            source_inclusion,
-            mut source_cmp,
-            history_root,
-            _post,
-        ) = build_test_source_witness(&circuit, 201, in_coin_amount);
+        let (source_proof, in_coin_id, source_inclusion, mut source_cmp, history_root, _post) =
+            build_test_source_witness(&circuit, 201, in_coin_amount);
 
         // Tamper the (e) MMR path — claim source's commitment_history
         // is somewhere it is not. The masked `mmr_b_computed ==
@@ -3584,7 +3587,8 @@ mod tests {
         let dummy_nip = dummy_non_inclusion_proof();
         let dummy_c = dummy_coin();
         let in_coins = slots_first_active(&in_coin, &in_nip, &dummy_c, &dummy_nip);
-        let inactive_out_coins: Vec<(bool, HashDigest, u64, &NonInclusionProof)> = (0..MAX_OUT_COINS)
+        let inactive_out_coins: Vec<(bool, HashDigest, u64, &NonInclusionProof)> = (0
+            ..MAX_OUT_COINS)
             .map(|_| (false, ZERO_HASH, 0u64, &dummy_nip))
             .collect();
         let source_witness = InCoinSourceWitness {
@@ -3616,14 +3620,8 @@ mod tests {
         let circuit = build_circuit();
 
         let in_coin_amount: u64 = 9;
-        let (
-            source_proof,
-            in_coin_id,
-            mut source_inclusion,
-            source_cmp,
-            history_root,
-            _post,
-        ) = build_test_source_witness(&circuit, 211, in_coin_amount);
+        let (source_proof, in_coin_id, mut source_inclusion, source_cmp, history_root, _post) =
+            build_test_source_witness(&circuit, 211, in_coin_amount);
 
         // Tamper the inclusion proof's first sibling — the recomputed
         // source-OCR no longer matches what the source actually published.
@@ -3645,7 +3643,8 @@ mod tests {
         let dummy_nip = dummy_non_inclusion_proof();
         let dummy_c = dummy_coin();
         let in_coins = slots_first_active(&in_coin, &in_nip, &dummy_c, &dummy_nip);
-        let inactive_out_coins: Vec<(bool, HashDigest, u64, &NonInclusionProof)> = (0..MAX_OUT_COINS)
+        let inactive_out_coins: Vec<(bool, HashDigest, u64, &NonInclusionProof)> = (0
+            ..MAX_OUT_COINS)
             .map(|_| (false, ZERO_HASH, 0u64, &dummy_nip))
             .collect();
         let source_witness = InCoinSourceWitness {
@@ -3740,11 +3739,8 @@ mod tests {
         set_next_public_key_witness(&mut pw, &circuit, &account_state.public_key);
 
         // Plug the LYING aggregator proof in place of an honest one.
-        pw.set_proof_with_pis_target::<C, D>(
-            &circuit.aggregator_proof_target,
-            &lying_agg_proof,
-        )
-        .unwrap();
+        pw.set_proof_with_pis_target::<C, D>(&circuit.aggregator_proof_target, &lying_agg_proof)
+            .unwrap();
 
         let inner_pis = std::iter::empty::<(usize, F)>().collect();
         pw.set_proof_with_pis_target::<C, D>(
