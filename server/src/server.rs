@@ -217,6 +217,18 @@ pub struct CommitRequest {
 #[derive(Serialize, Deserialize)]
 pub struct InfoResponse {
     network: String,
+    capabilities: Capabilities,
+}
+
+/// Server-side feature gates exposed to clients so the app can render
+/// capability-driven UI without a parallel build-time env-flag set.
+/// Each bool reflects a compile-time Cargo feature on the server binary.
+#[derive(Serialize, Deserialize)]
+pub struct Capabilities {
+    pub address_list: bool,
+    pub faucet: bool,
+    pub usernames: bool,
+    pub lnurl: bool,
 }
 
 // --- Username & LNURL types ---
@@ -818,6 +830,12 @@ async fn commit_handler(
 async fn info_handler() -> impl IntoResponse {
     Json(InfoResponse {
         network: NETWORK_CONFIG.network_name.clone(),
+        capabilities: Capabilities {
+            address_list: cfg!(feature = "address-list"),
+            faucet: cfg!(feature = "faucet"),
+            usernames: cfg!(feature = "usernames"),
+            lnurl: cfg!(feature = "lnurl"),
+        },
     })
 }
 

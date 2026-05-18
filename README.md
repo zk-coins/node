@@ -103,8 +103,8 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 #### Network info
 
 - **Module:** `server.rs::info_handler`
-- **Behaviour:** returns `{ "network": NETWORK_NAME }`. `NETWORK_NAME` defaults to `Mutinynet` when `IS_MAINNET=false`, `Mainnet` when `true`
-- **Tests:** `server.rs::tests::info_returns_network_name`
+- **Behaviour:** returns `{ network, capabilities: { address_list, faucet, usernames, lnurl } }`. `network` defaults to `Mutinynet` when `IS_MAINNET=false`, `Mainnet` when `true`. Each `capabilities.*` bool reflects whether the corresponding Cargo feature was compiled into this binary, letting clients gate UI on a single server-side source of truth instead of parallel build-time env flags
+- **Tests:** `server.rs::tests::info_returns_network_name_and_capabilities`, `server.rs::tests::info_serialization_format_is_stable`
 
 #### Get balance
 

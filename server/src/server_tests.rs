@@ -84,7 +84,7 @@ async fn root_returns_service_metadata() {
 // --- GET /api/info ---
 
 #[tokio::test]
-async fn info_returns_network_name() {
+async fn info_returns_network_name_and_capabilities() {
     let req = Request::get("/api/info").body(Body::empty()).unwrap();
     let (status, body) = send_request(req).await;
 
@@ -93,6 +93,33 @@ async fn info_returns_network_name() {
     let info: InfoResponse = serde_json::from_str(&body).expect("valid JSON");
     // The lazy_static defaults to "Mutinynet" when IS_MAINNET is unset
     assert!(!info.network.is_empty(), "network name must not be empty");
+
+    // Capabilities reflect the cargo feature set this binary was built with.
+    // Same `cfg!(...)` evaluation as the handler, so the test passes both in
+    // MVP builds (all false) and `--all-features` builds (all true).
+    assert_eq!(
+        info.capabilities.address_list,
+        cfg!(feature = "address-list")
+    );
+    assert_eq!(info.capabilities.faucet, cfg!(feature = "faucet"));
+    assert_eq!(info.capabilities.usernames, cfg!(feature = "usernames"));
+    assert_eq!(info.capabilities.lnurl, cfg!(feature = "lnurl"));
+}
+
+#[tokio::test]
+async fn info_serialization_format_is_stable() {
+    let req = Request::get("/api/info").body(Body::empty()).unwrap();
+    let (_, body) = send_request(req).await;
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+    // Top-level fields the app contract relies on.
+    assert!(v["network"].is_string());
+    assert!(v["capabilities"].is_object());
+
+    let caps = &v["capabilities"];
+    for key in ["address_list", "faucet", "usernames", "lnurl"] {
+        assert!(caps[key].is_boolean(), "capability `{key}` must be bool");
+    }
 }
 
 // --- GET /api/balance ---
