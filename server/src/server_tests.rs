@@ -18,7 +18,7 @@ fn test_state() -> AppState {
 
     // Seed a minting account with max balance (mirrors production setup)
     let mut minting_account = Account::new();
-    minting_account.balance = u64::MAX;
+    minting_account.balance = 1_000_000;
     account_server.import_account(*zkcoins_program::types::MINTING_ADDRESS, minting_account);
 
     // Create a dummy minting ClientAccount from a deterministic key
@@ -163,7 +163,9 @@ async fn balance_unknown_address_with_claimed_username_returns_username() {
 
 #[tokio::test]
 async fn balance_minting_address_returns_max() {
-    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS));
+    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(
+        &zkcoins_program::types::MINTING_ADDRESS,
+    ));
     let uri = format!("/api/balance?address={}", address_hex);
     let req = Request::get(&uri).body(Body::empty()).unwrap();
     let (status, body) = send_request(req).await;
@@ -171,7 +173,7 @@ async fn balance_minting_address_returns_max() {
     assert_eq!(status, StatusCode::OK);
 
     let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(resp.balance, u64::MAX);
+    assert_eq!(resp.balance, 1_000_000u64);
 }
 
 #[tokio::test]
@@ -346,7 +348,9 @@ async fn resolve_unknown_username_returns_404() {
 async fn resolve_minting_address_by_hex_prefix() {
     // The minting address starts with "af53a1" — a short prefix is enough
     // for resolve_identifier to match via hex-prefix fallback.
-    let full_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS));
+    let full_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(
+        &zkcoins_program::types::MINTING_ADDRESS,
+    ));
     let prefix = &full_hex[..8]; // first 8 hex chars
 
     let uri = format!("/api/username/resolve/{}", prefix);
@@ -406,7 +410,9 @@ async fn lnurlp_unknown_user_returns_404() {
 #[tokio::test]
 async fn lnurlp_known_address_returns_pay_request() {
     // The minting address is resolvable by hex prefix through resolve_identifier.
-    let full_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS));
+    let full_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(
+        &zkcoins_program::types::MINTING_ADDRESS,
+    ));
     let prefix = &full_hex[..8];
 
     let uri = format!("/.well-known/lnurlp/{}", prefix);
@@ -454,7 +460,9 @@ async fn lnurl_pay_callback_returns_phase2_error() {
 
 #[tokio::test]
 async fn balance_minting_address_has_no_username() {
-    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS));
+    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(
+        &zkcoins_program::types::MINTING_ADDRESS,
+    ));
     let uri = format!("/api/balance?address={}", address_hex);
     let req = Request::get(&uri).body(Body::empty()).unwrap();
     let (status, body) = send_request(req).await;
@@ -481,7 +489,9 @@ async fn balance_includes_username_when_claimed() {
             .expect("claim should succeed");
     }
 
-    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS));
+    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(
+        &zkcoins_program::types::MINTING_ADDRESS,
+    ));
     let uri = format!("/api/balance?address={}", address_hex);
     let req = Request::get(&uri).body(Body::empty()).unwrap();
     let (status, body) = send_request_with_state(state, req).await;
@@ -489,7 +499,7 @@ async fn balance_includes_username_when_claimed() {
     assert_eq!(status, StatusCode::OK);
 
     let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(resp.balance, u64::MAX);
+    assert_eq!(resp.balance, 1_000_000u64);
     assert_eq!(resp.username, Some("satoshi".to_string()));
 }
 
@@ -498,7 +508,9 @@ async fn balance_includes_username_when_claimed() {
 #[tokio::test]
 async fn concurrent_balance_reads_are_consistent() {
     let state = test_state();
-    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS));
+    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(
+        &zkcoins_program::types::MINTING_ADDRESS,
+    ));
     let uri = format!("/api/balance?address={}", address_hex);
 
     // Spawn many concurrent balance requests against the same shared state.
@@ -517,8 +529,7 @@ async fn concurrent_balance_reads_are_consistent() {
         assert_eq!(status, StatusCode::OK);
         let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
         assert_eq!(
-            resp.balance,
-            u64::MAX,
+            resp.balance, 1_000_000u64,
             "every concurrent read must see the same minting balance"
         );
     }
@@ -530,7 +541,9 @@ async fn concurrent_balance_reads_are_consistent() {
 #[tokio::test]
 async fn concurrent_reads_with_username_claim() {
     let state = test_state();
-    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS));
+    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(
+        &zkcoins_program::types::MINTING_ADDRESS,
+    ));
 
     // Claim a username through the store directly (bypasses signature validation)
     {
@@ -549,13 +562,13 @@ async fn concurrent_reads_with_username_claim() {
         handles.push(tokio::spawn(async move {
             if i % 2 == 0 {
                 // Balance request
-                let req = Request::get(&format!("/api/balance?address={}", hex))
+                let req = Request::get(format!("/api/balance?address={}", hex))
                     .body(Body::empty())
                     .unwrap();
                 let (status, body) = send_request_with_state(s, req).await;
                 assert_eq!(status, StatusCode::OK);
                 let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-                assert_eq!(resp.balance, u64::MAX);
+                assert_eq!(resp.balance, 1_000_000u64);
                 assert_eq!(resp.username, Some("testuser".to_string()));
             } else {
                 // Resolve request
@@ -736,7 +749,7 @@ fn send_signature_rejects_wrong_signature() {
 
     // Sign a DIFFERENT message than what verify_send_signature expects
     let wrong_msg = Message::from_digest([0u8; 32]);
-    let (xonly, _) = public_key.x_only_public_key();
+    let (_xonly, _) = public_key.x_only_public_key();
     let keypair = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &secret);
     let sig = secp.sign_schnorr(&wrong_msg, &keypair);
 
@@ -794,7 +807,10 @@ async fn claim_username_with_valid_signature() {
     let state = test_state();
     {
         let mut account_server = state.account_server.lock().unwrap();
-        account_server.import_account(address, Account::new());
+        account_server.import_account(
+            zkcoins_program::hash::digest_from_bytes(&address),
+            Account::new(),
+        );
     }
 
     let body = serde_json::json!({
@@ -1005,7 +1021,10 @@ async fn send_with_valid_signature_returns_proof_id_and_hashes() {
     let pk_0 = derive_pk(0);
     let pk_1 = derive_pk(1);
 
-    let account_address = "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS));
+    let account_address = "0x".to_string()
+        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
+            &zkcoins_program::types::MINTING_ADDRESS,
+        ));
     let recipient = "0x".to_string() + &hex::encode([1u8; 32]);
     let amount: u64 = 100;
     let now = std::time::SystemTime::now()
@@ -1092,7 +1111,10 @@ async fn commit_with_bad_message_hex_returns_422() {
     let pk_1 = derive_pk(1);
     let sk_0 = derive_sk(0);
 
-    let account_address = "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS));
+    let account_address = "0x".to_string()
+        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
+            &zkcoins_program::types::MINTING_ADDRESS,
+        ));
     let recipient = "0x".to_string() + &hex::encode([2u8; 32]);
     let amount: u64 = 50;
     let now = std::time::SystemTime::now()
@@ -1168,7 +1190,10 @@ async fn commit_with_bad_signature_hex_returns_422() {
     let pk_1 = derive_pk(1);
     let sk_0 = derive_sk(0);
 
-    let account_address = "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS));
+    let account_address = "0x".to_string()
+        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
+            &zkcoins_program::types::MINTING_ADDRESS,
+        ));
     let recipient = "0x".to_string() + &hex::encode([3u8; 32]);
     let amount: u64 = 50;
     let now = std::time::SystemTime::now()
@@ -1243,7 +1268,10 @@ async fn commit_with_unverifiable_commitment_returns_401() {
     let pk_1 = derive_pk(1);
     let sk_0 = derive_sk(0);
 
-    let account_address = "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS));
+    let account_address = "0x".to_string()
+        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
+            &zkcoins_program::types::MINTING_ADDRESS,
+        ));
     let recipient = "0x".to_string() + &hex::encode([4u8; 32]);
     let amount: u64 = 50;
     let now = std::time::SystemTime::now()
@@ -1474,7 +1502,10 @@ async fn send_with_insufficient_funds_returns_ok_with_success_false() {
         .unwrap()
         .private_key;
 
-    let account_address = "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS));
+    let account_address = "0x".to_string()
+        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
+            &zkcoins_program::types::MINTING_ADDRESS,
+        ));
     let recipient = "0x".to_string() + &hex::encode([1u8; 32]);
     let amount: u64 = 100;
     let now = std::time::SystemTime::now()
@@ -1542,7 +1573,10 @@ async fn send_with_non_hex_recipient_returns_422() {
         .unwrap()
         .private_key;
 
-    let account_address = "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS));
+    let account_address = "0x".to_string()
+        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
+            &zkcoins_program::types::MINTING_ADDRESS,
+        ));
     let recipient = "absolutely-not-hex".to_string();
     let amount: u64 = 1;
     let now = std::time::SystemTime::now()
@@ -1621,7 +1655,10 @@ async fn commit_with_valid_signature_fails_broadcast_returns_503() {
         .private_key;
 
     // Send first to get proof_id + the hashes the client signs over.
-    let account_address = "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS));
+    let account_address = "0x".to_string()
+        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
+            &zkcoins_program::types::MINTING_ADDRESS,
+        ));
     let recipient = "0x".to_string() + &hex::encode([5u8; 32]);
     let amount: u64 = 50;
     let now = std::time::SystemTime::now()
@@ -1785,7 +1822,10 @@ async fn commit_with_wrong_length_signature_returns_422() {
         .unwrap()
         .private_key;
 
-    let account_address = "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS));
+    let account_address = "0x".to_string()
+        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
+            &zkcoins_program::types::MINTING_ADDRESS,
+        ));
     let recipient = "0x".to_string() + &hex::encode([6u8; 32]);
     let amount: u64 = 1;
     let now = std::time::SystemTime::now()
@@ -1857,7 +1897,10 @@ async fn receive_coin_with_valid_proof_succeeds() {
         .unwrap()
         .private_key;
 
-    let account_address = "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS));
+    let account_address = "0x".to_string()
+        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
+            &zkcoins_program::types::MINTING_ADDRESS,
+        ));
     let recipient = "0x".to_string() + &hex::encode([7u8; 32]);
     let amount: u64 = 1;
     let now = std::time::SystemTime::now()
@@ -1921,7 +1964,7 @@ async fn receive_coin_with_valid_proof_succeeds() {
 #[tokio::test]
 async fn send_with_wrong_signature_returns_401() {
     use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
-    use bitcoin::secp256k1::{PublicKey, SecretKey};
+    use bitcoin::secp256k1::PublicKey;
     let secret_bytes = include_bytes!("../minting_secret.bin");
     let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
     let secp = secp::Secp256k1::new();
@@ -1934,7 +1977,10 @@ async fn send_with_wrong_signature_returns_401() {
         .unwrap()
         .public_key;
 
-    let account_address = "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS));
+    let account_address = "0x".to_string()
+        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
+            &zkcoins_program::types::MINTING_ADDRESS,
+        ));
     let recipient = "0x".to_string() + &hex::encode([8u8; 32]);
     let amount: u64 = 1;
     let now = std::time::SystemTime::now()
@@ -1987,7 +2033,10 @@ async fn receive_coin_duplicate_returns_success_false() {
         .unwrap()
         .private_key;
 
-    let account_address = "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS));
+    let account_address = "0x".to_string()
+        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
+            &zkcoins_program::types::MINTING_ADDRESS,
+        ));
     let recipient = "0x".to_string() + &hex::encode([9u8; 32]);
     let amount: u64 = 1;
     let now = std::time::SystemTime::now()
@@ -2087,7 +2136,7 @@ async fn send_without_signature_skips_verification_and_proceeds() {
         .unwrap();
     let (status, _) = send_request(req).await;
     // Without signature, the handler proceeds to send_coins on the
-    // minting account (which has u64::MAX balance) and returns OK.
+    // minting account (seeded with 1_000_000 in test_state) and returns OK.
     assert_eq!(status, StatusCode::OK);
 }
 

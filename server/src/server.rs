@@ -1198,15 +1198,6 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .layer(cors)
 }
 
-// STEP 7 MIGRATION: server_tests.rs is disabled at the include-point
-// because its fixtures rely on SP1's `ProgramInputsBuilder` and the
-// SP1-era `Prover::create_account` / `update_account` API. Porting
-// them to the Plonky2 wrapper's per-slot tuple API is a focused
-// follow-up task — see ROADMAP Step 7 status. The MVP coverage gate
-// scopes around server.rs in the meantime (CI workflow comment +
-// `account_server.rs::inline_tests` cover the activated error-path
-// surface).
-//
-// #[cfg(test)]
-// #[path = "server_tests.rs"]
-// mod tests;
+#[cfg(test)]
+#[path = "server_tests.rs"]
+mod tests;
