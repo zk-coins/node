@@ -65,8 +65,12 @@ if [ -n "$REF_BASE" ]; then
 fi
 
 if [ -n "$REF_BASE" ]; then
-  RUST_CHANGED=$(printf '%s\n' "$CHANGED_FILES" | grep -E '\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$' | wc -l | tr -d ' ')
-  CIRCUIT_CHANGED=$(printf '%s\n' "$CHANGED_FILES" | grep -E '^program-plonky2/' | wc -l | tr -d ' ')
+  # `grep` exits non-zero on no-match; under `set -e` that would kill
+  # the hook. Wrap each counter to coerce no-match → 0 explicitly.
+  RUST_CHANGED=$(printf '%s\n' "$CHANGED_FILES" | { grep -E '\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$' || true; } | grep -c '.' || true)
+  CIRCUIT_CHANGED=$(printf '%s\n' "$CHANGED_FILES" | { grep -E '^program-plonky2/' || true; } | grep -c '.' || true)
+  RUST_CHANGED=${RUST_CHANGED:-0}
+  CIRCUIT_CHANGED=${CIRCUIT_CHANGED:-0}
 else
   RUST_CHANGED="unknown"
   CIRCUIT_CHANGED="unknown"
