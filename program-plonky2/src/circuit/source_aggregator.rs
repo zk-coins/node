@@ -262,6 +262,29 @@ pub struct AggregatorSlotWitness<'a> {
     pub real_proof: Option<&'a ProofWithPublicInputs<F, C, D>>,
 }
 
+/// Caller-contract validation for [`prove_aggregator`]'s
+/// `slot_witnesses` argument. Panics with a descriptive message if:
+///
+/// - `slot_witnesses.len() != MAX_IN_COINS`, or
+/// - any `active = true` entry has `real_proof = None`.
+///
+/// Factored out so it can be tested in isolation without paying the
+/// state-transition + aggregator build cost — the panic-path tests
+/// only need the witness list, not a real circuit.
+pub fn assert_slot_witnesses_valid(slot_witnesses: &[AggregatorSlotWitness]) {
+    assert_eq!(
+        slot_witnesses.len(),
+        MAX_IN_COINS,
+        "prove_aggregator: caller must supply exactly MAX_IN_COINS slot witnesses"
+    );
+    for (i, w) in slot_witnesses.iter().enumerate() {
+        assert!(
+            !w.active || w.real_proof.is_some(),
+            "prove_aggregator: slot {i} active but missing real_proof"
+        );
+    }
+}
+
 /// Prove the aggregator circuit.
 ///
 /// `st_verifier_only` is the state-transition circuit's actual
@@ -273,17 +296,15 @@ pub struct AggregatorSlotWitness<'a> {
 /// `slot_witnesses.len()` must equal [`MAX_IN_COINS`]. Each entry's
 /// `real_proof` is required when `active = true` — its
 /// `public_inputs[0..16]` become the slot's exposed source-`ProofData`
-/// in the aggregator's public inputs.
+/// in the aggregator's public inputs. Both contract violations are
+/// caught upfront by [`assert_slot_witnesses_valid`] so they fail
+/// before any expensive proving work runs.
 pub fn prove_aggregator(
     aggregator: &SourceAggregatorCircuit,
     st_verifier_only: &VerifierOnlyCircuitData<C, D>,
     slot_witnesses: &[AggregatorSlotWitness],
 ) -> Result<ProofWithPublicInputs<F, C, D>> {
-    assert_eq!(
-        slot_witnesses.len(),
-        MAX_IN_COINS,
-        "prove_aggregator: caller must supply exactly MAX_IN_COINS slot witnesses"
-    );
+    assert_slot_witnesses_valid(slot_witnesses);
 
     let mut pw = PartialWitness::new();
 
@@ -314,10 +335,15 @@ pub fn prove_aggregator(
         // source proof; if inactive, fill with dummy so the SELECT op's
         // inputs are well-defined (verify_proof only consumes the
         // selected branch, so the dummy is harmless here).
+        // The `(true, None)` case is rejected upfront by
+        // `assert_slot_witnesses_valid`, so the `unreachable!` arm is
+        // genuinely unreachable here.
         let real = match (witness.active, witness.real_proof) {
             (true, Some(p)) => p,
-            (true, None) => panic!("prove_aggregator: active slot must supply a real_proof"),
             (false, _) => &dummy_proof,
+            (true, None) => {
+                unreachable!("assert_slot_witnesses_valid rejects (active=true, real_proof=None)")
+            }
         };
         pw.set_proof_with_pis_target::<C, D>(&slot_targets.real_proof, real)
             .unwrap();
@@ -468,5 +494,38 @@ mod tests {
                 "inactive slot {i} active bit must be zero"
             );
         }
+    }
+
+    /// Negative for `assert_slot_witnesses_valid`: wrong slot count
+    /// panics with the documented message.
+    ///
+    /// Fast: no `build_circuit` or aggregator build required — the
+    /// validation runs purely on the witness list.
+    #[test]
+    #[should_panic(expected = "must supply exactly MAX_IN_COINS slot witnesses")]
+    fn stage_5d_next_5_aggregator_assert_witnesses_panics_on_wrong_slot_count() {
+        // Empty slice — `assert_eq!(0, MAX_IN_COINS)` fires.
+        let slot_witnesses: Vec<AggregatorSlotWitness> = Vec::new();
+        assert_slot_witnesses_valid(&slot_witnesses);
+    }
+
+    /// Negative for `assert_slot_witnesses_valid`: an active slot with
+    /// no `real_proof` panics with the documented message.
+    ///
+    /// Fast: same fast path as above.
+    #[test]
+    #[should_panic(expected = "slot 0 active but missing real_proof")]
+    fn stage_5d_next_5_aggregator_assert_witnesses_panics_on_active_without_proof() {
+        let mut slot_witnesses: Vec<AggregatorSlotWitness> = (0..MAX_IN_COINS)
+            .map(|_| AggregatorSlotWitness {
+                active: false,
+                real_proof: None,
+            })
+            .collect();
+        slot_witnesses[0] = AggregatorSlotWitness {
+            active: true,
+            real_proof: None,
+        };
+        assert_slot_witnesses_valid(&slot_witnesses);
     }
 }
