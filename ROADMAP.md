@@ -32,9 +32,9 @@ person-days at full focus; multiply for part-time work.
 | 4c | In-circuit SMT non-inclusion gadget (verify only) | ✅ done | — | — |
 | 4c+ | In-circuit SMT insert gadget (new-root computation) | ✅ done | — | — |
 | 4d | Port `ProgramInputs` + `CommitmentMerkleProofs` types | ✅ done | — | — |
-| 5 | Monolithic state-transition circuit (recursion, padding, vk-pin) | ✅ done (5a/5b/5c/5c+/5d/5d-next-3); 5d-next-4 source-side cyclic verify deferred to 5d-next-5 (post-MVP) — see [MIGRATION_RESEARCH §7.21](./MIGRATION_RESEARCH.md#721-stage-5d-next-4-source-side-verification-blocked-on-plonky2-110--deferred-to-stage-5d-next-5-post-mvp) | — | — |
+| 5 | Monolithic state-transition circuit (recursion, padding, vk-pin) | ✅ done (5a/5b/5c/5c+/5d/5d-next-3/5d-next-5). Stage 5d-next-5 source-side cyclic verify landed via PR [#23](https://github.com/zk-coins/server/pull/23) — aggregator pattern + Phase 2b per-slot SMT inclusion + SPEC §8 (c)(d)(e) chain + 3 §13 negatives. See [`program-plonky2/STAGE_5D_NEXT_5_AGGREGATOR.md`](./program-plonky2/STAGE_5D_NEXT_5_AGGREGATOR.md) for the empirical insights (`ConstantGate::new(2)` injection + `helper_degree = pad_bits + 1` sweep). | — | — |
 | 6 | `script-plonky2/` host-side prover wrapper | ✅ done (`d96bb62`) | — | — |
-| 7 | Server: **replace** SP1 path with Plonky2 (no feature flag, no dual backend) | ✅ done — `send_coins` wired to the Plonky2 Prover (off-circuit source-side validation per server-heavy MVP, Stage 5d-next-5 Phase 2 deferred post-MVP per [#19](https://github.com/zk-coins/server/issues/19)). Dockerfile re-introduced (`dac0179`). 106 server tests pass on the MVP build, 119 with `--all-features` (32 baseline + 10 inline error-path in `d6a3cb9` + 64 ported SP1-era fixtures re-enabled in `account_server_tests.rs` / `server_tests.rs` + 13 feature-gated). Smoke-test verified end-to-end (`cargo run` + `/health` + `/api/info`, block scanner connects). | — | — |
+| 7 | Server: **replace** SP1 path with Plonky2 (no feature flag, no dual backend) | ✅ done — `send_coins` performs **in-circuit source-side validation via Stage 5d-next-5 Phase 2 aggregator** (PR [#23](https://github.com/zk-coins/server/pull/23)); off-circuit pre-checks retained as defense-in-depth (microsecond-level fast-fail before the minute-scale prove). Initial server cut (`c71c9fc`) ran off-circuit-only because Phase 2 was deferred; the in-circuit wiring landed via the Step-7 follow-up. Dockerfile re-introduced (`dac0179`). 106 server tests pass on the MVP build, 119 with `--all-features` (32 baseline + 10 inline error-path in `d6a3cb9` + 64 ported SP1-era fixtures re-enabled in `account_server_tests.rs` / `server_tests.rs` + 13 feature-gated). Smoke-test verified end-to-end (`cargo run` + `/health` + `/api/info`, block scanner connects). | — | — |
 | 8 | App / wallet: Schnorr-signing boundary, server-API integration | ⏳ todo | 1–2 d | low (server-side compute architecture — no wasm-crypto migration) |
 | 9 | DEV deployment + end-to-end roundtrip on signet | ⏳ todo | 3–5 d | medium |
 | — | Pre-mainnet blockers: D2/D10 (recipient hiding), D7 (reorg safety), D8 (per-coin nullifier-accum) | ⏳ todo | **+2–3 weeks** | high (real protocol redesign) |
@@ -262,23 +262,29 @@ stages so each lands as its own reviewable commit on the branch):
   (wrong identifier, underflow); two panic guards (nip-path length,
   out-slot count).
 
-- **5d-next-4 — source-side verification for in-coins** ⏳ (heaviest
-  remaining). Each in-coin requires recursively verifying its source
-  proof (another `StateTransitionCircuit` instance), then asserting
-  SPEC §8: `cp.output_coins_root` contains `coin.identifier` (SMT
-  inclusion); `cp.commitment_history_root` is a prefix of current
-  `history_root` (a CommitmentMerkleProofs (d)+(e) instance per
-  in-coin); `cp.output_coins_root == mp.commitment_out_coins_root`.
-  Requires multiple `conditionally_verify_cyclic_proof_or_dummy`
-  calls — the Plonky2 1.1.0 cyclic-recursion machinery accepts only
-  one inner proof per call, so we either iterate it `MAX_IN_COINS +
-  1` times (once for prev_account, once per in-coin) or fold all
-  inner proofs through a recursive aggregator first.
-  `common_data_for_recursion_c` shape must match the outer circuit's
-  actual verify_proof count; scale the helper accordingly.
-- **5e — negative tests from SPEC §13** ✅ done for everything the
-  current circuit can express (1 of 11 still pending the deferred
-  5d-next-4 source verification). Covered:
+- **5d-next-5 — source-side verification via aggregator pattern** ✅
+  done via PR [#23](https://github.com/zk-coins/server/pull/23).
+  Architecture: non-cyclic [`SourceAggregatorCircuit`](program-plonky2/src/circuit/source_aggregator.rs)
+  bundles up to `MAX_IN_COINS` source proofs via per-slot
+  `conditionally_verify_proof`; the outer state-transition circuit
+  verifies the aggregator proof once via `verify_proof` and binds its
+  claimed state-transition `verifier_data` to its own via
+  `connect_hashes`. Per-slot SPEC §8 step 2 gates fire inside the
+  in-coin loop: SMT inclusion of `coin.identifier` in
+  `source.output_coins_root`, OCR coupling, SPEC §8 (c)(d)(e) chain
+  for source's commitment in `history_root`, strict
+  `connect(slot.active, aggregator.slot[i].active_pi)` so no in-coin
+  can be consumed without a verified source. Two Plonky2 1.1.0
+  shape-mismatch blockers were resolved empirically: explicit
+  `ConstantGate::new(2)` injection in the helper's pass-3, and
+  `INNER_PAD_BITS_STAGE_5D_NEXT_5 = 15` (`helper_degree = pad_bits +
+  1`). Probes characterising both insights live in
+  [`src/circuit/recursion_shape_probe.rs`](program-plonky2/src/circuit/recursion_shape_probe.rs).
+  Full end-state in
+  [`program-plonky2/STAGE_5D_NEXT_5_AGGREGATOR.md`](./program-plonky2/STAGE_5D_NEXT_5_AGGREGATOR.md).
+- **5e — negative tests from SPEC §13** ✅ done — all 11 negatives
+  covered (the previously-deferred 3 source-side negatives landed
+  with Stage 5d-next-5 Phase 3). Covered:
   - Initial non-mint balance ≠ 0 → rejected (`stage_5c_plus_initial_non_mint_nonzero_balance_rejected`).
   - Initial mint accepted (`stage_5c_plus_initial_mint_with_balance_accepted`, returns coin_history_root = DEFAULT_HASHES[0]).
   - Account update mismatched state hash → rejected (`stage_5c_plus_account_update_state_discontinuity_rejected`).
@@ -298,10 +304,13 @@ stages so each lands as its own reviewable commit on the branch):
   - Wrong recipient on in-coin → rejected
     (`stage_5d_initial_in_coin_wrong_recipient_rejected`).
 
-  **Still deferred** (depends on 5d-next-4 source verification):
-  - Input coin whose source-proof is not in commitment history.
-  - Input coin whose identifier is not in source's `output_coins_root`.
-  - Wrong `vk` on recursive source proof.
+  Newly covered by Stage 5d-next-5 Phase 3 (PR #23):
+  - Input coin whose source-proof is not in commitment history →
+    `stage_5d_next_5_phase_3_source_not_in_history_rejected`.
+  - Input coin whose identifier is not in source's `output_coins_root`
+    → `stage_5d_next_5_phase_3_coin_not_in_source_ocr_rejected`.
+  - Wrong `vk` on recursive source proof →
+    `stage_5d_next_5_phase_3_wrong_st_vk_on_aggregator_rejected`.
 
   Original (pre-stage-5b) wording: Overflow, underflow,
   wrong vk, double-spend, wrong identifier, mismatched
