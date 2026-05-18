@@ -21,14 +21,25 @@ under the **Done** section.
   `feat/plonky2-5d-next-4-aggregator` per
   [zk-coins/server#19](https://github.com/zk-coins/server/issues/19)
 - Step 6 (script-plonky2 prover host wrapper): ✅ done (`d96bb62`)
-- Step 7 (server replacement): 🟡 **mostly done** (`00adbb4`).
+- Step 7 (server replacement): ✅ **done** (`c71c9fc`).
   Workspace toolchain unified to nightly. `program/` + `script/`
-  deleted. shared + server fully migrated to Plonky2-era modules
-  with HashDigest type-shift handled at all boundaries. 31 server
-  tests passing. **`account_server::send_coins` Prover-API
-  integration deferred** until Stage 5d-next-5 merges — wrapped
-  in `unimplemented!` with TODO marker, ~0.5 d to complete.
-- Steps 8–9: ⏳ todo (1–2 d + 3–5 d)
+  deleted (recoverable via `git checkout v0.last-sp1 -- ...`).
+  shared + server fully migrated to Plonky2-era modules with the
+  HashDigest type-shift handled at all boundaries.
+  `account_server::send_coins` wired to the Plonky2 `Prover`
+  wrapper; source-side recursive verify is off-circuit per
+  server-heavy MVP architecture (Stage 5d-next-5 Phase 2 deferred
+  post-MVP, see `STAGE_5D_NEXT_5_AGGREGATOR.md`). 32 server tests
+  pass. `account_server_tests` + `server_tests` modules remain
+  disabled at include-point pending a separate test-fixture
+  porting task (~3–6 h, SP1's `ProgramInputsBuilder` test helpers
+  need replacing).
+- Stage 5d-next-5 (aggregator): Phase 1 ✅ merged (`cc9c4b6`);
+  Phase 2 (outer integration) blocked, fully documented in
+  `STAGE_5D_NEXT_5_AGGREGATOR.md`.
+- Steps 8–9: ⏳ todo (App/Wallet integration + DEV deployment).
+  Both require work outside this repo (`zk-coins/app` + deploy
+  pipelines).
 
 ## Active parallel work
 
