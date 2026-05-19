@@ -34,11 +34,7 @@ env:
 # Rust change. Moving the gate into CI rather than the developer's
 # laptop unblocks the developer on push (issue #40).
 #
-# Initially `server-tests` and `coverage` are gated behind `if: false`
-# so the workflow YAML can land before a self-hosted runner is
-# registered. Flip to active in a follow-up commit once the runner
-# is online and the launchd service is service-managed
-# (see scripts/ci-runner/README.md).
+# Runner ops: see scripts/ci-runner/README.md.
 jobs:
   lint-and-build:
     name: Lint & Build
@@ -85,11 +81,6 @@ jobs:
 
   server-tests:
     name: Server + Shared Tests (M3 Ultra)
-    # Gated until a self-hosted runner is registered. Flip to `true`
-    # (or delete the `if:` line) in a follow-up commit once the
-    # `m3-ultra`-labelled runner is online — see
-    # scripts/ci-runner/README.md.
-    if: false
     needs: lint-and-build
     runs-on: [self-hosted, m3-ultra]
     timeout-minutes: 120
@@ -113,8 +104,6 @@ jobs:
 
   coverage:
     name: Coverage Gate (100% lines + functions)
-    # Gated together with `server-tests` — see comment above.
-    if: false
     needs: server-tests
     runs-on: [self-hosted, m3-ultra]
     timeout-minutes: 90
