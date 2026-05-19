@@ -86,19 +86,25 @@ and the relevant `### Step N` section *in the same PR*.
 
 ### Pre-push checklist
 
-From inside the affected crate (use `program-plonky2/` for the
-migration code; workspace root for `program`/`server`/`shared`/`script`):
+The repo-level pre-push hook (`.githooks/pre-push`) runs `cargo fmt
+--check`, `cargo clippy` (all three feature scopes), and `cargo
+check --workspace --all-features` automatically. The full test +
+coverage gate for `server` and `shared` runs in CI on the
+self-hosted M3 Ultra runner — push and keep working, do not block
+the terminal on the suite.
+
+When touching `program-plonky2/` specifically, also run the local
+sweep + coverage gate **before** opening / updating the PR — the
+sweep is not in CI yet (open question 4 in issue #40):
 
 ```bash
-cargo build
-cargo test -- --test-threads=1
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo llvm-cov --fail-under-lines 100 -- --test-threads=1   # only for program-plonky2 currently
+cd program-plonky2
+cargo test --release --lib -- --test-threads=1
+cargo llvm-cov --release --fail-under-lines 100 -- --test-threads=1
 ```
 
-All five must pass. After push, poll CI until it goes green; if red,
-investigate and fix — never abandon a red CI run.
+After push, poll CI until it goes green; if red, investigate and
+fix — never abandon a red CI run.
 
 ### Branch hygiene
 
@@ -157,91 +163,41 @@ SP1_PROVER=mock cargo run -p server
 
 ## Setup
 
-After cloning, enable the repo's pre-push hook. This runs local
-verification (fmt, clippy, build, server-tests, 100% coverage gate)
-before every `git push`. CI itself only runs lint + build, because the
-full suite was hitting the 75-min ubuntu-latest timeout (see issue #30).
+After cloning, enable the repo's pre-push hook. The hook runs `cargo
+fmt --check`, `cargo clippy` (all three feature scopes), and `cargo
+check --workspace --all-features` — fast enough that it stays out of
+the way (< 30 s warm, < 2 min cold) while still flagging lint and
+type regressions before they reach a CI runner.
 
 ```bash
 git config core.hooksPath .githooks
 ```
 
-The hook is **conditional on the file scope of the push**, diffed vs
-`origin/<branch>`:
+The authoritative test + coverage gate runs in CI on a self-hosted
+M3 Ultra runner (issue #40, `.github/workflows/ci.yaml`), not in
+this hook. CI takes 60-90 min for a Rust change but does not block
+your terminal — you push, you keep working, the runner reports back
+via PR check status.
 
-- **fmt / clippy / build** — always run. Seconds with a warm cache.
-  Catches lint regressions even in YAML-only or doc-only pushes.
-- **server + shared tests + 100% coverage gate** — run only when Rust
-  or Cargo files (`.rs`, `Cargo.toml/lock`, `rust-toolchain`) changed.
-  YAML / MD / githooks pushes skip this entirely.
-- **`program-plonky2` cyclic-recursion sweep** — run only when files
-  under `program-plonky2/` changed. At production parameters
-  (`MAX_IN_COINS = 8`) the sweep can take multiple hours; the server-
-  tests above already exercise the prover end-to-end via
-  `send_coins_*`, so the sweep is only worth its cost when the circuit
-  itself changed.
+Wall budgets on warm cache:
 
-Wall budgets on warm cache, M3 Ultra:
+| Stage                          | Wall      | Where     |
+|--------------------------------|-----------|-----------|
+| Pre-push hook (lint + check)   | < 30 s    | local     |
+| Server + shared tests          | 60-90 min | CI runner |
+| Coverage gate (100% scope)     | + 60 min  | CI runner |
 
-| Push scope                          | Wall      |
-|-------------------------------------|-----------|
-| YAML / MD / githooks only           | seconds   |
-| Rust change, no circuit code        | ~100 min  |
-| Circuit change                      | ~hours    |
-
-When preparing a release PR to `main`, run the sweep manually to gate
-the merge regardless of branch scope:
+When preparing a release PR to `main`, run the circuit sweep manually
+— it is not yet in CI (open question 4 in #40):
 
 ```bash
 cargo test -p zkcoins-program-plonky2 --release --lib -- --test-threads=1
 ```
 
 You can bypass the hook with `git push --no-verify` in genuine
-emergencies, but develop must be 100% green before any main-merge — if
-you bypass, you own the breakage.
-
-### Running pre-push on a remote host
-
-The wall-clock budgets above assume the project's hardware target — a
-Mac Studio M3 Ultra with 96 GB RAM. On a laptop the full suite is
-2-3x slower (8 cores instead of 28, 24 GB instead of 96 GB → the
-Plonky2 prover starts swapping under load) and competes with everything
-else you have open. The hook can transparently forward verification to
-a remote target host:
-
-```bash
-# In ~/.zshenv (or ~/.zprofile, etc.)
-export ZKCOINS_PREPUSH_REMOTE=dfx01-remote   # ssh host alias
-# Optional: override the staging dir (default: zkcoins-ci/server-staging)
-# export ZKCOINS_PREPUSH_REMOTE_DIR=zkcoins-ci/server-staging
-# macOS remote: point rsync at the Homebrew build (openrsync at
-# /usr/bin/rsync lacks --mkpath and other modern flags)
-export ZKCOINS_PREPUSH_REMOTE_RSYNC=/opt/homebrew/bin/rsync
-```
-
-With `ZKCOINS_PREPUSH_REMOTE` set, each `git push` rsyncs the working
-tree to `${REMOTE}:${REMOTE_DIR}` (excluding `target/` and `.cargo/`)
-and re-executes the hook on the remote host. Console output streams
-back to your local terminal; if the remote hook fails, the local push
-is aborted exactly as if the hook had run locally.
-
-**One-time remote setup:**
-
-```bash
-# On the remote host (macOS example)
-brew install rsync                            # GNU rsync, not openrsync
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-  sh -s -- -y --no-modify-path --default-toolchain none
-source ~/.cargo/env
-rustup toolchain install nightly -c llvm-tools -c rustc-dev -c rustfmt -c clippy
-cargo install cargo-llvm-cov
-```
-
-The rsync creates the staging directory on first use; the hook reads
-`rust-toolchain` from the synced tree, so rustup picks up the nightly
-channel automatically. Subsequent runs re-use the incremental cargo
-target cache on the remote host (kept under
-`~/zkcoins-ci/server-staging/target/`).
+emergencies. CI is the real gate, so a bypassed lint failure surfaces
+at the PR check level instead — and `develop` must be 100% green
+before any main-merge.
 
 ## Prerequisites
 
@@ -466,7 +422,9 @@ See [docs.zkcoins.app/infrastructure/backend](https://docs.zkcoins.app/infrastru
 
 | Workflow | Trigger | Action |
 |---|---|---|
-| `ci.yaml` | PR → develop, push to develop | `cargo fmt --check`, clippy (MVP + all-features + program lib), build (MVP + all-features). **Tests and coverage are NOT in CI** — see Setup above and issue #30. |
+| `ci.yaml` (Lint & Build) | PR → develop, push to develop | `cargo fmt --check`, clippy (MVP + all-features + program lib), build (MVP + all-features) on `ubuntu-latest`. |
+| `ci.yaml` (Server + Shared Tests) | PR → develop, push to develop | `cargo test -p server -p shared --release --all-features` on a self-hosted M3 Ultra runner (issue #40). |
+| `ci.yaml` (Coverage Gate) | PR → develop, push to develop | `cargo llvm-cov` with the 100% line + function gate, MVP scope, on the same self-hosted runner. |
 | `deploy-dev.yaml` | Push to develop | Docker build (ARM64) → push `zkcoin/server:beta` → deploy to DEV |
 | `deploy-prd.yaml` | Push to main | Docker build (ARM64) → push `zkcoin/server:latest` → deploy to PRD |
 | `auto-release-pr.yaml` | Push to develop | Creates Release PR (develop → main) |
