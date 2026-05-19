@@ -33,6 +33,55 @@
 # before main-merge.
 set -euo pipefail
 
+# Remote-routing escape hatch.
+#
+# The hardware target for zkCoins is a Mac Studio M3 Ultra with 96 GB
+# RAM (see CONTRIBUTING.md § Working on the Plonky2 Migration). On a
+# laptop with 8 cores / 24 GB the full suite + coverage runs ~2-3x
+# slower than on the target — and the laptop's other work (browser,
+# editors, video calls) competes for the same RAM that the Plonky2
+# prover wants. If `ZKCOINS_PREPUSH_REMOTE` is set, this hook rsyncs
+# the working tree to that host and re-executes itself there, so the
+# heavy verification runs on the target hardware while the laptop
+# stays responsive.
+#
+# Setup on the remote host (one-time):
+#   - Have `cargo` + `rustup` in PATH for non-interactive shells
+#   - `~/.cargo/env` must source the rust environment
+#   - Repo is cloned at `~/zkcoins-ci/server-staging` on first use
+#     (this script creates it via `rsync --mkpath` if missing)
+#
+# Setup locally (one-time, e.g. in `~/.zshenv`):
+#   export ZKCOINS_PREPUSH_REMOTE=dfx01-remote
+#
+# `ZKCOINS_PREPUSH_INNER=1` is set by the forwarder before the remote
+# re-exec; it short-circuits the guard so the hook does not recurse.
+# `git push --no-verify` still bypasses everything; the bypass docs
+# below apply unchanged when remote routing is enabled.
+if [ -z "${ZKCOINS_PREPUSH_INNER:-}" ] && [ -n "${ZKCOINS_PREPUSH_REMOTE:-}" ]; then
+  REMOTE_HOST="$ZKCOINS_PREPUSH_REMOTE"
+  REMOTE_DIR="${ZKCOINS_PREPUSH_REMOTE_DIR:-zkcoins-ci/server-staging}"
+  # macOS ships `openrsync` at /usr/bin/rsync which lacks --mkpath and a
+  # few other modern flags. When the remote is macOS the user should
+  # install GNU rsync via Homebrew and point this variable at it.
+  REMOTE_RSYNC="${ZKCOINS_PREPUSH_REMOTE_RSYNC:-rsync}"
+  echo "[pre-push] forwarding to ${REMOTE_HOST}:${REMOTE_DIR}"
+  # --mkpath: create the destination dir on first use.
+  # --delete: keep remote in sync with local (purge stale files).
+  # Exclude target/ + .cargo/ to avoid copying multi-GB build caches.
+  # Excluding .git/index.lock prevents a transient local index lock
+  # from aborting the sync mid-push.
+  rsync -a --rsync-path="$REMOTE_RSYNC" --mkpath --delete \
+    --exclude='target/' \
+    --exclude='.cargo/' \
+    --exclude='.git/index.lock' \
+    ./ "${REMOTE_HOST}:${REMOTE_DIR}/"
+  # Re-exec the same hook on the remote host with INNER=1 to skip this
+  # guard. Forward stdin (the list of refs being pushed) so the inner
+  # invocation sees identical args to the original.
+  exec ssh "$REMOTE_HOST" "bash -lc 'source ~/.cargo/env && cd ${REMOTE_DIR} && ZKCOINS_PREPUSH_INNER=1 .githooks/pre-push'"
+fi
+
 # Force Esplora broadcasts to fail fast. Some unit tests exercise the
 # commit pipeline that ends in a real HTTP broadcast; without this,
 # runs against the public Mutinynet API can take >60 s per test.
