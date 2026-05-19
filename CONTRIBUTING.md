@@ -200,6 +200,49 @@ You can bypass the hook with `git push --no-verify` in genuine
 emergencies, but develop must be 100% green before any main-merge — if
 you bypass, you own the breakage.
 
+### Running pre-push on a remote host
+
+The wall-clock budgets above assume the project's hardware target — a
+Mac Studio M3 Ultra with 96 GB RAM. On a laptop the full suite is
+2-3x slower (8 cores instead of 28, 24 GB instead of 96 GB → the
+Plonky2 prover starts swapping under load) and competes with everything
+else you have open. The hook can transparently forward verification to
+a remote target host:
+
+```bash
+# In ~/.zshenv (or ~/.zprofile, etc.)
+export ZKCOINS_PREPUSH_REMOTE=dfx01-remote   # ssh host alias
+# Optional: override the staging dir (default: zkcoins-ci/server-staging)
+# export ZKCOINS_PREPUSH_REMOTE_DIR=zkcoins-ci/server-staging
+# macOS remote: point rsync at the Homebrew build (openrsync at
+# /usr/bin/rsync lacks --mkpath and other modern flags)
+export ZKCOINS_PREPUSH_REMOTE_RSYNC=/opt/homebrew/bin/rsync
+```
+
+With `ZKCOINS_PREPUSH_REMOTE` set, each `git push` rsyncs the working
+tree to `${REMOTE}:${REMOTE_DIR}` (excluding `target/` and `.cargo/`)
+and re-executes the hook on the remote host. Console output streams
+back to your local terminal; if the remote hook fails, the local push
+is aborted exactly as if the hook had run locally.
+
+**One-time remote setup:**
+
+```bash
+# On the remote host (macOS example)
+brew install rsync                            # GNU rsync, not openrsync
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+  sh -s -- -y --no-modify-path --default-toolchain none
+source ~/.cargo/env
+rustup toolchain install nightly -c llvm-tools -c rustc-dev -c rustfmt -c clippy
+cargo install cargo-llvm-cov
+```
+
+The rsync creates the staging directory on first use; the hook reads
+`rust-toolchain` from the synced tree, so rustup picks up the nightly
+channel automatically. Subsequent runs re-use the incremental cargo
+target cache on the remote host (kept under
+`~/zkcoins-ci/server-staging/target/`).
+
 ## Prerequisites
 
 | Tool | Version | Purpose |
