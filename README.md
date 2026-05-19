@@ -26,7 +26,7 @@ Full rationale: [docs.zkcoins.app/tech-decisions](https://docs.zkcoins.app/tech-
 
 **New PRs may only merge into `develop` if test coverage is 100% on the activated surface.** Code behind a Cargo feature (`address-list`, `faucet`, `usernames`, `lnurl`) is excluded from the MVP measurement — feature-gated routes do not need to be tested as long as the feature stays off in the PRD build. Concretely:
 
-- `cargo llvm-cov -p server` (no `--all-features`) must report 100% lines, statements, branches, and functions on the MVP build. CI enforces this with `--fail-under-lines 100`. The current baseline is below 100% — the regression-block threshold is set to the current measured value and the goal is to lift it to 100% via follow-up PRs.
+- `cargo llvm-cov -p server` (no `--all-features`) must report 100% lines + 100% functions on the activated MVP surface. CI enforces this with `--fail-under-lines 100 --fail-under-functions 100` in the `Coverage Gate (100% lines + functions)` job. The current `develop` baseline is at the gate.
 - Defensive code that genuinely cannot be reached in unit tests (e.g. the publisher's Bitcoin-broadcast path that requires a signet/regtest node, the `main.rs` runtime bootstrap) is excluded from the measured scope at the file level rather than tested.
 - The branch is protected on GitHub: a PR cannot be merged while CI is red.
 
@@ -40,25 +40,25 @@ API endpoints, background services, their activation status, and the tests that 
 
 **Triage legend** (MVP testing decision): `mvp` = in MVP scope, must reach full test coverage before launch · `gate` = not in MVP scope; hidden behind a Cargo feature, default off, no test coverage required · `planned` = not in scope for MVP.
 
-**Coverage legend:** unit % refers to `cargo-llvm-cov` line coverage of the module that implements the function. Numbers in the table below are STALE — they were measured against the SP1-era build and have not yet been re-measured post-Plonky2 migration. See [`ROADMAP.md`](./ROADMAP.md) for the live status. `—` means no test exists.
+**Coverage legend:** unit % refers to `cargo-llvm-cov` line coverage of the module that implements the function. The MVP-scope per-module summary is in § "Test stack" below; the authoritative live numbers are in the `Coverage Gate` CI job. `—` means no test exists.
 
 | Function                             | Trigger                               | Status                   | Triage  | Tests                         |
 | ------------------------------------ | ------------------------------------- | ------------------------ | ------- | ----------------------------- |
-| Health check                         | `GET /health`                         | always                   | mvp     | 75% (server)                  |
-| Network info                         | `GET /api/info`                       | env¹                     | mvp     | 75% (server)                  |
-| Get balance                          | `GET /api/balance?address=<hex>`      | always                   | mvp     | 75% (server)                  |
-| List all addresses                   | `GET /api/address`                    | feature (`address-list`) | gate    | 75% (server)                  |
-| Mint coins (faucet, single-phase)    | `POST /api/mint`                      | feature (`faucet`)²      | gate    | 91% (account)                 |
-| Send — phase 1 (generate proof)      | `POST /api/send`                      | env²                     | mvp     | 75% (server)                  |
-| Send — phase 2 (commit + broadcast)  | `POST /api/commit`                    | env³                     | mvp     | 75% (server) · 0% (publisher) |
-| Receive coin                         | `POST /api/receive`                   | always                   | mvp     | 91% (account)                 |
-| Download coin proof                  | `GET /api/proof/:id`                  | always                   | mvp     | 75% (server)                  |
-| Claim username                       | `POST /api/username/claim`            | feature (`usernames`)    | gate    | 98% (username)                |
-| Resolve username                     | `GET /api/username/resolve/:username` | feature (`usernames`)    | gate    | 98% (username)                |
-| LNURL-Pay metadata                   | `GET /.well-known/lnurlp/:username`   | feature (`lnurl`)        | gate    | 75% (server)                  |
-| LNURL-Pay callback                   | `GET /lnurl/pay/:username`            | feature (`lnurl`)        | gate    | 75% (server)                  |
-| Bitcoin block scanner (background)   | Loop in `main.rs`, 30 s poll          | env⁴                     | mvp     | 51% (scanner) · 4% (main)     |
-| State persistence (SMT/MMR write)    | Scanner callback on commitment match  | always                   | mvp     | 97% (state)                   |
+| Health check                         | `GET /health`                         | always                   | mvp     | 100% (server)                  |
+| Network info                         | `GET /api/info`                       | env¹                     | mvp     | 100% (server)                  |
+| Get balance                          | `GET /api/balance?address=<hex>`      | always                   | mvp     | 100% (server)                  |
+| List all addresses                   | `GET /api/address`                    | feature (`address-list`) | gate    | 100% (server)                  |
+| Mint coins (faucet, single-phase)    | `POST /api/mint`                      | feature (`faucet`)²      | gate    | 100% (account_server)                 |
+| Send — phase 1 (generate proof)      | `POST /api/send`                      | env²                     | mvp     | 100% (server)                  |
+| Send — phase 2 (commit + broadcast)  | `POST /api/commit`                    | env³                     | mvp     | 100% (server) · 0% (publisher) |
+| Receive coin                         | `POST /api/receive`                   | always                   | mvp     | 100% (account_server)                 |
+| Download coin proof                  | `GET /api/proof/:id`                  | always                   | mvp     | 100% (server)                  |
+| Claim username                       | `POST /api/username/claim`            | feature (`usernames`)    | gate    | 100% (username)                |
+| Resolve username                     | `GET /api/username/resolve/:username` | feature (`usernames`)    | gate    | 100% (username)                |
+| LNURL-Pay metadata                   | `GET /.well-known/lnurlp/:username`   | feature (`lnurl`)        | gate    | 100% (server)                  |
+| LNURL-Pay callback                   | `GET /lnurl/pay/:username`            | feature (`lnurl`)        | gate    | 100% (server)                  |
+| Bitcoin block scanner (background)   | Loop in `main.rs`, 30 s poll          | env⁴                     | mvp     | 100% (scanner) · — (main, excluded) |
+| State persistence (SMT/MMR write)    | Scanner callback on commitment match  | always                   | mvp     | 100% (state)                   |
 | Taproot inscription broadcast        | Called by `/api/commit`               | env³                     | mvp     | 0% (publisher)                |
 | Publisher UTXO lookup                | Internal, before broadcast            | env³                     | mvp     | 0% (publisher)                |
 | Explorer endpoints (`/api/stats`, …) | n/a                                   | planned                  | planned | —                             |
@@ -218,19 +218,20 @@ Spawned from `main.rs::main`:
 | `cargo test`     | `cargo test -p server --all-features`         | Including the gated `address-list`, `faucet`, `usernames`, and `lnurl` routes                              |
 | `cargo-llvm-cov` | `cargo llvm-cov -p server`                    | Coverage gate enforced by CI: 100% lines + functions on the activated MVP surface                          |
 
-Per-module line coverage (latest CI run):
+Per-module coverage (CI-gated):
 
-| Module              | Tests | Line %  | Notes                                                                                                                  |
-| ------------------- | ----- | ------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `scanner.rs`        | 6     | 100%    |                                                                                                                        |
-| `state.rs`          | 13    | 100%    | Poseidon-based SMT + MMR                                                                                               |
-| `username.rs`       | 9     | 100%    |                                                                                                                        |
-| `account_server.rs` | 10 (inline) | excluded from gate | Inline error-path tests cover Account / lookup / IO / send_coins early returns; the `send_coins` body needs the SP1-fixture port to reach full coverage |
-| `server.rs`         | n/a   | excluded | Same as above                                                                                                          |
-| `publisher.rs`      | 0     | excluded | Bitcoin commit/reveal broadcasting — needs live signet/regtest node                                                    |
-| `main.rs`           | 0     | excluded | Runtime bootstrap                                                                                                      |
+| Module              | Line + function % | Notes                                                                              |
+| ------------------- | ----------------- | ---------------------------------------------------------------------------------- |
+| `account_server.rs` | 100%              | send-coins flow, account ledger, scanner integration                               |
+| `scanner.rs`        | 100%              | Bitcoin block / inscription scanner                                                |
+| `server.rs`         | 100%              | REST handlers + request validation                                                 |
+| `state.rs`          | 100%              | Poseidon-based SMT + MMR                                                           |
+| `username.rs`       | 100%              | Username claim / resolve / LNURL                                                   |
+| `publisher.rs`      | excluded          | Bitcoin commit/reveal broadcasting — needs live signet/regtest node                |
+| `main.rs`           | excluded          | Runtime bootstrap                                                                  |
+| `*_runtime.rs`      | excluded          | Background-loop wrappers; covered indirectly via integration tests against handlers |
 
-`publisher.rs` and `main.rs` are untested by design — they require a live Bitcoin node and a funded publisher key. `account_server.rs` + `server.rs` are temporarily excluded during the Step-7 SP1→Plonky2 migration. CI runs the MVP build (`cargo build/clippy`) and the all-features build, plus `cargo test --all-features` and `cargo llvm-cov`.
+`publisher.rs`, `main.rs`, and the `*_runtime.rs` wrappers are excluded by design — they require a live Bitcoin node, a funded publisher key, or a bound TCP socket, none of which fit in a unit test. The exclusion list is encoded in the CI gate's `--ignore-filename-regex`; everything else is held at 100% lines + 100% functions. CI runs the MVP build, the all-features build, `cargo test --all-features` on the self-hosted M3 Ultra runner, and the `Coverage Gate (100% lines + functions)` job.
 
 ## Running
 

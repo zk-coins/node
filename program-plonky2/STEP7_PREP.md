@@ -143,10 +143,10 @@ No SP1 references. **Zero changes.** Taproot inscription publishing is hash-agno
 On cutover (after Step 7's image is built and ready to deploy):
 
 ```bash
-# On dfxdev and dfxprd:
+# On the DEV and PRD hosts:
 sudo systemctl stop zkcoin-server
 rm /var/lib/zkcoin/smt.bin /var/lib/zkcoin/mmr.bin /var/lib/zkcoin/mmr.bin.prev_root /var/lib/zkcoin/latest_block.bin
-# accounts.bin — Cyrill's call: delete to force fresh accounts, or keep with the caveat that all stored proofs are now invalid
+# accounts.bin — operator's call: delete to force fresh accounts, or keep with the caveat that all stored proofs are now invalid
 # usernames.bin, minting_num_pubkeys.bin — fine to keep, no crypto dependency
 # proofs/*.bin — delete; old proofs are SP1 format, useless to the new server
 sudo systemctl start zkcoin-server

@@ -15,12 +15,30 @@ on:
   # draft PR is marked ready — drafts themselves skip CI via the
   # `if:` guard on each job (saves self-hosted-runner time while
   # work is still in progress).
+  #
+  # `labeled` / `unlabeled` are added so toggling the `ci:full`
+  # label triggers (or removes) the heavy self-hosted-runner jobs
+  # on demand — see the `server-tests` job below.
   pull_request:
     branches: [develop]
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
 concurrency:
-  group: ci-${{ github.event.pull_request.head.sha || github.sha }}
+  # Group by SHA so a new push cancels the in-flight run for the
+  # outdated commit. Label events (`labeled` / `unlabeled`) get their
+  # own isolated group keyed by run-id, so toggling a label on a PR
+  # does NOT cancel an in-flight 60-90-min Heavy run on the same SHA
+  # — most label toggles are unrelated (`bug`, `priority/*`, …) and
+  # killing the Heavy run for them would be a footgun. Trade-off:
+  # removing `ci:full` mid-run does NOT auto-stop a Heavy run that
+  # is already executing; cancel it manually with `gh run cancel`
+  # if you really need to free the runner.
+  group: >-
+    ${{
+      (github.event.action == 'labeled' || github.event.action == 'unlabeled')
+        && format('ci-label-{0}', github.run_id)
+        || format('ci-{0}', github.event.pull_request.head.sha || github.sha)
+    }}
   cancel-in-progress: true
 
 permissions:
@@ -89,6 +107,16 @@ jobs:
 
   server-tests:
     name: Server + Shared Tests (M3 Ultra)
+    # Heavy job (~60-90 min on the single self-hosted M3 Ultra). Gated
+    # behind the `ci:full` label on PRs so we don't burn runner time
+    # on every speculative push — apply the label when the PR is
+    # ready for the authoritative test+coverage gate. `push to
+    # develop` always runs the heavy gate (post-merge is the real
+    # source of truth). The `coverage` job inherits the skip via
+    # `needs: server-tests`, so no separate guard there.
+    if: >-
+      github.event_name == 'push' ||
+      contains(github.event.pull_request.labels.*.name, 'ci:full')
     needs: lint-and-build
     runs-on: [self-hosted, m3-ultra]
     timeout-minutes: 120

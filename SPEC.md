@@ -474,7 +474,7 @@ This implementation differs from the published Shielded CSV protocol in 11 concr
 | D1  | `identifier = H(asth ‖ u32_be(idx))` (32 B)                          | `CoinID = tx_hash ‖ idx` (34 B), `CoinIDOnChain = blockchain_loc ‖ idx` (8 B) | Architectural    | Accepted for MVP     |
 | D2  | `Coin.recipient = Address` (plaintext)                              | `coin.essence.address = Commitment::commit(acct_id, rand)` (hiding)      | **Privacy**      | **Must fix pre-mainnet** |
 | D3  | Single Schnorr commitment in Taproot inscription, txid prefix `4242` | Half-aggregate BIP-340 Schnorr `AggregateNullifier` via third-party publishers | Architectural    | Accepted for MVP     |
-| D4  | Global state = SMT(`H(pk)` → `H(asth ‖ ocr)`) + MMR over `H(smt_root ‖ prev_mmr_root)` | `ToSAcc` tuple-of-sets over `(pk, sig_comm, blockchain_loc, fee_acct_comm)` with prefix proofs | Architectural    | Discuss with Robin   |
+| D4  | Global state = SMT(`H(pk)` → `H(asth ‖ ocr)`) + MMR over `H(smt_root ‖ prev_mmr_root)` | `ToSAcc` tuple-of-sets over `(pk, sig_comm, blockchain_loc, fee_acct_comm)` with prefix proofs | Architectural    | Open                 |
 | D5  | SMT depth 256, hash-keyed (uniform)                                  | `AccM` lex-ordered by `CoinIDOnChain` for subtree pruning                | Scalability      | Re-evaluate at scale |
 | D6  | No fee field, no fee output                                          | `fee: u64` + `FEE_IDX = 0xffff` reserved coin index for publisher payout | Missing feature  | Deferred             |
 | D7  | No conditional-noop on reorg                                         | `conditional_nav` degrades tx to no-op if claimed nullifier-accum no longer prefix | **Reorg safety** | **Must fix pre-mainnet** |

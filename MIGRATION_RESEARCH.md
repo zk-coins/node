@@ -14,7 +14,7 @@ Companion document to [`SPEC.md`](./SPEC.md). Summarises what we can take from t
 1. **`BitVM/zkCoins` is a 182-LOC IVC toy, not a zkCoins prototype.** It gives us a Plonky2 version pin and a cyclic-recursion code recipe, nothing more.
 2. **The real normative reference is `ShieldedCSV/ShieldedCSV`** — a non-circuit Rust implementation of the paper's PCD predicate.
 3. **Our current SP1 implementation has departed from the published protocol in 11 distinct ways.** Some are simplifications (Schnorr commitment on a Taproot inscription instead of half-aggregate nullifier publication), some are arguably regressions (recipient is plaintext `Address`, linkable across coins), some are missing features (fee output, conditional-noop on reorg).
-4. **Decision point for Robin / Cyrill:** Are we implementing _Shielded CSV as published_, or are we shipping a zkCoins MVP that intentionally diverges? Both are defensible; we just need to pick before we re-implement the circuit in Plonky2, otherwise we lock in design choices that aren't reviewable against any spec.
+4. **Decision point for the maintainers:** Are we implementing _Shielded CSV as published_, or are we shipping a zkCoins MVP that intentionally diverges? Both are defensible; we just need to pick before we re-implement the circuit in Plonky2, otherwise we lock in design choices that aren't reviewable against any spec.
 
 ---
 
@@ -40,7 +40,7 @@ Despite the repo name, it contains **none** of: SMT, MMR, AccountState, Coin, Pr
 
 | Aspect | Decision | Why |
 | --- | --- | --- |
-| `plonky2 = "0.2.0"` version pin | **Adopt** | Same version Robin used; ecosystem-current. |
+| `plonky2 = "0.2.0"` version pin | **Adopt** | Same version as the upstream `BitVM/zkCoins` reference; ecosystem-current. |
 | `PoseidonGoldilocksConfig`, `D = 2` | **Adopt** | Standard Plonky2 recursion setup. Matches SPEC §12.1. |
 | `standard_recursion_config()` | **Adopt as starting point** | Re-evaluate gate budget once we know our N-coin fanout. |
 | `common_data_for_recursion()` two-pass build pattern | **Adopt with adaptation** | Plonky2 idiom to stabilise public-input count under cyclic recursion. Need to extend to our (prev account proof + N coin proofs) fanout. |
@@ -136,7 +136,7 @@ For a Plonky2 MVP shipping in weeks-not-months:
 
 - **Keep as deliberate simplifications (document in README + this file):** D1, D3, D5, D6, D11. These trade flexibility for shipping speed; explicitly call them out so reviewers know.
 - **Should-fix before mainnet:** D2 + D10 (privacy regression — recipient unlinkability is a stated zkCoins selling point), D7 (reorg safety — Bitcoin reorgs happen), D8 (soundness — receivers should be able to verify coin age locally).
-- **Discuss with Robin:** D4 (does the SMT+MMR scanner model actually give the same security properties as `ToSAcc` for our threat model?), D9 (cheap to add).
+- **Open / discuss with the maintainers:** D4 (does the SMT+MMR scanner model actually give the same security properties as `ToSAcc` for our threat model?), D9 (cheap to add).
 
 ---
 
@@ -408,8 +408,8 @@ commands run in background contexts. Captured in memory as
 
 ### 7.8 Reference repos: BitVM/zkCoins is a 182-LOC toy, ShieldedCSV/ShieldedCSV is the real one — **codified**
 
-**Re-stated for emphasis:** the `BitVM/zkCoins` repo Robin pointed us
-at is a Plonky2 IVC scaffold (182 LOC, no SMT/MMR/AccountState/Coin/
+**Re-stated for emphasis:** the upstream `BitVM/zkCoins` reference
+repo is a Plonky2 IVC scaffold (182 LOC, no SMT/MMR/AccountState/Coin/
 Schnorr/tests). The actual normative reference implementation is
 `github.com/ShieldedCSV/ShieldedCSV`. Our implementation diverges from
 the paper in 11 ways (see §3 of this doc / SPEC.md §15).
