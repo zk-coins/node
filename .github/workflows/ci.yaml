@@ -23,14 +23,22 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
-# Authoritative test + coverage verification runs in the enforced
-# pre-push git hook (.githooks/pre-push), not in CI. On M3 Ultra the
-# full suite (server tests + coverage) is ~100 min on a Rust change
-# and multiple hours when circuit code under program-plonky2/ changed;
-# on GitHub-hosted ubuntu-latest it was 75+ min and repeatedly hit the
-# timeout. CI now only catches what the dev environment cannot:
-# cross-platform compile bitrot. See issue #30 and CONTRIBUTING.md §
-# Setup for the per-scope wall-budget table.
+# `lint-and-build` catches what GitHub-hosted Linux can cheaply catch:
+# cross-platform compile bitrot and lint regressions.
+#
+# `server-tests` + `coverage` are the authoritative test + coverage gate.
+# They run on a self-hosted M3 Ultra runner (label `m3-ultra`) — the
+# documented hardware target (CONTRIBUTING.md § "Working on the Plonky2
+# Migration"). On `ubuntu-latest` the full suite repeatedly hit the
+# 75-min timeout (issue #30); on the M3 Ultra it is ~60-90 min for a
+# Rust change. Moving the gate into CI rather than the developer's
+# laptop unblocks the developer on push (issue #40).
+#
+# Initially `server-tests` and `coverage` are gated behind `if: false`
+# so the workflow YAML can land before a self-hosted runner is
+# registered. Flip to active in a follow-up commit once the runner
+# is online and the launchd service is service-managed
+# (see scripts/ci-runner/README.md).
 jobs:
   lint-and-build:
     name: Lint & Build
@@ -74,3 +82,53 @@ jobs:
 
       - name: Build server (all features — the DEV image)
         run: cargo build -p server --all-features
+
+  server-tests:
+    name: Server + Shared Tests (M3 Ultra)
+    # Gated until a self-hosted runner is registered. Flip to `true`
+    # (or delete the `if:` line) in a follow-up commit once the
+    # `m3-ultra`-labelled runner is online — see
+    # scripts/ci-runner/README.md.
+    if: false
+    needs: lint-and-build
+    runs-on: [self-hosted, m3-ultra]
+    timeout-minutes: 120
+    env:
+      # Force Esplora broadcasts to fail fast. Some unit tests exercise
+      # the commit pipeline that ends in a real HTTP broadcast; without
+      # this, runs against the public Mutinynet API can take >60 s per
+      # test. Mirrors the pre-push hook.
+      ESPLORA_URL: http://127.0.0.1:1/api
+      # `USERNAME_DOMAIN` is required by the server bootstrap (no
+      # default — see server/src/main.rs and issue #95). The test value
+      # is irrelevant for the `info_returns_*` assertions (they only
+      # check non-empty + shape).
+      USERNAME_DOMAIN: test.zkcoins.local
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run server + shared tests (release, all features)
+        run: cargo test -p server -p shared --release --all-features -- --test-threads=1
+
+  coverage:
+    name: Coverage Gate (100% lines + functions)
+    # Gated together with `server-tests` — see comment above.
+    if: false
+    needs: server-tests
+    runs-on: [self-hosted, m3-ultra]
+    timeout-minutes: 90
+    env:
+      ESPLORA_URL: http://127.0.0.1:1/api
+      USERNAME_DOMAIN: test.zkcoins.local
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run llvm-cov (MVP scope, 100% line + function gate)
+        run: |
+          cargo llvm-cov --release -p server --show-missing-lines \
+            --ignore-filename-regex 'main\.rs|publisher\.rs|server_runtime\.rs|scanner_runtime\.rs|_tests\.rs$' \
+            --fail-under-lines 100 \
+            --fail-under-functions 100 \
+            -- --test-threads=1
