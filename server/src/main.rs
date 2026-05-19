@@ -104,6 +104,21 @@ fn load_latest_block(path: &str) -> Result<BlockHash, Box<dyn StdError>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn StdError>> {
+    // A panic in any tokio worker — for example the bootstrap task that
+    // owns the HTTP listener — by default only kills that task. The rest
+    // of the process (notably the chain scanner) keeps running, the
+    // container stays `Up`, but the REST port is never bound. Cloudflare
+    // sees the upstream as alive-but-unresponsive and serves 502s for
+    // hours. Override the panic hook so any panic anywhere aborts the
+    // whole process; `restart: unless-stopped` in compose then crash-
+    // loops the container until the underlying cause is fixed, which is
+    // far easier to spot than a silent zombie.
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_panic_hook(info);
+        std::process::exit(1);
+    }));
+
     // Create a new State wrapped in Arc<Mutex>
     // Try to load existing state or create a new one
     let state = Arc::new(Mutex::new(

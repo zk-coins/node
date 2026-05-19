@@ -98,11 +98,18 @@ pub async fn start_rest_server(
                 minting_client.num_pubkeys = n;
             }
         }
-        assert_eq!(
-            minting_client.address,
-            *zkcoins_program::types::MINTING_ADDRESS,
-            "Minting account address mismatch — minting_secret.bin or MINTING_ADDRESS constant is wrong"
-        );
+        // Plonky2 migration (D11 in MIGRATION_RESEARCH.md): MINTING_ADDRESS
+        // is now a well-known constant derived from `hash_bytes(b"zkcoins:
+        // minting-address:placeholder:v1")`, NOT from minting_secret.bin.
+        // ClientAccount::new derives `address` from the privkey's first
+        // child pubkey for ordinary wallets; for the faucet wallet that
+        // derivation is meaningless — only the wallet's commitment-signing
+        // side is used. Force the address to the canonical constant so
+        // the rest of the server (which reads minting_account.address as
+        // the on-chain identity of the faucet) is internally consistent.
+        // The test harness already constructs the minting account this
+        // way (see server_tests.rs::TestAccountData::new_minting_account).
+        minting_client.address = *zkcoins_program::types::MINTING_ADDRESS;
         Arc::new(Mutex::new(minting_client))
     };
 
@@ -204,3 +211,7 @@ pub(crate) async fn broadcast_commit_and_deliver(
         }),
     )
 }
+
+#[cfg(test)]
+#[path = "server_runtime_tests.rs"]
+mod tests;
