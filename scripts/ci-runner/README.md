@@ -154,24 +154,24 @@ gh api repos/zk-coins/server/actions/runners | jq '.runners[] | {name, status, b
 A healthy runner reports `"status": "online"` and includes the
 `m3-ultra` label.
 
-## Activating the CI jobs
+## Activating the CI jobs (historical — done)
+
+This section describes the rollout sequence used when the workflow
+landed before the runner existed. It is kept as a reference for
+future runner additions; the current jobs are already active.
 
 The `server-tests` and `coverage` jobs in `.github/workflows/ci.yaml`
-ship gated behind `if: false` so the workflow YAML can land before
-the runner exists. After the runner is online and verified, flip
-both jobs by removing the `if: false` lines, and open a no-op PR to
-measure wall time and confirm the green path.
-
-Once the workflow has produced a green run on `develop`, add the two
-new check names as required status checks on the `develop` branch
-protection rule:
+were originally gated behind `if: false` so the workflow YAML could
+land before the runner came online. After the runner was verified,
+both gates were removed (PR #43). Branch protection on `develop`
+already requires:
 
 - `Server + Shared Tests (M3 Ultra)`
 - `Coverage Gate (100% lines + functions)`
 
-(The same operation should also drop the stale `Tests` and
-`Coverage (MVP scope)` required checks left over from issue #30 —
-those job names no longer exist in the current workflow.)
+(The pre-Plonky2 `Tests` and `Coverage (MVP scope)` required checks
+were removed from branch protection in the same operation; they are
+not referenced in the current workflow.)
 
 ## Operations
 
