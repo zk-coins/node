@@ -99,6 +99,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The launchd-spawned runner agent inherits a minimal PATH that
+      # includes /opt/homebrew/bin (where a stable Rust lives) but not
+      # ~/.cargo/bin (where rustup proxies live). Without this step,
+      # `cargo` resolves to Homebrew's stable cargo, the rust-toolchain
+      # file pinning nightly is ignored, and dependencies that need
+      # `#![feature(...)]` (e.g. plonky2_field) fail to compile. Prepend
+      # ~/.cargo/bin so the rustup proxy is found first and reads the
+      # workspace rust-toolchain.
+      - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - name: Run server + shared tests (release, all features)
         run: cargo test -p server -p shared --release --all-features -- --test-threads=1
 
@@ -113,6 +124,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Run llvm-cov (MVP scope, 100% line + function gate)
         run: |
