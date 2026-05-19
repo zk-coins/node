@@ -65,3 +65,27 @@ jobs:
             -o ProxyCommand="cloudflared access ssh --hostname ${{ secrets.DEPLOY_DEV_HOST }}" \
             ${{ secrets.DEPLOY_DEV_USER }}@${{ secrets.DEPLOY_DEV_HOST }} \
             "$DEPLOY_CMD"
+
+      # Post-deploy smoke test: hit the public endpoint until /api/info
+      # answers 200 or we give up. A green "Build and deploy to DEV"
+      # without this step was historically misleading — a runtime-bootstrap
+      # panic left the container Up-but-unresponsive while the workflow
+      # reported success. Failing this step blocks the auto-release PR
+      # from collecting a green check and surfaces the regression in CI.
+      - name: Smoke test public endpoint
+        run: |
+          set -euo pipefail
+          URL="https://dev-api.zkcoins.app/api/info"
+          for i in $(seq 1 30); do
+            code=$(curl -sS -o /tmp/info.json -w '%{http_code}' --max-time 10 "$URL" || echo "000")
+            if [ "$code" = "200" ]; then
+              echo "DEV /api/info responded 200 after ${i} attempt(s):"
+              cat /tmp/info.json
+              echo
+              exit 0
+            fi
+            echo "[$i/30] $URL -> ${code} (waiting 10 s)"
+            sleep 10
+          done
+          echo "::error::DEV /api/info never returned 200 within ~5 min after deploy"
+          exit 1
