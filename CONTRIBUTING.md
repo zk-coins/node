@@ -423,17 +423,31 @@ See [docs.zkcoins.app/infrastructure/backend](https://docs.zkcoins.app/infrastru
 | Workflow | Trigger | Action |
 |---|---|---|
 | `ci.yaml` (Lint & Build) | Ready PR → develop, push to develop | `cargo fmt --check`, clippy (MVP + all-features + program lib), build (MVP + all-features) on `ubuntu-latest`. |
-| `ci.yaml` (Server + Shared Tests) | Ready PR → develop, push to develop | `cargo test -p server -p shared --release --all-features` on a self-hosted M3 Ultra runner (issue #40). |
-| `ci.yaml` (Coverage Gate) | Ready PR → develop, push to develop | `cargo llvm-cov` with the 100% line + function gate, MVP scope, on the same self-hosted runner. |
+| `ci.yaml` (Server + Shared Tests) | Ready PR → develop with `ci:full` label, push to develop | `cargo test -p server -p shared --release --all-features` on a self-hosted M3 Ultra runner (issue #40). |
+| `ci.yaml` (Coverage Gate) | Ready PR → develop with `ci:full` label, push to develop | `cargo llvm-cov` with the 100% line + function gate, MVP scope, on the same self-hosted runner. |
 | `deploy-dev.yaml` | Push to develop | Docker build (ARM64) → push `zkcoin/server:beta` → deploy to DEV |
 | `deploy-prd.yaml` | Push to main | Docker build (ARM64) → push `zkcoin/server:latest` → deploy to PRD |
 | `auto-release-pr.yaml` | Push to develop | Creates Release PR (develop → main) |
 
-Draft PRs skip the `ci.yaml` jobs entirely — the workflow fires once
-the PR is marked ready-for-review (or on every subsequent push while
-it stays ready). This keeps the self-hosted M3 Ultra runner free
-while work is still in progress; mark the PR ready before requesting
-a merge so the gate has a chance to run.
+**Draft PRs** skip every `ci.yaml` job — the workflow fires once the
+PR is marked ready-for-review.
+
+**Heavy jobs** (`Server + Shared Tests`, `Coverage Gate`) additionally
+require the `ci:full` label on a ready PR. Apply the label when the
+PR is in shape to run against the authoritative ~60-90 min M3 Ultra
+gate; remove it before the next push to keep the runner free for
+other work. `Lint & Build` (fast, GitHub-hosted, free) keeps running
+on every ready-PR push.
+
+`push to develop` always runs the full gate — the post-merge run on
+`develop` is the source of truth, and `deploy-dev.yaml` consumes its
+result via the auto-release PR's check rollup.
+
+To stop a Heavy run that is already executing, removing the `ci:full`
+label is *not* enough — the workflow isolates label events into their
+own concurrency group so an unrelated label toggle doesn't cancel an
+in-flight 60-min run. If you need to free the runner immediately, use
+`gh run cancel <run-id>` (the run id is on the PR's checks tab).
 
 Build time is ~5 minutes (Rust compilation on ARM64).
 
