@@ -4,123 +4,23 @@
 # Activation (one-time per clone):
 #   git config core.hooksPath .githooks
 #
-# This hook is the authoritative test + coverage verification — CI runs
-# only lint + build (see .github/workflows/ci.yaml). Rationale and
-# trade-offs: issue #30.
+# This hook catches lint regressions in seconds — there is no point
+# waiting for CI to flag a missing import or a misformatted file.
 #
-# The hook is scoped to the actual file changes being pushed:
-#
-#   - fmt + clippy + build: ALWAYS run. They are seconds with a warm
-#     cache and catch lint regressions even in pure-config commits.
-#   - server + shared tests + coverage gate: run only when Rust/Cargo
-#     code changed vs origin/<branch> (.rs, Cargo.toml/lock, rust-
-#     toolchain). Pure YAML/MD/githooks pushes skip this — there is no
-#     Rust code path that those changes could break.
-#   - program-plonky2 cyclic-recursion sweep: run only when files under
-#     program-plonky2/ changed. At production parameters (MAX_IN_COINS
-#     = 8) the sweep can take multiple hours; the server-tests above
-#     already exercise the prover end-to-end via send_coins_*, so the
-#     sweep is only worth its cost when the circuit itself changed.
+# The authoritative test + coverage gate runs in CI on a self-hosted
+# M3 Ultra runner (issue #40, .github/workflows/ci.yaml). The hook
+# does *not* re-run those — locally on a laptop they take 60-90 min,
+# and a developer waiting that long on every push is exactly what
+# issue #40 removed.
 #
 # Wall budgets (warm cache, M3 Ultra) — kept in sync with the matching
 # table in CONTRIBUTING.md § Setup:
-#   - YAML / MD / githooks only:          seconds
-#   - Rust change, no circuit code:       ~100 min (server tests + cov)
-#   - Circuit change:                     ~hours (above + full sweep)
+#   - cold cache:                         < 2 min
+#   - warm cache:                         < 30 s
 #
-# Bypass: `git push --no-verify` works. Bypassing makes you personally
-# on the hook for any breakage in develop — DEV must be 100% green
-# before main-merge.
+# Bypass: `git push --no-verify` works. CI is the real gate, so a
+# bypassed lint failure surfaces at the PR check level instead.
 set -euo pipefail
-
-# Remote-routing escape hatch.
-#
-# The hardware target for zkCoins is a Mac Studio M3 Ultra with 96 GB
-# RAM (see CONTRIBUTING.md § Working on the Plonky2 Migration). On a
-# laptop with 8 cores / 24 GB the full suite + coverage runs ~2-3x
-# slower than on the target — and the laptop's other work (browser,
-# editors, video calls) competes for the same RAM that the Plonky2
-# prover wants. If `ZKCOINS_PREPUSH_REMOTE` is set, this hook rsyncs
-# the working tree to that host and re-executes itself there, so the
-# heavy verification runs on the target hardware while the laptop
-# stays responsive.
-#
-# Setup on the remote host (one-time):
-#   - Have `cargo` + `rustup` in PATH for non-interactive shells
-#   - `~/.cargo/env` must source the rust environment
-#   - Repo is cloned at `~/zkcoins-ci/server-staging` on first use
-#     (this script creates it via `rsync --mkpath` if missing)
-#
-# Setup locally (one-time, e.g. in `~/.zshenv`):
-#   export ZKCOINS_PREPUSH_REMOTE=dfx01-remote
-#
-# `ZKCOINS_PREPUSH_INNER=1` is set by the forwarder before the remote
-# re-exec; it short-circuits the guard so the hook does not recurse.
-# `git push --no-verify` still bypasses everything; the bypass docs
-# below apply unchanged when remote routing is enabled.
-if [ -z "${ZKCOINS_PREPUSH_INNER:-}" ] && [ -n "${ZKCOINS_PREPUSH_REMOTE:-}" ]; then
-  REMOTE_HOST="$ZKCOINS_PREPUSH_REMOTE"
-  REMOTE_DIR="${ZKCOINS_PREPUSH_REMOTE_DIR:-zkcoins-ci/server-staging}"
-  # macOS ships `openrsync` at /usr/bin/rsync which lacks --mkpath and a
-  # few other modern flags. When the remote is macOS the user should
-  # install GNU rsync via Homebrew and point this variable at it.
-  REMOTE_RSYNC="${ZKCOINS_PREPUSH_REMOTE_RSYNC:-rsync}"
-  echo "[pre-push] forwarding to ${REMOTE_HOST}:${REMOTE_DIR}"
-  # --mkpath: create the destination dir on first use.
-  # --delete: keep remote in sync with local (purge stale files).
-  # Exclude target/ + .cargo/ to avoid copying multi-GB build caches.
-  # Excluding .git/index.lock prevents a transient local index lock
-  # from aborting the sync mid-push.
-  rsync -a --rsync-path="$REMOTE_RSYNC" --mkpath --delete \
-    --exclude='target/' \
-    --exclude='.cargo/' \
-    --exclude='.git/index.lock' \
-    ./ "${REMOTE_HOST}:${REMOTE_DIR}/"
-  # Re-exec the same hook on the remote host with INNER=1 to skip this
-  # guard. Forward stdin (the list of refs being pushed) so the inner
-  # invocation sees identical args to the original.
-  exec ssh "$REMOTE_HOST" "bash -lc 'source ~/.cargo/env && cd ${REMOTE_DIR} && ZKCOINS_PREPUSH_INNER=1 .githooks/pre-push'"
-fi
-
-# Force Esplora broadcasts to fail fast. Some unit tests exercise the
-# commit pipeline that ends in a real HTTP broadcast; without this,
-# runs against the public Mutinynet API can take >60 s per test.
-export ESPLORA_URL="${ESPLORA_URL:-http://127.0.0.1:1/api}"
-# `USERNAME_DOMAIN` is required by the server bootstrap (no default —
-# see main.rs and #95). The test value is irrelevant for the
-# `info_returns_*` assertions (they only check non-empty + shape).
-export USERNAME_DOMAIN="${USERNAME_DOMAIN:-test.zkcoins.local}"
-
-# Resolve the base ref we diff against to decide what changed in *this*
-# push. Prefer the remote head of the current branch (these are the
-# commits we are about to publish). Fall back to origin/develop for
-# brand-new branches, then to local develop, then to the conservative
-# "run everything" default.
-CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-REF_BASE=""
-if git rev-parse --verify "origin/$CURRENT_BRANCH" >/dev/null 2>&1; then
-  REF_BASE="origin/$CURRENT_BRANCH"
-elif git rev-parse --verify origin/develop >/dev/null 2>&1; then
-  REF_BASE="origin/develop"
-elif git rev-parse --verify develop >/dev/null 2>&1; then
-  REF_BASE="develop"
-fi
-
-# Files changed in this push (vs the chosen base), used for the two
-# conditional gates below. Both gates fall through to "run" when we
-# couldn't resolve a base ref — safest default.
-if [ -n "$REF_BASE" ]; then
-  CHANGED_FILES=$(git diff --name-only "$REF_BASE"...HEAD)
-  # `grep` exits non-zero on no-match; under `set -e` that would kill
-  # the hook. Wrap each counter to coerce no-match → 0 explicitly.
-  RUST_CHANGED=$(printf '%s\n' "$CHANGED_FILES" | { grep -E '\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$' || true; } | grep -c '.' || true)
-  CIRCUIT_CHANGED=$(printf '%s\n' "$CHANGED_FILES" | { grep -E '^program-plonky2/' || true; } | grep -c '.' || true)
-  RUST_CHANGED=${RUST_CHANGED:-0}
-  CIRCUIT_CHANGED=${CIRCUIT_CHANGED:-0}
-else
-  RUST_CHANGED="unknown"
-  CIRCUIT_CHANGED="unknown"
-fi
 
 echo "[pre-push] cargo fmt --all --check"
 cargo fmt --all --check
@@ -134,46 +34,7 @@ cargo clippy -p server --all-features -- -D warnings
 echo "[pre-push] cargo clippy -p zkcoins-program-plonky2 -p zkcoins-prover-plonky2 --lib"
 cargo clippy -p zkcoins-program-plonky2 -p zkcoins-prover-plonky2 --lib -- -D warnings
 
-echo "[pre-push] cargo build -p server --release (MVP / PRD image)"
-cargo build -p server --release
-
-echo "[pre-push] cargo build -p server --release --all-features (DEV image)"
-cargo build -p server --release --all-features
-
-if [ "$RUST_CHANGED" = "0" ]; then
-  echo "[pre-push] skipping server + shared tests — no Rust/Cargo changes vs $REF_BASE."
-else
-  if [ "$RUST_CHANGED" = "unknown" ]; then
-    echo "[pre-push] no base ref to diff against — running server + shared tests (conservative default)"
-  else
-    echo "[pre-push] $RUST_CHANGED Rust/Cargo file(s) changed vs $REF_BASE — running server + shared tests"
-  fi
-  echo "[pre-push] cargo test --release --all-features (server + shared, full suite incl. account_server)"
-  cargo test -p server -p shared --release --all-features -- --test-threads=1
-fi
-
-if [ "$CIRCUIT_CHANGED" = "0" ]; then
-  echo "[pre-push] skipping full cyclic-recursion sweep — no program-plonky2/ changes vs $REF_BASE."
-  echo "[pre-push] run manually before release-PR-to-main: cargo test -p zkcoins-program-plonky2 --release --lib -- --test-threads=1"
-else
-  if [ "$CIRCUIT_CHANGED" = "unknown" ]; then
-    echo "[pre-push] no base ref to diff against — running full cyclic-recursion sweep (conservative default)"
-  else
-    echo "[pre-push] $CIRCUIT_CHANGED file(s) under program-plonky2/ changed vs $REF_BASE — running full cyclic-recursion sweep"
-  fi
-  echo "[pre-push] cargo test -p zkcoins-program-plonky2 --release --lib (full cyclic-recursion sweep, can take hours)"
-  cargo test -p zkcoins-program-plonky2 --release --lib -- --test-threads=1
-fi
-
-if [ "$RUST_CHANGED" = "0" ]; then
-  echo "[pre-push] skipping coverage gate — no Rust/Cargo changes vs $REF_BASE."
-else
-  echo "[pre-push] cargo llvm-cov --release (MVP scope, 100% line + function gate)"
-  cargo llvm-cov --release -p server --show-missing-lines \
-    --ignore-filename-regex 'main\.rs|publisher\.rs|server_runtime\.rs|scanner_runtime\.rs|_tests\.rs$' \
-    --fail-under-lines 100 \
-    --fail-under-functions 100 \
-    -- --test-threads=1
-fi
+echo "[pre-push] cargo check --workspace --all-features"
+cargo check --workspace --all-features
 
 echo "[pre-push] all checks passed."
