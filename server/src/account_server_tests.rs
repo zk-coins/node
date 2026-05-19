@@ -10,7 +10,9 @@ use bitcoin::{
 };
 use lazy_static::lazy_static;
 use shared::{commitment::Commitment, ProofData};
-use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes, hash_bytes, hash_concat};
+use zkcoins_program::hash::{
+    digest_from_bytes, digest_to_bytes, hash_bytes, hash_concat, ZERO_HASH,
+};
 use zkcoins_program::types::MINTING_ADDRESS;
 
 lazy_static! {
@@ -1019,4 +1021,93 @@ fn test_send_coins_rejects_coin_queue_entry_without_commitment() {
         None,
     );
     assert_eq!(result.unwrap_err(), "Coin is missing commitment");
+}
+
+/// In-coin loop: when the off-circuit pre-check at
+/// `account_server.rs:419` rebuilds a source `CommitmentMerkleProofs`
+/// whose `commitment_root_mmr_sibling` does not match the actual
+/// MMR leaf for that source, `verify_commitment` returns false and
+/// `send_coins` surfaces "Source commitment not present in history
+/// MMR". This is the companion of
+/// `test_send_coins_rejects_tampered_source_proof_inclusion`: it
+/// closes the line-419 error branch the way the inclusion-proof
+/// test closes the line-416 branch, and it is the off-circuit
+/// defense-in-depth analogue of the in-circuit history-MMR check.
+///
+/// Construction: honest mint → `state.update` → recipient
+/// `receive_coin`, so the recipient's `coin_queue[0]` carries a
+/// well-formed `inclusion_proof` (line 416 passes) and the source
+/// commitment is genuinely indexed in `state.smt` / `state.mmr`
+/// (line-241 `get_mmr_inclusion_proof` lookup succeeds). Then
+/// overwrite `state.prev_mmr_root` with `ZERO_HASH` directly. The
+/// `get_merkle_proofs` builder reads that field verbatim into
+/// `commitment_root_mmr_sibling`, so the source CMP recomputes a
+/// leaf `hash_concat(commitment_root, ZERO_HASH)` that does not
+/// appear in `state.mmr`. The genuine MMR proof is still threaded
+/// through, so the recomputed root mismatches the actual history
+/// root and only the MMR half of `verify_commitment` rejects —
+/// leaving the line-416 SMT-out_coins-inclusion path untouched,
+/// which is exactly the branch line 419 is meant to gate.
+#[test]
+fn test_send_coins_rejects_source_commitment_missing_from_history_mmr() {
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    let mut server = AccountServer::new(Arc::clone(&state_arc));
+
+    let mut minting = TestAccountData::new_minting_account();
+    server.import_account(
+        minting.address,
+        Account {
+            proof: None,
+            coin_queue: vec![],
+            coin_history: SparseMerkleTree::new(),
+            balance: 10_000,
+        },
+    );
+
+    let recipient_data = TestAccountData::new_generic(&[43u8; 32], Network::Signet);
+    let recipient_addr = recipient_data.address;
+
+    let mut coin_proofs = minting
+        .execute_send_coins(&mut server, vec![Invoice::new(100, recipient_addr)])
+        .expect("mint send_coins");
+    state_arc
+        .lock()
+        .unwrap()
+        .update(
+            &coin_proofs
+                .iter()
+                .map(|x| x.commitment.clone().unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .expect("state.update");
+
+    server
+        .receive_coin(coin_proofs.pop().expect("at least one coin"))
+        .expect("recipient receive_coin");
+
+    // Desync `state.prev_mmr_root` from the actual history-MMR
+    // leaf. `get_merkle_proofs` writes this verbatim into source
+    // CMP's `commitment_root_mmr_sibling`, so the off-circuit
+    // `verify_commitment_root` recomputes a leaf that doesn't
+    // appear in `state.mmr` — without touching the out-coins SMT
+    // inclusion path that line 416 gates.
+    {
+        let mut state = state_arc.lock().unwrap();
+        state.prev_mmr_root = ZERO_HASH;
+    }
+
+    let current_pk = generate_test_public_key(&recipient_data.xpriv, 0);
+    let next_pk = generate_test_public_key(&recipient_data.xpriv, 1);
+    let result = server.send_coins(
+        vec![Invoice::new(1, digest_from_bytes(&[99u8; 32]))],
+        recipient_addr,
+        current_pk,
+        next_pk,
+        None,
+    );
+    assert_eq!(
+        result.unwrap_err(),
+        "Source commitment not present in history MMR",
+        "desynced `state.prev_mmr_root` must surface the off-circuit history-MMR rejection at account_server.rs:419",
+    );
 }
