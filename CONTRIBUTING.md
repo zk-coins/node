@@ -110,8 +110,8 @@ fix — never abandon a red CI run.
 
 - No force-pushes, even to side branches.
 - No `--no-verify` on commits.
-- No squashing by the agent — Cyrill squashes at merge time if needed.
-- Cyrill merges PRs; agents open them as drafts.
+- No squashing by the agent — the maintainer squashes at merge time if needed.
+- Maintainers merge PRs; agents open them as drafts.
 - Doc-only commits to `ROADMAP.md` / `SPEC.md` / `MIGRATION_RESEARCH.md`
   / `CONTRIBUTING.md` / `program-plonky2/CONTRIBUTING.md` that just
   correct or extend these files are not individually listed in
@@ -379,7 +379,7 @@ The pre-built ELF (`elf/zkcoins-program`) is committed to the repo, so Docker bu
 
 ## Persistent State
 
-The server writes the following files under its data volume (`/data` in the container, `zkcoins_server-data` Docker volume on dfxdev/dfxprd). Together they define the recoverable state:
+The server writes the following files under its data volume (`/data` in the container, `zkcoins_server-data` Docker volume on the DEV / PRD hosts). Together they define the recoverable state:
 
 | File                       | Format                         | Purpose                                                                                                                                |
 | -------------------------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
@@ -399,7 +399,7 @@ The server writes the following files under its data volume (`/data` in the cont
 If the DEV server gets into a bad state (panic loop, mint failures with `prev_commitment_pubkey required`, balance never rising after a successful mint, etc.), the recovery procedure is to wipe the data volume:
 
 ```bash
-# On the host running the server (e.g. dfxdev):
+# On the host running the server (DEV or PRD):
 docker stop zkcoins-server
 docker run --rm -v zkcoins_server-data:/data alpine sh -c 'rm -f /data/*.bin /data/*.bin.prev_root'
 docker start zkcoins-server

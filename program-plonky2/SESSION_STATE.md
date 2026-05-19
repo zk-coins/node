@@ -45,7 +45,7 @@ Tests, Analyze rust, Analyze actions, CodeQL, Coverage MVP scope).
   end-to-end in release mode.
 - Steps 8–9: ⏳ todo (App/Wallet integration + DEV deployment).
   Both require work outside this repo (`zk-coins/app` + deploy
-  pipelines + SSH access to dfxdev/dfxprd).
+  pipelines + SSH access to the DEV / PRD hosts).
 
 ## Smoke test verified
 
@@ -199,7 +199,7 @@ likely to be touched next" above.
 2. Steps 8–9 in [`../ROADMAP.md`](../ROADMAP.md): App/wallet Schnorr
    signing integration + DEV deployment + Signet end-to-end
    roundtrip. Both span repos outside this one (`zk-coins/app` plus
-   deploy pipelines / SSH to dfxdev/dfxprd).
+   deploy pipelines / SSH to the DEV / PRD hosts).
 3. ✅ done — empirical insights from the Stage 5d-next-5 aggregator
    work now live in
    [`../MIGRATION_RESEARCH.md` §7.22](../MIGRATION_RESEARCH.md#722-stage-5d-next-5-source-side-verification-via-aggregator-pattern--codified-resolves-721).

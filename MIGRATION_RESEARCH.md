@@ -14,7 +14,7 @@ Companion document to [`SPEC.md`](./SPEC.md). Summarises what we can take from t
 1. **`BitVM/zkCoins` is a 182-LOC IVC toy, not a zkCoins prototype.** It gives us a Plonky2 version pin and a cyclic-recursion code recipe, nothing more.
 2. **The real normative reference is `ShieldedCSV/ShieldedCSV`** — a non-circuit Rust implementation of the paper's PCD predicate.
 3. **Our current SP1 implementation has departed from the published protocol in 11 distinct ways.** Some are simplifications (Schnorr commitment on a Taproot inscription instead of half-aggregate nullifier publication), some are arguably regressions (recipient is plaintext `Address`, linkable across coins), some are missing features (fee output, conditional-noop on reorg).
-4. **Decision point for Robin / Cyrill:** Are we implementing _Shielded CSV as published_, or are we shipping a zkCoins MVP that intentionally diverges? Both are defensible; we just need to pick before we re-implement the circuit in Plonky2, otherwise we lock in design choices that aren't reviewable against any spec.
+4. **Decision point for the maintainers:** Are we implementing _Shielded CSV as published_, or are we shipping a zkCoins MVP that intentionally diverges? Both are defensible; we just need to pick before we re-implement the circuit in Plonky2, otherwise we lock in design choices that aren't reviewable against any spec.
 
 ---
 
