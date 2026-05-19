@@ -11,6 +11,18 @@ on:
         type: boolean
         default: false
 
+# Serialize DEV deploys per branch. Multiple develop pushes in quick
+# succession (e.g. three PRs merged back-to-back) used to fire three
+# parallel deploys that raced on `docker compose recreate` on the
+# host and left the zkcoins-server container half-renamed in
+# `Created` state, blocking the next `up -d` with a name conflict.
+# `cancel-in-progress: true` keeps the newest commit's deploy; the
+# older deploy is irrelevant the moment its commit is no longer the
+# branch tip.
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: true
+
 env:
   DOCKER_TAGS: zkcoin/server:beta
 
