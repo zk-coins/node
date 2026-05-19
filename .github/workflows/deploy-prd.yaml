@@ -5,6 +5,15 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Serialize PRD deploys. Unlike Deploy DEV (cancel-in-progress: true,
+# "newest commit wins") production deploys must NEVER be killed mid-
+# flight: cancelling halfway through `docker compose recreate` is
+# exactly what produced the half-renamed Created-state container
+# that took DEV down. Queue subsequent deploys instead.
+concurrency:
+  group: deploy-prd
+  cancel-in-progress: false
+
 env:
   DOCKER_TAGS: zkcoin/server:latest
 
@@ -51,3 +60,27 @@ jobs:
             -o ProxyCommand="cloudflared access ssh --hostname ${{ secrets.DEPLOY_PRD_HOST }}" \
             ${{ secrets.DEPLOY_PRD_USER }}@${{ secrets.DEPLOY_PRD_HOST }} \
             "zkcoins-server"
+
+      # Post-deploy smoke test: hit the public PRD endpoint until
+      # /api/info answers 200 or we give up. Mirrors the Deploy DEV
+      # post-deploy probe. Without this a runtime-bootstrap panic
+      # leaves the container Up-but-unresponsive on PRD while the
+      # workflow reports success — the exact failure mode that took
+      # DEV down silently before the Plonky2 migration fix.
+      - name: Smoke test public PRD endpoint
+        run: |
+          set -euo pipefail
+          URL="https://api.zkcoins.app/api/info"
+          for i in $(seq 1 30); do
+            code=$(curl -sS -o /tmp/info.json -w '%{http_code}' --max-time 10 "$URL" || echo "000")
+            if [ "$code" = "200" ]; then
+              echo "PRD /api/info responded 200 after ${i} attempt(s):"
+              cat /tmp/info.json
+              echo
+              exit 0
+            fi
+            echo "[$i/30] $URL -> ${code} (waiting 10 s)"
+            sleep 10
+          done
+          echo "::error::PRD /api/info never returned 200 within ~5 min after deploy"
+          exit 1
