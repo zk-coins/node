@@ -40,7 +40,7 @@ Despite the repo name, it contains **none** of: SMT, MMR, AccountState, Coin, Pr
 
 | Aspect | Decision | Why |
 | --- | --- | --- |
-| `plonky2 = "0.2.0"` version pin | **Adopt** | Same version Robin used; ecosystem-current. |
+| `plonky2 = "0.2.0"` version pin | **Adopt** | Same version as the upstream `BitVM/zkCoins` reference; ecosystem-current. |
 | `PoseidonGoldilocksConfig`, `D = 2` | **Adopt** | Standard Plonky2 recursion setup. Matches SPEC §12.1. |
 | `standard_recursion_config()` | **Adopt as starting point** | Re-evaluate gate budget once we know our N-coin fanout. |
 | `common_data_for_recursion()` two-pass build pattern | **Adopt with adaptation** | Plonky2 idiom to stabilise public-input count under cyclic recursion. Need to extend to our (prev account proof + N coin proofs) fanout. |
@@ -136,7 +136,7 @@ For a Plonky2 MVP shipping in weeks-not-months:
 
 - **Keep as deliberate simplifications (document in README + this file):** D1, D3, D5, D6, D11. These trade flexibility for shipping speed; explicitly call them out so reviewers know.
 - **Should-fix before mainnet:** D2 + D10 (privacy regression — recipient unlinkability is a stated zkCoins selling point), D7 (reorg safety — Bitcoin reorgs happen), D8 (soundness — receivers should be able to verify coin age locally).
-- **Discuss with Robin:** D4 (does the SMT+MMR scanner model actually give the same security properties as `ToSAcc` for our threat model?), D9 (cheap to add).
+- **Open / discuss with the maintainers:** D4 (does the SMT+MMR scanner model actually give the same security properties as `ToSAcc` for our threat model?), D9 (cheap to add).
 
 ---
 
@@ -408,8 +408,8 @@ commands run in background contexts. Captured in memory as
 
 ### 7.8 Reference repos: BitVM/zkCoins is a 182-LOC toy, ShieldedCSV/ShieldedCSV is the real one — **codified**
 
-**Re-stated for emphasis:** the `BitVM/zkCoins` repo Robin pointed us
-at is a Plonky2 IVC scaffold (182 LOC, no SMT/MMR/AccountState/Coin/
+**Re-stated for emphasis:** the upstream `BitVM/zkCoins` reference
+repo is a Plonky2 IVC scaffold (182 LOC, no SMT/MMR/AccountState/Coin/
 Schnorr/tests). The actual normative reference implementation is
 `github.com/ShieldedCSV/ShieldedCSV`. Our implementation diverges from
 the paper in 11 ways (see §3 of this doc / SPEC.md §15).

@@ -405,7 +405,7 @@ Plonky2 is bridge technology. Post-MVP (after step 9): Plonky3 evaluation. Field
 ### R1 — Plonky2 cyclic recursion correctness (high)
 **What can go wrong:** Step 5 fails because `circuit_digest` isn't stable between the two `common_data_for_recursion` passes, or the public-input layout in `add_verifier_data_public_inputs` is misaligned.
 **Mitigation:** Start step 5 with the simplest possible "I verify myself with a trivial payload" circuit before adding the real predicate. Validates the recursion plumbing in isolation.
-**Trigger to escalate:** if 1 day of debugging step 5 doesn't produce a verifying proof, ask Robin / the Plonky2 community.
+**Trigger to escalate:** if 1 day of debugging step 5 doesn't produce a verifying proof, escalate to the maintainers / the Plonky2 community.
 
 ### R2 — 1-second proof target unreachable on M3 Ultra (medium)
 **What can go wrong:** Real circuit with 1+8 recursive verifies is too large for sub-second proving on the target hardware.
