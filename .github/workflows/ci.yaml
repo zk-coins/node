@@ -10,8 +10,14 @@ on:
   # check list whenever the concurrency block cancelled the older
   # one. The push event already covers develop, and its run is
   # associated with the same SHA on the release PR.
+  #
+  # `ready_for_review` is added so the workflow fires the moment a
+  # draft PR is marked ready — drafts themselves skip CI via the
+  # `if:` guard on each job (saves self-hosted-runner time while
+  # work is still in progress).
   pull_request:
     branches: [develop]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
   group: ci-${{ github.event.pull_request.head.sha || github.sha }}
@@ -38,6 +44,8 @@ env:
 jobs:
   lint-and-build:
     name: Lint & Build
+    # Skip on draft PRs; downstream `needs:` jobs inherit the skip.
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
