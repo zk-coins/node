@@ -1,17 +1,30 @@
-//! Smoke test that exercises the runtime bootstrap end-to-end.
+//! Smoke tests that exercise the runtime bootstrap end-to-end.
 //!
 //! `server_runtime.rs` itself is excluded from the coverage scope (it
-//! binds a real socket and owns the process lifecycle), but its bootstrap
-//! path WAS the failure mode in the Plonky2 migration: an `assert_eq!`
-//! against `MINTING_ADDRESS` panicked the tokio worker that owned the
-//! HTTP listener while the scanner worker kept running. The container
-//! stayed `Up` for hours, Cloudflare served 502s, and no unit test
-//! caught it because no test ever ran the bootstrap path.
+//! binds a real socket and owns the process lifecycle), but its
+//! bootstrap path carries regressions that the 100% MVP-scope gate
+//! cannot catch. Each test here covers a specific failure mode that
+//! production has hit (or would hit on the next migration in the same
+//! class):
 //!
-//! This test spawns `start_rest_server` against an ephemeral port, waits
-//! for the listener to come up, and probes `/health`. A bootstrap panic
-//! (or any other early failure) manifests as a TCP connect timeout and
-//! the test fails with a clear diagnostic.
+//! - `start_rest_server_binds_and_serves_health` — the Plonky2-migration
+//!   outage. An `assert_eq!` against `MINTING_ADDRESS` panicked the
+//!   tokio worker that owned the HTTP listener while the scanner worker
+//!   kept running. Container stayed `Up`, Cloudflare served 502s for
+//!   hours. The test probes `/health`; a bootstrap panic manifests as
+//!   a TCP connect timeout and fails the test with a clear diagnostic.
+//!
+//! - `bootstrap_initial_minting_account_balance_is_goldilocks_safe` —
+//!   guards the `1u64 << 48` constant for the seeded minting balance.
+//!   `u64::MAX` (the pre-Plonky2 value) reduces mod the Goldilocks
+//!   prime inside the state-transition circuit and trips a
+//!   "wire set twice" panic on every mint. The test probes
+//!   `/api/balance?address=<MINTING_ADDRESS hex>` and asserts the
+//!   returned balance stays in the Goldilocks-safe range.
+//!
+//! Both tests share the same probe-port / spawn / wait / cleanup
+//! shape; once a third bootstrap test lands the duplicated setup is
+//! worth extracting into a helper.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
