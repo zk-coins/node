@@ -146,6 +146,14 @@ jobs:
       - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
+      # The `db_tests` added in PR-A1 use testcontainers to spin up a
+      # real Postgres 17 per test. The runner host has Docker (via
+      # Colima) available on PATH; fail fast with a readable error
+      # if it ever goes away, instead of letting the test suite die
+      # 5 minutes into the run with a hard-to-read bollard error.
+      - name: Verify Docker is reachable (testcontainers dependency)
+        run: docker info > /dev/null
+
       - name: Run server + shared tests (release, all features)
         run: cargo test -p server -p shared --release --all-features -- --test-threads=1
 
@@ -163,6 +171,12 @@ jobs:
 
       - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Coverage runs the same `db_tests` as `server-tests` and so
+      # needs Docker reachable for testcontainers. See the matching
+      # check in the `server-tests` job for the rationale.
+      - name: Verify Docker is reachable (testcontainers dependency)
+        run: docker info > /dev/null
 
       - name: Run llvm-cov (MVP scope, 100% line + function gate)
         run: |

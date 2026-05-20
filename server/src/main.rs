@@ -1,4 +1,5 @@
 mod account_server;
+mod db;
 mod publisher;
 mod scanner;
 mod scanner_runtime;

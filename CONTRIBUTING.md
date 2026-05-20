@@ -167,6 +167,41 @@ USERNAME_DOMAIN=test.zkcoins.local cargo run -p server
 # Server starts on http://0.0.0.0:4242
 ```
 
+## Local Development with Postgres
+
+The Postgres state-layer added in PR-A1 expects a running PostgreSQL
+instance to be reachable at `DATABASE_URL`. The module is not wired
+into the bootstrap yet (PR-A2 + PR-A3 land that), so you can develop
+without it — but to run the `db_tests` locally you do need either
+Docker available (the tests spin up a Postgres 17 container via
+`testcontainers-modules`) or a manually-started Postgres.
+
+Manual Postgres for ad-hoc query work:
+
+```bash
+docker run --name zkcoins-pg \
+  -e POSTGRES_PASSWORD=dev \
+  -p 5432:5432 \
+  -d postgres:17
+export DATABASE_URL=postgres://postgres:dev@localhost:5432/postgres
+
+# Apply the migrations against the running instance:
+cargo install sqlx-cli --no-default-features --features rustls,postgres
+cd server
+sqlx migrate run
+```
+
+Run the `db_tests` (Docker required, runs `postgres:17` per test):
+
+```bash
+cargo test -p server db -- --test-threads=1
+```
+
+The schema lives in `server/migrations/0001_initial.sql`. After
+changing it, drop the local database (`docker rm -f zkcoins-pg`) and
+re-run `sqlx migrate run` against a fresh instance — there is no
+`down` migration in the MVP, the migration set is forward-only.
+
 ## Setup
 
 After cloning, enable the repo's pre-push hook. The hook runs `cargo
