@@ -1,13 +1,21 @@
 # Session state — pickup notes for the next agent
 
+> **STATUS — SNAPSHOT OF PRE-MERGE STATE.** This file documents the
+> migration session state as of the PR
+> [#17](https://github.com/zk-coins/server/pull/17) merge on
+> 2026-05-18. Current work is on `develop`. The per-stage commit map
+> (below) and the lesson index remain useful as a historical pickup
+> reference; the "What's deferred to post-MVP" and "Next session"
+> sections are superseded by the Step 9 entries in [`../ROADMAP.md`](../ROADMAP.md).
+
 Read this first if you're picking up where the previous session
 left off.
 
-## Current branch + HEAD
+## Pre-merge branch state (historical)
 
-`feat/plonky2-migration`, latest commit on `origin`: see `git log`.
-PR [#17](https://github.com/zk-coins/server/pull/17) is the
-mergeable migration PR with all 6 CI checks passing (Lint & Build,
+`feat/plonky2-migration` → merged into `develop` via PR
+[#17](https://github.com/zk-coins/server/pull/17) on 2026-05-18
+21:50 UTC. All 6 CI checks were green at merge time (Lint & Build,
 Tests, Analyze rust, Analyze actions, CodeQL, Coverage MVP scope).
 
 ## Step status summary

@@ -1,3 +1,9 @@
+> **STATUS — DONE / HISTORICAL.** Step 4 + Step 5 both merged via PR
+> [#17](https://github.com/zk-coins/server/pull/17) on 2026-05-18. The
+> N1–N6 findings below are either addressed in the final monolithic
+> circuit (`circuit/main.rs`) or moot. This file is preserved as the
+> audit record from commit `fa2532f`. No action items remain.
+
 # Step 4 Critical Review
 
 Independent review of the Step 4 gadget set (`4a`, `4b`, `4c`, `4c+`,

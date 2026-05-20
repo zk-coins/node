@@ -2,15 +2,17 @@
 
 This guide covers everything you need to develop, test, and deploy the zkCoins backend.
 
-If you arrived here while working on the `feat/plonky2-migration` branch (or any of its successors), read § "Working on the Plonky2 Migration" *first* — it covers project invariants, the decision recipe for "should this go in the MVP?", a pre-push checklist, and the known foot-guns. The rest of this file is the long-standing dev guide for the `develop`/SP1 branch.
+The first section, "Working on the Plonky2 Migration", documents the project invariants, the decision recipe for "should this go in the MVP?", the pre-push checklist, and the known foot-guns. It applies to all work on `develop` after the 2026-05-18 SP1 → Plonky2 cutover. The rest of this file is the dev guide for day-to-day server work.
 
 ---
 
 ## Working on the Plonky2 Migration
 
 Canonical entry point for any session (agent or human) picking up the
-`feat/plonky2-migration` branch without prior context. Read this section,
-then dive into the linked documents in the order given below.
+codebase without prior context. The Plonky2 migration (PR [#17](https://github.com/zk-coins/server/pull/17))
+merged on 2026-05-18; this section captures the project invariants that
+survive the migration. Read this section, then dive into the linked
+documents in the order given below.
 
 ### Reading order
 
@@ -30,7 +32,7 @@ then dive into the linked documents in the order given below.
 ### Project invariants (non-negotiable)
 
 The five constraints below are decided and apply across every PR on
-this migration branch.
+`develop`.
 
 1. **Server-side compute architecture.** The server generates every ZK
    proof, holds every Merkle tree, broadcasts every Taproot inscription.
@@ -39,9 +41,9 @@ this migration branch.
    Poseidon, no wasm-Plonky2 verifier, no in-app ZK gadget.
 2. **Closed test environment** — DEV *and* PRD. No external users, no
    real money, no migration of existing state. Step 7 of the ROADMAP
-   deletes the SP1 path outright; no Cargo feature flag, no dual
-   backend. On cutover the server state files are wiped and the new
-   Plonky2 server starts fresh.
+   deleted the SP1 path outright; no Cargo feature flag, no dual
+   backend. At cutover (PR [#17](https://github.com/zk-coins/server/pull/17), 2026-05-18) the server state files
+   were wiped and the new Plonky2 server started fresh.
 3. **Hardware target: Mac Studio M3 Ultra, 96 GB unified RAM, single
    host.** All on-box compute resources are available (Performance +
    Efficiency cores, the integrated Apple GPU reachable via Metal,
@@ -56,8 +58,12 @@ this migration branch.
    not alternative. "Minimal" reduces the surface; "100%" keeps what
    remains clean. Gate: `cargo llvm-cov --fail-under-lines 100 -- --test-threads=1`
    from inside the affected crate. Current state on `program-plonky2`:
-   100% lines / functions / regions, 72 tests. See `ROADMAP.md`
-   § "Done" for the live test count and breakdown.
+   100% lines / functions / regions, 115 default-run tests (+ 2
+   `#[ignore]`d `recursion_shape_probe` diagnostics). The authoritative
+   coverage gate for `server` runs in CI on the self-hosted M3 Ultra
+   runner (`.github/workflows/ci.yaml`, `Coverage Gate` job, gated
+   behind the `ci:full` label on PRs). See `ROADMAP.md` § "Done" for
+   the live test count and breakdown.
 5. **Plonky2 is bridge tech; Plonky3 is the long-term destination.**
    But we do not preemptively adopt BabyBear / Poseidon2 inside this
    migration — see `MIGRATION_RESEARCH.md` §5 (decisions) and ROADMAP
@@ -95,7 +101,7 @@ the terminal on the suite.
 
 When touching `program-plonky2/` specifically, also run the local
 sweep + coverage gate **before** opening / updating the PR — the
-sweep is not in CI yet (open question 4 in issue #40):
+cyclic-recursion sweep is not in CI yet (decision tracked in [issue #50](https://github.com/zk-coins/server/issues/50)):
 
 ```bash
 cd program-plonky2
@@ -157,7 +163,7 @@ Condensed pointers into [`MIGRATION_RESEARCH.md`](./MIGRATION_RESEARCH.md) §7:
 ```bash
 git clone https://github.com/zk-coins/server.git
 cd server
-SP1_PROVER=mock cargo run -p server
+USERNAME_DOMAIN=test.zkcoins.local cargo run -p server
 # Server starts on http://0.0.0.0:4242
 ```
 
@@ -188,7 +194,8 @@ Wall budgets on warm cache:
 | Coverage gate (100% scope)     | + 60 min  | CI runner |
 
 When preparing a release PR to `main`, run the circuit sweep manually
-— it is not yet in CI (open question 4 in #40):
+— only the `server` + `shared` test sweep is gated in CI (decision
+on the cyclic sweep is tracked in [issue #50](https://github.com/zk-coins/server/issues/50)):
 
 ```bash
 cargo test -p zkcoins-program-plonky2 --release --lib -- --test-threads=1
@@ -203,7 +210,7 @@ before any main-merge.
 
 | Tool | Version | Purpose |
 |---|---|---|
-| Rust | 1.81+ | Build toolchain (pinned via `rust-toolchain`) |
+| Rust | nightly (pinned via `rust-toolchain`) | Required for Plonky2 (`feature(specialization)`) |
 | Bitcoin node | — | Required for blockchain scanning (or use Esplora API) |
 
 ## Project Structure
@@ -222,16 +229,19 @@ server/
 │   └── src/
 │       ├── lib.rs         # Types, key derivation, crypto helpers
 │       └── commitment.rs  # Schnorr commitment (sign + verify)
-├── program/               # SP1 zkVM circuit (Zero-Knowledge proof logic)
+├── program-plonky2/       # Plonky2 + Poseidon cyclic-recursion state-transition circuit
 │   └── src/
-│       ├── lib.rs         # Types: AccountState, Coin, ProofData, ProgramInputs
-│       ├── main.rs        # zkVM entrypoint (gated behind "zkvm" feature)
-│       └── merkle/        # SMT + MMR implementations
-├── script/                # Prover wrapper (stub for Docker, real SP1 for local)
-│   └── src/lib.rs         # Prover struct: create_account(), update_account()
-├── Cargo.toml             # Workspace root
-├── Dockerfile             # Multi-stage Rust build
-└── rust-toolchain         # Pinned Rust version (1.81.0)
+│       ├── lib.rs         # Prelude: F, C, D type aliases
+│       ├── hash.rs        # Poseidon HashDigest + byte conversions
+│       ├── types.rs       # AccountState, Coin, ProofData, MINTING_ADDRESS placeholder
+│       ├── inputs.rs      # ProgramInputs, CommitmentMerkleProofs
+│       ├── merkle/        # Poseidon-based SMT + MMR
+│       └── circuit/       # build_circuit + per-stage gadgets + aggregator
+├── script-plonky2/        # Host-side Plonky2 prover wrapper (zkcoins-prover-plonky2)
+│   └── src/lib.rs         # Prover struct: prove_initial / prove_account_update
+├── Cargo.toml             # Workspace root (nightly toolchain, no SP1 patches)
+├── Dockerfile             # Multi-stage Rust build (linux/arm64, FEATURES build-arg)
+└── rust-toolchain         # Pinned nightly date (matches program-plonky2)
 ```
 
 ## Git Workflow
@@ -277,7 +287,7 @@ update
 
 | Item | Convention | Example |
 |---|---|---|
-| Crate | kebab-case | `zkcoins-program` |
+| Crate | kebab-case | `zkcoins-program-plonky2` |
 | Module | snake_case | `account_server` |
 | Struct | PascalCase | `AccountState`, `CoinProof` |
 | Function | snake_case | `process_block`, `send_coins` |
@@ -297,7 +307,7 @@ let block = fetch_block(hash).unwrap();
 
 - Workspace dependencies in root `Cargo.toml` — individual crates reference `{ workspace = true }`
 - Pin exact versions for security-critical crates (`bitcoin`, `sha2`)
-- SP1 patches in `[patch.crates-io]` — only in the full workspace, removed in the Docker stub
+- `plonky2 = "1.1.0"` from crates.io; no `[patch.crates-io]` entries
 
 ## Architecture
 
@@ -305,7 +315,7 @@ let block = fetch_block(hash).unwrap();
 
 ```
 Client Request → Axum Router → server.rs (endpoint) → account_server.rs (logic)
-                                                          ├── Prover (stub/SP1)
+                                                          ├── Prover (Plonky2)
                                                           ├── State (SMT + MMR)
                                                           └── Publisher (Bitcoin)
 ```
@@ -324,9 +334,12 @@ struct Account {
 }
 ```
 
-**Prover abstraction:** The `Prover` trait has two implementations:
-- **Stub** (`script/src/lib.rs`) — returns mock proofs, compiles without SP1 toolchain
-- **Real SP1** — requires the `succinct` Rust toolchain and SP1 SDK (not used in Docker)
+**Prover:** `zkcoins_prover_plonky2::Prover` (in `script-plonky2/src/lib.rs`)
+wraps the cyclic state-transition circuit. `Prover::new()` builds the
+circuit once; `prove_initial` / `prove_account_update` (with their
+`_with_in_coins` / `_with_in_and_out_coins_and_sources` variants) drive
+individual transitions. No mock/stub backend — the only build is the
+Plonky2 prover.
 
 ### Bitcoin Integration
 
@@ -342,25 +355,25 @@ The publisher (`publisher.rs`) creates Taproot Inscriptions:
 - Data split into 520-byte chunks (max push size)
 - Broadcasts via Esplora API
 
-### SP1 zkVM Circuit
+### Plonky2 State-Transition Circuit
 
-The `program/` crate defines the Zero-Knowledge proof logic. It compiles to two targets:
-
-| Target | Feature | Use |
-|---|---|---|
-| Native (x86/ARM) | default (no `zkvm`) | Library — types and Merkle trees used by server |
-| RISC-V (SP1) | `zkvm` | zkVM binary — actual proof execution |
-
-The `zkvm` feature gates the SP1 entrypoint and all `sp1_zkvm::` calls.
+The `program-plonky2/` crate defines the Zero-Knowledge proof logic.
+The full SPEC §8 predicate (cyclic recursion, MMR + SMT inclusion,
+in-coin source-side aggregator pattern from Stage 5d-next-5, out-coin
+identifier derivation, pubkey rotation) lives in `circuit/main.rs`.
+`MAX_IN_COINS = MAX_OUT_COINS = 8`. See
+[`MIGRATION_RESEARCH.md` §7.22](./MIGRATION_RESEARCH.md#722-stage-5d-next-5-source-side-verification-via-aggregator-pattern--codified-resolves-721)
+for the architecture writeup and `program-plonky2/SESSION_STATE.md`
+for the historical pickup record.
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `SP1_PROVER` | `mock` | `mock` (no proof), `cpu`, `cuda`, or `network` |
 | `ESPLORA_URL` | `https://mutinynet.com/api` | Esplora API endpoint (electrs or public) |
 | `IS_MAINNET` | `false` | `true` for Bitcoin Mainnet, `false` for Mutinynet/Signet |
-| `NETWORK_NAME` | `Mutinynet` | Human-readable network name (returned by `/api/info`) |
+| `NETWORK_NAME` | `Mutinynet` / `Mainnet` | Human-readable name returned by `/api/info` |
+| `USERNAME_DOMAIN` | _(required, no default)_ | External hostname returned by `/api/info`; server panics on startup if unset (see PR [#36](https://github.com/zk-coins/server/pull/36) for the regression that introduced the global panic hook) |
 | `PUBLISHER_KEY` | test key | 32-byte hex private key for inscription publishing. **Required on mainnet** |
 | `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
 
@@ -370,12 +383,12 @@ The `zkvm` feature gates the SP1 entrypoint and all `sp1_zkvm::` calls.
 docker build -t zkcoin/server .
 docker run -p 4242:4242 \
   --network bitcoin \
-  -e SP1_PROVER=mock \
   -e ESPLORA_URL=http://electrs-mainnet:3000 \
+  -e USERNAME_DOMAIN=zkcoins.app \
   zkcoin/server
 ```
 
-The pre-built ELF (`elf/zkcoins-program`) is committed to the repo, so Docker builds do not require the Succinct toolchain — only standard Rust.
+Docker builds use nightly Rust auto-installed via the workspace `rust-toolchain` — no Succinct toolchain, no zkVM target.
 
 ## Persistent State
 
