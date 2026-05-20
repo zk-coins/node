@@ -20,7 +20,14 @@ on:
   # label triggers (or removes) the heavy self-hosted-runner jobs
   # on demand — see the `server-tests` job below.
   pull_request:
-    branches: [develop]
+    # `develop` is the long-lived integration branch. `feat/postgres-**`
+    # is a temporary glob for the 3-PR Postgres-migration stack (PR-A1,
+    # PR-A2, PR-A3) where each PR uses the previous one as its base.
+    # Without the glob, only the bottom PR of the stack would get CI
+    # runs — the upper two would silently skip because their base is
+    # a feature branch, not develop. Remove the glob once the stack
+    # has fully landed on develop.
+    branches: [develop, 'feat/postgres-**']
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
 concurrency:
