@@ -261,14 +261,14 @@ async fn connect_and_migrate_propagates_migration_failure() {
     // This is the only sqlx-native way to force a deterministic
     // migration error without writing a second `.sql` file solely
     // for the test (which would itself drift from the real schema).
-    let (pool, _container) = setup_pool().await;
+    let (pool, container) = setup_pool().await;
     sqlx::query("UPDATE _sqlx_migrations SET checksum = $1")
         .bind(vec![0u8; 32])
         .execute(&pool)
         .await
         .unwrap();
-    let host = _container.get_host().await.unwrap();
-    let port = _container.get_host_port_ipv4(5432).await.unwrap();
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
     let err = connect_and_migrate(&url)
         .await
