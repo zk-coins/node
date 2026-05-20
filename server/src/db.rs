@@ -30,8 +30,6 @@
 // later failure mode for schema drift, which the tests catch on the
 // first run.
 
-#![allow(dead_code)]
-
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
 /// Connect to `url` and run every migration in `./migrations` against
@@ -148,6 +146,7 @@ pub async fn persist_state_tx(
 ///
 /// Used at boot in PR-A3 to rebuild the in-memory `AccountServer`
 /// map. Returns an empty vector if the table is empty.
+#[allow(dead_code)] // wired up in PR-A3
 pub async fn load_all_accounts(pool: &PgPool) -> Result<Vec<(Vec<u8>, Vec<u8>)>, sqlx::Error> {
     let rows: Vec<(Vec<u8>, Vec<u8>)> =
         sqlx::query_as("SELECT address, data FROM accounts ORDER BY address")
@@ -159,6 +158,7 @@ pub async fn load_all_accounts(pool: &PgPool) -> Result<Vec<(Vec<u8>, Vec<u8>)>,
 /// Upsert a single account row. The bincode blob in `data` is
 /// considered authoritative — concurrent writers must serialize at
 /// the application layer (`Arc<Mutex<AccountServer>>` in main.rs).
+#[allow(dead_code)] // wired up in PR-A3
 pub async fn upsert_account(pool: &PgPool, address: &[u8], data: &[u8]) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO accounts (address, data, updated_at) \
@@ -176,6 +176,7 @@ pub async fn upsert_account(pool: &PgPool, address: &[u8], data: &[u8]) -> Resul
 // ---- Username persistence (PR-A3) -----------------------------------------
 
 /// Load every `(name, address)` pair from the `usernames` table.
+#[allow(dead_code)] // wired up in PR-A3
 pub async fn load_all_usernames(pool: &PgPool) -> Result<Vec<(String, Vec<u8>)>, sqlx::Error> {
     let rows: Vec<(String, Vec<u8>)> =
         sqlx::query_as("SELECT name, address FROM usernames ORDER BY name")
@@ -188,6 +189,7 @@ pub async fn load_all_usernames(pool: &PgPool) -> Result<Vec<(String, Vec<u8>)>,
 /// fresh claim, `Ok(false)` if the name is already taken (no row
 /// inserted, existing row left untouched). The `ON CONFLICT DO
 /// NOTHING` makes this race-free at the SQL level.
+#[allow(dead_code)] // wired up in PR-A3
 pub async fn claim_username(
     pool: &PgPool,
     name: &str,
@@ -207,6 +209,7 @@ pub async fn claim_username(
 
 /// Resolve a username to its bound address. Returns `Ok(None)` if
 /// the name is not registered.
+#[allow(dead_code)] // wired up in PR-A3
 pub async fn resolve_username(pool: &PgPool, name: &str) -> Result<Option<Vec<u8>>, sqlx::Error> {
     let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT address FROM usernames WHERE name = $1")
         .bind(name)
