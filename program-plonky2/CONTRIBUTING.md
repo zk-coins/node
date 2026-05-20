@@ -10,14 +10,15 @@ carries its own toolchain pin.
 > crate, but the rules in the repo-root CONTRIBUTING constrain what you
 > may change here.
 
-## Why this crate is standalone
+## Toolchain
 
 Plonky2 1.1.0 requires nightly Rust because `plonky2_field` uses
-`#![feature(specialization)]`. The rest of the zkCoins workspace is
-pinned to stable 1.81.0 for SP1 compatibility. To avoid forcing nightly
-on the whole workspace during the migration, this crate is excluded
-from `members` in the root `Cargo.toml` (`exclude = ["program-plonky2"]`)
-and has its own `rust-toolchain.toml`.
+`#![feature(specialization)]`. After PR [#17](https://github.com/zk-coins/server/pull/17)
+the entire workspace was unified to nightly (root `rust-toolchain`
+matches `program-plonky2/rust-toolchain.toml`), so this crate is a
+regular workspace member rather than the excluded standalone it was
+during the migration. Cargo commands work from the workspace root or
+from inside `program-plonky2/`.
 
 ## First-time setup
 
@@ -139,9 +140,12 @@ program-plonky2/
     │   └── merkle_mountain_range.rs # off-circuit Poseidon MMR
     └── circuit/
         ├── mod.rs
-        ├── util.rs       # swap_if shared helper (pub(crate))
-        ├── mmr.rs        # in-circuit MMR inclusion gadget
-        └── smt.rs        # in-circuit SMT inclusion + non-inclusion verify
+        ├── util.rs                    # swap_if shared helper (pub(crate))
+        ├── mmr.rs                     # in-circuit MMR inclusion gadget
+        ├── smt.rs                     # in-circuit SMT inclusion + non-inclusion + insert
+        ├── main.rs                    # monolithic StateTransitionCircuit (cyclic recursion)
+        ├── source_aggregator.rs       # Stage 5d-next-5 per-slot source aggregator (non-cyclic)
+        └── recursion_shape_probe.rs   # diagnostic probes for Plonky2 1.1.0 shape blockers
 ```
 
 ## Adding a new gadget
@@ -172,11 +176,16 @@ The established pattern (see `circuit/mmr.rs` and `circuit/smt.rs`):
 
 ## CI integration
 
-The root workspace's CI (`.github/workflows/ci.yaml`) does NOT currently
-build or test this crate, because it requires a different toolchain.
-Adding a parallel job that runs `(cd program-plonky2 && cargo build &&
-cargo clippy && cargo test -- --test-threads=1)` is on the roadmap
-(step 5+) — defer until the circuit lands so CI runtime stays sub-10-min.
+The root workspace's CI (`.github/workflows/ci.yaml`) clippies this
+crate's libs as part of `Lint & Build` (the only required check on
+`develop` per PR [#48](https://github.com/zk-coins/server/pull/48)).
+The cyclic-recursion test sweep at production parameters (~22 cyclic
+tests × 3–15 min each) is NOT in CI — `Server + Shared Tests` runs
+`-p server -p shared` only. Decision on whether/how to gate the sweep
+in CI is tracked in [issue #50](https://github.com/zk-coins/server/issues/50);
+until that lands, contributors run the sweep locally before opening /
+updating a PR that touches this crate (see
+[`../CONTRIBUTING.md`](../CONTRIBUTING.md) § "Pre-push checklist").
 
 ## Common pitfalls
 

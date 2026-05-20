@@ -1,8 +1,10 @@
 # Plonky2 Migration Roadmap
 
-Living tracker for the SP1 → Plonky2 + Poseidon migration on branch
-`feat/plonky2-migration`. **Updated on every commit to this branch** — if
-this file is stale relative to recent commits, that is a bug.
+Living tracker for the SP1 → Plonky2 + Poseidon migration. **Updated on
+every commit to `develop`** — if this file is stale relative to recent
+commits, that is a bug. The migration PR ([#17](https://github.com/zk-coins/server/pull/17))
+merged 2026-05-18; Steps 1–8 are done and Step 9 is partially done
+(DEV live, signet e2e roundtrip + R2 performance measurement remain).
 
 Source documents:
 
@@ -36,10 +38,10 @@ person-days at full focus; multiply for part-time work.
 | 6 | `script-plonky2/` host-side prover wrapper | ✅ done (`d96bb62`) | — | — |
 | 7 | Server: **replace** SP1 path with Plonky2 (no feature flag, no dual backend) | ✅ done — `send_coins` performs **in-circuit source-side validation via Stage 5d-next-5 Phase 2 aggregator** (PR [#23](https://github.com/zk-coins/server/pull/23)); off-circuit pre-checks retained as defense-in-depth (microsecond-level fast-fail before the minute-scale prove). Initial server cut (`c71c9fc`) ran off-circuit-only because Phase 2 was deferred; the in-circuit wiring landed via the Step-7 follow-up. Dockerfile re-introduced (`dac0179`). 106 server tests pass on the MVP build, 119 with `--all-features` (32 baseline + 10 inline error-path in `d6a3cb9` + 64 ported SP1-era fixtures re-enabled in `account_server_tests.rs` / `server_tests.rs` + 13 feature-gated). Smoke-test verified end-to-end (`cargo run` + `/health` + `/api/info`, block scanner connects). | — | — |
 | 8 | App / wallet: Schnorr-signing boundary, server-API integration | ✅ done — `zk-coins/app` ships `wasm.createCommitment(xpriv, num_pubkeys, asth_hex, ocr_hex)` (in `app/rust/client/src/lib.rs`) signing `SHA256(asth ‖ ocr)` via BIP-340 Schnorr (D11). Two-phase send: `/api/send` (Phase 1, proof) → `/api/commit` (Phase 2, signature). API client in `app/src/lib/api/client.ts` covers `info` / `balance` / `send` / `commit` / `mint` / `username/*` endpoints exactly matching server routes registered at `server/src/server.rs:1261–1289`. WASM mock + Vitest coverage gate already enforced in app repo. | — | — |
-| 9 | DEV deployment + end-to-end roundtrip on signet | 🟡 infra ready — `Dockerfile` (`dac0179`) builds `zkcoin/server:beta` for `linux/arm64`; `.github/workflows/deploy-dev.yaml` auto-builds + pushes to Docker Hub on push to `develop`, then deploys via cloudflared-tunnel SSH to DEV. **Remaining:** ① merge PR [#17](https://github.com/zk-coins/server/pull/17) (user merges); ② verify auto-deploy lands on `dev-app.zkcoins.app`; ③ e2e roundtrip (create account → mint → send → receive) on signet; ④ real performance measurement on M3 Ultra (R2 budget: warm ≤ 5 s, ideal ≤ 1 s; cold ≤ 30 s; peak mem < 64 GB). | 3–5 d | medium |
+| 9 | DEV deployment + end-to-end roundtrip on signet | 🟡 DEV live — PR [#17](https://github.com/zk-coins/server/pull/17) merged 2026-05-18 21:50 UTC; auto-deploy via `.github/workflows/deploy-dev.yaml` landed `zkcoin/server:beta` on `dev-api.zkcoins.app`. `/health` → 200 `ok`; `/api/info` → 200 with `{network:"Mutinynet", capabilities:{address_list, faucet, usernames, lnurl: true}, username_domain:"dev.zkcoins.app"}`. Bootstrap-unblock fix in PR [#36](https://github.com/zk-coins/server/pull/36) (explicit `MINTING_ADDRESS` override + global panic hook + smoke test + deploy-dev post-curl-retry; see [`MIGRATION_RESEARCH.md` §7.23](./MIGRATION_RESEARCH.md#723-minting_address-panic-in-tokiospawn-task-swallows-server-bootstrap--mediumcodified)). Deploy concurrency guards + PRD smoke test in PR [#51](https://github.com/zk-coins/server/pull/51). **Remaining:** ① e2e roundtrip (create account → mint → send → receive) on signet from `dev.zkcoins.app`; ② R2 measurement on M3 Ultra (warm ≤ 5 s, ideal ≤ 1 s; cold ≤ 30 s; peak mem < 64 GB); ③ reactive: redesign per R2 if the budget is missed. | 2–4 d | medium |
 | — | Pre-mainnet blockers: D2/D10 (recipient hiding), D7 (reorg safety), D8 (per-coin nullifier-accum) | ⏳ todo | **+2–3 weeks** | high (real protocol redesign) |
 
-**MVP status:** Steps 1–8 ✅ done. Step 9 infra ready, gated on user-driven merge + DEV verification + performance measurement on M3 Ultra. **Remaining engineering effort: 0 d** for the migration itself; **remaining ops effort: ~3–5 d** for merge → auto-deploy → e2e probes → R2 budget check. If the R2 budget holds on first measurement, the migration is complete and the project moves to the pre-mainnet hardening track.
+**MVP status:** Steps 1–8 ✅ done. Step 9 partially done — DEV is live and serving traffic; signet e2e roundtrip and the R2 performance measurement on M3 Ultra remain. **Remaining engineering effort: 0 d** for the migration itself; **remaining ops effort: ~2–4 d** for the e2e probe campaign + R2 budget check. If the R2 budget holds on first measurement, the migration is complete and the project moves to the pre-mainnet hardening track.
 
 ### Definition of "MVP"
 
@@ -139,8 +141,9 @@ rather than carrying its own perpetually-uncovered branch.
 
 ## In Progress
 
-**Step 5 — Monolithic state-transition circuit** (🟡, broken into five
-stages so each lands as its own reviewable commit on the branch):
+**Step 5 — Monolithic state-transition circuit** (✅ done, broken into
+stages, each landed as its own reviewable commit; preserved below as
+the historical record):
 
 - **5a — recursion plumbing PoC** ✅ done in [`83fa0c1`](./../../commit/83fa0c1),
   superseded by 5b. `circuit/main.rs` skeleton with
@@ -322,8 +325,8 @@ Each stage carries the 100 % line coverage gate before commit.
 
 ## Next (in order)
 
-### Step 5 — Monolithic state-transition circuit — 🟡 **in progress** (see *In Progress* above)
-**Effort:** 3–5 days.
+### Step 5 — Monolithic state-transition circuit — ✅ done (see *In Progress* above for the historical breakdown)
+**Effort:** 3–5 days (actual).
 **Files:** `program-plonky2/src/circuit/main.rs` (new) — the equivalent of `program/src/main.rs`.
 **Scope:** assemble all gadgets into the full circuit; implement Initial vs. AccountUpdate branch via `conditionally_verify_cyclic_proof_or_dummy`; fix `MAX_IN_COINS = 8`; pin `vk` via `add_verifier_data_public_inputs`; commit `ProofData` as 16-element public output.
 **Test plan (100% coverage gate applies):**
@@ -363,18 +366,16 @@ Each stage carries the 100 % line coverage gate before commit.
 **Test gate:** existing Vitest coverage gate in `zk-coins/app` (per that repo's CONTRIBUTING.md). No new gate.
 **Remaining open question for Step 9 verification:** that `signature_verifies_after_app_send` lands as an e2e probe against the live DEV server. This is part of Step 9, not Step 8.
 
-### Step 9 — DEV deployment + e2e — 🟡 infra ready, waiting on merge + verification
-**Infrastructure status:**
-  - `Dockerfile` (`dac0179`) — multi-stage build, `linux/arm64`, optional `FEATURES` build-arg; DEV image bakes `address-list,faucet,usernames,lnurl`.
-  - `.github/workflows/deploy-dev.yaml` — on push to `develop`, builds + pushes `zkcoin/server:beta` to Docker Hub, then deploys to DEV host via cloudflared-tunnel SSH. Optional `reset_state` workflow_dispatch wipes blockchain state for a clean re-mint.
-  - Endpoint surface verified: every wallet call in `app/src/lib/api/client.ts` matches a route registered in `server/src/server.rs:1257–1289`.
-**Remaining (user-driven):**
-  1. Merge PR #17 (`feat/plonky2-migration` → `develop`). Per repo convention the user merges; CI/auto-deploy take over from there.
-  2. Auto-deploy lands `zkcoin/server:beta` on the DEV host; verify `/health` and `/api/info` return 200 and the new capabilities object.
-  3. e2e roundtrip on signet from `dev-app.zkcoins.app`: create account → mint → send → recipient receives. One happy-path + one failure-path per route per Step-9 success criteria.
-  4. Real performance measurement on the M3 Ultra. R2 budget: warm proof ≤ 5 s, ideally ≤ 1 s; cold-start (first-proof after boot) ≤ 30 s including circuit-data load; peak mem < 64 GB during proving. Plonky2 currently runs CPU-only on Apple Silicon (no Metal backend); that's the operative baseline.
-  5. If budget is missed: redesign per R2 (reduce `MAX_IN_COINS`, drop in-coin recursion, or switch to folding). **NOT** add external hardware or move to a cloud prover — the closed-environment + single-host constraint is non-negotiable.
-**Test plan:** existing `cargo llvm-cov` gate (run by the pre-push hook, `.githooks/pre-push`) is the unit-coverage authority; Step 9 verifies integration, not unit coverage. e2e success criterion: every endpoint round-trips under realistic conditions (one happy-path traversal per route plus at least one failure path per route).
+### Step 9 — DEV deployment + e2e — 🟡 DEV live, e2e + R2 pending
+**Done:**
+  - PR [#17](https://github.com/zk-coins/server/pull/17) merged 2026-05-18 21:50 UTC. Auto-deploy via `.github/workflows/deploy-dev.yaml` pushed `zkcoin/server:beta` to Docker Hub and deployed to the DEV host. Bootstrap fix in PR [#36](https://github.com/zk-coins/server/pull/36) (explicit `MINTING_ADDRESS` override + global panic hook + smoke test + deploy-dev post-curl-retry — see [`MIGRATION_RESEARCH.md` §7.23](./MIGRATION_RESEARCH.md#723-minting_address-panic-in-tokiospawn-task-swallows-server-bootstrap--mediumcodified)).
+  - `https://dev-api.zkcoins.app/health` → 200 `ok`; `https://dev-api.zkcoins.app/api/info` → 200 with `{network:"Mutinynet", capabilities:{address_list, faucet, usernames, lnurl: true}, username_domain:"dev.zkcoins.app"}`.
+  - Deploy hardening: PR [#51](https://github.com/zk-coins/server/pull/51) added deploy-dev + deploy-prd concurrency guards and a PRD smoke test.
+**Remaining:**
+  1. e2e roundtrip on signet from `dev.zkcoins.app`: create account → mint → send → recipient receives. Success criterion: one happy-path + one failure-path per route. Tracked via a follow-up GitHub issue.
+  2. Real performance measurement on the M3 Ultra. R2 budget: warm proof ≤ 5 s, ideally ≤ 1 s; cold-start ≤ 30 s including circuit-data load; peak mem < 64 GB during proving. Plonky2 currently runs CPU-only on Apple Silicon (no Metal backend); that's the operative baseline.
+  3. If budget is missed: redesign per R2 (reduce `MAX_IN_COINS`, drop in-coin recursion, or switch to folding). **NOT** add external hardware or move to a cloud prover — the closed-environment + single-host constraint is non-negotiable.
+**Test plan:** the authoritative coverage gate runs in CI on the self-hosted M3 Ultra runner (`.github/workflows/ci.yaml`, jobs `Server + Shared Tests` and `Coverage Gate`, gated behind the `ci:full` label per PR [#48](https://github.com/zk-coins/server/pull/48)); the pre-push hook only enforces fmt + clippy + `cargo check`. Step 9 verifies integration, not unit coverage. e2e success criterion: every endpoint round-trips under realistic conditions (one happy-path traversal per route plus at least one failure path per route).
 **Risk:** Medium. First real exposure of the cyclic-recursive prover to production hardware under realistic load. If the budget holds, MVP is done.
 
 ---

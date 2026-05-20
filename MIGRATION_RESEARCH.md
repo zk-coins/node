@@ -1256,6 +1256,61 @@ the fixed-point iteration in `common_data_for_recursion_c_inner` then
 needs `ConstantGate::new(2)` injection in pass 3 and
 `pad_bits = outer_degree - 1` to converge.
 
+### 7.23 `MINTING_ADDRESS` panic in `tokio::spawn`-ed task swallows server bootstrap — **MEDIUM, codified**
+
+**Discovered:** first auto-deploy of `zkcoin/server:beta` on the DEV
+host post-PR [#17](https://github.com/zk-coins/server/pull/17). The
+container started, the REST server bound `0.0.0.0:4242`, but
+`https://dev-api.zkcoins.app/health` returned Cloudflare 502 for hours.
+`docker compose ps` showed the container as `Up (unhealthy)` — the
+tokio worker that owned the HTTP listener panicked on every cold boot
+after the Plonky2 migration, while the block-scanner worker kept
+processing blocks. No restart, no monitor, no visible failure in
+`docker logs`.
+
+**Root cause:** the Plonky2 migration moved `MINTING_ADDRESS` to a
+well-known constant (`hash_bytes(b"zkcoins:minting-address:placeholder:v1")`
+in `program-plonky2/src/types.rs`). The SP1-era `ClientAccount::new`
+in `server` still derived `address` from the privkey's first child
+pubkey; the `assert_eq!` in `start_rest_server` between the two could
+never hold again. **And** a panic inside a `tokio::spawn`-ed task by
+default only kills the task — the process happily continued in zombie
+state for 8 h with the listener dead and the scanner alive.
+
+**Fix (PR [#36](https://github.com/zk-coins/server/pull/36)):**
+
+1. **Explicit `MINTING_ADDRESS` override** passed from `main.rs` into
+   `AccountServer::new`, so the same constant flows through both the
+   prover circuit and the runtime state. Matches the pattern already
+   used in `server_tests.rs::TestAccountData::new_minting_account`.
+2. **Global panic hook** installed at the top of `main.rs::main` that
+   runs the default reporter and then `exit(1)`. Any future tokio
+   worker panic now crash-loops the container via `restart:
+   unless-stopped` instead of becoming a silent zombie.
+3. **Integration smoke test** (`start_rest_server_binds_and_serves_health`)
+   that spawns `start_rest_server` against an ephemeral port and probes
+   `/health` over real TCP. `server_runtime.rs` was excluded from the
+   coverage scope, so the bootstrap path that exploded had no test at
+   all. ~22 s warm; runs in the standard test sweep.
+4. **deploy-dev post-curl-retry** in `.github/workflows/deploy-dev.yaml`:
+   up to 30 × 10 s polls of `https://dev-api.zkcoins.app/api/info` after
+   the ssh deploy. A green "Build and deploy to DEV" with a broken
+   upstream is no longer possible — the workflow fails, the auto-release
+   PR loses its green check, and the regression surfaces immediately
+   instead of hours later. Mirrored to deploy-prd in PR [#51](https://github.com/zk-coins/server/pull/51).
+
+**Lesson:** in async server code, NEVER let a spawned task panic
+silently. Either install a global panic hook (the cheap fix taken
+here) or wrap every spawned future in a `Result`-returning closure
+that explicitly propagates the panic to the main task via a watcher
+channel. The deploy workflow must also probe the public health
+endpoint before declaring success — `docker compose up -d` exiting 0
+is a build-time signal, not a runtime-readiness signal.
+
+**Regression guard:** the smoke test fires on every test sweep; the
+deploy-dev post-curl-retry fires on every DEV deploy. A regression
+that brings back the silent-panic shape fails one or both gates.
+
 ---
 
 ## 8. Local Artifacts

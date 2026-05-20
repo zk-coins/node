@@ -1,3 +1,14 @@
+> **STATUS — DONE / HISTORICAL — SUPERSEDED BY STAGE 5D-NEXT-5.**
+> Stage 5d-next-4 was deferred per [`../MIGRATION_RESEARCH.md`](../MIGRATION_RESEARCH.md) §7.21
+> (two Plonky2 1.1.0 shape blockers). The work was completed under
+> Stage 5d-next-5 (PR [#23](https://github.com/zk-coins/server/pull/23))
+> using the **aggregator pattern (Option B below)**, not the
+> originally-recommended Option A. See [`../MIGRATION_RESEARCH.md`](../MIGRATION_RESEARCH.md) §7.22
+> for the empirical resolution (`ConstantGate::new(2)` injection +
+> `helper_degree = pad_bits + 1`). All 11 SPEC §13 negatives are now
+> covered. This file is the design sketch preserved as the historical
+> record.
+
 # Stage 5d-next-4 design — source-side verification for in-coins
 
 Read-only design document for the deferred 5d-next-4 work. Captures

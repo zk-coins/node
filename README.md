@@ -286,7 +286,7 @@ docker run -p 4242:4242 \
   zkcoin/server
 ```
 
-Docker builds use standard nightly Rust (no external toolchain needed). The Dockerfile is being re-introduced as part of Step 9 (DEV deployment); the SP1-era Dockerfile was removed in the migration since the new build uses workspace-standard nightly with no zkVM target.
+Docker builds use nightly Rust auto-installed via `rust-toolchain` (no external toolchain needed). The Dockerfile lives at the repo root; `.github/workflows/deploy-dev.yaml` builds `zkcoin/server:beta` for `linux/arm64` and deploys to the DEV host on every push to `develop`.
 
 ## CI/CD
 
@@ -308,9 +308,9 @@ Current cyclic-recursion proof times at production parameters (`MAX_IN_COINS = M
 
 ## Open Tasks
 
-- [ ] Step 7 final: Prover-API integration in `account_server::send_coins` after Stage 5d-next-5 merge (issue [#19](https://github.com/zk-coins/server/issues/19))
-- [ ] Step 8: app / wallet integration (Schnorr signing boundary)
-- [ ] Step 9: DEV deployment + signet end-to-end roundtrip + Dockerfile rewrite
+- [ ] Step 9: signet end-to-end roundtrip against `dev.zkcoins.app` (create account → mint → send → receive)
+- [ ] Step 9: R2 performance measurement on the M3 Ultra (warm proof ≤ 5 s target ≤ 1 s; cold ≤ 30 s; peak mem < 64 GB)
+- [ ] Pre-mainnet hardening: D2/D10 (hiding recipient), D7 (reorg safety), D8 (per-coin nullifier-accum) — see `SPEC.md` §15
 - [ ] Explorer endpoints (`/api/stats`, `/api/nullifiers`)
 - [ ] Light client support
 
@@ -330,10 +330,10 @@ Current cyclic-recursion proof times at production parameters (`MAX_IN_COINS = M
 | [`BITVM_BRIDGE.md`](./BITVM_BRIDGE.md)                  | BTC ↔ zkCoins trustless mint/burn bridge — landscape, BitVM2 / Glock / Mosaic comparison, N=100 federation target | Draft  |
 | [`BRIDGE_MVP.md`](./BRIDGE_MVP.md)                      | Engineering spec for the bridge MVP — 8 phases, file-by-file, 5–7 months effort estimate                       | Draft  |
 
-These documents describe the bridge and swap roadmap. They
-presuppose the Plonky2 migration currently on `feat/plonky2-migration`
-(PR #17) and cross-reference `SPEC.md`, `MIGRATION_RESEARCH.md`, and
-`ROADMAP.md`, which currently live on that branch.
+These documents describe the bridge and swap roadmap. They build on
+the Plonky2 migration that landed via PR [#17](https://github.com/zk-coins/server/pull/17)
+on 2026-05-18 and cross-reference `SPEC.md`, `MIGRATION_RESEARCH.md`,
+and `ROADMAP.md`.
 
 ## Protocol
 
