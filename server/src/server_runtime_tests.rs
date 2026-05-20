@@ -20,6 +20,8 @@ use crate::account_server::AccountServer;
 use crate::server_runtime::start_rest_server;
 use crate::state::State;
 use crate::username::UsernameStore;
+use zkcoins_program::hash::digest_to_bytes;
+use zkcoins_program::types::MINTING_ADDRESS;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn start_rest_server_binds_and_serves_health() {
@@ -94,6 +96,122 @@ async fn start_rest_server_binds_and_serves_health() {
                     resp.starts_with("HTTP/1.1 200"),
                     "expected 200 on /health, got: {}",
                     &resp[..resp.len().min(300)]
+                );
+                return;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    handle.abort();
+    std::fs::remove_dir_all(&tmp).ok();
+    panic!(
+        "start_rest_server never bound on 127.0.0.1:{} within 5 s; last connect error: {:?}",
+        port, last_err
+    );
+}
+
+/// Regression guard: the bootstrap-seeded minting account balance must
+/// stay Goldilocks-safe (strictly less than `2^48`).
+///
+/// The Plonky2 state-transition circuit packs `u64` balances as
+/// `balance_hi * 2^32 + balance_lo`. Values at or above the Goldilocks
+/// modulus `p ≈ 2^64 - 2^32 + 1` reduce mod `p` inside the circuit but
+/// stay full-width in the witness setter — that mismatch trips a
+/// "wire set twice" partition error and panics every mint operation.
+/// Before the Plonky2 migration the initial balance was `u64::MAX`,
+/// which is exactly the value that triggers the panic.
+///
+/// This test exercises the bootstrap end-to-end, queries the public
+/// `/api/balance?address=<MINTING_ADDRESS hex>` endpoint, and asserts
+/// the returned balance is non-zero *and* well below `2^49` (one bit of
+/// head-room above the documented `< 2^48` cap so a deliberate bump
+/// within the safe range does not require updating the test, while a
+/// regression to `u64::MAX` or any other unsafe value fails loudly).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bootstrap_initial_minting_account_balance_is_goldilocks_safe() {
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind probe");
+    let port = probe.local_addr().expect("probe addr").port();
+    drop(probe);
+    let addr = format!("127.0.0.1:{}", port);
+
+    std::env::set_var("USERNAME_DOMAIN", "test.zkcoins.local");
+    std::env::set_var("ESPLORA_URL", "http://127.0.0.1:1/api");
+
+    let tmp = std::env::temp_dir().join(format!(
+        "zkcoins-balance-test-{}-{}",
+        std::process::id(),
+        port
+    ));
+    std::fs::create_dir_all(&tmp).expect("create tempdir");
+    let accounts_path = tmp.join("accounts.bin").to_string_lossy().into_owned();
+    let usernames_path = tmp.join("usernames.bin").to_string_lossy().into_owned();
+
+    let state = Arc::new(Mutex::new(State::new()));
+    let account_server = AccountServer::new(Arc::clone(&state));
+    let username_store = UsernameStore::new();
+
+    let handle = tokio::spawn(async move {
+        start_rest_server(
+            account_server,
+            username_store,
+            &addr,
+            accounts_path,
+            usernames_path,
+        )
+        .await
+    });
+
+    let minting_hex = hex::encode(digest_to_bytes(&MINTING_ADDRESS));
+    let request = format!(
+        "GET /api/balance?address={} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        minting_hex
+    );
+
+    let mut last_err: Option<std::io::Error> = None;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        match tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await {
+            Ok(mut stream) => {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                stream
+                    .write_all(request.as_bytes())
+                    .await
+                    .expect("write probe");
+                let mut buf = Vec::with_capacity(2048);
+                stream.read_to_end(&mut buf).await.expect("read response");
+                handle.abort();
+                std::fs::remove_dir_all(&tmp).ok();
+                let resp = String::from_utf8_lossy(&buf).into_owned();
+                assert!(
+                    resp.starts_with("HTTP/1.1 200"),
+                    "expected 200 on /api/balance, got: {}",
+                    &resp[..resp.len().min(300)]
+                );
+                // Body is the JSON payload after the blank line separating
+                // headers and body. Find it and parse the `balance` field.
+                let body = resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or(&resp);
+                let parsed: serde_json::Value =
+                    serde_json::from_str(body.trim()).unwrap_or_else(|e| {
+                        panic!("failed to parse balance JSON body {:?}: {}", body, e)
+                    });
+                let balance = parsed
+                    .get("balance")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_else(|| panic!("balance field missing or not u64: {}", body));
+                assert!(
+                    balance > 0,
+                    "bootstrap must seed a non-zero minting balance, got 0 \
+                     (regression: bootstrap path skipped or import_account broken)"
+                );
+                assert!(
+                    balance < (1u64 << 49),
+                    "bootstrap minting balance {} is NOT Goldilocks-safe \
+                     (must stay below 2^48; 2^49 ceiling here gives 1 bit of \
+                     head-room). u64::MAX or any value >= p would panic the \
+                     Plonky2 circuit with `wire set twice` on the next mint.",
+                    balance
                 );
                 return;
             }
