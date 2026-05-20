@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use axum::http::StatusCode;
 use axum::Json;
 use shared::commitment::Commitment;
+use sqlx::PgPool;
 use tokio::net::TcpListener;
 
 use crate::account_server::CoinProof;
@@ -38,6 +39,11 @@ pub async fn start_rest_server(
     addr: &str,
     accounts_path: String,
     #[cfg_attr(not(feature = "usernames"), allow(unused_variables))] usernames_path: String,
+    // Threaded through now so PR-A3 can move accounts/usernames to
+    // Postgres without re-touching main.rs. Currently unused — the
+    // accounts/usernames stores still use bincode files. Underscore
+    // prefix keeps clippy quiet about the unused binding.
+    _pool: Arc<PgPool>,
 ) -> anyhow::Result<()> {
     let socket_addr = addr
         .parse::<SocketAddr>()

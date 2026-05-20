@@ -29,12 +29,51 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use sqlx::PgPool;
+use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
+use testcontainers_modules::postgres::Postgres;
+
 use crate::account_server::AccountServer;
+use crate::db::connect_and_migrate;
 use crate::server_runtime::start_rest_server;
 use crate::state::State;
 use crate::username::UsernameStore;
 use zkcoins_program::hash::digest_to_bytes;
 use zkcoins_program::types::MINTING_ADDRESS;
+
+/// Boot a fresh `postgres:17` container, run the server migrations
+/// against it, and return the live pool plus the container handle.
+/// Dropping the container handle tears the container down, so the
+/// caller keeps it alive for the duration of the test.
+///
+/// Each test gets its own container — the same isolation model as
+/// `db_tests::setup_pool`. The shape is duplicated here rather than
+/// re-exported across modules to keep `db_tests` and
+/// `server_runtime_tests` independently runnable (a shared helper
+/// would have to live in a `pub(crate)` module guarded with `#[cfg
+/// (test)]` and pulled in by both test files via `#[path = ...]`,
+/// which is heavier than the few lines below). The PR-A3 cleanup may
+/// dedupe both into a `test_db` helper module.
+async fn setup_pool() -> (Arc<PgPool>, ContainerAsync<Postgres>) {
+    let container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = container
+        .get_host()
+        .await
+        .expect("failed to get container host");
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("failed to get container port");
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = connect_and_migrate(&url)
+        .await
+        .expect("connect_and_migrate failed");
+    (Arc::new(pool), container)
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn start_rest_server_binds_and_serves_health() {
@@ -76,6 +115,13 @@ async fn start_rest_server_binds_and_serves_health() {
     let account_server = AccountServer::new(Arc::clone(&state));
     let username_store = UsernameStore::new();
 
+    // `start_rest_server` accepts a `pool` argument (PR-A2 plumbing
+    // for PR-A3). The bootstrap path does not currently exercise it,
+    // but a real, migrated pool is supplied here so the signature is
+    // honored end-to-end and future PR-A3 wiring slots in without
+    // re-touching this test.
+    let (pool, _pg_container) = setup_pool().await;
+
     let handle = tokio::spawn(async move {
         start_rest_server(
             account_server,
@@ -83,6 +129,7 @@ async fn start_rest_server_binds_and_serves_health() {
             &addr,
             accounts_path,
             usernames_path,
+            pool,
         )
         .await
     });
@@ -165,6 +212,8 @@ async fn bootstrap_initial_minting_account_balance_is_goldilocks_safe() {
     let account_server = AccountServer::new(Arc::clone(&state));
     let username_store = UsernameStore::new();
 
+    let (pool, _pg_container) = setup_pool().await;
+
     let handle = tokio::spawn(async move {
         start_rest_server(
             account_server,
@@ -172,6 +221,7 @@ async fn bootstrap_initial_minting_account_balance_is_goldilocks_safe() {
             &addr,
             accounts_path,
             usernames_path,
+            pool,
         )
         .await
     });
