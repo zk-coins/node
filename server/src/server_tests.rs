@@ -7,6 +7,24 @@ use tower::ServiceExt;
 use crate::account_server::{Account, AccountServer};
 use crate::state::State;
 
+/// Build a `PgPool` that points at nowhere — every query against it
+/// fails fast with a connect error. Used by the server-handler test
+/// suite below so the handlers' persistence-side `.await` lines run
+/// the error branch (which mirrors the legacy file-IO best-effort
+/// semantics: log + continue, never fail the response). The matching
+/// happy-path tests for the upsert lines run against a real
+/// Postgres 17 testcontainer in `db_tests.rs`, `account_server_tests.rs`,
+/// `username_tests.rs`, and `server_runtime_tests.rs`.
+fn dead_pool() -> Arc<sqlx::PgPool> {
+    Arc::new(
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(50))
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/postgres")
+            .expect("connect_lazy never fails"),
+    )
+}
+
 /// Create a minimal AppState for testing.
 /// The AccountServer is constructed with a real (mock) prover so that the
 /// type system is satisfied, but we seed it with a minting account so that
@@ -36,9 +54,7 @@ fn test_state() -> AppState {
         #[cfg(feature = "faucet")]
         minting_account: Arc::new(Mutex::new(minting_client)),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
-        accounts_path: String::new(),
-        #[cfg(feature = "usernames")]
-        usernames_path: String::new(),
+        pool: dead_pool(),
     }
 }
 
@@ -153,10 +169,11 @@ async fn balance_unknown_address_with_claimed_username_returns_username() {
     let address_bytes = [0xABu8; 32];
     let address = zkcoins_program::hash::digest_from_bytes(&address_bytes);
 
-    // Claim a username for an address that has no on-chain activity yet.
+    // Pre-populate the in-memory map (no Postgres round-trip — see
+    // the comment on `insert_for_test`).
     {
         let mut store = state.username_store.lock().unwrap();
-        store.claim("alice", address).expect("claim should succeed");
+        store.insert_for_test("alice", address);
     }
 
     let uri = format!("/api/balance?address={}", hex::encode(address_bytes));
@@ -489,12 +506,12 @@ async fn balance_minting_address_has_no_username() {
 async fn balance_includes_username_when_claimed() {
     let state = test_state();
 
-    // Manually claim a username for the minting address
+    // Pre-populate the in-memory username map via the test-only
+    // helper (bypasses the async Postgres path; production code
+    // claims via the /api/username/claim handler).
     {
         let mut username_store = state.username_store.lock().unwrap();
-        username_store
-            .claim("satoshi", *zkcoins_program::types::MINTING_ADDRESS)
-            .expect("claim should succeed");
+        username_store.insert_for_test("satoshi", *zkcoins_program::types::MINTING_ADDRESS);
     }
 
     let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(
@@ -553,12 +570,12 @@ async fn concurrent_reads_with_username_claim() {
         &zkcoins_program::types::MINTING_ADDRESS,
     ));
 
-    // Claim a username through the store directly (bypasses signature validation)
+    // Claim a username through the store directly (bypasses both
+    // signature validation and the async Postgres path; production
+    // claims go through the /api/username/claim handler).
     {
         let mut store = state.username_store.lock().unwrap();
-        store
-            .claim("testuser", *zkcoins_program::types::MINTING_ADDRESS)
-            .unwrap();
+        store.insert_for_test("testuser", *zkcoins_program::types::MINTING_ADDRESS);
     }
 
     // Spawn concurrent balance + resolve requests
@@ -1489,9 +1506,7 @@ async fn send_with_insufficient_funds_returns_422_with_error_string() {
         #[cfg(feature = "faucet")]
         minting_account: Arc::new(Mutex::new(minting_client)),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
-        accounts_path: String::new(),
-        #[cfg(feature = "usernames")]
-        usernames_path: String::new(),
+        pool: dead_pool(),
     };
 
     let secret_bytes = include_bytes!("../minting_secret.bin");

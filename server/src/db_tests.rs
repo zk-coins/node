@@ -57,12 +57,14 @@ async fn connect_and_migrate_creates_all_tables() {
     .expect("introspection query failed");
     let names: Vec<String> = rows.into_iter().map(|r| r.get::<String, _>(0)).collect();
     // _sqlx_migrations is created implicitly by sqlx::migrate!.
+    // `minting_meta` lands via 0002_minting_meta.sql (PR-A3).
     assert_eq!(
         names,
         vec![
             "_sqlx_migrations".to_string(),
             "accounts".to_string(),
             "latest_block".to_string(),
+            "minting_meta".to_string(),
             "mmr_state".to_string(),
             "smt_state".to_string(),
             "usernames".to_string(),
@@ -236,6 +238,72 @@ async fn resolve_username_returns_none_for_unknown() {
     let (pool, _container) = setup_pool().await;
     let resolved = resolve_username(&pool, "nobody").await.unwrap();
     assert!(resolved.is_none());
+}
+
+#[tokio::test]
+async fn load_minting_num_pubkeys_returns_none_initially() {
+    let (pool, _container) = setup_pool().await;
+    assert!(load_minting_num_pubkeys(&pool).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn upsert_minting_num_pubkeys_inserts_then_updates() {
+    let (pool, _container) = setup_pool().await;
+    upsert_minting_num_pubkeys(&pool, 7).await.unwrap();
+    assert_eq!(load_minting_num_pubkeys(&pool).await.unwrap(), Some(7));
+
+    upsert_minting_num_pubkeys(&pool, 42).await.unwrap();
+    assert_eq!(load_minting_num_pubkeys(&pool).await.unwrap(), Some(42));
+}
+
+#[tokio::test]
+async fn upsert_minting_num_pubkeys_round_trips_full_u32_range() {
+    let (pool, _container) = setup_pool().await;
+    upsert_minting_num_pubkeys(&pool, u32::MAX).await.unwrap();
+    assert_eq!(
+        load_minting_num_pubkeys(&pool).await.unwrap(),
+        Some(u32::MAX)
+    );
+}
+
+#[tokio::test]
+async fn load_minting_num_pubkeys_rejects_negative_value() {
+    // Plant a negative BIGINT directly via SQL and assert the loader
+    // surfaces the out-of-range value as an sqlx::Error::Decode rather
+    // than silently casting through `as u32`.
+    let (pool, _container) = setup_pool().await;
+    sqlx::query("INSERT INTO minting_meta (id, num_pubkeys) VALUES (1, $1)")
+        .bind(-1_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = load_minting_num_pubkeys(&pool)
+        .await
+        .expect_err("expected decode error");
+    assert!(
+        matches!(err, sqlx::Error::Decode(_)),
+        "unexpected: {:?}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn load_minting_num_pubkeys_rejects_value_above_u32_max() {
+    // Same as above, but for the upper-bound branch.
+    let (pool, _container) = setup_pool().await;
+    sqlx::query("INSERT INTO minting_meta (id, num_pubkeys) VALUES (1, $1)")
+        .bind(i64::from(u32::MAX) + 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = load_minting_num_pubkeys(&pool)
+        .await
+        .expect_err("expected decode error");
+    assert!(
+        matches!(err, sqlx::Error::Decode(_)),
+        "unexpected: {:?}",
+        err
+    );
 }
 
 #[tokio::test]

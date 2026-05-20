@@ -96,17 +96,19 @@ async fn start_rest_server_binds_and_serves_health() {
     std::env::set_var("USERNAME_DOMAIN", "test.zkcoins.local");
     std::env::set_var("ESPLORA_URL", "http://127.0.0.1:1/api");
 
-    // Per-invocation tempdir for the persistent files the bootstrap
-    // writes (initial accounts seed). PID + port keeps it unique across
-    // parallel runs even though pre-push uses --test-threads=1.
+    // PR-A3 moved all sibling-file state (accounts.bin, usernames.bin,
+    // minting_num_pubkeys.bin) into Postgres; the bootstrap only needs
+    // a proofs directory now, which is configured via the `PROOFS_DIR`
+    // env var read inside `start_rest_server`. PID + port keeps the
+    // tempdir unique across parallel runs even though pre-push uses
+    // --test-threads=1.
     let tmp = std::env::temp_dir().join(format!(
         "zkcoins-startup-test-{}-{}",
         std::process::id(),
         port
     ));
     std::fs::create_dir_all(&tmp).expect("create tempdir");
-    let accounts_path = tmp.join("accounts.bin").to_string_lossy().into_owned();
-    let usernames_path = tmp.join("usernames.bin").to_string_lossy().into_owned();
+    std::env::set_var("PROOFS_DIR", tmp.to_string_lossy().into_owned());
 
     // Mimic main.rs wiring: fresh State and empty AccountServer /
     // UsernameStore, so the bootstrap exercises the "no saved state"
@@ -115,23 +117,10 @@ async fn start_rest_server_binds_and_serves_health() {
     let account_server = AccountServer::new(Arc::clone(&state));
     let username_store = UsernameStore::new();
 
-    // `start_rest_server` accepts a `pool` argument (PR-A2 plumbing
-    // for PR-A3). The bootstrap path does not currently exercise it,
-    // but a real, migrated pool is supplied here so the signature is
-    // honored end-to-end and future PR-A3 wiring slots in without
-    // re-touching this test.
     let (pool, _pg_container) = setup_pool().await;
 
     let handle = tokio::spawn(async move {
-        start_rest_server(
-            account_server,
-            username_store,
-            &addr,
-            accounts_path,
-            usernames_path,
-            pool,
-        )
-        .await
+        start_rest_server(account_server, username_store, &addr, pool).await
     });
 
     // Wait for the listener to come up. axum binds within ~hundreds of
@@ -205,8 +194,7 @@ async fn bootstrap_initial_minting_account_balance_is_goldilocks_safe() {
         port
     ));
     std::fs::create_dir_all(&tmp).expect("create tempdir");
-    let accounts_path = tmp.join("accounts.bin").to_string_lossy().into_owned();
-    let usernames_path = tmp.join("usernames.bin").to_string_lossy().into_owned();
+    std::env::set_var("PROOFS_DIR", tmp.to_string_lossy().into_owned());
 
     let state = Arc::new(Mutex::new(State::new()));
     let account_server = AccountServer::new(Arc::clone(&state));
@@ -215,15 +203,7 @@ async fn bootstrap_initial_minting_account_balance_is_goldilocks_safe() {
     let (pool, _pg_container) = setup_pool().await;
 
     let handle = tokio::spawn(async move {
-        start_rest_server(
-            account_server,
-            username_store,
-            &addr,
-            accounts_path,
-            usernames_path,
-            pool,
-        )
-        .await
+        start_rest_server(account_server, username_store, &addr, pool).await
     });
 
     let minting_hex = hex::encode(digest_to_bytes(&MINTING_ADDRESS));

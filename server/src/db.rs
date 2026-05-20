@@ -1,25 +1,16 @@
 // Postgres state-layer for the zkCoins server.
 //
-// This module is part of PR-A1 in the 3-PR Postgres migration series.
-// It defines the schema (see `server/migrations/0001_initial.sql`),
-// exposes a small typed API around `sqlx::PgPool`, and is unit-tested
-// against a real Postgres 17 container in `db_tests.rs`. The bootstrap
-// integration (`main.rs`, `state.rs`, `account_server.rs`,
-// `username.rs`) is intentionally deferred:
-//
-//   * PR-A2 — wire `connect_and_migrate` into `main.rs`, replace the
-//     file-based SMT / MMR / latest-block paths with `load_smt`,
-//     `load_mmr`, `load_latest_block`, and the atomic
-//     `persist_state_tx` writer. Fixes the cross-file inconsistency
-//     window flagged as issue #11.
-//   * PR-A3 — replace the accounts/usernames bincode files with
-//     `load_all_accounts` / `upsert_account` and
-//     `load_all_usernames` / `claim_username` / `resolve_username`.
-//
-// Until PR-A2/PR-A3 land, none of the functions below are called from
-// the production bootstrap; the `#[allow(dead_code)]` on the module
-// keeps clippy quiet without papering over genuine dead code elsewhere
-// in the crate.
+// Introduced in PR-A1 of the 3-PR Postgres migration series; the
+// schema (see `server/migrations/*.sql`) and the typed API around
+// `sqlx::PgPool` were defined there. PR-A2 wired the state-layer
+// (`load_smt`, `load_mmr`, `load_latest_block`, `persist_state_tx`)
+// into the bootstrap and scanner callback, fixing the cross-file
+// inconsistency window flagged as issue #11. PR-A3 (this commit)
+// wires the remaining `load_all_accounts` / `upsert_account` /
+// `load_all_usernames` / `claim_username` / `resolve_username` calls
+// into `AccountServer` and `UsernameStore`, and adds the
+// `load_minting_num_pubkeys` / `upsert_minting_num_pubkeys` pair that
+// replaces the legacy `minting_num_pubkeys.bin` sibling file.
 //
 // Choice of `sqlx::query` (runtime checked) over `sqlx::query!`
 // (compile-time checked): all SQL in this module is short, hand-
@@ -146,7 +137,6 @@ pub async fn persist_state_tx(
 ///
 /// Used at boot in PR-A3 to rebuild the in-memory `AccountServer`
 /// map. Returns an empty vector if the table is empty.
-#[allow(dead_code)] // wired up in PR-A3
 pub async fn load_all_accounts(pool: &PgPool) -> Result<Vec<(Vec<u8>, Vec<u8>)>, sqlx::Error> {
     let rows: Vec<(Vec<u8>, Vec<u8>)> =
         sqlx::query_as("SELECT address, data FROM accounts ORDER BY address")
@@ -158,7 +148,6 @@ pub async fn load_all_accounts(pool: &PgPool) -> Result<Vec<(Vec<u8>, Vec<u8>)>,
 /// Upsert a single account row. The bincode blob in `data` is
 /// considered authoritative — concurrent writers must serialize at
 /// the application layer (`Arc<Mutex<AccountServer>>` in main.rs).
-#[allow(dead_code)] // wired up in PR-A3
 pub async fn upsert_account(pool: &PgPool, address: &[u8], data: &[u8]) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO accounts (address, data, updated_at) \
@@ -176,7 +165,6 @@ pub async fn upsert_account(pool: &PgPool, address: &[u8], data: &[u8]) -> Resul
 // ---- Username persistence (PR-A3) -----------------------------------------
 
 /// Load every `(name, address)` pair from the `usernames` table.
-#[allow(dead_code)] // wired up in PR-A3
 pub async fn load_all_usernames(pool: &PgPool) -> Result<Vec<(String, Vec<u8>)>, sqlx::Error> {
     let rows: Vec<(String, Vec<u8>)> =
         sqlx::query_as("SELECT name, address FROM usernames ORDER BY name")
@@ -189,7 +177,11 @@ pub async fn load_all_usernames(pool: &PgPool) -> Result<Vec<(String, Vec<u8>)>,
 /// fresh claim, `Ok(false)` if the name is already taken (no row
 /// inserted, existing row left untouched). The `ON CONFLICT DO
 /// NOTHING` makes this race-free at the SQL level.
-#[allow(dead_code)] // wired up in PR-A3
+///
+/// `cfg`-gated on the `usernames` feature plus `test`: only the
+/// gated `claim_username_handler` calls it in production. The unit
+/// tests in `db_tests.rs` exercise it unconditionally.
+#[cfg(any(feature = "usernames", test))]
 pub async fn claim_username(
     pool: &PgPool,
     name: &str,
@@ -209,13 +201,79 @@ pub async fn claim_username(
 
 /// Resolve a username to its bound address. Returns `Ok(None)` if
 /// the name is not registered.
-#[allow(dead_code)] // wired up in PR-A3
+///
+/// Currently unused on the read path — `UsernameStore` keeps the full
+/// `name → address` map in memory after the bootstrap `load_all_usernames`
+/// call, and `resolve` / `get_username` answer locally. Kept exposed
+/// so a future `lnurl`-style read-through cache can call it directly
+/// without re-introducing a `HashMap` mirror.
+#[allow(dead_code)] // re-added when a read-through caller lands
 pub async fn resolve_username(pool: &PgPool, name: &str) -> Result<Option<Vec<u8>>, sqlx::Error> {
     let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT address FROM usernames WHERE name = $1")
         .bind(name)
         .fetch_optional(pool)
         .await?;
     Ok(row.map(|(addr,)| addr))
+}
+
+// ---- Minting metadata (PR-A3) ---------------------------------------------
+
+/// Load the faucet's monotonic `num_pubkeys` counter from the
+/// `minting_meta` singleton row.
+///
+/// Returns `Ok(None)` when the row has never been written (fresh
+/// database / no successful mint since bootstrap). Values outside the
+/// `0..=u32::MAX` range are rejected as a decode error — the in-
+/// memory counter is `u32` (BIP-32 child indices wrap at 2^31, so
+/// `u32` is already more head-room than the derivation path supports).
+///
+/// `cfg`-gated on the `faucet` feature plus `test`: in non-faucet
+/// production builds the function has no caller, and the
+/// Coverage-Gate would flag it as uncovered. The unit-test suite
+/// in `db_tests.rs` exercises it unconditionally.
+#[cfg(any(feature = "faucet", test))]
+pub async fn load_minting_num_pubkeys(pool: &PgPool) -> Result<Option<u32>, sqlx::Error> {
+    let row: Option<(i64,)> = sqlx::query_as("SELECT num_pubkeys FROM minting_meta WHERE id = 1")
+        .fetch_optional(pool)
+        .await?;
+    match row {
+        None => Ok(None),
+        Some((n,)) => {
+            // Defensive: BIGINT is signed and the column has no CHECK
+            // constraint, so a manual operator INSERT could plant a
+            // negative value or one above `u32::MAX`. Surface that as
+            // a decode error rather than panicking on the `as u32`
+            // cast.
+            if !(0..=i64::from(u32::MAX)).contains(&n) {
+                return Err(sqlx::Error::Decode(
+                    format!(
+                        "minting_meta.num_pubkeys out of u32 range: {} (must be 0..=u32::MAX)",
+                        n
+                    )
+                    .into(),
+                ));
+            }
+            Ok(Some(n as u32))
+        }
+    }
+}
+
+/// Upsert the faucet's monotonic `num_pubkeys` counter. Idempotent
+/// on conflict — the singleton row is keyed on `id = 1`. See
+/// `load_minting_num_pubkeys` for the matching read and the rationale
+/// behind the `faucet`-feature gate.
+#[cfg(any(feature = "faucet", test))]
+pub async fn upsert_minting_num_pubkeys(pool: &PgPool, n: u32) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO minting_meta (id, num_pubkeys, updated_at) \
+         VALUES (1, $1, NOW()) \
+         ON CONFLICT (id) DO UPDATE \
+         SET num_pubkeys = EXCLUDED.num_pubkeys, updated_at = EXCLUDED.updated_at",
+    )
+    .bind(i64::from(n))
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]

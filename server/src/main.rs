@@ -15,15 +15,17 @@ use crate::state::State;
 use shared::commitment::Commitment;
 use sqlx::PgPool;
 use std::error::Error as StdError;
-use std::fs::File;
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-// SMT, MMR and latest-block state moved out of `*.bin` files into
-// Postgres (PR-A2). The accounts and usernames stores still use
-// bincode files; PR-A3 will migrate those.
-const ACCOUNTS_PATH: &str = "accounts.bin";
-const USERNAMES_PATH: &str = "usernames.bin";
+// Postgres state-layer carries every persistent slice of server state
+// after PR-A3: SMT / MMR / latest_block (PR-A2), accounts + usernames
+// (PR-A3), and the faucet's `minting_meta.num_pubkeys` counter
+// (PR-A3). The `accounts.bin`, `usernames.bin`, and
+// `minting_num_pubkeys.bin` sibling files no longer exist, and the
+// `atomic_write` helper that supported them is removed — the only
+// remaining on-disk writes are the per-proof files under
+// `${PROOFS_DIR:-./proofs}/{id}.bin`, owned by `ProofStore` in
+// `server.rs`.
 const ACCOUNT_SERVER_ADDR: &str = "0.0.0.0:4242";
 //const START_BLOCK_HASH: &str = "000000f43ca5c99c54c4738878fe1c5cca07691dc614a2734b73aa78ca868fb8";
 
@@ -90,20 +92,6 @@ lazy_static::lazy_static! {
     };
 }
 
-/// Atomic write: write to a temp file, then rename.
-/// This prevents data corruption if the process crashes mid-write.
-///
-/// Still used by the accounts/usernames bincode stores (PR-A3 will
-/// move those to Postgres and remove this helper).
-pub fn atomic_write(path: &str, data: &[u8]) -> std::io::Result<()> {
-    let tmp_path = format!("{}.tmp", path);
-    let mut file = File::create(&tmp_path)?;
-    file.write_all(data)?;
-    file.sync_all()?;
-    std::fs::rename(&tmp_path, path)?;
-    Ok(())
-}
-
 /// Run `db::persist_state_tx` from a *synchronous* context that already
 /// lives on a tokio worker thread.
 ///
@@ -148,6 +136,7 @@ pub fn persist_state_from_sync_context(
     })
 }
 
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn StdError>> {
     // A panic in any tokio worker — for example the bootstrap task that
@@ -187,47 +176,26 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     ));
     println!("Loaded State from Postgres");
 
-    // Create a new AccountServer instance with a reference to the state.
-    // Try to restore persisted accounts; otherwise start with an empty server
-    // and let start_rest_server seed the minting account.
-    //
-    // AccountServer + UsernameStore stay on bincode files for PR-A2;
-    // PR-A3 moves both to Postgres via `accounts` / `usernames` tables.
-    let account_server =
-        match account_server::AccountServer::load_from_file(Arc::clone(&state), ACCOUNTS_PATH) {
-            Ok(server) => {
-                println!("Loaded existing accounts from {}", ACCOUNTS_PATH);
-                server
-            }
-            Err(_) => {
-                println!("No accounts file found, creating new AccountServer");
-                account_server::AccountServer::new(Arc::clone(&state))
-            }
-        };
+    // Reload AccountServer + UsernameStore from Postgres. The matching
+    // file-based loaders from PR-A1/A2 are gone — these two calls are
+    // the single source of truth after PR-A3. A DB error here aborts
+    // the bootstrap (same reasoning as the State load above).
+    let account_server = account_server::AccountServer::load_from_pg(Arc::clone(&state), &pool)
+        .await
+        .expect("load account server from Postgres");
+    println!("Loaded AccountServer from Postgres");
+    let username_store = username::UsernameStore::load_from_pg(&pool)
+        .await
+        .expect("load username store from Postgres");
+    println!("Loaded UsernameStore from Postgres");
 
-    // Load or create UsernameStore
-    let username_store = match username::UsernameStore::load_from_file(USERNAMES_PATH) {
-        Ok(store) => {
-            println!("Loaded existing usernames from {}", USERNAMES_PATH);
-            store
-        }
-        Err(_) => {
-            println!("No usernames file found, creating new UsernameStore");
-            username::UsernameStore::new()
-        }
-    };
-
-    // Spawn the account_server as a separate task. `pool` is wired in
-    // already so PR-A3 only needs to swap the AccountServer/UsernameStore
-    // bootstrap branches and does not have to touch `main.rs` again.
+    // Spawn the account_server as a separate task.
     let pool_for_rest = Arc::clone(&pool);
     tokio::spawn(async move {
         if let Err(e) = start_rest_server(
             account_server,
             username_store,
             ACCOUNT_SERVER_ADDR,
-            ACCOUNTS_PATH.to_string(),
-            USERNAMES_PATH.to_string(),
             pool_for_rest,
         )
         .await
