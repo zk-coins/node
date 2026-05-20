@@ -1279,10 +1279,13 @@ state for 8 h with the listener dead and the scanner alive.
 
 **Fix (PR [#36](https://github.com/zk-coins/server/pull/36)):**
 
-1. **Explicit `MINTING_ADDRESS` override** passed from `main.rs` into
-   `AccountServer::new`, so the same constant flows through both the
-   prover circuit and the runtime state. Matches the pattern already
-   used in `server_tests.rs::TestAccountData::new_minting_account`.
+1. **Explicit `MINTING_ADDRESS` override** applied in
+   `server_runtime.rs::start_rest_server`: after constructing the
+   minting `ClientAccount` from `minting_secret.bin`, the code
+   overwrites `minting_client.address = *MINTING_ADDRESS` so the
+   on-chain identity matches the well-known constant that the Plonky2
+   circuit uses, replacing the failing `assert_eq!`. Matches the
+   pattern already used in `server_tests.rs::TestAccountData::new_minting_account`.
 2. **Global panic hook** installed at the top of `main.rs::main` that
    runs the default reporter and then `exit(1)`. Any future tokio
    worker panic now crash-loops the container via `restart:

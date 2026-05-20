@@ -14,11 +14,12 @@ carries its own toolchain pin.
 
 Plonky2 1.1.0 requires nightly Rust because `plonky2_field` uses
 `#![feature(specialization)]`. After PR [#17](https://github.com/zk-coins/server/pull/17)
-the entire workspace was unified to nightly (root `rust-toolchain`
-matches `program-plonky2/rust-toolchain.toml`), so this crate is a
-regular workspace member rather than the excluded standalone it was
-during the migration. Cargo commands work from the workspace root or
-from inside `program-plonky2/`.
+the entire workspace was unified to nightly via a single root
+`rust-toolchain` file; the standalone `program-plonky2/rust-toolchain.toml`
+was removed. This crate is now a regular workspace member
+(`members = ["program-plonky2", ...]` in the root `Cargo.toml`)
+rather than the excluded standalone it was during the migration. Cargo
+commands work from the workspace root or from inside `program-plonky2/`.
 
 ## First-time setup
 

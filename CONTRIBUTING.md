@@ -373,7 +373,7 @@ for the historical pickup record.
 | `ESPLORA_URL` | `https://mutinynet.com/api` | Esplora API endpoint (electrs or public) |
 | `IS_MAINNET` | `false` | `true` for Bitcoin Mainnet, `false` for Mutinynet/Signet |
 | `NETWORK_NAME` | `Mutinynet` / `Mainnet` | Human-readable name returned by `/api/info` |
-| `USERNAME_DOMAIN` | _(required, no default)_ | External hostname returned by `/api/info`; server panics on startup if unset (see PR [#36](https://github.com/zk-coins/server/pull/36) + issue #95) |
+| `USERNAME_DOMAIN` | _(required, no default)_ | External hostname returned by `/api/info`; server panics on startup if unset (see PR [#36](https://github.com/zk-coins/server/pull/36) for the regression that introduced the global panic hook) |
 | `PUBLISHER_KEY` | test key | 32-byte hex private key for inscription publishing. **Required on mainnet** |
 | `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
 
