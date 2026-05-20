@@ -131,6 +131,14 @@ jobs:
       # is irrelevant for the `info_returns_*` assertions (they only
       # check non-empty + shape).
       USERNAME_DOMAIN: test.zkcoins.local
+      # `db_tests` use the `testcontainers` crate, which talks to the local
+      # Docker daemon. The M3 Ultra runner on dfx01 runs Colima (not
+      # Docker Desktop), whose socket lives under the runner user's home
+      # directory. `testcontainers` defaults to `/var/run/docker.sock`,
+      # which does not exist on Colima, so we point it at the real socket
+      # — same value the `docker info` step picks up implicitly via the
+      # default `docker` context.
+      DOCKER_HOST: unix:///Users/dfx01/.colima/default/docker.sock
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -165,6 +173,14 @@ jobs:
     env:
       ESPLORA_URL: http://127.0.0.1:1/api
       USERNAME_DOMAIN: test.zkcoins.local
+      # `db_tests` use the `testcontainers` crate, which talks to the local
+      # Docker daemon. The M3 Ultra runner on dfx01 runs Colima (not
+      # Docker Desktop), whose socket lives under the runner user's home
+      # directory. `testcontainers` defaults to `/var/run/docker.sock`,
+      # which does not exist on Colima, so we point it at the real socket
+      # — same value the `docker info` step picks up implicitly via the
+      # default `docker` context.
+      DOCKER_HOST: unix:///Users/dfx01/.colima/default/docker.sock
     steps:
       - name: Checkout
         uses: actions/checkout@v4
