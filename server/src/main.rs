@@ -13,6 +13,7 @@ use crate::scanner_runtime::scan_for_inscriptions;
 use crate::server_runtime::start_rest_server;
 use crate::state::State;
 use shared::commitment::Commitment;
+use sqlx::PgPool;
 use std::error::Error as StdError;
 use std::fs::File;
 use std::io::Write;
@@ -101,6 +102,50 @@ pub fn atomic_write(path: &str, data: &[u8]) -> std::io::Result<()> {
     file.sync_all()?;
     std::fs::rename(&tmp_path, path)?;
     Ok(())
+}
+
+/// Run `db::persist_state_tx` from a *synchronous* context that already
+/// lives on a tokio worker thread.
+///
+/// The scanner's `InscriptionCallback` is a sync `Fn` (see
+/// `scanner::InscriptionCallback`), but `persist_state_tx` is async
+/// and must be awaited. The naive bridge —
+/// `Handle::current().block_on(future)` — panics on the
+/// `#[tokio::main]` multi_thread flavor: from the Tokio docs,
+/// `Handle::block_on` "may panic when called from a thread that is
+/// part of the current Tokio runtime". Wrapping with
+/// `tokio::task::block_in_place` is the documented sync-in-async
+/// escape hatch for multi_thread runtimes — it tells the scheduler
+/// that this worker is about to block and migrates other tasks off
+/// it, then it is safe to drive the future to completion with
+/// `block_on`.
+///
+/// See:
+///   - <https://docs.rs/tokio/latest/tokio/task/fn.block_in_place.html>
+///   - <https://docs.rs/tokio/latest/tokio/runtime/struct.Handle.html#method.block_on>
+///
+/// **Important:** `block_in_place` requires the `rt-multi-thread`
+/// flavor. On a `current_thread` runtime it panics with
+/// "can call blocking only when running on the multi-threaded
+/// runtime". The production bootstrap uses `#[tokio::main]` (which
+/// defaults to multi_thread) and tests that exercise this helper must
+/// be annotated `#[tokio::test(flavor = "multi_thread", …)]` —
+/// `current_thread` would hit that panic before we ever reach the
+/// production code path.
+pub fn persist_state_from_sync_context(
+    pool: &PgPool,
+    smt: &[u8],
+    mmr: &[u8],
+    latest_block: &[u8; 32],
+) -> Result<(), sqlx::Error> {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(db::persist_state_tx(
+            pool,
+            smt,
+            mmr,
+            latest_block,
+        ))
+    })
 }
 
 #[tokio::main]
@@ -272,7 +317,6 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 
                 if let Some((new_root, smt_bytes, mmr_bytes)) = snapshot {
                     let block_hash_bytes = current_block_hash.to_byte_array();
-                    let pool_clone = Arc::clone(&pool_for_callback);
 
                     // `scan_for_inscriptions` defines its callback as a
                     // sync `Fn(Vec<u8>, BlockHash)` (see
@@ -282,17 +326,31 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                     // outside PR-A2's scope.
                     //
                     // The callback runs INSIDE the async
-                    // `scan_for_inscriptions` task, so a tokio runtime
-                    // handle is always available and
-                    // `Handle::current().block_on(...)` is the standard
-                    // sync-in-async escape hatch. The pool itself uses a
-                    // dedicated set of connections, so the block-on does
-                    // not block the worker on its own work; it just
-                    // serializes scanner progress against DB commit
-                    // latency — exactly the durability semantics we
-                    // want for issue #11.
-                    let persist_result = tokio::runtime::Handle::current().block_on(
-                        db::persist_state_tx(&pool_clone, &smt_bytes, &mmr_bytes, &block_hash_bytes),
+                    // `scan_for_inscriptions` task on a multi_thread
+                    // tokio runtime, so we cannot just
+                    // `Handle::current().block_on(...)` — the docs say
+                    // "may panic when called from a thread that is part
+                    // of the current Tokio runtime" and on
+                    // `#[tokio::main]` (multi_thread by default) it
+                    // does panic the first time a real inscription is
+                    // scanned. The fix is the documented
+                    // `block_in_place(|| Handle::current().block_on(…))`
+                    // pattern, encapsulated in
+                    // `persist_state_from_sync_context` so we can unit-
+                    // test that bridge end-to-end against testcontainer
+                    // Postgres without standing up the whole scanner.
+                    //
+                    // The pool itself uses a dedicated set of
+                    // connections, so the block does not stall the
+                    // worker on its own DB work; it just serializes
+                    // scanner progress against DB commit latency —
+                    // exactly the durability semantics we want for
+                    // issue #11.
+                    let persist_result = persist_state_from_sync_context(
+                        &pool_for_callback,
+                        &smt_bytes,
+                        &mmr_bytes,
+                        &block_hash_bytes,
                     );
                     match persist_result {
                         Ok(()) => println!(
@@ -313,3 +371,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "main_tests.rs"]
+mod tests;
