@@ -22,6 +22,26 @@ Rust/Axum backend for [zkcoins.app](https://zkcoins.app) — account management,
 
 Full rationale: [docs.zkcoins.app/tech-decisions](https://docs.zkcoins.app/tech-decisions)
 
+## Trust Model
+
+Proof generation runs **inside this server process**. `AccountServer::send_coins` (`server/src/account_server.rs`) calls `self.prover.prove_account_update_with_in_and_out_coins_and_sources(...)` (and the `prove_initial_*` variant for first-time accounts) on every send / receive / mint. ZK proving requires the full private witness, so the server sees, in cleartext:
+
+- Sender, recipient, and amount of every coin movement
+- The complete in-coin / out-coin / source-aggregator slot layout per account
+- Account history roots, Merkle proofs, and inclusion-proof witnesses
+- Usernames and their bound coin sets (`UsernameStore`)
+- Postgres rows persisting all of the above (`server/migrations/000{1,2}_*.sql`)
+
+The **on-chain footprint stays private** — Plonky2 ensures that the public outputs (nullifiers, history roots, Taproot inscriptions) carry no readable transaction data. Block explorers and chain analytics see only opaque 64-byte commitments. The trust boundary is therefore the **server operator**, not the chain.
+
+| | Hosted (`api.zkcoins.app`) | Self-hosted |
+| --- | --- | --- |
+| On-chain privacy (vs. block explorers) | ✅ | ✅ |
+| Operator sees plaintext transaction data | ❌ Yes — DFX runs the hosted node | ✅ No |
+| Setup effort | ✅ None | ⚠️ Postgres + electrs + Bitcoin node |
+
+**If you need full transaction privacy, run your own server.** Every release is shipped as `zkcoin/server:latest` (see [Live](#live)), the build recipe is [`Dockerfile`](./Dockerfile), and runtime knobs are documented in [Configuration](#configuration). Point the [zkcoins.app](https://zkcoins.app) client at your self-hosted instance for end-to-end self-custody of transaction data.
+
 ## Contributing
 
 **New PRs may only merge into `develop` if test coverage is 100% on the activated surface.** Code behind a Cargo feature (`address-list`, `faucet`, `usernames`, `lnurl`) is excluded from the MVP measurement — feature-gated routes do not need to be tested as long as the feature stays off in the PRD build. Concretely:
