@@ -20,7 +20,14 @@ on:
   # label triggers (or removes) the heavy self-hosted-runner jobs
   # on demand — see the `server-tests` job below.
   pull_request:
-    branches: [develop]
+    # `develop` is the long-lived integration branch. `feat/postgres-**`
+    # is a temporary glob for the 3-PR Postgres-migration stack (PR-A1,
+    # PR-A2, PR-A3) where each PR uses the previous one as its base.
+    # Without the glob, only the bottom PR of the stack would get CI
+    # runs — the upper two would silently skip because their base is
+    # a feature branch, not develop. Remove the glob once the stack
+    # has fully landed on develop.
+    branches: [develop, 'feat/postgres-**']
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
 concurrency:
@@ -131,6 +138,14 @@ jobs:
       # is irrelevant for the `info_returns_*` assertions (they only
       # check non-empty + shape).
       USERNAME_DOMAIN: test.zkcoins.local
+      # `db_tests` use the `testcontainers` crate, which talks to the local
+      # Docker daemon. The M3 Ultra runner on dfx01 runs Colima (not
+      # Docker Desktop), whose socket lives under the runner user's home
+      # directory. `testcontainers` defaults to `/var/run/docker.sock`,
+      # which does not exist on Colima, so we point it at the real socket
+      # — same value the `docker info` step picks up implicitly via the
+      # default `docker` context.
+      DOCKER_HOST: unix:///Users/dfx01/.colima/default/docker.sock
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -146,6 +161,14 @@ jobs:
       - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
+      # The `db_tests` added in PR-A1 use testcontainers to spin up a
+      # real Postgres 17 per test. The runner host has Docker (via
+      # Colima) available on PATH; fail fast with a readable error
+      # if it ever goes away, instead of letting the test suite die
+      # 5 minutes into the run with a hard-to-read bollard error.
+      - name: Verify Docker is reachable (testcontainers dependency)
+        run: docker info > /dev/null
+
       - name: Run server + shared tests (release, all features)
         run: cargo test -p server -p shared --release --all-features -- --test-threads=1
 
@@ -157,12 +180,26 @@ jobs:
     env:
       ESPLORA_URL: http://127.0.0.1:1/api
       USERNAME_DOMAIN: test.zkcoins.local
+      # `db_tests` use the `testcontainers` crate, which talks to the local
+      # Docker daemon. The M3 Ultra runner on dfx01 runs Colima (not
+      # Docker Desktop), whose socket lives under the runner user's home
+      # directory. `testcontainers` defaults to `/var/run/docker.sock`,
+      # which does not exist on Colima, so we point it at the real socket
+      # — same value the `docker info` step picks up implicitly via the
+      # default `docker` context.
+      DOCKER_HOST: unix:///Users/dfx01/.colima/default/docker.sock
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Coverage runs the same `db_tests` as `server-tests` and so
+      # needs Docker reachable for testcontainers. See the matching
+      # check in the `server-tests` job for the rationale.
+      - name: Verify Docker is reachable (testcontainers dependency)
+        run: docker info > /dev/null
 
       - name: Run llvm-cov (MVP scope, 100% line + function gate)
         run: |

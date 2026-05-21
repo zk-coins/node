@@ -2,22 +2,18 @@ use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::PublicKey;
 use serde::{Deserialize, Serialize};
 use shared::commitment::Commitment;
+use sqlx::PgPool;
 use std::collections::HashMap;
-use std::io;
 use zkcoins_program::circuit::main::MMR_PROOF_PATH_LEN;
-use zkcoins_program::hash::{
-    digest_from_bytes, digest_to_bytes, hash_concat, HashDigest, ZERO_HASH,
-};
-use zkcoins_program::merkle::merkle_mountain_range::{
-    load_mmr, save_mmr, MMRProof, MerkleMountainRange,
-};
-use zkcoins_program::merkle::sparse_merkle_tree::{
-    load_merkle_tree, save_merkle_tree, InclusionProof, SparseMerkleTree,
-};
+use zkcoins_program::hash::{hash_concat, HashDigest, ZERO_HASH};
+use zkcoins_program::merkle::merkle_mountain_range::{MMRProof, MerkleMountainRange};
+use zkcoins_program::merkle::sparse_merkle_tree::{InclusionProof, SparseMerkleTree};
+
+use crate::db;
 
 /// State stores both a Sparse Merkle Tree (for individual commitments)
 /// and a Merkle Mountain Range (for accumulating SMT roots).
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct State {
     /// The Sparse Merkle Tree to store individual commitments
     pub smt: SparseMerkleTree,
@@ -27,6 +23,48 @@ pub struct State {
     pub root_indices: HashMap<HashDigest, (HashDigest, usize)>,
     /// The previous MMR root
     pub prev_mmr_root: HashDigest,
+}
+
+/// Error type for `State::load_from_pg`. Distinguishes database errors
+/// (connectivity, schema mismatch) from on-disk-blob corruption
+/// (bincode rejected the SMT or MMR payload) so the bootstrap caller
+/// can react accordingly.
+#[derive(Debug)]
+pub enum LoadStateError {
+    /// The Postgres call itself failed (connect, query, decode).
+    Db(sqlx::Error),
+    /// The SMT/MMR bincode blob in Postgres could not be deserialized.
+    Deserialize(bincode::Error),
+}
+
+impl std::fmt::Display for LoadStateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadStateError::Db(e) => write!(f, "database error: {}", e),
+            LoadStateError::Deserialize(e) => write!(f, "state blob deserialize: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for LoadStateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LoadStateError::Db(e) => Some(e),
+            LoadStateError::Deserialize(e) => Some(e),
+        }
+    }
+}
+
+impl From<sqlx::Error> for LoadStateError {
+    fn from(e: sqlx::Error) -> Self {
+        LoadStateError::Db(e)
+    }
+}
+
+impl From<bincode::Error> for LoadStateError {
+    fn from(e: bincode::Error) -> Self {
+        LoadStateError::Deserialize(e)
+    }
 }
 
 impl State {
@@ -56,7 +94,7 @@ impl State {
             // as a Poseidon `HashOut<F>` — `digest_from_bytes` is the
             // canonical inverse of `digest_to_bytes` (round-trip safe).
             let message_bytes = commitment.get_account_state_hash();
-            let message_data = digest_from_bytes(&message_bytes);
+            let message_data = zkcoins_program::hash::digest_from_bytes(&message_bytes);
 
             // Update the SMT with just the message
             self.smt.insert(key, message_data)?;
@@ -132,44 +170,43 @@ impl State {
         Ok((commitment, smt_proof, smt_root, mmr_proof))
     }
 
-    /// Saves the state to two files: one for the SMT and one for the MMR.
-    pub fn save_to_files(&self, smt_path: &str, mmr_path: &str) -> io::Result<()> {
-        save_merkle_tree(&self.smt, smt_path)?;
-        save_mmr(&self.mmr, mmr_path)?;
-
-        // Save prev_mmr_root to a separate file as 32 raw bytes.
-        let prev_root_path = format!("{}.prev_root", mmr_path);
-        crate::atomic_write(&prev_root_path, &digest_to_bytes(&self.prev_mmr_root))?;
-
-        Ok(())
+    /// Load the SMT and MMR blobs from Postgres and rebuild a `State`.
+    ///
+    /// When either blob is missing (fresh database, no prior bootstrap),
+    /// the corresponding tree is initialized empty. `root_indices` is
+    /// always rebuilt empty — it is a runtime memoization of
+    /// `(prev_mmr_root) -> (smt_root, leaf_index)` that is rebuilt
+    /// incrementally by `State::update` as new commitments arrive.
+    /// `prev_mmr_root` is similarly derived on the next `update()`
+    /// from `self.mmr.root_extended(MMR_PROOF_PATH_LEN)`, so a freshly
+    /// loaded state without it starts at `ZERO_HASH` exactly like the
+    /// previous file-based `load_from_files` fallback.
+    pub async fn load_from_pg(pool: &PgPool) -> Result<Self, LoadStateError> {
+        let mut state = Self::new();
+        if let Some(data) = db::load_smt(pool).await? {
+            state.smt = bincode::deserialize(&data)?;
+        }
+        if let Some(data) = db::load_mmr(pool).await? {
+            state.mmr = bincode::deserialize(&data)?;
+        }
+        Ok(state)
     }
 
-    /// Loads the state from two files: one for the SMT and one for the MMR.
-    pub fn load_from_files(smt_path: &str, mmr_path: &str) -> io::Result<Self> {
-        let smt = load_merkle_tree(smt_path)?;
-        let mmr = load_mmr(mmr_path)?;
-
-        // Load prev_mmr_root from its file
-        let prev_root_path = format!("{}.prev_root", mmr_path);
-        let prev_mmr_root = match std::fs::read(prev_root_path) {
-            Ok(bytes) if bytes.len() == 32 => {
-                let mut root_bytes = [0u8; 32];
-                root_bytes.copy_from_slice(&bytes);
-                digest_from_bytes(&root_bytes)
-            }
-            // If file doesn't exist or has wrong size, use zeros
-            _ => ZERO_HASH,
-        };
-
-        // Initialize an empty root_indices map
-        let root_indices = HashMap::new();
-
-        Ok(State {
-            smt,
-            mmr,
-            root_indices,
-            prev_mmr_root,
-        })
+    /// Serialize the SMT and MMR to bincode blobs for `persist_state_tx`.
+    ///
+    /// Returned tuple is `(smt_bytes, mmr_bytes)`. The caller is
+    /// expected to hand these straight to `db::persist_state_tx`
+    /// together with the corresponding block hash.
+    ///
+    /// `bincode::serialize` on these structures is infallible in
+    /// practice (no `Serialize` impl in the SMT/MMR trees returns Err),
+    /// but the error path is propagated as a `bincode::Error` rather
+    /// than panicked over so a future schema change that introduces a
+    /// fallible branch surfaces as a recoverable error.
+    pub fn serialize_for_persist(&self) -> Result<(Vec<u8>, Vec<u8>), bincode::Error> {
+        let smt_bytes = bincode::serialize(&self.smt)?;
+        let mmr_bytes = bincode::serialize(&self.mmr)?;
+        Ok((smt_bytes, mmr_bytes))
     }
 }
 

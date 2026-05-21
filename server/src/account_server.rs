@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::db;
 use crate::state::State;
 use bitcoin::secp256k1::PublicKey;
 use serde::{Deserialize, Serialize};
 use shared::commitment::Commitment;
 use shared::{Address, Invoice};
-use zkcoins_program::hash::{HashDigest, ZERO_HASH};
+use sqlx::PgPool;
+use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes, HashDigest, ZERO_HASH};
 use zkcoins_program::inputs::CommitmentMerkleProofs;
 use zkcoins_program::merkle::merkle_mountain_range::MMR_MAX_DEPTH;
 use zkcoins_program::merkle::sparse_merkle_tree::{
@@ -109,6 +111,13 @@ impl AccountServer {
     /// Get the keypair to the pubkey this account commited to (which is derived key num_pubkeys -
     /// 1)
     // TODO: Move to client.
+    ///
+    /// Test-only after PR-A3 — the production bootstrap rehydrates the
+    /// server from Postgres via `load_from_pg`, never `new`. Kept
+    /// because every test in `account_server_tests.rs`,
+    /// `server_tests.rs`, and `server_runtime_tests.rs` uses it to
+    /// build a known-empty server before importing fixture accounts.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(state: Arc<Mutex<State>>) -> Self {
         let accounts = HashMap::new();
         let prover = Prover::new();
@@ -556,18 +565,56 @@ impl AccountServer {
         }
     }
 
-    pub fn save_to_file(&self, path: &str) -> std::io::Result<()> {
-        // bincode::serialize on HashMap<Address, Account> cannot fail
-        // in practice; pass the error through as a function reference
-        // so the path does not introduce an uncovered closure.
-        let bytes = bincode::serialize(&self.accounts).map_err(std::io::Error::other)?;
-        crate::atomic_write(path, &bytes)
+    /// Borrow a single account by address. Returned for read-only
+    /// inspection (e.g. snapshotting a freshly mutated `Account` for
+    /// persistence outside the lock).
+    pub fn get_account(&self, address: &Address) -> Option<&Account> {
+        self.accounts.get(address)
     }
 
-    pub fn load_from_file(state: Arc<Mutex<State>>, path: &str) -> std::io::Result<Self> {
-        let bytes = std::fs::read(path)?;
-        let accounts: HashMap<Address, Account> =
-            bincode::deserialize(&bytes).map_err(std::io::Error::other)?;
+    /// Serialize a single `Account` to bincode for `db::upsert_account`.
+    ///
+    /// Pulled out as an associated function (no `&self` borrow) so
+    /// handlers can take an account snapshot, drop the
+    /// `Arc<Mutex<AccountServer>>` lock, and persist the bytes outside
+    /// the lock — required because the upsert is `async` and a
+    /// `std::sync::MutexGuard` may not be held across an `.await`.
+    ///
+    /// `bincode::serialize` on a well-formed `Account` cannot fail in
+    /// practice (no fallible `Serialize` impls in the field graph), so
+    /// the return type is the raw byte vector rather than a `Result`.
+    /// Returning `Result` previously introduced an uncovered `?`
+    /// branch at every call site without buying any real recovery
+    /// path; if a future field gains a fallible serializer, switch
+    /// this back to `Result` and propagate through the existing
+    /// `PersistAccountError::Serialize` variant.
+    pub fn serialize_account(account: &Account) -> Vec<u8> {
+        bincode::serialize(account)
+            .expect("bincode::serialize cannot fail for the current Account shape")
+    }
+
+    /// Reload an `AccountServer` from Postgres.
+    ///
+    /// The faucet's bootstrap-seeded minting account is NOT created
+    /// here — `start_rest_server` does that explicitly once it has
+    /// observed an absent minting row. Returning the rebuilt map here
+    /// keeps this constructor a pure "rehydrate everything that was
+    /// persisted" call with no side effects.
+    pub async fn load_from_pg(
+        state: Arc<Mutex<State>>,
+        pool: &PgPool,
+    ) -> Result<Self, LoadAccountServerError> {
+        let rows = db::load_all_accounts(pool).await?;
+        let mut accounts: HashMap<Address, Account> = HashMap::with_capacity(rows.len());
+        for (addr_bytes, data_bytes) in rows {
+            let addr_arr: [u8; 32] = addr_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| LoadAccountServerError::BadAddressLength(addr_bytes.len()))?;
+            let address = digest_from_bytes(&addr_arr);
+            let account: Account = bincode::deserialize(&data_bytes)?;
+            accounts.insert(address, account);
+        }
         let prover = Prover::new();
         Ok(AccountServer {
             accounts,
@@ -577,14 +624,123 @@ impl AccountServer {
     }
 }
 
+/// Error type for `AccountServer::load_from_pg`. Mirrors the
+/// `state::LoadStateError` split so the bootstrap caller can react
+/// differently to "database is unreachable" (retry, fail loud) vs.
+/// "the persisted blob is corrupt" (no useful retry — escalate).
+#[derive(Debug)]
+pub enum LoadAccountServerError {
+    /// The Postgres call itself failed (connect, query, decode).
+    Db(sqlx::Error),
+    /// A row's `address` column was not the expected 32 bytes.
+    BadAddressLength(usize),
+    /// A row's `data` column failed bincode-deserialize as `Account`.
+    Deserialize(bincode::Error),
+}
+
+impl std::fmt::Display for LoadAccountServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadAccountServerError::Db(e) => write!(f, "database error: {}", e),
+            LoadAccountServerError::BadAddressLength(n) => write!(
+                f,
+                "accounts.address has unexpected length {} (expected 32)",
+                n
+            ),
+            LoadAccountServerError::Deserialize(e) => {
+                write!(f, "account blob deserialize: {}", e)
+            }
+        }
+    }
+}
+
+impl std::error::Error for LoadAccountServerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LoadAccountServerError::Db(e) => Some(e),
+            LoadAccountServerError::BadAddressLength(_) => None,
+            LoadAccountServerError::Deserialize(e) => Some(e),
+        }
+    }
+}
+
+impl From<sqlx::Error> for LoadAccountServerError {
+    fn from(e: sqlx::Error) -> Self {
+        LoadAccountServerError::Db(e)
+    }
+}
+
+impl From<bincode::Error> for LoadAccountServerError {
+    fn from(e: bincode::Error) -> Self {
+        LoadAccountServerError::Deserialize(e)
+    }
+}
+
+/// Helper used by both the bootstrap and the handlers: serialize the
+/// account at `address` and persist it via `db::upsert_account`.
+///
+/// Holds an `&AccountServer` to snapshot the bincode bytes
+/// *synchronously*, then runs the `async` upsert with no live mutex
+/// guard. Callers MUST acquire the snapshot before the `.await` (i.e.
+/// inside a `{ ... }` scope that releases the
+/// `MutexGuard<'_, AccountServer>`) — see the handler sites in
+/// `server.rs` for the pattern.
+///
+/// Returns the bincode-encoded bytes on success so the caller can log
+/// the byte length without re-serializing.
+pub async fn persist_account(
+    pool: &PgPool,
+    address: &Address,
+    account: &Account,
+) -> Result<usize, PersistAccountError> {
+    let bytes = AccountServer::serialize_account(account);
+    let addr_bytes = digest_to_bytes(address);
+    db::upsert_account(pool, &addr_bytes, &bytes).await?;
+    Ok(bytes.len())
+}
+
+/// Error type for `persist_account`. Wraps the single failure mode
+/// (database write — connect, transaction, decode). Bincode encoding
+/// of the in-memory `Account` is infallible for the current shape and
+/// is therefore unwrapped inside `serialize_account` rather than
+/// propagated here.
+#[derive(Debug)]
+pub enum PersistAccountError {
+    /// The Postgres upsert failed (connect, transaction, decode).
+    Db(sqlx::Error),
+}
+
+impl std::fmt::Display for PersistAccountError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PersistAccountError::Db(e) => write!(f, "database error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for PersistAccountError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PersistAccountError::Db(e) => Some(e),
+        }
+    }
+}
+
+impl From<sqlx::Error> for PersistAccountError {
+    fn from(e: sqlx::Error) -> Self {
+        PersistAccountError::Db(e)
+    }
+}
+
 #[cfg(test)]
 mod inline_tests {
     //! Inline error-path tests that don't require a full Plonky2 prove.
-    //! They cover the early-return error paths in `send_coins`, the
-    //! file-IO failure path in `load_from_file`, and the single-line
-    //! lookup paths in `get_minting_account_address` and
-    //! `get_account_balance`. The richer prover-driven fixtures live in
-    //! `account_server_tests.rs` (included as `mod tests;` below).
+    //! They cover the early-return error paths in `send_coins` and the
+    //! single-line lookup paths in `get_minting_account_address`,
+    //! `get_account`, and `get_account_balance`. The Postgres-based
+    //! `load_from_pg` and `persist_account` paths are tested against a
+    //! real Postgres 17 container in `account_server_tests.rs`. The
+    //! richer prover-driven fixtures also live there.
 
     use super::*;
 
@@ -630,28 +786,30 @@ mod inline_tests {
     }
 
     #[test]
-    fn load_from_file_rejects_corrupted_bytes() {
-        let path = std::env::temp_dir().join(format!(
-            "zkcoins-account-server-corrupt-{}.bin",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(&path, b"not bincode").unwrap();
-        let state = Arc::new(Mutex::new(State::new()));
-        let result = AccountServer::load_from_file(state, path.to_str().unwrap());
-        std::fs::remove_file(&path).ok();
-        assert!(result.is_err());
+    fn get_account_returns_some_for_known_address() {
+        let mut server = fresh_server();
+        let address = zkcoins_program::hash::digest_from_bytes(&[1u8; 32]);
+        let mut account = Account::new();
+        account.balance = 42;
+        server.import_account(address, account);
+        let got = server.get_account(&address).expect("present");
+        assert_eq!(got.balance, 42);
     }
 
     #[test]
-    fn load_from_file_rejects_missing_path() {
-        let path = std::env::temp_dir().join("zkcoins-account-server-does-not-exist.bin");
-        std::fs::remove_file(&path).ok();
-        let state = Arc::new(Mutex::new(State::new()));
-        let result = AccountServer::load_from_file(state, path.to_str().unwrap());
-        assert!(result.is_err());
+    fn get_account_returns_none_for_unknown_address() {
+        let server = fresh_server();
+        let unknown = zkcoins_program::hash::digest_from_bytes(&[9u8; 32]);
+        assert!(server.get_account(&unknown).is_none());
+    }
+
+    #[test]
+    fn serialize_account_roundtrips_via_bincode() {
+        let mut a = Account::new();
+        a.balance = 7;
+        let bytes = AccountServer::serialize_account(&a);
+        let back: Account = bincode::deserialize(&bytes).expect("deserialize ok");
+        assert_eq!(back.balance, 7);
     }
 
     /// Helper: build a stable PublicKey for use in send_coins error
@@ -706,22 +864,115 @@ mod inline_tests {
     }
 
     #[test]
-    fn account_save_and_load_roundtrip() {
-        let mut server = fresh_server();
-        let address = zkcoins_program::hash::digest_from_bytes(&[6u8; 32]);
-        server.import_account(address, Account::new());
-        let path = std::env::temp_dir().join(format!(
-            "zkcoins-account-server-roundtrip-{}.bin",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        server.save_to_file(path.to_str().unwrap()).unwrap();
+    fn load_account_server_error_display_and_source() {
+        // Display and `source()` coverage for all three error variants.
+        // The Db variant wraps the simplest sqlx::Error we can construct:
+        // ColumnNotFound is a unit-ish variant taking only the column name.
+        let db_err =
+            LoadAccountServerError::from(sqlx::Error::ColumnNotFound("address".to_string()));
+        assert!(format!("{}", db_err).contains("database error"));
+        assert!(std::error::Error::source(&db_err).is_some());
+
+        let bad = LoadAccountServerError::BadAddressLength(7);
+        assert!(format!("{}", bad).contains("expected 32"));
+        assert!(std::error::Error::source(&bad).is_none());
+
+        let de_err = LoadAccountServerError::from(bincode::Error::new(bincode::ErrorKind::Custom(
+            "boom".into(),
+        )));
+        assert!(format!("{}", de_err).contains("account blob deserialize"));
+        assert!(std::error::Error::source(&de_err).is_some());
+    }
+
+    #[test]
+    fn persist_account_error_display_and_source() {
+        let db_err = PersistAccountError::from(sqlx::Error::ColumnNotFound("data".to_string()));
+        assert!(format!("{}", db_err).contains("database error"));
+        assert!(std::error::Error::source(&db_err).is_some());
+    }
+
+    #[tokio::test]
+    async fn persist_account_propagates_db_error() {
+        // Lazy pool that never connects → upsert returns Db error.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(100))
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/postgres")
+            .expect("connect_lazy never fails");
+        let address = zkcoins_program::hash::digest_from_bytes(&[1u8; 32]);
+        let account = Account::new();
+        let err = persist_account(&pool, &address, &account)
+            .await
+            .expect_err("expected db error");
+        assert!(
+            matches!(err, PersistAccountError::Db(_)),
+            "unexpected: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn load_from_pg_propagates_db_error() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(100))
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/postgres")
+            .expect("connect_lazy never fails");
         let state = Arc::new(Mutex::new(State::new()));
-        let loaded = AccountServer::load_from_file(state, path.to_str().unwrap()).unwrap();
-        std::fs::remove_file(&path).ok();
-        assert!(loaded.get_account_balance(&address).is_ok());
+        // `AccountServer` is intentionally not `Debug` (it owns a
+        // `Prover` which is itself non-Debug), so `expect_err` is not
+        // available. Use `.err()` + `.expect()` instead of a `match`
+        // with an `Ok(_) => panic!` arm — that arm is structurally
+        // unreachable in a passing test, which leaves the Coverage
+        // Gate (`account_server.rs` is in scope, only `_tests.rs$`
+        // files are ignored) at 99.83% on the dead match arm.
+        let err = AccountServer::load_from_pg(state, &pool)
+            .await
+            .err()
+            .expect("load_from_pg should fail when DB is unreachable");
+        assert!(
+            matches!(err, LoadAccountServerError::Db(_)),
+            "unexpected: {:?}",
+            err
+        );
+    }
+
+    /// Mirror of `server_tests::lock_or_recover_recovers_from_poisoned_mutex`
+    /// for the `send_coins` site: poisoning the shared `state` mutex
+    /// must NOT crash the handler — the `unwrap_or_else(PoisonError::
+    /// into_inner)` recovery branch returns the inner guard so the
+    /// next check (the "Unknown account address" guard in this test)
+    /// is the one that surfaces in the response. Without this, the
+    /// recovery closure has no covering test and any future change to
+    /// the lock-acquire pattern would silently lose the poison-safe
+    /// behaviour.
+    #[test]
+    fn send_coins_recovers_from_poisoned_state_mutex() {
+        let state = Arc::new(Mutex::new(State::new()));
+        let state_for_poison = Arc::clone(&state);
+
+        // Poison the state mutex by panicking while holding the guard.
+        let _ = std::thread::spawn(move || {
+            let _guard = state_for_poison.lock().unwrap();
+            panic!("intentional panic to poison the state mutex");
+        })
+        .join();
+        assert!(state.is_poisoned(), "state mutex must be poisoned");
+
+        let mut server = AccountServer::new(Arc::clone(&state));
+        let recipient = zkcoins_program::hash::digest_from_bytes(&[2u8; 32]);
+        let account_address = zkcoins_program::hash::digest_from_bytes(&[3u8; 32]);
+        let pk = dummy_secp_public_key();
+        // The send_coins call must traverse the poisoned-lock recovery
+        // path before hitting the "Unknown account address" guard.
+        let result = server.send_coins(
+            vec![Invoice::new(1, recipient)],
+            account_address,
+            pk,
+            pk,
+            None,
+        );
+        assert_eq!(result.unwrap_err(), "Unknown account address");
     }
 }
 
