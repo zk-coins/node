@@ -34,6 +34,10 @@ sqlx = { version = "0.8", default-features = false, features = [
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 serde_json = "1.0"
+# Used by `publisher_tests` for Esplora mocking and by `server_tests`
+# to mock the Esplora HTTP endpoint behind the `/health/ready`
+# readiness probe so the tests never hit the real
+# `https://mutinynet.com/api` from CI.
 wiremock = "0.6"
 # Used by `db_tests` to spin up a real Postgres 17 per test run.
 # The legacy `clients::Cli` of v0.14/0.15 was replaced by a global

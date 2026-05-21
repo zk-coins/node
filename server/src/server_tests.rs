@@ -55,6 +55,16 @@ fn test_state() -> AppState {
         minting_account: Arc::new(Mutex::new(minting_client)),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
         pool: dead_pool(),
+        // Most tests don't exercise the readiness probe and so don't
+        // care about Esplora — point at a guaranteed-unreachable URL
+        // so an accidental call fails fast instead of hitting the real
+        // mutinynet.com from CI. The three `/health/ready` tests below
+        // override this slot with a `wiremock::MockServer` URL.
+        esplora_config: Arc::new(crate::publisher::EsploraConfig {
+            url: "http://127.0.0.1:1/api".to_string(),
+            is_mainnet: false,
+            network_name: "Mutinynet".to_string(),
+        }),
     }
 }
 
@@ -1667,6 +1677,11 @@ async fn send_with_insufficient_funds_returns_422_with_error_string() {
         minting_account: Arc::new(Mutex::new(minting_client)),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
         pool: dead_pool(),
+        esplora_config: Arc::new(crate::publisher::EsploraConfig {
+            url: "http://127.0.0.1:1/api".to_string(),
+            is_mainnet: false,
+            network_name: "Mutinynet".to_string(),
+        }),
     };
 
     let secret_bytes = include_bytes!("../minting_secret.bin");
@@ -2586,4 +2601,151 @@ async fn send_with_unknown_account_returns_404_with_error_string() {
     let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(resp["success"], false);
     assert_eq!(resp["error"], "Unknown account address");
+}
+
+// =======================================================================
+// GET /health/ready — readiness probe
+// =======================================================================
+//
+// The readiness probe combines a Postgres `SELECT 1` with an Esplora
+// `/blocks/tip/height` ping. Each test below exercises one of the three
+// reachable code paths (db ok + esplora ok / db fail + esplora ok / db
+// ok + esplora fail) so the new `ready_handler` and `check_esplora`
+// functions reach 100% line + region coverage. The DB side uses the
+// existing `dead_pool` / live-testcontainer helpers; the Esplora side
+// uses a per-test `wiremock::MockServer` so no real network is hit.
+
+/// Spin up a Postgres 17 testcontainer and return a migrated pool —
+/// the live half of the readiness happy path (and the db-ok side of
+/// the esplora-fails test).
+async fn ready_live_pool() -> (
+    Arc<sqlx::PgPool>,
+    testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
+) {
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container
+        .get_host()
+        .await
+        .expect("failed to get container host");
+    let port = pg_container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("failed to get container port");
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+    // The container handle MUST outlive the pool: `testcontainers`
+    // tears the container down on `Drop`, which would close the
+    // backing Postgres before the test finishes querying.
+    (pool, pg_container)
+}
+
+/// Build an `AppState` whose `esplora_config` points at the supplied
+/// `wiremock` URL. The DB pool is supplied separately so tests can
+/// mix-and-match dead vs. live Postgres.
+fn ready_state(pool: Arc<sqlx::PgPool>, esplora_url: String) -> AppState {
+    let mut state = test_state();
+    state.pool = pool;
+    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
+        url: esplora_url,
+        is_mainnet: false,
+        network_name: "Mutinynet".to_string(),
+    });
+    state
+}
+
+#[tokio::test]
+async fn ready_returns_200_when_db_and_esplora_reachable() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (pool, _pg) = ready_live_pool().await;
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/height"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("123456"))
+        .mount(&mock_server)
+        .await;
+
+    let state = ready_state(pool, mock_server.uri());
+    let req = Request::get("/health/ready").body(Body::empty()).unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+
+    assert_eq!(status, StatusCode::OK, "body={}", body);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(v["ready"], true);
+    assert_eq!(v["failures"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn ready_returns_503_when_db_unreachable() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Esplora is healthy …
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/height"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("123456"))
+        .mount(&mock_server)
+        .await;
+
+    // … but Postgres is the lazy-connect dead pool, which fails on first
+    // query with a connect error. `ready_handler` must surface that as
+    // 503 + `failures: ["db"]`.
+    let state = ready_state(dead_pool(), mock_server.uri());
+    let req = Request::get("/health/ready").body(Body::empty()).unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body={}", body);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(v["ready"], false);
+    let failures: Vec<String> = v["failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(failures, vec!["db".to_string()]);
+}
+
+#[tokio::test]
+async fn ready_returns_503_when_esplora_unreachable() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (pool, _pg) = ready_live_pool().await;
+
+    // Live Postgres + Esplora returning 500 → only `esplora` fails.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/height"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream down"))
+        .mount(&mock_server)
+        .await;
+
+    let state = ready_state(pool, mock_server.uri());
+    let req = Request::get("/health/ready").body(Body::empty()).unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body={}", body);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(v["ready"], false);
+    let failures: Vec<String> = v["failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(failures, vec!["esplora".to_string()]);
 }
