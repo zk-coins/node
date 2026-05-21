@@ -699,17 +699,13 @@ pub async fn persist_account(
     Ok(bytes.len())
 }
 
-/// Error type for `persist_account`. Splits the two failure modes
-/// (bincode encode vs. database write) so callers can decide whether
-/// to retry, log, or escalate.
+/// Error type for `persist_account`. Wraps the single failure mode
+/// (database write — connect, transaction, decode). Bincode encoding
+/// of the in-memory `Account` is infallible for the current shape and
+/// is therefore unwrapped inside `serialize_account` rather than
+/// propagated here.
 #[derive(Debug)]
 pub enum PersistAccountError {
-    /// `bincode::serialize` failed on the in-memory `Account`. In
-    /// practice this is unreachable for the current `Account` shape,
-    /// but the path is propagated rather than panicked over so a
-    /// future fallible `Serialize` impl surfaces as a recoverable
-    /// error.
-    Serialize(bincode::Error),
     /// The Postgres upsert failed (connect, transaction, decode).
     Db(sqlx::Error),
 }
@@ -717,7 +713,6 @@ pub enum PersistAccountError {
 impl std::fmt::Display for PersistAccountError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PersistAccountError::Serialize(e) => write!(f, "account serialize: {}", e),
             PersistAccountError::Db(e) => write!(f, "database error: {}", e),
         }
     }
@@ -726,15 +721,8 @@ impl std::fmt::Display for PersistAccountError {
 impl std::error::Error for PersistAccountError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            PersistAccountError::Serialize(e) => Some(e),
             PersistAccountError::Db(e) => Some(e),
         }
-    }
-}
-
-impl From<bincode::Error> for PersistAccountError {
-    fn from(e: bincode::Error) -> Self {
-        PersistAccountError::Serialize(e)
     }
 }
 
@@ -901,12 +889,6 @@ mod inline_tests {
         let db_err = PersistAccountError::from(sqlx::Error::ColumnNotFound("data".to_string()));
         assert!(format!("{}", db_err).contains("database error"));
         assert!(std::error::Error::source(&db_err).is_some());
-
-        let ser_err = PersistAccountError::from(bincode::Error::new(bincode::ErrorKind::Custom(
-            "boom".into(),
-        )));
-        assert!(format!("{}", ser_err).contains("account serialize"));
-        assert!(std::error::Error::source(&ser_err).is_some());
     }
 
     #[tokio::test]
