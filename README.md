@@ -152,7 +152,7 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 #### Claim username
 
 - **Module:** `server.rs::claim_username_handler` → `username.rs::UsernameStore::claim`
-- **Behaviour:** verifies Schnorr signature over `SHA256(username || pubkey || timestamp)` (5 min skew); writes to `usernames.bin` (atomic)
+- **Behaviour:** verifies Schnorr signature over `SHA256(username || pubkey || timestamp)` (5 min skew); persists to the Postgres `usernames` table via `db::claim_username` (`INSERT … ON CONFLICT DO NOTHING`)
 - **Tests:** `server.rs::tests::claim_username_*` (3 tests) + `username.rs::tests::*` (8 tests covering valid charset, duplicates, persistence)
 
 #### Resolve username
@@ -175,8 +175,8 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 
 #### State persistence (SMT/MMR write)
 
-- **Module:** `state.rs::State::update` (atomic writes via `atomic_write` helper)
-- **Behaviour:** on each verified commitment: append SMT root to MMR, persist `smt.bin`, `mmr.bin`, `latest_block.bin`
+- **Module:** `state.rs::State::update` + scanner callback in `main.rs` → `db::persist_state_tx`
+- **Behaviour:** on each verified commitment: append SMT root to MMR, then atomically upsert the SMT bytes, MMR bytes, and last-processed block hash inside a single `BEGIN; UPSERT; UPSERT; UPSERT; COMMIT` against Postgres (issue #11 fix). Replaces the pre-migration `smt.bin` / `mmr.bin` / `latest_block.bin` sibling files
 - **Tests:** `state.rs::tests::*` (9 tests covering single + multiple updates, persistence roundtrip, proof generation/verification, empty MMR edge cases)
 
 #### Taproot inscription broadcast and Publisher UTXO lookup

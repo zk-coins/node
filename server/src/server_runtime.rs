@@ -16,9 +16,11 @@ use std::sync::{Arc, Mutex};
 use axum::http::StatusCode;
 use axum::Json;
 use shared::commitment::Commitment;
+use sqlx::PgPool;
 use tokio::net::TcpListener;
 
-use crate::account_server::CoinProof;
+use crate::account_server::{persist_account, CoinProof};
+use crate::db;
 use crate::publisher::create_and_broadcast_inscription;
 use crate::server::{lock_or_recover, SendCoinResponse};
 use crate::NETWORK_CONFIG;
@@ -36,8 +38,7 @@ pub async fn start_rest_server(
     account_server: AccountServer,
     username_store: UsernameStore,
     addr: &str,
-    accounts_path: String,
-    #[cfg_attr(not(feature = "usernames"), allow(unused_variables))] usernames_path: String,
+    pool: Arc<PgPool>,
 ) -> anyhow::Result<()> {
     let socket_addr = addr
         .parse::<SocketAddr>()
@@ -45,13 +46,13 @@ pub async fn start_rest_server(
 
     let shared_account_server = Arc::new(Mutex::new(account_server));
 
-    let proofs_dir = format!(
-        "{}/proofs",
-        std::path::Path::new(&accounts_path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .display()
-    );
+    // Proof files keep using a local directory — the proof store is
+    // append-only and the proofs themselves are large (bincode-
+    // serialized Plonky2 proofs) so a `BYTEA` column would balloon the
+    // Postgres image. `PROOFS_DIR` defaults to `./proofs` for parity
+    // with the pre-PR-A3 layout; the deployment overrides it to the
+    // mounted data volume.
+    let proofs_dir = std::env::var("PROOFS_DIR").unwrap_or_else(|_| "./proofs".to_string());
     let proof_store = Arc::new(ProofStore::new(&proofs_dir));
 
     #[cfg(feature = "faucet")]
@@ -71,31 +72,23 @@ pub async fn start_rest_server(
         // the wrong prev_commitment_pubkey, and send_coins fails with
         // "prev_commitment_pubkey required for account update".
         //
-        // Persist it in a tiny sibling file (4 bytes LE u32) next to
-        // accounts.bin. Read here, written in mint_handler after every
-        // successful increment.
-        // accounts_path is typically a relative path like "accounts.bin"
-        // (cwd-relative). Path::parent() returns Some("") for that, and
-        // `format!("{}/minting_num_pubkeys.bin", "")` gives the absolute
-        // path `/minting_num_pubkeys.bin` (filesystem root), not a
-        // sibling of accounts.bin. Resolve to "." in that case so the
-        // counter lands next to accounts.bin inside the data volume.
-        let minting_pubkeys_path = {
-            let parent = std::path::Path::new(&accounts_path).parent();
-            let dir = match parent {
-                Some(p) if !p.as_os_str().is_empty() => p.display().to_string(),
-                _ => ".".to_string(),
-            };
-            format!("{}/minting_num_pubkeys.bin", dir)
-        };
-        if let Ok(bytes) = std::fs::read(&minting_pubkeys_path) {
-            if bytes.len() == 4 {
-                let n = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                println!(
-                    "Loaded minting num_pubkeys={} from {}",
-                    n, minting_pubkeys_path
-                );
+        // PR-A3 moved the counter from the `minting_num_pubkeys.bin`
+        // sibling file into the `minting_meta` Postgres table. A read
+        // failure here is non-fatal — we log it and start from 0,
+        // exactly like the legacy file-missing fallback used to do.
+        match db::load_minting_num_pubkeys(&pool).await {
+            Ok(Some(n)) => {
+                println!("Loaded minting num_pubkeys={} from Postgres", n);
                 minting_client.num_pubkeys = n;
+            }
+            Ok(None) => {
+                println!("No minting_meta row found, starting num_pubkeys=0");
+            }
+            Err(e) => {
+                eprintln!(
+                    "Failed to load minting num_pubkeys from Postgres ({}); starting at 0",
+                    e
+                );
             }
         }
         // Plonky2 migration (D11 in MIGRATION_RESEARCH.md): MINTING_ADDRESS
@@ -121,11 +114,14 @@ pub async fn start_rest_server(
         #[cfg(feature = "faucet")]
         minting_account,
         username_store: shared_username_store,
-        accounts_path,
-        #[cfg(feature = "usernames")]
-        usernames_path,
+        pool: Arc::clone(&pool),
     };
-    {
+
+    // Bootstrap the minting account if it isn't already in the DB.
+    // The snapshot pattern mirrors the handler sites: take the
+    // mutation under the sync guard, then drop the guard before the
+    // async upsert.
+    let bootstrap_snapshot: Option<(zkcoins_program::hash::HashDigest, Vec<u8>)> = {
         let mut account_server_guard = state.account_server.lock().unwrap();
         if account_server_guard.get_minting_account_address().is_err() {
             let mut minting_server_account = crate::account_server::Account::new();
@@ -142,8 +138,30 @@ pub async fn start_rest_server(
                 *zkcoins_program::types::MINTING_ADDRESS,
                 minting_server_account,
             );
-            if let Err(e) = account_server_guard.save_to_file(&state.accounts_path) {
-                eprintln!("Failed to save initial accounts file: {}", e);
+            account_server_guard
+                .get_account(&zkcoins_program::types::MINTING_ADDRESS)
+                .map(AccountServer::serialize_account)
+                .map(|bytes| (*zkcoins_program::types::MINTING_ADDRESS, bytes))
+        } else {
+            None
+        }
+    };
+    if let Some((address, _bytes)) = bootstrap_snapshot.as_ref() {
+        // Look the account up once more through `persist_account` so
+        // the helper's error variants are wired in the same way as the
+        // handler sites. The address + (re-fetched) account go through
+        // the lock again only briefly; the second snapshot reads the
+        // same row we just inserted so it is guaranteed to be present.
+        let acct_clone = {
+            let guard = state.account_server.lock().unwrap();
+            guard.get_account(address).and_then(|a| {
+                let b = AccountServer::serialize_account(a);
+                bincode::deserialize::<crate::account_server::Account>(&b).ok()
+            })
+        };
+        if let Some(account) = acct_clone {
+            if let Err(e) = persist_account(&pool, address, &account).await {
+                eprintln!("Failed to upsert bootstrap minting account: {}", e);
             }
         }
     }
@@ -192,12 +210,21 @@ pub(crate) async fn broadcast_commit_and_deliver(
 
     let mut updated_proof = coin_proof;
     updated_proof.commitment = Some(commitment);
-    let mut account_server_guard = lock_or_recover(&state.account_server);
-    if let Err(e) = account_server_guard.receive_coin(updated_proof) {
-        eprintln!("Failed to receive coin after commit: {}", e);
-    }
-    if let Err(e) = account_server_guard.save_to_file(&state.accounts_path) {
-        eprintln!("Failed to persist accounts after commit: {}", e);
+    let recipient = updated_proof.coin.recipient;
+    let snapshot: Option<Vec<u8>> = {
+        let mut account_server_guard = lock_or_recover(&state.account_server);
+        if let Err(e) = account_server_guard.receive_coin(updated_proof) {
+            eprintln!("Failed to receive coin after commit: {}", e);
+        }
+        account_server_guard
+            .get_account(&recipient)
+            .map(AccountServer::serialize_account)
+    };
+    if let Some(bytes) = snapshot {
+        let addr_bytes = zkcoins_program::hash::digest_to_bytes(&recipient);
+        if let Err(e) = db::upsert_account(&state.pool, &addr_bytes, &bytes).await {
+            eprintln!("Failed to upsert account after commit: {}", e);
+        }
     }
 
     (

@@ -18,6 +18,16 @@
 FROM rust:bookworm AS builder
 WORKDIR /app
 
+# `sqlx::migrate!("./migrations")` is compile-time, so the migrations
+# directory must exist when `cargo build` runs (the COPY below pulls
+# it in). The current `db.rs` uses runtime-checked `sqlx::query` /
+# `sqlx::query_as`, so no `.sqlx/` offline cache is needed; setting
+# `SQLX_OFFLINE=true` is defensive — if a future change introduces a
+# compile-checked `sqlx::query!` macro, the build will surface the
+# missing `.sqlx/` immediately rather than trying (and failing) to
+# reach a live database from the builder.
+ENV SQLX_OFFLINE=true
+
 # Copy just the toolchain file first so rustup can fetch the right
 # channel before the slow source copy. Cuts a few seconds off cold
 # builds; layer-caches well across source-only changes.

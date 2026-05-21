@@ -431,27 +431,63 @@ fn test_mint_repro_live_setup() {
     assert_eq!(coin_proofs.len(), 1);
 }
 
-#[test]
-fn test_save_and_load_roundtrip() {
+/// PR-A3 replacement for the previous file-based `save_and_load_roundtrip`:
+/// persist an imported account via `persist_account` (the same helper
+/// the handler sites call), then rebuild a fresh `AccountServer` via
+/// `load_from_pg` and assert the imported account survived round-trip.
+#[tokio::test]
+async fn test_persist_and_load_from_pg_roundtrip() {
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = crate::db::connect_and_migrate(&url)
+        .await
+        .expect("connect_and_migrate failed");
+
     let state_arc = Arc::new(Mutex::new(State::new()));
     let mut server = AccountServer::new(Arc::clone(&state_arc));
 
     let address: HashDigest = digest_from_bytes(&[42u8; 32]);
-    server.import_account(address, Account::new());
+    let mut acct = Account::new();
+    acct.balance = 11;
+    server.import_account(address, acct);
 
-    let path = std::env::temp_dir().join(format!(
-        "zkcoins-account-server-test-{}.bin",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    server.save_to_file(path.to_str().unwrap()).unwrap();
+    // Snapshot + upsert mirrors the handler-site pattern.
+    let account_snapshot = server.get_account(&address).cloned_via_bincode();
+    crate::account_server::persist_account(&pool, &address, &account_snapshot)
+        .await
+        .expect("persist_account ok");
 
-    let loaded = AccountServer::load_from_file(state_arc, path.to_str().unwrap()).unwrap();
-    assert_eq!(loaded.get_account_balance(&address).unwrap(), 0);
+    // Rebuild from PG and verify the row came back.
+    let loaded = AccountServer::load_from_pg(state_arc, &pool)
+        .await
+        .expect("load_from_pg ok");
+    assert_eq!(loaded.get_account_balance(&address).unwrap(), 11);
+}
 
-    std::fs::remove_file(&path).ok();
+/// `Account` does not implement `Clone` (its inner Plonky2 proof types
+/// are sealed). The test above only needs an owned copy for the
+/// persistence call, so bounce it through bincode locally. Kept as a
+/// trait extension to keep the test body readable without polluting
+/// the production `Account` API.
+trait CloneViaBincode {
+    fn cloned_via_bincode(self) -> Account;
+}
+
+impl CloneViaBincode for Option<&Account> {
+    fn cloned_via_bincode(self) -> Account {
+        let a = self.expect("account present");
+        let bytes = bincode::serialize(a).expect("serialize");
+        bincode::deserialize(&bytes).expect("deserialize")
+    }
 }
 
 #[test]
@@ -469,20 +505,90 @@ fn test_get_account_balance_returns_err_for_unknown_address() {
     assert!(server.get_account_balance(&unknown).is_err());
 }
 
-#[test]
-fn test_load_from_file_rejects_corrupted_bytes() {
-    let path = std::env::temp_dir().join(format!(
-        "zkcoins-account-server-corrupt-{}.bin",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::write(&path, b"not bincode").unwrap();
+/// PR-A3 replacement for the previous `test_load_from_file_rejects_corrupted_bytes`:
+/// plant a row whose `data` blob is not valid bincode and assert
+/// `load_from_pg` surfaces the corruption as `LoadAccountServerError
+/// ::Deserialize` rather than panicking or silently dropping the row.
+#[tokio::test]
+async fn test_load_from_pg_rejects_corrupted_blob() {
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = crate::db::connect_and_migrate(&url)
+        .await
+        .expect("connect_and_migrate failed");
+
+    let bad_addr = vec![0xAAu8; 32];
+    sqlx::query("INSERT INTO accounts (address, data) VALUES ($1, $2)")
+        .bind(&bad_addr)
+        .bind(b"not bincode".to_vec())
+        .execute(&pool)
+        .await
+        .unwrap();
+
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let result = AccountServer::load_from_file(state_arc, path.to_str().unwrap());
-    assert!(result.is_err());
-    std::fs::remove_file(&path).ok();
+    // `AccountServer` is intentionally not `Debug`, so `expect_err`
+    // isn't available; match the Result instead.
+    match AccountServer::load_from_pg(state_arc, &pool).await {
+        Ok(_) => panic!("expected deserialize error"),
+        Err(err) => assert!(
+            matches!(
+                err,
+                crate::account_server::LoadAccountServerError::Deserialize(_)
+            ),
+            "unexpected: {:?}",
+            err
+        ),
+    }
+}
+
+/// PR-A3 negative test: plant a row whose `address` column is not the
+/// expected 32 bytes and assert the loader surfaces the mismatch as
+/// `LoadAccountServerError::BadAddressLength`.
+#[tokio::test]
+async fn test_load_from_pg_rejects_wrong_address_length() {
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = crate::db::connect_and_migrate(&url)
+        .await
+        .expect("connect_and_migrate failed");
+
+    sqlx::query("INSERT INTO accounts (address, data) VALUES ($1, $2)")
+        .bind(vec![0u8; 7]) // wrong length
+        .bind(b"anything".to_vec())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    match AccountServer::load_from_pg(state_arc, &pool).await {
+        Ok(_) => panic!("expected bad-address length"),
+        Err(err) => assert!(
+            matches!(
+                err,
+                crate::account_server::LoadAccountServerError::BadAddressLength(7)
+            ),
+            "unexpected: {:?}",
+            err
+        ),
+    }
 }
 
 #[test]
