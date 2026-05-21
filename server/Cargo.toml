@@ -39,6 +39,10 @@ serde_json = "1.0"
 # `runner()` — see `db_tests::setup_pool` for the shape we use.
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
+# Used by `server_tests` to mock the Esplora HTTP endpoint behind the
+# `/health/ready` readiness probe so the tests never hit the real
+# `https://mutinynet.com/api` from CI.
+wiremock = "0.6"
 
 [features]
 # All non-MVP features are off by default. When a feature is not enabled, the
