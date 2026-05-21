@@ -58,6 +58,17 @@ fn test_state() -> AppState {
     }
 }
 
+/// Variant of [`test_state`] that swaps the lazy `dead_pool` for a real
+/// migrated Postgres pool. Used by the handful of happy-path tests
+/// whose handler actually has to persist (e.g. `claim_username` —
+/// hard-fails with 503 on DB error, unlike `send`/`mint`/`receive`
+/// whose `db::upsert_account` calls are best-effort log-and-continue).
+fn live_test_state(pool: Arc<sqlx::PgPool>) -> AppState {
+    let mut state = test_state();
+    state.pool = pool;
+    state
+}
+
 /// Helper: send a request through the router and return (status, body string).
 async fn send_request(request: Request<Body>) -> (StatusCode, String) {
     let app = create_router(test_state());
@@ -801,6 +812,34 @@ fn send_signature_rejects_wrong_signature() {
 #[tokio::test]
 async fn claim_username_with_valid_signature() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    // The `claim_username_handler` hard-fails with 503 if persistence
+    // fails — unlike the other handlers whose DB upserts are
+    // log-and-continue. So this happy-path test cannot use the lazy
+    // `dead_pool`; it boots a real Postgres 17 container, mirroring
+    // the per-test isolation pattern from `db_tests::setup_pool` /
+    // `username_tests::setup_pool` / `server_runtime_tests::setup_pool`.
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container
+        .get_host()
+        .await
+        .expect("failed to get container host");
+    let port = pg_container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("failed to get container port");
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
 
     let secp = secp::Secp256k1::new();
     let secret = SecretKey::from_slice(&[7u8; 32]).unwrap();
@@ -829,7 +868,7 @@ async fn claim_username_with_valid_signature() {
     let sig = secp.sign_schnorr(&msg, &keypair);
 
     // Import the address into the account_server so resolve_identifier can find it
-    let state = test_state();
+    let state = live_test_state(pool);
     {
         let mut account_server = state.account_server.lock().unwrap();
         account_server.import_account(
