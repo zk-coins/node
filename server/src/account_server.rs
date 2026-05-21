@@ -579,8 +579,18 @@ impl AccountServer {
     /// `Arc<Mutex<AccountServer>>` lock, and persist the bytes outside
     /// the lock — required because the upsert is `async` and a
     /// `std::sync::MutexGuard` may not be held across an `.await`.
-    pub fn serialize_account(account: &Account) -> Result<Vec<u8>, bincode::Error> {
+    ///
+    /// `bincode::serialize` on a well-formed `Account` cannot fail in
+    /// practice (no fallible `Serialize` impls in the field graph), so
+    /// the return type is the raw byte vector rather than a `Result`.
+    /// Returning `Result` previously introduced an uncovered `?`
+    /// branch at every call site without buying any real recovery
+    /// path; if a future field gains a fallible serializer, switch
+    /// this back to `Result` and propagate through the existing
+    /// `PersistAccountError::Serialize` variant.
+    pub fn serialize_account(account: &Account) -> Vec<u8> {
         bincode::serialize(account)
+            .expect("bincode::serialize cannot fail for the current Account shape")
     }
 
     /// Reload an `AccountServer` from Postgres.
@@ -683,7 +693,7 @@ pub async fn persist_account(
     address: &Address,
     account: &Account,
 ) -> Result<usize, PersistAccountError> {
-    let bytes = AccountServer::serialize_account(account)?;
+    let bytes = AccountServer::serialize_account(account);
     let addr_bytes = digest_to_bytes(address);
     db::upsert_account(pool, &addr_bytes, &bytes).await?;
     Ok(bytes.len())
@@ -809,7 +819,7 @@ mod inline_tests {
     fn serialize_account_roundtrips_via_bincode() {
         let mut a = Account::new();
         a.balance = 7;
-        let bytes = AccountServer::serialize_account(&a).expect("serialize ok");
+        let bytes = AccountServer::serialize_account(&a);
         let back: Account = bincode::deserialize(&bytes).expect("deserialize ok");
         assert_eq!(back.balance, 7);
     }

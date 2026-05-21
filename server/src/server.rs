@@ -531,7 +531,7 @@ async fn receive_coin_handler(
         match account_server.receive_coin(coin_proof) {
             Ok(_) => account_server
                 .get_account(&recipient)
-                .and_then(|a| AccountServer::serialize_account(a).ok()),
+                .map(AccountServer::serialize_account),
             Err(_) => None,
         }
     };
@@ -611,8 +611,15 @@ async fn send_coin_handler(
     // MutexGuard` is not `Send`, and even if it were, parking the
     // future would block other handlers behind the same lock for the
     // duration of the DB round-trip.
+    // `updated_account_bytes` is only meaningful on the Ok branch
+    // below — `send_coins` Ok implies the sender account exists in
+    // memory (it was just mutated). On the Err branch the snapshot is
+    // unused; we initialize it to an empty `Vec` to avoid an
+    // `Option`-shaped sentinel whose `None`-arm at the upsert site
+    // would never be reached at runtime (and thus could not be
+    // covered by tests).
     let send_result: Result<Vec<CoinProof>, &str>;
-    let updated_account_bytes: Option<Vec<u8>>;
+    let updated_account_bytes: Vec<u8>;
     {
         let mut account_server_lock = lock_or_recover(&state.account_server);
         let res = account_server_lock.send_coins(
@@ -622,12 +629,13 @@ async fn send_coin_handler(
             request.next_public_key,
             request.prev_commitment_pubkey,
         );
-        updated_account_bytes = if res.is_ok() {
-            account_server_lock
-                .get_account(&from_address)
-                .and_then(|a| AccountServer::serialize_account(a).ok())
-        } else {
-            None
+        updated_account_bytes = match &res {
+            Ok(_) => AccountServer::serialize_account(
+                account_server_lock
+                    .get_account(&from_address)
+                    .expect("send_coins Ok implies the sender account is in memory"),
+            ),
+            Err(_) => Vec::new(),
         };
         send_result = res;
     }
@@ -682,11 +690,11 @@ async fn send_coin_handler(
             // account row stale; the next mutation will overwrite it.
             // We log and continue rather than failing the request,
             // which mirrors the pre-Postgres `save_to_file` semantics.
-            if let Some(bytes) = updated_account_bytes {
-                let addr_bytes = digest_to_bytes(&from_address);
-                if let Err(e) = db::upsert_account(&state.pool, &addr_bytes, &bytes).await {
-                    eprintln!("Failed to upsert sender account after send: {}", e);
-                }
+            let addr_bytes = digest_to_bytes(&from_address);
+            if let Err(e) =
+                db::upsert_account(&state.pool, &addr_bytes, &updated_account_bytes).await
+            {
+                eprintln!("Failed to upsert sender account after send: {}", e);
             }
 
             (
@@ -896,9 +904,7 @@ async fn mint_handler(
                     Vec::with_capacity(affected.len());
                 for addr in affected {
                     if let Some(acct) = account_server_guard.get_account(&addr) {
-                        if let Ok(bytes) = AccountServer::serialize_account(acct) {
-                            out.push((addr, bytes));
-                        }
+                        out.push((addr, AccountServer::serialize_account(acct)));
                     }
                 }
                 out

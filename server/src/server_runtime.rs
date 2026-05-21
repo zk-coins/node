@@ -140,7 +140,7 @@ pub async fn start_rest_server(
             );
             account_server_guard
                 .get_account(&zkcoins_program::types::MINTING_ADDRESS)
-                .and_then(|a| AccountServer::serialize_account(a).ok())
+                .map(AccountServer::serialize_account)
                 .map(|bytes| (*zkcoins_program::types::MINTING_ADDRESS, bytes))
         } else {
             None
@@ -155,9 +155,8 @@ pub async fn start_rest_server(
         let acct_clone = {
             let guard = state.account_server.lock().unwrap();
             guard.get_account(address).and_then(|a| {
-                AccountServer::serialize_account(a)
-                    .ok()
-                    .and_then(|b| bincode::deserialize::<crate::account_server::Account>(&b).ok())
+                let b = AccountServer::serialize_account(a);
+                bincode::deserialize::<crate::account_server::Account>(&b).ok()
             })
         };
         if let Some(account) = acct_clone {
@@ -219,7 +218,7 @@ pub(crate) async fn broadcast_commit_and_deliver(
         }
         account_server_guard
             .get_account(&recipient)
-            .and_then(|a| AccountServer::serialize_account(a).ok())
+            .map(AccountServer::serialize_account)
     };
     if let Some(bytes) = snapshot {
         let addr_bytes = zkcoins_program::hash::digest_to_bytes(&recipient);
