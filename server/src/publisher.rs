@@ -358,3 +358,7 @@ pub async fn create_and_broadcast_inscription(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "publisher_tests.rs"]
+mod tests;
