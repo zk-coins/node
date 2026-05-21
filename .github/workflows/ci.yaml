@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [develop]
   # CI runs on every pull request regardless of target branch. This
   # makes the default safe for stacked PRs (PR-A → PR-B → PR-C where
   # each PR's base is the previous PR's branch) and any other workflow
@@ -12,6 +10,17 @@ on:
   # feature stack. Letting every PR trigger CI is cheap (the heavy
   # M3 Ultra jobs are still gated behind the `ci:full` label below)
   # and matches what most repos default to.
+  #
+  # `push: develop` is intentionally absent. Every commit reaching
+  # `develop` is already covered by the open Release PR (`Release:
+  # develop -> main`, created by auto-release-pr.yaml) — that PR's
+  # `synchronize` event runs CI on the new HEAD, and because the
+  # Release PR carries the `ci:full` label the heavy gate runs too.
+  # Adding `on: push: branches: [develop]` would queue a second
+  # workflow instance on the same SHA, which the concurrency-group
+  # below cancels immediately — producing permanent "(push) cancelled"
+  # checks that look like failures in the PR UI without protecting
+  # anything.
   #
   # `ready_for_review` is added so the workflow fires the moment a
   # draft PR is marked ready — drafts themselves skip CI via the
@@ -109,15 +118,13 @@ jobs:
   server-tests:
     name: Server + Shared Tests (M3 Ultra)
     # Heavy job (~60-90 min on the single self-hosted M3 Ultra). Gated
-    # behind the `ci:full` label on PRs so we don't burn runner time
-    # on every speculative push — apply the label when the PR is
-    # ready for the authoritative test+coverage gate. `push to
-    # develop` always runs the heavy gate (post-merge is the real
-    # source of truth). The `coverage` job inherits the skip via
+    # behind the `ci:full` label so we don't burn runner time on every
+    # speculative PR — apply the label when the PR is ready for the
+    # authoritative test+coverage gate. The Release PR
+    # (`develop -> main`) gets the label applied automatically by
+    # auto-release-pr.yaml. The `coverage` job inherits the skip via
     # `needs: server-tests`, so no separate guard there.
-    if: >-
-      github.event_name == 'push' ||
-      contains(github.event.pull_request.labels.*.name, 'ci:full')
+    if: contains(github.event.pull_request.labels.*.name, 'ci:full')
     needs: lint-and-build
     runs-on: [self-hosted, m3-ultra]
     timeout-minutes: 120

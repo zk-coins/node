@@ -8,6 +8,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  issues: write  # required by `gh label create`
 
 concurrency:
   group: auto-release-pr
@@ -58,8 +59,18 @@ jobs:
             "- [ ] Merge when ready for production" \
             > /tmp/pr-body.md
 
+          # `ci:full` opts the PR into the heavy M3 Ultra test + coverage
+          # jobs (see ci.yaml). Release PRs are exactly when we want the
+          # authoritative gate, so apply it on creation rather than
+          # relying on a human to remember the click.
+          gh label create ci:full \
+            --color FFA500 \
+            --description "Run heavy M3 Ultra test + coverage jobs on this PR" \
+            2>/dev/null || true
+
           gh pr create \
             --base main \
             --head develop \
             --title "Release: develop -> main" \
+            --label ci:full \
             --body-file /tmp/pr-body.md
