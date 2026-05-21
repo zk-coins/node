@@ -1146,6 +1146,127 @@ async fn send_with_valid_signature_returns_proof_id_and_hashes() {
     );
 }
 
+/// Companion to `send_with_valid_signature_returns_proof_id_and_hashes`
+/// that drives the post-send `db::upsert_account` path against a real
+/// Postgres 17 testcontainer instead of `dead_pool`. The default
+/// `test_state` exercises the upsert *error* arm (log-and-continue);
+/// this test exercises the upsert *success* arm so the if-let-Some
+/// block falls through without entering the `if let Err` branch —
+/// the only path that touches the line after the inner Err handler.
+///
+/// The persist itself is best-effort, so the assertions are scoped
+/// to (a) the handler still returning 200 with a usable proof_id and
+/// (b) the `accounts` row being readable from Postgres after the
+/// call. Together they pin both observable side-effects of the
+/// happy-path upsert.
+#[tokio::test]
+async fn send_with_valid_signature_persists_sender_account_to_postgres() {
+    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
+    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container
+        .get_host()
+        .await
+        .expect("failed to get container host");
+    let port = pg_container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("failed to get container port");
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
+    let state = live_test_state(Arc::clone(&pool));
+
+    let secret_bytes = include_bytes!("../minting_secret.bin");
+    let xpriv =
+        Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).expect("test minting xpriv");
+    let secp = secp::Secp256k1::new();
+
+    let derive_pk = |index: u32| -> PublicKey {
+        Xpub::from_priv(&secp, &xpriv)
+            .derive_pub(&secp, &[ChildNumber::Normal { index }])
+            .expect("derive_pub")
+            .public_key
+    };
+    let derive_sk = |index: u32| -> SecretKey {
+        xpriv
+            .derive_priv(&secp, &[ChildNumber::Normal { index }])
+            .expect("derive_priv")
+            .private_key
+    };
+
+    let sk_0 = derive_sk(0);
+    let pk_0 = derive_pk(0);
+    let pk_1 = derive_pk(1);
+
+    let account_address = "0x".to_string()
+        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
+            &zkcoins_program::types::MINTING_ADDRESS,
+        ));
+    let recipient = "0x".to_string() + &hex::encode([1u8; 32]);
+    let amount: u64 = 100;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let mut hasher = Sha256::new();
+    hasher.update(account_address.as_bytes());
+    hasher.update(recipient.as_bytes());
+    hasher.update(amount.to_le_bytes());
+    hasher.update(now.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+
+    let msg = Message::from_digest(hash);
+    let keypair = Keypair::from_secret_key(&secp, &sk_0);
+    let sig = secp.sign_schnorr(&msg, &keypair);
+
+    let body = serde_json::json!({
+        "account_address": account_address,
+        "recipient": recipient,
+        "amount": amount,
+        "public_key": hex::encode(pk_0.serialize()),
+        "next_public_key": hex::encode(pk_1.serialize()),
+        "signature": hex::encode(sig.serialize()),
+        "timestamp": now,
+    });
+
+    let req = Request::post("/api/send")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, resp_body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::OK, "body: {resp_body}");
+    let response_json: serde_json::Value =
+        serde_json::from_str(&resp_body).expect("response is valid JSON");
+    assert_eq!(response_json["success"], true);
+    assert!(response_json["proof_id"].as_u64().is_some());
+
+    // The post-send upsert must have written the sender (minting)
+    // account row. Confirm it via a direct SELECT so the assertion
+    // doesn't depend on the handler's own read path.
+    let from_address_bytes =
+        zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS);
+    let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT data FROM accounts WHERE address = $1")
+        .bind(&from_address_bytes[..])
+        .fetch_optional(&*pool)
+        .await
+        .expect("select accounts row");
+    let (data,) = row.expect("upsert wrote the sender account row");
+    assert!(!data.is_empty(), "account blob must be non-empty");
+}
+
 #[tokio::test]
 async fn commit_with_bad_message_hex_returns_422() {
     // Build a sendable state + perform a valid send first so a proof_id

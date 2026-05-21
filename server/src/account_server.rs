@@ -939,6 +939,44 @@ mod inline_tests {
             ),
         }
     }
+
+    /// Mirror of `server_tests::lock_or_recover_recovers_from_poisoned_mutex`
+    /// for the `send_coins` site: poisoning the shared `state` mutex
+    /// must NOT crash the handler — the `unwrap_or_else(PoisonError::
+    /// into_inner)` recovery branch returns the inner guard so the
+    /// next check (the "Unknown account address" guard in this test)
+    /// is the one that surfaces in the response. Without this, the
+    /// recovery closure has no covering test and any future change to
+    /// the lock-acquire pattern would silently lose the poison-safe
+    /// behaviour.
+    #[test]
+    fn send_coins_recovers_from_poisoned_state_mutex() {
+        let state = Arc::new(Mutex::new(State::new()));
+        let state_for_poison = Arc::clone(&state);
+
+        // Poison the state mutex by panicking while holding the guard.
+        let _ = std::thread::spawn(move || {
+            let _guard = state_for_poison.lock().unwrap();
+            panic!("intentional panic to poison the state mutex");
+        })
+        .join();
+        assert!(state.is_poisoned(), "state mutex must be poisoned");
+
+        let mut server = AccountServer::new(Arc::clone(&state));
+        let recipient = zkcoins_program::hash::digest_from_bytes(&[2u8; 32]);
+        let account_address = zkcoins_program::hash::digest_from_bytes(&[3u8; 32]);
+        let pk = dummy_secp_public_key();
+        // The send_coins call must traverse the poisoned-lock recovery
+        // path before hitting the "Unknown account address" guard.
+        let result = server.send_coins(
+            vec![Invoice::new(1, recipient)],
+            account_address,
+            pk,
+            pk,
+            None,
+        );
+        assert_eq!(result.unwrap_err(), "Unknown account address");
+    }
 }
 
 #[cfg(test)]

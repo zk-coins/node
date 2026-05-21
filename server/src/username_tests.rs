@@ -221,3 +221,45 @@ fn validation_error_display_passes_through_message() {
     assert_eq!(format!("{}", err), "Username must be 1-64 characters");
     assert!(std::error::Error::source(&err).is_none());
 }
+
+/// Simulate a race between the in-memory pre-check and the SQL
+/// `ON CONFLICT DO NOTHING` boundary: another writer (here, a direct
+/// SQL insert that bypasses the in-memory mirror) claims the name
+/// first, so when `claim` reaches the database the row already exists.
+/// `db::claim_username` then returns `inserted = false`, and `claim`
+/// must surface the same "Username already taken" Validation error
+/// as the in-memory pre-check would have produced. This is the
+/// branch that wraps the SQL-layer race fallback in `username.rs`.
+#[tokio::test]
+async fn claim_falls_back_to_validation_when_sql_layer_catches_race() {
+    let (pool, _container) = setup_pool().await;
+
+    // Plant the row directly via SQL so `UsernameStore::new()`'s
+    // in-memory map stays empty — the in-memory `contains_key` check
+    // will pass, and execution will flow into `db::claim_username`
+    // where Postgres' `ON CONFLICT DO NOTHING` will return 0 rows
+    // affected.
+    sqlx::query("INSERT INTO usernames (name, address) VALUES ($1, $2)")
+        .bind("alice")
+        .bind(vec![1u8; 32])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut store = UsernameStore::new();
+    let err = store
+        .claim(&pool, "alice", addr(2))
+        .await
+        .expect_err("expected sql-race Validation error");
+    assert!(
+        matches!(err, ClaimUsernameError::Validation(_)),
+        "unexpected: {:?}",
+        err
+    );
+    assert!(format!("{}", err).contains("Username already taken"));
+
+    // The in-memory mirror must NOT have been updated when the SQL
+    // layer rejected the claim — otherwise a follow-up resolve would
+    // bind the name to the wrong address.
+    assert_eq!(store.resolve("alice"), None);
+}
