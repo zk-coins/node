@@ -921,15 +921,20 @@ mod inline_tests {
         let state = Arc::new(Mutex::new(State::new()));
         // `AccountServer` is intentionally not `Debug` (it owns a
         // `Prover` which is itself non-Debug), so `expect_err` is not
-        // available here; use a match instead.
-        match AccountServer::load_from_pg(state, &pool).await {
-            Ok(_) => panic!("expected db error"),
-            Err(err) => assert!(
-                matches!(err, LoadAccountServerError::Db(_)),
-                "unexpected: {:?}",
-                err
-            ),
-        }
+        // available. Use `.err()` + `.expect()` instead of a `match`
+        // with an `Ok(_) => panic!` arm — that arm is structurally
+        // unreachable in a passing test, which leaves the Coverage
+        // Gate (`account_server.rs` is in scope, only `_tests.rs$`
+        // files are ignored) at 99.83% on the dead match arm.
+        let err = AccountServer::load_from_pg(state, &pool)
+            .await
+            .err()
+            .expect("load_from_pg should fail when DB is unreachable");
+        assert!(
+            matches!(err, LoadAccountServerError::Db(_)),
+            "unexpected: {:?}",
+            err
+        );
     }
 
     /// Mirror of `server_tests::lock_or_recover_recovers_from_poisoned_mutex`
