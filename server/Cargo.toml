@@ -19,11 +19,26 @@ zkcoins-program = { path = "../program-plonky2/", package = "zkcoins-program-plo
 shared = { path = "../shared/" }
 lazy_static = { workspace = true }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
+# Postgres state-layer. PR-A1 wires the module + migrations + tests
+# only; bootstrap integration happens in PR-A2 + PR-A3 (see the
+# `#[allow(dead_code)]` on the module).
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "macros",
+    "migrate",
+] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 serde_json = "1.0"
+# Used by `db_tests` to spin up a real Postgres 17 per test run.
+# The legacy `clients::Cli` of v0.14/0.15 was replaced by a global
+# `runner()` — see `db_tests::setup_pool` for the shape we use.
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
 
 [features]
 # All non-MVP features are off by default. When a feature is not enabled, the
