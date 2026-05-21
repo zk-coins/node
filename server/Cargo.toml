@@ -34,6 +34,7 @@ sqlx = { version = "0.8", default-features = false, features = [
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 serde_json = "1.0"
+wiremock = "0.6"
 # Used by `db_tests` to spin up a real Postgres 17 per test run.
 # The legacy `clients::Cli` of v0.14/0.15 was replaced by a global
 # `runner()` — see `db_tests::setup_pool` for the shape we use.
