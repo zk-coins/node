@@ -140,6 +140,11 @@ jobs:
       # — same value the `docker info` step picks up implicitly via the
       # default `docker` context.
       DOCKER_HOST: unix:///Users/dfx01/.colima/default/docker.sock
+      # `sccache` wraps `rustc` and caches compiled crates across CI
+      # runs. The M3 Ultra runner is self-hosted, so the cache lives on
+      # local disk and survives between jobs — the speedup is biggest
+      # for PR pushes that re-touch the same dependency set.
+      RUSTC_WRAPPER: sccache
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -155,6 +160,18 @@ jobs:
       - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
+      # `sccache` (compile cache) and `cargo-nextest` (test runner) are
+      # installed once per runner via Homebrew. Re-running on a host
+      # where they already exist is a no-op. Start sccache's server
+      # explicitly so the first compile step has a warm cache daemon
+      # and print stats up-front for visibility in the run log.
+      - name: Ensure sccache + cargo-nextest are installed
+        run: |
+          command -v sccache >/dev/null || brew install sccache
+          command -v cargo-nextest >/dev/null || brew install cargo-nextest
+          sccache --start-server >/dev/null 2>&1 || true
+          sccache --show-stats
+
       # The `db_tests` added in PR-A1 use testcontainers to spin up a
       # real Postgres 17 per test. The runner host has Docker (via
       # Colima) available on PATH; fail fast with a readable error
@@ -163,8 +180,16 @@ jobs:
       - name: Verify Docker is reachable (testcontainers dependency)
         run: docker info > /dev/null
 
+      # `cargo nextest` replaces `cargo test`: process-per-test isolation
+      # plus smart scheduling (slow tests start first). `--test-threads=1`
+      # is preserved — the repo invariant is that tests run serially to
+      # avoid testcontainers port races and shared-state pollution.
       - name: Run server + shared tests (release, all features)
-        run: cargo test -p server -p shared --release --all-features -- --test-threads=1
+        run: cargo nextest run -p server -p shared --release --all-features --test-threads 1
+
+      - name: sccache stats (post-build)
+        if: always()
+        run: sccache --show-stats
 
   coverage:
     name: Coverage Gate (100% lines + functions)
@@ -182,6 +207,9 @@ jobs:
       # — same value the `docker info` step picks up implicitly via the
       # default `docker` context.
       DOCKER_HOST: unix:///Users/dfx01/.colima/default/docker.sock
+      # Same sccache wrapper as `server-tests`; reuses the same on-disk
+      # cache populated by the previous job in the same workflow run.
+      RUSTC_WRAPPER: sccache
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -189,16 +217,33 @@ jobs:
       - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
+      # Same install gate as `server-tests`. Idempotent: no-op on a
+      # warm runner where both tools already exist.
+      - name: Ensure sccache + cargo-nextest are installed
+        run: |
+          command -v sccache >/dev/null || brew install sccache
+          command -v cargo-nextest >/dev/null || brew install cargo-nextest
+          sccache --start-server >/dev/null 2>&1 || true
+          sccache --show-stats
+
       # Coverage runs the same `db_tests` as `server-tests` and so
       # needs Docker reachable for testcontainers. See the matching
       # check in the `server-tests` job for the rationale.
       - name: Verify Docker is reachable (testcontainers dependency)
         run: docker info > /dev/null
 
+      # `cargo llvm-cov nextest` is the nextest-aware coverage subcommand:
+      # collects llvm-cov data while driving the suite through nextest,
+      # so the 100% line/function gate and the test execution share a
+      # single binary run (same as the old `cargo llvm-cov -- ...` form).
       - name: Run llvm-cov (MVP scope, 100% line + function gate)
         run: |
-          cargo llvm-cov --release -p server --show-missing-lines \
+          cargo llvm-cov nextest --release -p server --show-missing-lines \
             --ignore-filename-regex 'main\.rs|publisher\.rs|server_runtime\.rs|scanner_runtime\.rs|_tests\.rs$' \
             --fail-under-lines 100 \
             --fail-under-functions 100 \
-            -- --test-threads=1
+            --test-threads 1
+
+      - name: sccache stats (post-build)
+        if: always()
+        run: sccache --show-stats
