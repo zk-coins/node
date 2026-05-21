@@ -136,7 +136,6 @@ pub fn persist_state_from_sync_context(
     })
 }
 
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn StdError>> {
     // A panic in any tokio worker — for example the bootstrap task that
