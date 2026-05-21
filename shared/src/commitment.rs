@@ -96,3 +96,7 @@ impl fmt::Debug for Commitment {
             .finish()
     }
 }
+
+#[cfg(test)]
+#[path = "commitment_tests.rs"]
+mod tests;
