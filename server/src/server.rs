@@ -13,6 +13,7 @@ use shared::commitment::Commitment;
 #[cfg(feature = "faucet")]
 use shared::ClientAccount;
 use shared::{Invoice, ProofData};
+use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -21,6 +22,7 @@ use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes};
 use zkcoins_prover::Proof;
 
 use crate::account_server::{AccountServer, CoinProof};
+use crate::db;
 #[cfg(feature = "faucet")]
 use crate::publisher::create_and_broadcast_inscription;
 use crate::username::UsernameStore;
@@ -78,9 +80,10 @@ pub(crate) struct AppState {
     #[cfg(feature = "faucet")]
     pub(crate) minting_account: Arc<Mutex<ClientAccount>>,
     pub(crate) username_store: Arc<Mutex<UsernameStore>>,
-    pub(crate) accounts_path: String,
-    #[cfg(feature = "usernames")]
-    pub(crate) usernames_path: String,
+    /// Postgres pool for per-account upserts (accounts table) and the
+    /// faucet's `minting_meta.num_pubkeys` counter. Cloned cheaply via
+    /// `Arc`; the underlying connections are pooled.
+    pub(crate) pool: Arc<PgPool>,
 }
 
 // Response types for our API
@@ -183,9 +186,29 @@ impl ProofStore {
     /// Best-effort persist: write `bytes` to `path` atomically, log the
     /// I/O error if the write fails. Extracted so the error arm can be
     /// exercised directly without having to construct a real `CoinProof`
-    /// (which requires the SP1 prover to run).
+    /// (which requires the Plonky2 prover to run).
+    ///
+    /// "Atomic" here means write-to-temp + rename. `File::create` +
+    /// `sync_all` flushes the data file before the rename, and the
+    /// final rename is a single inode swap from the OS's perspective,
+    /// so a crash between the two never leaves a half-written
+    /// `{id}.bin` for `get_proof` to find. Inlined (rather than calling
+    /// a shared `atomic_write` helper) because the only remaining
+    /// user after PR-A3 is this proof store — `accounts.bin`,
+    /// `usernames.bin`, and `minting_num_pubkeys.bin` all moved to
+    /// Postgres.
     fn persist_proof_bytes(path: &std::path::Path, bytes: &[u8], id: u64) {
-        if let Err(e) = crate::atomic_write(path.to_str().unwrap_or(""), bytes) {
+        let path_str = path.to_str().unwrap_or("");
+        let tmp_path = format!("{}.tmp", path_str);
+        let result: std::io::Result<()> = (|| {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp_path)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&tmp_path, path_str)?;
+            Ok(())
+        })();
+        if let Err(e) = result {
             eprintln!("Failed to persist proof {}: {}", id, e);
         }
     }
@@ -492,21 +515,38 @@ async fn receive_coin_handler(
     body: Bytes, // Accept raw binary data instead of multipart
 ) -> impl IntoResponse {
     // Try to deserialize the binary data as a CoinProof
-    match bincode::deserialize::<CoinProof>(&body) {
-        Ok(coin_proof) => {
-            let mut account_server = lock_or_recover(&state.account_server);
-            match account_server.receive_coin(coin_proof) {
-                Ok(_) => Json(SendCoinResponse {
-                    success: true,
-                    ..Default::default()
-                }),
-                Err(_) => Json(SendCoinResponse::default()),
-            }
-        }
+    let coin_proof = match bincode::deserialize::<CoinProof>(&body) {
+        Ok(cp) => cp,
         Err(e) => {
             eprintln!("Failed to deserialize proof with commitment: {}", e);
-            Json(SendCoinResponse::default())
+            return Json(SendCoinResponse::default());
         }
+    };
+    let recipient = coin_proof.coin.recipient;
+    // Snapshot the recipient's mutated account inside the (sync) lock
+    // scope so the post-receive Postgres upsert runs without holding
+    // the guard across an `.await` point.
+    let snapshot: Option<Vec<u8>> = {
+        let mut account_server = lock_or_recover(&state.account_server);
+        match account_server.receive_coin(coin_proof) {
+            Ok(_) => account_server
+                .get_account(&recipient)
+                .map(AccountServer::serialize_account),
+            Err(_) => None,
+        }
+    };
+    match snapshot {
+        Some(bytes) => {
+            let addr_bytes = digest_to_bytes(&recipient);
+            if let Err(e) = db::upsert_account(&state.pool, &addr_bytes, &bytes).await {
+                eprintln!("Failed to upsert recipient account after receive: {}", e);
+            }
+            Json(SendCoinResponse {
+                success: true,
+                ..Default::default()
+            })
+        }
+        None => Json(SendCoinResponse::default()),
     }
 }
 
@@ -563,18 +603,42 @@ async fn send_coin_handler(
     let to_address = digest_from_bytes(&to_address_bytes);
 
     // TODO: Provide the correct public keys from the client
-    // Acquire the account_server lock only for the duration of sending coins.
-    let send_result = {
+    // Acquire the account_server lock only for the duration of sending
+    // coins, and snapshot the resulting account bincode bytes *inside*
+    // the lock scope so the post-send Postgres upsert runs without
+    // holding the (sync) `std::sync::Mutex` guard across the `.await`.
+    // The guard cannot be held across an await point: `std::sync::
+    // MutexGuard` is not `Send`, and even if it were, parking the
+    // future would block other handlers behind the same lock for the
+    // duration of the DB round-trip.
+    // `updated_account_bytes` is only meaningful on the Ok branch
+    // below — `send_coins` Ok implies the sender account exists in
+    // memory (it was just mutated). On the Err branch the snapshot is
+    // unused; we initialize it to an empty `Vec` to avoid an
+    // `Option`-shaped sentinel whose `None`-arm at the upsert site
+    // would never be reached at runtime (and thus could not be
+    // covered by tests).
+    let send_result: Result<Vec<CoinProof>, &str>;
+    let updated_account_bytes: Vec<u8>;
+    {
         let mut account_server_lock = lock_or_recover(&state.account_server);
-        account_server_lock.send_coins(
+        let res = account_server_lock.send_coins(
             vec![Invoice::new(request.amount, to_address)],
             from_address,
             request.public_key,
             request.next_public_key,
             request.prev_commitment_pubkey,
-        )
-        // NOTE: accounts are NOT saved here — proof must be persisted first
-    };
+        );
+        updated_account_bytes = match &res {
+            Ok(_) => AccountServer::serialize_account(
+                account_server_lock
+                    .get_account(&from_address)
+                    .expect("send_coins Ok implies the sender account is in memory"),
+            ),
+            Err(_) => Vec::new(),
+        };
+        send_result = res;
+    }
 
     eprintln!(
         "Send result: {}",
@@ -620,12 +684,17 @@ async fn send_coin_handler(
                     .pop()
                     .expect("send_coins returns at least one coin_proof on Ok"),
             );
-            // Now persist accounts (proof is already safe on disk)
+            // Now persist the mutated sender account (proof is already
+            // safe on disk). Best-effort: a database hiccup here leaves
+            // the proof + in-memory state correct but the persistent
+            // account row stale; the next mutation will overwrite it.
+            // We log and continue rather than failing the request,
+            // which mirrors the pre-Postgres `save_to_file` semantics.
+            let addr_bytes = digest_to_bytes(&from_address);
+            if let Err(e) =
+                db::upsert_account(&state.pool, &addr_bytes, &updated_account_bytes).await
             {
-                let account_server_lock = lock_or_recover(&state.account_server);
-                if let Err(e) = account_server_lock.save_to_file(&state.accounts_path) {
-                    eprintln!("Failed to persist accounts after send: {}", e);
-                }
+                eprintln!("Failed to upsert sender account after send: {}", e);
             }
 
             (
@@ -719,39 +788,22 @@ async fn mint_handler(
     // Now that the locks are dropped, we can await safely.
     match send_result {
         Ok(mut coin_proofs) => {
-            // Increment num_pubkeys *after* successful send and before await
+            // Increment num_pubkeys *after* successful send and snapshot
+            // the new counter value so the Postgres upsert can run after
+            // the lock is released (sync mutex must not be held across
+            // `.await`).
+            let num_pubkeys_to_persist: Option<u32>;
             {
                 let mut minting_account_guard = lock_or_recover(&state.minting_account);
                 // Ensure we only increment if the send was successful and based on the state *before* the send
                 if minting_account_guard.num_pubkeys == num_pubkeys_before_mint {
                     minting_account_guard.num_pubkeys += 1;
-                    // Persist the new counter so a server restart keeps the
-                    // ClientAccount aligned with the on-disk server-side
-                    // minting_account.proof. See the corresponding load in
-                    // server_runtime.rs for the matching half.
-                    //
-                    // Same path-resolution logic as in server_runtime.rs:
-                    // a relative accounts_path like "accounts.bin" has an
-                    // empty parent; in that case fall back to "." so the
-                    // counter lands next to accounts.bin, not at filesystem
-                    // root.
-                    let path = {
-                        let parent = std::path::Path::new(&state.accounts_path).parent();
-                        let dir = match parent {
-                            Some(p) if !p.as_os_str().is_empty() => p.display().to_string(),
-                            _ => ".".to_string(),
-                        };
-                        format!("{}/minting_num_pubkeys.bin", dir)
-                    };
-                    if let Err(e) =
-                        crate::atomic_write(&path, &minting_account_guard.num_pubkeys.to_le_bytes())
-                    {
-                        eprintln!("Failed to persist minting num_pubkeys to {}: {}", path, e);
-                    }
+                    num_pubkeys_to_persist = Some(minting_account_guard.num_pubkeys);
                 } else {
                     // This case might indicate a race condition or unexpected state change.
                     // Handle appropriately, maybe log an error or return a specific response.
                     eprintln!("WARNING: num_pubkeys changed unexpectedly during mint operation.");
+                    num_pubkeys_to_persist = None;
                 }
                 let pis: Result<
                     [zkcoins_program::F;
@@ -775,6 +827,20 @@ async fn mint_handler(
                     &proof_data.output_coins_root,
                 ));
                 // minting_account_guard is dropped here
+            }
+
+            // Persist the new counter so a server restart keeps the
+            // ClientAccount aligned with the server-side
+            // minting_account.proof. Replaces the legacy
+            // `minting_num_pubkeys.bin` sibling file; the matching
+            // load lives in `server_runtime.rs`. Best-effort: a DB
+            // hiccup leaves the in-memory counter ahead of the
+            // persistent row, which the next successful mint will
+            // re-sync.
+            if let Some(n) = num_pubkeys_to_persist {
+                if let Err(e) = db::upsert_minting_num_pubkeys(&state.pool, n).await {
+                    eprintln!("Failed to upsert minting num_pubkeys to Postgres: {}", e);
+                }
             }
 
             let commitment = coin_proofs[0]
@@ -816,15 +882,37 @@ async fn mint_handler(
                     "DEV_SKIP_BROADCAST_FAILURE=true — continuing without on-chain commitment"
                 );
             }
-            {
+            // Snapshot the mutated accounts (the minting account and
+            // every recipient) so the post-mint upserts run lock-free.
+            // The set of affected addresses is the recipient(s) plus
+            // the faucet's MINTING_ADDRESS (the source side of the
+            // transition).
+            let accounts_to_persist: Vec<(zkcoins_program::hash::HashDigest, Vec<u8>)> = {
                 let mut account_server_guard = lock_or_recover(&state.account_server);
                 for coin_proof in &coin_proofs {
                     if let Err(e) = account_server_guard.receive_coin(coin_proof.clone()) {
                         eprintln!("Failed to receive minted coin: {}", e);
                     }
                 }
-                if let Err(e) = account_server_guard.save_to_file(&state.accounts_path) {
-                    eprintln!("Failed to persist accounts after mint: {}", e);
+                let mut affected: Vec<zkcoins_program::hash::HashDigest> =
+                    Vec::with_capacity(1 + coin_proofs.len());
+                affected.push(*zkcoins_program::types::MINTING_ADDRESS);
+                for cp in &coin_proofs {
+                    affected.push(cp.coin.recipient);
+                }
+                let mut out: Vec<(zkcoins_program::hash::HashDigest, Vec<u8>)> =
+                    Vec::with_capacity(affected.len());
+                for addr in affected {
+                    if let Some(acct) = account_server_guard.get_account(&addr) {
+                        out.push((addr, AccountServer::serialize_account(acct)));
+                    }
+                }
+                out
+            };
+            for (addr, bytes) in accounts_to_persist {
+                let addr_bytes = digest_to_bytes(&addr);
+                if let Err(e) = db::upsert_account(&state.pool, &addr_bytes, &bytes).await {
+                    eprintln!("Failed to upsert account after mint: {}", e);
                 }
             }
 
@@ -1117,20 +1205,63 @@ async fn claim_username_handler(
             .into_response();
     }
 
-    // Claim the username
-    let mut username_store = lock_or_recover(&state.username_store);
-    if let Err(e) = username_store.claim(&request.username, address) {
+    // Claim the username. `UsernameStore::claim` is async (it persists
+    // through `db::claim_username` before mutating the in-memory map),
+    // so the lock-acquire / drop ordering matters: we must hold the
+    // store guard only synchronously, but the persistence call lives
+    // inside it. We solve this by using `tokio::sync::Mutex` would
+    // ripple through every other handler; instead we serialize the
+    // claim path application-side: take the (sync) `std::sync::Mutex`,
+    // do the in-memory pre-check + DB call + in-memory commit inside
+    // the same `claim` method, and rely on the SQL `ON CONFLICT DO
+    // NOTHING` to catch any race that slips past the in-memory
+    // pre-check. Because `claim` is `async`, we have to drop the sync
+    // guard before the `.await`, which means we cannot hold it across
+    // the persistence call. The compromise: short critical section
+    // around `std::mem::take` of the in-memory map, run the claim
+    // against a temporary, then swap it back. Simpler and equivalent
+    // for the MVP: leave the sync guard NOT held across the await by
+    // routing the claim through a clone-out / merge-back pattern.
+    //
+    // For the MVP, the username-claim endpoint is feature-gated and
+    // expected to see < 1 req/s in production. We just acquire the
+    // guard, take ownership of the store, drop the guard, run the
+    // async claim, then re-acquire and merge the result back. The
+    // brief window where the guard is dropped is bounded by the DB
+    // round-trip; concurrent claimers serialize at the SQL `ON
+    // CONFLICT DO NOTHING` boundary regardless.
+    let mut snapshot = {
+        let mut guard = lock_or_recover(&state.username_store);
+        std::mem::take(&mut *guard)
+    };
+    let claim_outcome = snapshot
+        .claim(&state.pool, &request.username, address)
+        .await;
+    {
+        let mut guard = lock_or_recover(&state.username_store);
+        *guard = snapshot;
+    }
+    if let Err(e) = claim_outcome {
+        let (status, reason): (StatusCode, String) = match e {
+            crate::username::ClaimUsernameError::Validation(s) => {
+                (StatusCode::CONFLICT, s.to_string())
+            }
+            crate::username::ClaimUsernameError::Db(db_err) => {
+                eprintln!("Failed to persist username claim: {}", db_err);
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Failed to persist username claim".to_string(),
+                )
+            }
+        };
         return (
-            StatusCode::CONFLICT,
+            status,
             Json(LnurlErrorResponse {
                 status: "ERROR".into(),
-                reason: e.into(),
+                reason,
             }),
         )
             .into_response();
-    }
-    if let Err(e) = username_store.save_to_file(&state.usernames_path) {
-        eprintln!("Failed to persist usernames: {}", e);
     }
 
     let normalized = request.username.to_lowercase();

@@ -167,6 +167,41 @@ USERNAME_DOMAIN=test.zkcoins.local cargo run -p server
 # Server starts on http://0.0.0.0:4242
 ```
 
+## Local Development with Postgres
+
+The Postgres state-layer added in PR-A1 expects a running PostgreSQL
+instance to be reachable at `DATABASE_URL`. The module is not wired
+into the bootstrap yet (PR-A2 + PR-A3 land that), so you can develop
+without it — but to run the `db_tests` locally you do need either
+Docker available (the tests spin up a Postgres 17 container via
+`testcontainers-modules`) or a manually-started Postgres.
+
+Manual Postgres for ad-hoc query work:
+
+```bash
+docker run --name zkcoins-pg \
+  -e POSTGRES_PASSWORD=dev \
+  -p 5432:5432 \
+  -d postgres:17
+export DATABASE_URL=postgres://postgres:dev@localhost:5432/postgres
+
+# Apply the migrations against the running instance:
+cargo install sqlx-cli --no-default-features --features rustls,postgres
+cd server
+sqlx migrate run
+```
+
+Run the `db_tests` (Docker required, runs `postgres:17` per test):
+
+```bash
+cargo test -p server db -- --test-threads=1
+```
+
+The schema lives in `server/migrations/0001_initial.sql`. After
+changing it, drop the local database (`docker rm -f zkcoins-pg`) and
+re-run `sqlx migrate run` against a fresh instance — there is no
+`down` migration in the MVP, the migration set is forward-only.
+
 ## Setup
 
 After cloning, enable the repo's pre-push hook. The hook runs `cargo
@@ -392,33 +427,37 @@ Docker builds use nightly Rust auto-installed via the workspace `rust-toolchain`
 
 ## Persistent State
 
-The server writes the following files under its data volume (`/data` in the container, `zkcoins_server-data` Docker volume on the DEV / PRD hosts). Together they define the recoverable state:
+After the PR-A1/PR-A2/PR-A3 Postgres migration series, all persistent server state lives in a Postgres 17 database (`DATABASE_URL` env var). The only on-disk state remaining is the per-proof file store. The state-layer schema (`server/migrations/*.sql`) is applied idempotently on every boot by `db::connect_and_migrate`.
 
-| File                       | Format                         | Purpose                                                                                                                                |
-| -------------------------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `smt.bin`                  | bincode `SparseMerkleTree`     | Sparse Merkle Tree of every commitment ever processed (key = sha256(public_key), leaf = account_state_hash).                            |
-| `mmr.bin`                  | bincode `MerkleMountainRange`  | Append-only Merkle Mountain Range of `hash(smt_root ‖ prev_mmr_root)` leaves; one entry per processed commitment.                       |
-| `mmr.bin.prev_root`        | 32 bytes                       | The previous MMR root, kept separately so the SMT/MMR pair stays atomically consistent across restarts.                                 |
-| `latest_block.bin`         | 32 bytes (block hash)          | Last Bitcoin block whose inscriptions were fully processed and persisted. Scanner resumes from `latest_block + 1` after a restart.      |
-| `accounts.bin`             | bincode `HashMap<Address, Account>` | Server-side account ledger — per-address balance, coin_queue, coin_history (SMT), and latest proof. Includes the minting account.        |
-| `usernames.bin`            | bincode `UsernameStore`        | Gated by `usernames` Cargo feature. Bidirectional map of claimed usernames ↔ addresses.                                                |
-| `minting_num_pubkeys.bin`  | 4 bytes LE u32                 | Gated by `faucet`. Counter of how many mint commitments have been issued; **must** survive restart, otherwise the next mint sends a stale `prev_commitment_pubkey` and `send_coins` returns `prev_commitment_pubkey required for account update`. |
-| `proofs/<id>.bin`          | bincode `CoinProof`            | Individual per-send proof + commitment, indexed by `proof_id`. Append-only.                                                            |
+| Location                                | Format                                                     | Purpose                                                                                                                                                                                                                                                                          |
+| --------------------------------------- | ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `smt_state` row (singleton, `id = 1`)   | bincode `SparseMerkleTree` in a `BYTEA` column             | Sparse Merkle Tree of every commitment ever processed (key = sha256(public_key), leaf = account_state_hash).                                                                                                                                                                     |
+| `mmr_state` row (singleton, `id = 1`)   | bincode `MerkleMountainRange` in a `BYTEA` column          | Append-only Merkle Mountain Range of `hash(smt_root ‖ prev_mmr_root)` leaves; one entry per processed commitment.                                                                                                                                                                |
+| `latest_block` row (singleton, `id = 1`) | 32-byte block hash in a `BYTEA` column                     | Last Bitcoin block whose inscriptions were fully processed and persisted. Scanner resumes from `latest_block + 1` after a restart. Written in the same `BEGIN; UPSERT; UPSERT; UPSERT; COMMIT` transaction as the SMT and MMR (issue #11 fix).                                   |
+| `accounts` table (one row per address)  | 32-byte `address` PRIMARY KEY + bincode `Account` `BYTEA`  | Server-side account ledger — per-address balance, coin_queue, coin_history (SMT), and latest proof. Includes the minting account. Upserted per mutation by the send / receive / mint handlers.                                                                                  |
+| `usernames` table (one row per name)    | `TEXT` name PRIMARY KEY + 32-byte `address` `BYTEA`        | Gated by `usernames` Cargo feature. Bidirectional map of claimed usernames ↔ addresses. Race-free claims via `INSERT … ON CONFLICT (name) DO NOTHING`.                                                                                                                            |
+| `minting_meta` row (singleton, `id = 1`) | `BIGINT` num_pubkeys                                       | Gated by `faucet`. Counter of how many mint commitments have been issued; **must** survive restart, otherwise the next mint sends a stale `prev_commitment_pubkey` and `send_coins` returns `prev_commitment_pubkey required for account update`.                                |
+| `proofs/<id>.bin` (on-disk file)        | bincode `CoinProof`                                        | Individual per-send proof + commitment, indexed by `proof_id`. Append-only. **Not** in Postgres because the per-proof blobs are large Plonky2 proof bytes and the directory layout makes recovery trivial. Path configurable via `PROOFS_DIR` (default `./proofs`).               |
 
-`atomic_write` is used for every write (tempfile + rename). A crash between writes can still leave `latest_block.bin` lagging the SMT/MMR pair; the scanner is now tolerant of this — `state.update` errors are logged (see `main.rs::scan_for_inscriptions` callback) rather than propagated as panics.
+Writes are atomic at the row / transaction level (`ON CONFLICT DO UPDATE` for singleton rows, the BEGIN/COMMIT block in `db::persist_state_tx` for the SMT/MMR/latest-block trio). Per-proof file writes still use a write-to-temp + rename pattern inside `ProofStore::persist_proof_bytes`. The pre-migration `smt.bin` / `mmr.bin` / `latest_block.bin` / `accounts.bin` / `usernames.bin` / `minting_num_pubkeys.bin` sibling files no longer exist, and the previous `main.rs::atomic_write` helper has been removed.
 
 ### DEV state recovery
 
-If the DEV server gets into a bad state (panic loop, mint failures with `prev_commitment_pubkey required`, balance never rising after a successful mint, etc.), the recovery procedure is to wipe the data volume:
+If the DEV server gets into a bad state (panic loop, mint failures with `prev_commitment_pubkey required`, balance never rising after a successful mint, etc.), the recovery procedure is to truncate the Postgres state-layer tables (and drop the on-disk proofs directory):
 
 ```bash
 # On the host running the server (DEV or PRD):
 docker stop zkcoins-server
-docker run --rm -v zkcoins_server-data:/data alpine sh -c 'rm -f /data/*.bin /data/*.bin.prev_root'
+# Truncate every state-layer table. _sqlx_migrations is intentionally
+# left in place so connect_and_migrate skips re-applying the schema.
+docker exec -i zkcoins-postgres psql -U zkcoins -d zkcoins -c \
+  'TRUNCATE accounts, usernames, smt_state, mmr_state, latest_block, minting_meta;'
+# Drop the per-proof files (proof_id state resets at next boot).
+docker run --rm -v zkcoins_server-data:/data alpine sh -c 'rm -rf /data/proofs'
 docker start zkcoins-server
 ```
 
-The server starts from genesis on next boot: `Creating new State / No accounts file found / No saved block hash found / fetching latest from Esplora`. Past test wallets are abandoned on-chain (they're random) but the SMT is re-built from the chain tip onwards. This is **destructive** — never run it on PRD without a known-needed reason.
+The server starts from genesis on next boot: `Loaded State from Postgres` (empty), `Loaded AccountServer from Postgres` (empty), `No saved block hash found, fetching latest from Esplora`. Past test wallets are abandoned on-chain (they're random) but the SMT is re-built from the chain tip onwards. This is **destructive** — never run it on PRD without a known-needed reason.
 
 The E2E regen workflow on the app repo wipes this state before every run as part of the per-PR cadence in `app/e2e/README.md § 11.3`.
 

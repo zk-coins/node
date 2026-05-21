@@ -7,6 +7,24 @@ use tower::ServiceExt;
 use crate::account_server::{Account, AccountServer};
 use crate::state::State;
 
+/// Build a `PgPool` that points at nowhere — every query against it
+/// fails fast with a connect error. Used by the server-handler test
+/// suite below so the handlers' persistence-side `.await` lines run
+/// the error branch (which mirrors the legacy file-IO best-effort
+/// semantics: log + continue, never fail the response). The matching
+/// happy-path tests for the upsert lines run against a real
+/// Postgres 17 testcontainer in `db_tests.rs`, `account_server_tests.rs`,
+/// `username_tests.rs`, and `server_runtime_tests.rs`.
+fn dead_pool() -> Arc<sqlx::PgPool> {
+    Arc::new(
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(50))
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/postgres")
+            .expect("connect_lazy never fails"),
+    )
+}
+
 /// Create a minimal AppState for testing.
 /// The AccountServer is constructed with a real (mock) prover so that the
 /// type system is satisfied, but we seed it with a minting account so that
@@ -36,10 +54,19 @@ fn test_state() -> AppState {
         #[cfg(feature = "faucet")]
         minting_account: Arc::new(Mutex::new(minting_client)),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
-        accounts_path: String::new(),
-        #[cfg(feature = "usernames")]
-        usernames_path: String::new(),
+        pool: dead_pool(),
     }
+}
+
+/// Variant of [`test_state`] that swaps the lazy `dead_pool` for a real
+/// migrated Postgres pool. Used by the handful of happy-path tests
+/// whose handler actually has to persist (e.g. `claim_username` —
+/// hard-fails with 503 on DB error, unlike `send`/`mint`/`receive`
+/// whose `db::upsert_account` calls are best-effort log-and-continue).
+fn live_test_state(pool: Arc<sqlx::PgPool>) -> AppState {
+    let mut state = test_state();
+    state.pool = pool;
+    state
 }
 
 /// Helper: send a request through the router and return (status, body string).
@@ -153,10 +180,11 @@ async fn balance_unknown_address_with_claimed_username_returns_username() {
     let address_bytes = [0xABu8; 32];
     let address = zkcoins_program::hash::digest_from_bytes(&address_bytes);
 
-    // Claim a username for an address that has no on-chain activity yet.
+    // Pre-populate the in-memory map (no Postgres round-trip — see
+    // the comment on `insert_for_test`).
     {
         let mut store = state.username_store.lock().unwrap();
-        store.claim("alice", address).expect("claim should succeed");
+        store.insert_for_test("alice", address);
     }
 
     let uri = format!("/api/balance?address={}", hex::encode(address_bytes));
@@ -489,12 +517,12 @@ async fn balance_minting_address_has_no_username() {
 async fn balance_includes_username_when_claimed() {
     let state = test_state();
 
-    // Manually claim a username for the minting address
+    // Pre-populate the in-memory username map via the test-only
+    // helper (bypasses the async Postgres path; production code
+    // claims via the /api/username/claim handler).
     {
         let mut username_store = state.username_store.lock().unwrap();
-        username_store
-            .claim("satoshi", *zkcoins_program::types::MINTING_ADDRESS)
-            .expect("claim should succeed");
+        username_store.insert_for_test("satoshi", *zkcoins_program::types::MINTING_ADDRESS);
     }
 
     let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(
@@ -553,12 +581,12 @@ async fn concurrent_reads_with_username_claim() {
         &zkcoins_program::types::MINTING_ADDRESS,
     ));
 
-    // Claim a username through the store directly (bypasses signature validation)
+    // Claim a username through the store directly (bypasses both
+    // signature validation and the async Postgres path; production
+    // claims go through the /api/username/claim handler).
     {
         let mut store = state.username_store.lock().unwrap();
-        store
-            .claim("testuser", *zkcoins_program::types::MINTING_ADDRESS)
-            .unwrap();
+        store.insert_for_test("testuser", *zkcoins_program::types::MINTING_ADDRESS);
     }
 
     // Spawn concurrent balance + resolve requests
@@ -784,6 +812,34 @@ fn send_signature_rejects_wrong_signature() {
 #[tokio::test]
 async fn claim_username_with_valid_signature() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    // The `claim_username_handler` hard-fails with 503 if persistence
+    // fails — unlike the other handlers whose DB upserts are
+    // log-and-continue. So this happy-path test cannot use the lazy
+    // `dead_pool`; it boots a real Postgres 17 container, mirroring
+    // the per-test isolation pattern from `db_tests::setup_pool` /
+    // `username_tests::setup_pool` / `server_runtime_tests::setup_pool`.
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container
+        .get_host()
+        .await
+        .expect("failed to get container host");
+    let port = pg_container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("failed to get container port");
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
 
     let secp = secp::Secp256k1::new();
     let secret = SecretKey::from_slice(&[7u8; 32]).unwrap();
@@ -812,7 +868,7 @@ async fn claim_username_with_valid_signature() {
     let sig = secp.sign_schnorr(&msg, &keypair);
 
     // Import the address into the account_server so resolve_identifier can find it
-    let state = test_state();
+    let state = live_test_state(pool);
     {
         let mut account_server = state.account_server.lock().unwrap();
         account_server.import_account(
@@ -1088,6 +1144,127 @@ async fn send_with_valid_signature_returns_proof_id_and_hashes() {
         response_json["output_coins_root"].as_str().is_some(),
         "output_coins_root missing: {body}"
     );
+}
+
+/// Companion to `send_with_valid_signature_returns_proof_id_and_hashes`
+/// that drives the post-send `db::upsert_account` path against a real
+/// Postgres 17 testcontainer instead of `dead_pool`. The default
+/// `test_state` exercises the upsert *error* arm (log-and-continue);
+/// this test exercises the upsert *success* arm so the if-let-Some
+/// block falls through without entering the `if let Err` branch —
+/// the only path that touches the line after the inner Err handler.
+///
+/// The persist itself is best-effort, so the assertions are scoped
+/// to (a) the handler still returning 200 with a usable proof_id and
+/// (b) the `accounts` row being readable from Postgres after the
+/// call. Together they pin both observable side-effects of the
+/// happy-path upsert.
+#[tokio::test]
+async fn send_with_valid_signature_persists_sender_account_to_postgres() {
+    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
+    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container
+        .get_host()
+        .await
+        .expect("failed to get container host");
+    let port = pg_container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("failed to get container port");
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
+    let state = live_test_state(Arc::clone(&pool));
+
+    let secret_bytes = include_bytes!("../minting_secret.bin");
+    let xpriv =
+        Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).expect("test minting xpriv");
+    let secp = secp::Secp256k1::new();
+
+    let derive_pk = |index: u32| -> PublicKey {
+        Xpub::from_priv(&secp, &xpriv)
+            .derive_pub(&secp, &[ChildNumber::Normal { index }])
+            .expect("derive_pub")
+            .public_key
+    };
+    let derive_sk = |index: u32| -> SecretKey {
+        xpriv
+            .derive_priv(&secp, &[ChildNumber::Normal { index }])
+            .expect("derive_priv")
+            .private_key
+    };
+
+    let sk_0 = derive_sk(0);
+    let pk_0 = derive_pk(0);
+    let pk_1 = derive_pk(1);
+
+    let account_address = "0x".to_string()
+        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
+            &zkcoins_program::types::MINTING_ADDRESS,
+        ));
+    let recipient = "0x".to_string() + &hex::encode([1u8; 32]);
+    let amount: u64 = 100;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let mut hasher = Sha256::new();
+    hasher.update(account_address.as_bytes());
+    hasher.update(recipient.as_bytes());
+    hasher.update(amount.to_le_bytes());
+    hasher.update(now.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+
+    let msg = Message::from_digest(hash);
+    let keypair = Keypair::from_secret_key(&secp, &sk_0);
+    let sig = secp.sign_schnorr(&msg, &keypair);
+
+    let body = serde_json::json!({
+        "account_address": account_address,
+        "recipient": recipient,
+        "amount": amount,
+        "public_key": hex::encode(pk_0.serialize()),
+        "next_public_key": hex::encode(pk_1.serialize()),
+        "signature": hex::encode(sig.serialize()),
+        "timestamp": now,
+    });
+
+    let req = Request::post("/api/send")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, resp_body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::OK, "body: {resp_body}");
+    let response_json: serde_json::Value =
+        serde_json::from_str(&resp_body).expect("response is valid JSON");
+    assert_eq!(response_json["success"], true);
+    assert!(response_json["proof_id"].as_u64().is_some());
+
+    // The post-send upsert must have written the sender (minting)
+    // account row. Confirm it via a direct SELECT so the assertion
+    // doesn't depend on the handler's own read path.
+    let from_address_bytes =
+        zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS);
+    let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT data FROM accounts WHERE address = $1")
+        .bind(&from_address_bytes[..])
+        .fetch_optional(&*pool)
+        .await
+        .expect("select accounts row");
+    let (data,) = row.expect("upsert wrote the sender account row");
+    assert!(!data.is_empty(), "account blob must be non-empty");
 }
 
 #[tokio::test]
@@ -1489,9 +1666,7 @@ async fn send_with_insufficient_funds_returns_422_with_error_string() {
         #[cfg(feature = "faucet")]
         minting_account: Arc::new(Mutex::new(minting_client)),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
-        accounts_path: String::new(),
-        #[cfg(feature = "usernames")]
-        usernames_path: String::new(),
+        pool: dead_pool(),
     };
 
     let secret_bytes = include_bytes!("../minting_secret.bin");
