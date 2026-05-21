@@ -3,13 +3,15 @@ name: CI
 on:
   push:
     branches: [develop]
-  # Only trigger on PRs targeting develop (feature → develop). The
-  # release PR (develop → main) is opened automatically and would
-  # otherwise fire a second CI run for every push to develop — those
-  # duplicate runs surfaced as "fail" entries on the release PR's
-  # check list whenever the concurrency block cancelled the older
-  # one. The push event already covers develop, and its run is
-  # associated with the same SHA on the release PR.
+  # CI runs on every pull request regardless of target branch. This
+  # makes the default safe for stacked PRs (PR-A → PR-B → PR-C where
+  # each PR's base is the previous PR's branch) and any other workflow
+  # that opens a PR against a non-`develop` branch — previously such
+  # PRs were silently skipped because `branches: [develop]` filtered
+  # them out, and the only fix was to hand-edit ci.yaml on each new
+  # feature stack. Letting every PR trigger CI is cheap (the heavy
+  # M3 Ultra jobs are still gated behind the `ci:full` label below)
+  # and matches what most repos default to.
   #
   # `ready_for_review` is added so the workflow fires the moment a
   # draft PR is marked ready — drafts themselves skip CI via the
@@ -20,7 +22,6 @@ on:
   # label triggers (or removes) the heavy self-hosted-runner jobs
   # on demand — see the `server-tests` job below.
   pull_request:
-    branches: [develop]
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
 concurrency:
