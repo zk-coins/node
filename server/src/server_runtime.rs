@@ -197,18 +197,10 @@ pub(crate) async fn broadcast_commit_and_deliver(
     );
     if let Err(err) = create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG).await {
         eprintln!("Error broadcasting commit inscription: {}", err);
-        // Mirror of the mint_handler tolerance: when
-        // DEV_SKIP_BROADCAST_FAILURE=true the operator opts into
-        // continuing without an on-chain commitment so E2E tests on a
-        // dry Mutinynet publisher still succeed. See the comment over
-        // the matching branch in server.rs::mint_handler.
-        if std::env::var("DEV_SKIP_BROADCAST_FAILURE").unwrap_or_default() != "true" {
-            return crate::server::handler_error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Failed to broadcast commitment inscription on-chain",
-            );
-        }
-        eprintln!("DEV_SKIP_BROADCAST_FAILURE=true — continuing without on-chain commitment");
+        return crate::server::handler_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Failed to broadcast commitment inscription on-chain",
+        );
     }
 
     let mut updated_proof = coin_proof;

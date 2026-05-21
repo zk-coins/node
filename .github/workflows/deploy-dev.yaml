@@ -53,8 +53,6 @@ jobs:
           push: true
           tags: ${{ env.DOCKER_TAGS }}
           platforms: linux/arm64
-          build-args: |
-            FEATURES=address-list,faucet,usernames,lnurl
 
       - name: Install cloudflared
         run: |
