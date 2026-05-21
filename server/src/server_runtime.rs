@@ -115,6 +115,9 @@ pub async fn start_rest_server(
         minting_account,
         username_store: shared_username_store,
         pool: Arc::clone(&pool),
+        // The readiness probe uses this to ping Esplora; in production
+        // it points at the same `ESPLORA_URL` as the scanner / publisher.
+        esplora_config: Arc::new(NETWORK_CONFIG.clone()),
     };
 
     // Bootstrap the minting account if it isn't already in the DB.

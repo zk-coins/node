@@ -25,6 +25,7 @@ use crate::account_server::{AccountServer, CoinProof};
 use crate::db;
 #[cfg(feature = "faucet")]
 use crate::publisher::create_and_broadcast_inscription;
+use crate::publisher::EsploraConfig;
 use crate::username::UsernameStore;
 use crate::{NETWORK_CONFIG, USERNAME_DOMAIN};
 
@@ -84,6 +85,14 @@ pub(crate) struct AppState {
     /// faucet's `minting_meta.num_pubkeys` counter. Cloned cheaply via
     /// `Arc`; the underlying connections are pooled.
     pub(crate) pool: Arc<PgPool>,
+    /// Esplora endpoint configuration consumed by the `/health/ready`
+    /// readiness probe (and only there — production handlers read
+    /// `NETWORK_CONFIG` directly via lazy_static). Injecting the config
+    /// through `AppState` lets the probe tests redirect Esplora calls
+    /// at a `wiremock::MockServer` without having to mutate the
+    /// process-wide `NETWORK_CONFIG`. In production
+    /// `start_rest_server` clones `NETWORK_CONFIG` into this slot.
+    pub(crate) esplora_config: Arc<EsploraConfig>,
 }
 
 // Response types for our API
@@ -1037,6 +1046,70 @@ async fn commit_handler(
     .await
 }
 
+/// JSON body returned by `GET /health/ready`. `failures` is empty on a
+/// fully ready server; each failing dependency contributes one stable
+/// short tag (`"db"`, `"esplora"`) so a Kuma monitor parses the cause
+/// without having to scrape the status code in isolation.
+#[derive(Serialize)]
+struct ReadyResponse {
+    ready: bool,
+    failures: Vec<&'static str>,
+}
+
+/// Readiness probe (`GET /health/ready`).
+///
+/// **Liveness vs readiness.** The pre-existing `/health` endpoint is
+/// the Kubernetes-style liveness probe: it returns `"ok"` with 200 as
+/// long as the HTTP listener is bound and the tokio runtime is alive.
+/// It deliberately does NOT touch the database or Esplora, so an
+/// upstream blip never restarts the process — losing the in-memory
+/// `account_server` and `state` to a restart would lose every mint /
+/// send the scanner has not yet checkpointed.
+///
+/// `/health/ready` is the complementary readiness probe: it actively
+/// pings Postgres (`SELECT 1`) and Esplora (`GET /blocks/tip/height`,
+/// re-using the configured `ESPLORA_URL`) and returns 503 if either
+/// fails. A load balancer / uptime monitor uses this to decide
+/// "should traffic flow?" without using it to decide "should this
+/// process die?". The Kuma monitor at
+/// <https://kuma.dfxserve.com> watches `api.zkcoins.app/health/ready`
+/// on a 60 s interval — separate alert from the liveness check.
+///
+/// No caching: each call issues a fresh DB round-trip plus an Esplora
+/// HEAD-equivalent. Both are sub-100 ms in steady state, and a cached
+/// stale "ready" is worse than a slightly slow honest answer.
+async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let mut failures: Vec<&'static str> = Vec::new();
+
+    if sqlx::query("SELECT 1").execute(&*state.pool).await.is_err() {
+        failures.push("db");
+    }
+
+    if check_esplora(&state.esplora_config).await.is_err() {
+        failures.push("esplora");
+    }
+
+    let ready = failures.is_empty();
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(ReadyResponse { ready, failures }))
+}
+
+/// Ping the configured Esplora endpoint. A successful tip-height fetch
+/// proves the upstream is reachable AND serving the public REST API
+/// (a TCP-only liveness check would miss a broken nginx upstream).
+async fn check_esplora(
+    config: &EsploraConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use esplora_client::{r#async::DefaultSleeper, AsyncClient, Builder};
+    let client = AsyncClient::<DefaultSleeper>::from_builder(Builder::new(&config.url))?;
+    client.get_height().await?;
+    Ok(())
+}
+
 async fn info_handler() -> impl IntoResponse {
     Json(InfoResponse {
         network: NETWORK_CONFIG.network_name.clone(),
@@ -1395,6 +1468,7 @@ pub(crate) fn create_router(state: AppState) -> Router {
     let app = Router::new()
         .route("/", get(root_handler))
         .route("/health", get(|| async { "ok" }))
+        .route("/health/ready", get(ready_handler))
         .route("/api/info", get(info_handler))
         .route("/api/balance", get(get_balance_handler))
         .route("/api/send", post(send_coin_handler))
