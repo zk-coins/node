@@ -10,7 +10,6 @@ use bitcoin::secp256k1::{self as secp, schnorr::Signature as SchnorrSignature, M
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shared::commitment::Commitment;
-#[cfg(feature = "faucet")]
 use shared::ClientAccount;
 use shared::{Invoice, ProofData};
 use sqlx::PgPool;
@@ -23,7 +22,6 @@ use zkcoins_prover::Proof;
 
 use crate::account_server::{AccountServer, CoinProof};
 use crate::db;
-#[cfg(feature = "faucet")]
 use crate::publisher::create_and_broadcast_inscription;
 use crate::publisher::EsploraConfig;
 use crate::username::UsernameStore;
@@ -78,12 +76,11 @@ pub(crate) fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(crate) struct AppState {
     pub(crate) account_server: Arc<Mutex<AccountServer>>,
     pub(crate) proof_store: Arc<ProofStore>,
-    #[cfg(feature = "faucet")]
     pub(crate) minting_account: Arc<Mutex<ClientAccount>>,
     pub(crate) username_store: Arc<Mutex<UsernameStore>>,
     /// Postgres pool for per-account upserts (accounts table) and the
-    /// faucet's `minting_meta.num_pubkeys` counter. Cloned cheaply via
-    /// `Arc`; the underlying connections are pooled.
+    /// minting account's `minting_meta.num_pubkeys` counter. Cloned
+    /// cheaply via `Arc`; the underlying connections are pooled.
     pub(crate) pool: Arc<PgPool>,
     /// Esplora endpoint configuration consumed by the `/health/ready`
     /// readiness probe (and only there — production handlers read
@@ -121,7 +118,6 @@ pub struct SendCoinRequest {
     timestamp: Option<u64>,
 }
 
-#[cfg(feature = "faucet")]
 #[derive(Deserialize)]
 pub struct MintRequest {
     account_address: String,
@@ -388,10 +384,16 @@ pub struct InfoResponse {
 
 /// Server-side feature gates exposed to clients so the app can render
 /// capability-driven UI without a parallel build-time env-flag set.
-/// Each bool reflects a compile-time Cargo feature on the server binary.
+/// Each bool reflects a compile-time Cargo feature on the server binary,
+/// except `faucet`: mint is part of the MVP and is always available, so
+/// the field is hardcoded `true`. It is kept on the struct for API
+/// back-compat with wallet clients that introspect `/api/info`.
 #[derive(Serialize, Deserialize)]
 pub struct Capabilities {
     pub address_list: bool,
+    /// Always `true`. Mint is permanently part of the MVP binary; the
+    /// field is retained only so existing wallet clients deserialising
+    /// `/api/info` don't break.
     pub faucet: bool,
     pub usernames: bool,
     pub lnurl: bool,
@@ -670,10 +672,9 @@ async fn send_coin_handler(
             let ocr_hex = Some(hex::encode(digest_to_bytes(&pd.output_coins_root)));
 
             // Mint flow only — broadcasting a pre-set commitment is the
-            // server-signed minting path. The mint endpoint is feature-
-            // gated, so in the MVP build coin_proofs[0].commitment is
-            // always None and this block is excluded entirely.
-            #[cfg(feature = "faucet")]
+            // server-signed minting path. User-initiated sends never
+            // pre-set `coin_proofs[0].commitment`, so this block is
+            // a no-op for the non-mint flow.
             if let Some(commitment) = coin_proofs[0].commitment.as_ref() {
                 let commitment_data =
                     bincode::serialize(commitment).expect("Failed to serialize commitment");
@@ -724,7 +725,6 @@ async fn send_coin_handler(
     }
 }
 
-#[cfg(feature = "faucet")]
 async fn mint_handler(
     State(state): State<AppState>,
     Json(request): Json<MintRequest>,
@@ -878,7 +878,7 @@ async fn mint_handler(
             // Snapshot the mutated accounts (the minting account and
             // every recipient) so the post-mint upserts run lock-free.
             // The set of affected addresses is the recipient(s) plus
-            // the faucet's MINTING_ADDRESS (the source side of the
+            // the well-known MINTING_ADDRESS (the source side of the
             // transition).
             let accounts_to_persist: Vec<(zkcoins_program::hash::HashDigest, Vec<u8>)> = {
                 let mut account_server_guard = lock_or_recover(&state.account_server);
@@ -1099,7 +1099,8 @@ async fn info_handler() -> impl IntoResponse {
         network: NETWORK_CONFIG.network_name.clone(),
         capabilities: Capabilities {
             address_list: cfg!(feature = "address-list"),
-            faucet: cfg!(feature = "faucet"),
+            // Hardcoded — mint is permanent MVP; field is back-compat only.
+            faucet: true,
             usernames: cfg!(feature = "usernames"),
             lnurl: cfg!(feature = "lnurl"),
         },
@@ -1458,7 +1459,8 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/api/send", post(send_coin_handler))
         .route("/api/receive", post(receive_coin_handler))
         .route("/api/proof/:id", get(get_proof_handler))
-        .route("/api/commit", post(commit_handler));
+        .route("/api/commit", post(commit_handler))
+        .route("/api/mint", post(mint_handler));
 
     // Gated routes — only compiled in when their Cargo feature is enabled.
     // With a feature off, the handler does not exist in the binary and the
@@ -1466,9 +1468,6 @@ pub(crate) fn create_router(state: AppState) -> Router {
     // and there is no code path to execute.
     #[cfg(feature = "address-list")]
     let app = app.route("/api/address", get(get_address_handler));
-
-    #[cfg(feature = "faucet")]
-    let app = app.route("/api/mint", post(mint_handler));
 
     #[cfg(feature = "usernames")]
     let app = app

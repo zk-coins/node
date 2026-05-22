@@ -60,6 +60,5 @@ rand = "0.8"
 # cannot run, crash, or be exploited at runtime.
 default = []
 address-list = []
-faucet = []
 usernames = []
 lnurl = ["usernames"]

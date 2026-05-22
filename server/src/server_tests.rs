@@ -40,7 +40,6 @@ fn test_state() -> AppState {
     account_server.import_account(*zkcoins_program::types::MINTING_ADDRESS, minting_account);
 
     // Create a dummy minting ClientAccount from a deterministic key
-    #[cfg(feature = "faucet")]
     let minting_client = {
         let secret = include_bytes!("../minting_secret.bin");
         let private_key = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Signet, secret)
@@ -51,7 +50,6 @@ fn test_state() -> AppState {
     AppState {
         account_server: Arc::new(Mutex::new(account_server)),
         proof_store: Arc::new(ProofStore::new("/tmp/zkcoins-test-proofs")),
-        #[cfg(feature = "faucet")]
         minting_account: Arc::new(Mutex::new(minting_client)),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
         pool: dead_pool(),
@@ -138,7 +136,8 @@ async fn info_returns_network_name_capabilities_and_username_domain() {
         info.capabilities.address_list,
         cfg!(feature = "address-list")
     );
-    assert_eq!(info.capabilities.faucet, cfg!(feature = "faucet"));
+    // Mint is permanent MVP — `faucet` is hardcoded `true`, not cfg-derived.
+    assert!(info.capabilities.faucet);
     assert_eq!(info.capabilities.usernames, cfg!(feature = "usernames"));
     assert_eq!(info.capabilities.lnurl, cfg!(feature = "lnurl"));
 
@@ -314,7 +313,6 @@ async fn send_no_content_type_returns_error() {
 
 // --- POST /api/mint with missing fields ---
 
-#[cfg(feature = "faucet")]
 #[tokio::test]
 async fn mint_missing_body_returns_error() {
     let req = Request::post("/api/mint")
@@ -1663,7 +1661,6 @@ async fn send_with_insufficient_funds_returns_422_with_error_string() {
     let mut empty_minting = Account::new();
     empty_minting.balance = 0;
     account_server.import_account(*zkcoins_program::types::MINTING_ADDRESS, empty_minting);
-    #[cfg(feature = "faucet")]
     let minting_client = {
         let secret = include_bytes!("../minting_secret.bin");
         let private_key = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Signet, secret)
@@ -1673,7 +1670,6 @@ async fn send_with_insufficient_funds_returns_422_with_error_string() {
     let state = AppState {
         account_server: Arc::new(Mutex::new(account_server)),
         proof_store: Arc::new(ProofStore::new("/tmp/zkcoins-test-proofs-empty")),
-        #[cfg(feature = "faucet")]
         minting_account: Arc::new(Mutex::new(minting_client)),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
         pool: dead_pool(),
