@@ -191,8 +191,15 @@ jobs:
       # plus smart scheduling (slow tests start first). `--test-threads=1`
       # is preserved — the repo invariant is that tests run serially to
       # avoid testcontainers port races and shared-state pollution.
+      # `api_remote` is the live-DEV-server verification integration test
+      # (server/tests/api_remote.rs). It targets `https://dev-api.zkcoins.app`
+      # by default and is meant to run AFTER a deploy, from the `api-e2e`
+      # job in deploy-dev.yaml — not against whatever DEV currently runs
+      # while a PR is still open. Excluding it here keeps `server-tests`
+      # hermetic: only unit + non-remote integration tests run; remote
+      # verification fires post-deploy as the merge-then-deploy gate.
       - name: Run server + shared tests (release, all features)
-        run: cargo nextest run -p server -p shared --release --all-features --test-threads 1
+        run: cargo nextest run -p server -p shared --release --all-features --test-threads 1 -E 'not binary(api_remote)'
 
       - name: sccache stats (post-build)
         if: always()
