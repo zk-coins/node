@@ -44,7 +44,7 @@ The **on-chain footprint stays private** — Plonky2 ensures that the public out
 
 ## Contributing
 
-**New PRs may only merge into `develop` if test coverage is 100% on the activated surface.** Code behind a Cargo feature (`address-list`, `usernames`, `lnurl`) is excluded from the MVP measurement — feature-gated routes do not need to be tested because both DEV and PRD ship the MVP-only binary with every Cargo feature off. (Mint is part of the MVP and is permanently compiled in — no Cargo feature gate.) Concretely:
+**New PRs may only merge into `develop` if test coverage is 100% on the activated surface.** Code behind a Cargo feature (`address-list`, `lnurl`) is excluded from the MVP measurement — feature-gated routes do not need to be tested because both DEV and PRD ship the MVP-only binary with every Cargo feature off. (Mint and usernames are part of the MVP and are permanently compiled in — no Cargo feature gate.) Concretely:
 
 - `cargo llvm-cov -p server` (no `--all-features`) must report 100% lines + 100% functions on the activated MVP surface. CI enforces this with `--fail-under-lines 100 --fail-under-functions 100` in the `Coverage Gate (100% lines + functions)` job. The current `develop` baseline is at the gate.
 - Defensive code that genuinely cannot be reached in unit tests (e.g. the publisher's Bitcoin-broadcast path that requires a signet/regtest node, the `main.rs` runtime bootstrap) is excluded from the measured scope at the file level rather than tested.
@@ -73,8 +73,8 @@ API endpoints, background services, their activation status, and the tests that 
 | Send — phase 2 (commit + broadcast)  | `POST /api/commit`                    | env³                     | mvp     | 100% (server) · 0% (publisher) |
 | Receive coin                         | `POST /api/receive`                   | always                   | mvp     | 100% (account_server)                 |
 | Download coin proof                  | `GET /api/proof/:id`                  | always                   | mvp     | 100% (server)                  |
-| Claim username                       | `POST /api/username/claim`            | feature (`usernames`)    | gate    | 100% (username)                |
-| Resolve username                     | `GET /api/username/resolve/:username` | feature (`usernames`)    | gate    | 100% (username)                |
+| Claim username                       | `POST /api/username/claim`            | always                   | mvp     | 100% (username)                |
+| Resolve username                     | `GET /api/username/resolve/:username` | always                   | mvp     | 100% (username)                |
 | LNURL-Pay metadata                   | `GET /.well-known/lnurlp/:username`   | feature (`lnurl`)        | gate    | 100% (server)                  |
 | LNURL-Pay callback                   | `GET /lnurl/pay/:username`            | feature (`lnurl`)        | gate    | 100% (server)                  |
 | Bitcoin block scanner (background)   | Loop in `main.rs`, 30 s poll          | env⁴                     | mvp     | 100% (scanner) · — (main, excluded) |
@@ -96,8 +96,7 @@ All non-MVP routes are gated by Cargo features so the disabled handler functions
 | Feature        | Gates                                                                                                                                                 |
 | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `address-list` | `GET /api/address`                                                                                                                                    |
-| `usernames`    | `POST /api/username/claim`, `GET /api/username/resolve/:u`, `ClaimUsernameRequest`, `UsernameStore::{claim,save_to_file}`, `AppState::usernames_path` |
-| `lnurl`        | `GET /.well-known/lnurlp/:u`, `GET /lnurl/pay/:u` (depends on `usernames`)                                                                            |
+| `lnurl`        | `GET /.well-known/lnurlp/:u`, `GET /lnurl/pay/:u`                                                                                                     |
 
 Build the MVP-only binary (DEV + PRD ship this): `cargo build --release -p server`. Build with every feature enabled (CI clippy + tests + self-host opt-in): `cargo build --release -p server --all-features`. The Docker `FEATURES` build arg accepts a comma-separated list and is forwarded to `cargo build --features`; both `deploy-dev.yaml` and `deploy-prd.yaml` leave it empty.
 
@@ -122,7 +121,7 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 #### Network info
 
 - **Module:** `server.rs::info_handler`
-- **Behaviour:** returns `{ network, capabilities: { address_list, faucet, usernames, lnurl }, username_domain }`. `network` defaults to `Mutinynet` when `IS_MAINNET=false`, `Mainnet` when `true`. `capabilities.{address_list,usernames,lnurl}` each reflect whether the corresponding Cargo feature was compiled into this binary, letting clients gate UI on a single server-side source of truth instead of parallel build-time env flags. `capabilities.faucet` is hardcoded `true` — mint is permanent MVP — and is retained only for back-compat with wallet clients that deserialise the shape. `username_domain` is the external hostname this server serves; **required env var** (server panics on startup if unset). PRD sets `USERNAME_DOMAIN=zkcoins.app`, DEV sets `USERNAME_DOMAIN=dev.zkcoins.app` — distinct from `network` because the same chain can be served from two isolated external hostnames, and the client renders `<hex|username>@<domain>` from this field
+- **Behaviour:** returns `{ network, capabilities: { address_list, faucet, usernames, lnurl }, username_domain }`. `network` defaults to `Mutinynet` when `IS_MAINNET=false`, `Mainnet` when `true`. `capabilities.{address_list,lnurl}` each reflect whether the corresponding Cargo feature was compiled into this binary, letting clients gate UI on a single server-side source of truth instead of parallel build-time env flags. `capabilities.{faucet,usernames}` are hardcoded `true` — mint and usernames are permanent MVP — and are retained only for back-compat with wallet clients that deserialise the shape. `username_domain` is the external hostname this server serves; **required env var** (server panics on startup if unset). PRD sets `USERNAME_DOMAIN=zkcoins.app`, DEV sets `USERNAME_DOMAIN=dev.zkcoins.app` — distinct from `network` because the same chain can be served from two isolated external hostnames, and the client renders `<hex|username>@<domain>` from this field
 - **Tests:** `server.rs::tests::info_returns_network_name_capabilities_and_username_domain`, `server.rs::tests::info_serialization_format_is_stable`
 
 #### Get balance
@@ -234,7 +233,7 @@ Spawned from `main.rs::main`:
 | Stack            | Command                                       | What it covers                                                                                             |
 | ---------------- | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
 | `cargo test`     | `cargo test -p server`                        | MVP code paths — what the DEV + PRD binary actually contains                                               |
-| `cargo test`     | `cargo test -p server --all-features`         | Including the gated `address-list`, `usernames`, and `lnurl` routes                                        |
+| `cargo test`     | `cargo test -p server --all-features`         | Including the gated `address-list` and `lnurl` routes                                                      |
 | `cargo-llvm-cov` | `cargo llvm-cov -p server`                    | Coverage gate enforced by CI: 100% lines + functions on the activated MVP surface                          |
 
 Per-module coverage (CI-gated):
