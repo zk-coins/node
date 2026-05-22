@@ -58,7 +58,7 @@ Two design pressures pull in opposite directions:
 This document picks **simplicity**. The privacy trade-off is
 explicit: an outside observer learns which asset moved per
 transaction; the sender, recipient, and amount stay private as
-before. Per-asset privacy pools are deferred (see §12).
+before. Per-asset privacy pools are deferred (see §12.10).
 
 The decision space matches `MIGRATION_RESEARCH.md` §5's pattern:
 each constraint below is locked for v1 and reversible only at the
@@ -74,7 +74,7 @@ means a non-trivial protocol-level change.
 | # | Decision | Consequence |
 | - | -------- | ----------- |
 | **M1** | **Token creation is permissionless.** Any account can call `/api/asset/create` and mint a new asset. No whitelist, no admin gate, no fee gate. | The server is a pass-through registrar. Spam pressure is handled by the on-chain inscription fee on the genesis transaction's `Commitment`, not by the server. |
-| **M2** | **Creator retains ongoing mint authority.** The asset's genesis transaction pins a `mint_authority_pubkey` (the creator's compressed secp256k1 pubkey). Subsequent `/api/mint` calls require a fresh Schnorr signature verifiable against that pubkey. No fixed-supply rule. | No "burn the key after genesis" mode. Total supply is open-ended; trust in the asset is trust in the creator not to over-issue. Key rotation is out of scope (see §11, §12). |
+| **M2** | **Creator retains ongoing mint authority.** The asset's genesis transaction pins a `mint_authority_pubkey` (the creator's compressed secp256k1 pubkey). Subsequent `/api/mint` calls require a fresh Schnorr signature verifiable against that pubkey. No fixed-supply rule. | No "burn the key after genesis" mode. Total supply is open-ended; trust in the asset is trust in the creator not to over-issue. Key rotation is out of scope (see §11, §12.7). |
 | **M3** | **Asset namespace is first-come-first-served on `name`.** The first genesis transaction binding a given `name` wins; later attempts return `409 Conflict`. Normalisation is `name.to_lowercase()` to remove the cheapest look-alike attacks; the trade-off is documented in §10. | `assets.name UNIQUE` at the SQL layer is the enforcement point. No retroactive renaming, no namespace governance. |
 | **M4** | **Privacy pool is a single shared SMT.** `asset_id` is a public field on each coin commitment and a public input on each state-transition proof. Anonymity-set is per-asset (all `asset_id = X` traffic mixes; `asset_id = Y` is a separate pool). | Circuit complexity unchanged modulo one extra public input + one cross-coin equality constraint. Per-asset trees and per-asset MMRs are deferred. |
 | **M5** | **Cross-asset transfers are out of protocol.** Every state transition moves exactly one `asset_id`; no atomic A↔B swap inside zkCoins. A↔B trading is a separate DEX layer (out of scope: BitVM2 bridge, Lightning atomic swap, off-protocol order-book). | The in-circuit invariant is simple: all input coins and all output coins in a transition carry the same `asset_id`. Multi-leg trades are wallet-side UX over multiple proofs, or an external swap protocol. |
@@ -205,8 +205,14 @@ asset_id := Poseidon(
 `DOMAIN_TAG_ASSET_GENESIS` is a fixed Goldilocks field element
 constant (e.g. `hash_bytes(b"zkcoins:asset-genesis:v1")` taken as a
 field element). `timestamp` is the genesis request's unix-seconds
-timestamp included to prevent two creators colliding on
-`(creator_pubkey, name, decimals)` if they pick identical inputs.
+value, included so the AssetId is content-addressed: two creators
+who pick the same `(creator_pubkey, name, decimals)` (e.g. on a
+state-wiped DEV that allows name reuse, or after a future asset
+deletion mechanism) still get distinct `asset_id`s. Note that
+`assets.name UNIQUE` already prevents production name collisions
+on a single instance — the timestamp is belt-and-braces, plus a
+provenance marker for off-chain registries. See §12.1 for the
+open question on whether to drop it.
 
 The genesis carries five things into the world:
 
@@ -258,7 +264,8 @@ their own asset.
 ### 4.4 Send
 
 `/api/send` keeps its current shape, with `asset_id` added to the
-`Invoice` and the existing Schnorr signature widened to cover it:
+`Invoice` and the existing Schnorr signature widened to cover it
+under a new domain-prefix tag:
 
 ```
 H("zkcoins:send"
@@ -269,11 +276,28 @@ H("zkcoins:send"
   || timestamp_le)
 ```
 
-Existing wallets sign over `(account_address, recipient, amount,
-timestamp)` — see `verify_send_signature` in `server/src/server.rs`.
-The `asset_id` byte addition is a breaking change for the wallet
-signature shape; bump `Capabilities.multi_asset` (§7) so wallets
-know to include it.
+Existing wallets sign over `SHA256(account_address || recipient
+|| amount_le || timestamp_le)` with **no** domain prefix — see
+`verify_send_signature` in `server/src/server.rs`. The multi-asset
+upgrade does two things to this hash:
+
+1. **Adds `asset_id`** between `amount_le` and `timestamp_le`.
+   This is the necessary part — the signature must commit to
+   which asset is moving.
+2. **Prepends `"zkcoins:send"`** as a domain-separation tag.
+   This is a deliberate defense-in-depth addition, not a passive
+   widening: it future-proofs against a `/api/mint` or
+   `/api/asset/create` message hash being reused as a send
+   signature once those endpoints share the same secp256k1 key
+   material (the wallet's account key signs both). The mint and
+   genesis hashes already carry their own `"zkcoins:mint"` and
+   `"zkcoins:asset-genesis"` prefixes (§4.2, §4.3); adding
+   `"zkcoins:send"` here normalises the convention across all
+   three message types. See §12.5 for the open question on
+   whether the prefix is strictly required given invariant 2.
+
+Both changes are breaking for the wallet signature shape; bump
+`Capabilities.multi_asset` (§7) so wallets know to include them.
 
 **Single-asset invariant.** In a single transition, all input coins
 and all output coins share the same `asset_id`. This is enforced
@@ -417,24 +441,32 @@ Two viable architectures, mirroring the recurring trade-off in
 
 → **v1: option 1.** The mint-authority pubkey is a regular
   public-input on the genesis/mint branches; the signature check is
-  off-circuit. Carry the architecture decision under §12 "future
-  work" if a future deployment requires the in-circuit version.
+  off-circuit. The architectural call is open at §12.6 — flip to
+  in-circuit if a future deployment requires the stronger trust
+  model.
 
 ### 5.4 Prover cost delta
 
 The per-tx cost delta is **minor**:
 
 - +4 public inputs (one new `HashDigest` worth) per proof.
-- +2 × (`MAX_IN_COINS` + `MAX_OUT_COINS`) = +32 masked-equality
-  gates per proof. At Goldilocks gate cost these add tens of gates
-  total — negligible against the ~50 k-gate outer circuit
-  (`INNER_PAD_BITS_STAGE_5D_NEXT_5 = 15` per
-  `program-plonky2/src/circuit/main.rs`).
-- One extra Poseidon field element in the coin-identifier
-  derivation (was `(asth, coin_index)`; now `(asth, asset_id,
-  coin_index)`). No additional Poseidon call — the input vector
-  for `hash_no_pad` lengthens from 5 to 9 field elements, both
-  within the standard sponge rate.
+- +4 × (`MAX_IN_COINS` + `MAX_OUT_COINS`) = +64 masked-equality
+  field-element constraints per proof. Each `connect_hashes_masked`
+  on a `HashOut<F>` (4 elements per Plonky2
+  `NUM_HASH_OUT_ELTS`) lands four masked-equality gates; with
+  `MAX_IN_COINS = MAX_OUT_COINS = 8` per
+  `program-plonky2/src/circuit/main.rs`, that is 16 slots × 4 =
+  64 gates total — negligible against the ~50 k-gate outer
+  circuit (`INNER_PAD_BITS_STAGE_5D_NEXT_5 = 15`).
+- One extra `HashOut<F>` (4 field elements) added to the
+  coin-identifier pre-image (was `(asth_4, coin_index_1)` = 5
+  elements; now `(asth_4, asset_id_4, coin_index_1)` = 9
+  elements). Plonky2 Goldilocks Poseidon has `SPONGE_RATE = 8`
+  (`plonky2::hash::poseidon::SPONGE_RATE`), so 5 elements
+  absorbed in one permutation; 9 elements now absorb in two. The
+  per-coin Poseidon cost roughly doubles for the identifier
+  derivation, but this is one extra permutation per slot —
+  negligible against the per-slot work elsewhere in the circuit.
 
 The R2 performance budget from `CONTRIBUTING.md` invariant 3 (warm
 ≤ 5 s, ≤ 64 GB peak) is not threatened by multi-asset alone.
@@ -594,10 +626,14 @@ The handler:
    `H("zkcoins:asset-genesis" || name_normalised || decimals ||
    initial_supply_le || timestamp_le)`.
 4. Computes `asset_id` per §4.2.
-5. Begins a transaction: `INSERT INTO assets …`. On `unique_violation`
-   on the `name` column → return 409. Otherwise, run the prover to
+5. Begins a transaction: `INSERT INTO assets … ON CONFLICT (name)
+   DO NOTHING`. If the insert affected zero rows, the name was
+   already taken — return 409. Otherwise, run the prover to
    produce the `AssetGenesisProof`, persist the proof file, and
-   advance the SMT.
+   advance the SMT. This matches the existing
+   `UsernameStore::claim` pattern in `server/src/username.rs`
+   (`ON CONFLICT (username) DO NOTHING` + post-check on the
+   returned row count).
 6. Returns `{ asset_id, name }`.
 
 Suggested handler name: `asset_create_handler`. Suggested request
@@ -793,14 +829,15 @@ accepts under M4.
 **Mitigation paths (out of scope for v1):**
 
 - Per-asset privacy pools with a per-asset SMT and a per-asset
-  MMR. Multiplies state cost by `n_assets`; deferred (§12).
+  MMR. Multiplies state cost by `n_assets`; deferred (§12.10).
 - Hide `asset_id` behind a commitment (Pedersen `Commitment::commit(asset_id, rand)`)
   in the on-chain inscription. Closes the "asset_id is public"
   leak at the cost of a `Commitment::commit` opening in every
   recipient's proof — same shape as the D2/D10 hiding-recipient
-  fix in `SPEC.md` §15.
+  fix in `SPEC.md` §15. Tracked in §12.11.
 
-The two mitigations compose; they are tracked together in §12.
+The two mitigations compose; they are tracked together in §12.10
+and §12.11.
 
 ---
 
@@ -831,8 +868,11 @@ The mechanics behind decision M3.
 
 Race-handling at the database layer is the canonical solution; do
 not rely on application-side locking. Postgres' MVCC guarantees
-exactly one writer wins on a `UNIQUE` violation, the other gets
-`23505 unique_violation` which the handler translates to HTTP 409.
+that exactly one writer wins the unique-key race; the others'
+`INSERT ... ON CONFLICT (name) DO NOTHING` returns zero affected
+rows, which the handler translates to HTTP 409. This avoids the
+need to catch and re-classify a `23505 unique_violation` —
+matches `db::claim_username` in `server/src/db.rs`.
 
 ---
 
@@ -863,53 +903,205 @@ The mechanics behind decision M2.
 - **Key rotation is out of scope.** A creator who loses their
   mint-authority key loses the ability to mint more units. There
   is no admin override, no rotation endpoint, no escape hatch.
-  Future work — see §12.
+  Future work — see §12.7.
 
 ---
 
 ## 12. Open questions / future work
 
-Bullets in the same shape as `BRIDGE_MVP.md` §13.
+Three groups: open architectural questions the maintainer needs
+to rule on before P2 starts (§12.1 – §12.6), deferred features
+the design explicitly punts on (§12.7 – §12.12), and one
+semantic clarification (§12.13). Bullets follow the shape of
+`BRIDGE_MVP.md` §13.
 
-- **Key rotation for mint authority.** If a creator loses their
-  signing key (or wants to migrate to a new one), the asset is
-  effectively frozen at its current supply. A rotation mechanism
-  — signed by the old key, written as an `assets.rotation_pubkey`
-  column — is the obvious extension. Out of scope for v1 to keep
-  the genesis path immutable.
-- **Richer on-chain metadata.** Logos, URIs, descriptions, social
-  links. M6 explicitly excludes these — they live in an off-chain
-  registry the wallet consults by `asset_id`. The on-chain genesis
-  stays small.
-- **Cross-asset atomic swap inside zkCoins.** M5 defers this.
-  Trading happens on a separate DEX layer; the BitVM2 bridge
-  (`BRIDGE_MVP.md`) and the Lightning atomic swap layer
-  (`LIGHTNING_ATOMIC_SWAP.md`) are the canonical out-of-protocol
-  paths.
-- **Per-asset privacy pools.** M4 picks the shared-pool design
-  for simplicity. A per-asset SMT + per-asset MMR raises
-  anonymity-set per asset to "the asset's own traffic, hidden
-  from other assets' traffic" — same as Tornado-style pool
-  separation. Cost: multiplies state and Bitcoin-side commitment
-  traffic by `n_assets`. Deferred.
-- **Hiding `asset_id`.** Combines with the D2/D10 hiding-recipient
-  fix in `SPEC.md` §15. Out of scope for v1; tracked alongside the
-  mainnet-blocker privacy fixes.
-- **Burn (asset deflation).** Not in MVP. If a future creator
-  wants explicit burn, the cleanest design is a sentinel
-  recipient address (`BURN_ADDRESS = HashDigest::ZERO` or a
-  domain-separated constant) that the circuit treats as a coin
-  sink with no corresponding `apply_coin`. Adds one branch in
-  `account_server::receive_coin`. Defer until a real use case
-  arrives.
-- **Decimals semantics.** Purely UX-display. The on-chain `amount`
-  is a `u64`; the wallet formats with `decimals` for display only.
-  No on-chain math change. The protocol does not enforce that
-  `amount % 10**decimals` makes sense.
-- **In-circuit Schnorr verify.** §5.3 picks off-circuit; if a
-  future deployment demands in-circuit (e.g. minting-as-bridge
-  semantics), the gadget cost is non-trivial — `MIGRATION_RESEARCH.md`
-  §5.4 has the analysis.
+### 12.1 AssetId pre-image: keep `timestamp` or drop it?
+
+§4.2 includes `timestamp` in the Poseidon pre-image alongside
+`creator_pubkey`, `name`, and `decimals`. The `assets.name UNIQUE`
+constraint (M3 / §10) already enforces first-come-first-served
+name uniqueness at the SQL layer, so `timestamp` is not load-
+bearing for collision resistance on a single instance.
+
+- **Choice in doc:** include `timestamp`. Acts as a provenance
+  marker (off-chain registries learn when the asset was created
+  by inspecting the AssetId) and lets the same `(pubkey, name,
+  decimals)` tuple produce distinct AssetIds across state-wiped
+  test environments.
+- **Alternative:** drop `timestamp`. AssetId becomes a pure
+  function of `(creator_pubkey, name, decimals)`; reproducible
+  across environments; smaller pre-image.
+- **Trade-off:** keeping it costs nothing on-chain (one extra
+  field element in a Poseidon pre-image, already covered by §5.4)
+  and gives a free provenance hint. Dropping it makes AssetIds
+  reproducible across DEV/PRD, which simplifies cross-environment
+  testing but means a wiped DEV that re-creates `("FOO", 8)` from
+  the same creator collides with the old AssetId — fine in
+  practice (state is wiped together) but worth a maintainer call.
+
+### 12.2 Postgres balance shape: JSONB column vs separate table?
+
+§6.2 picks **option (a) — JSONB column on `accounts`**. The
+trade-off is real and the maintainer may prefer (b).
+
+- **Choice in doc:** JSONB column. Composes naturally with the
+  existing `bincode-Account-in-BYTEA` pattern; the JSONB is a
+  side index for `WHERE balances ? '<asset_id_hex>'` queries.
+- **Alternative:** separate `account_balances` table keyed by
+  `(address, asset_id)` with a `BIGINT amount` column. Cleaner
+  for Postgres-side queries (top-holders, distribution
+  histograms, `SUM(amount) WHERE asset_id = X` for total
+  supply audits).
+- **Trade-off:** JSONB minimises moving parts but pushes
+  query complexity into application code. The separate table
+  multiplies writes per state transition (one row per affected
+  asset per account) but makes operational queries trivial. If
+  the maintainer expects significant on-Postgres analytics
+  tooling, switch to (b) before P3 lands.
+
+### 12.3 Wallet rollout coordination for the breaking `/api/balance` shape
+
+§7.6 changes `/api/balance` from `{ balance: u64 }` to `{
+balances: [{ asset_id, amount }] }`. This is the single
+client-visible breaking change in the upgrade.
+
+- **Choice in doc:** gate purely on `Capabilities.multi_asset =
+  true` from `/api/info`. Wallets check the capability flag on
+  every boot and switch their parser accordingly.
+- **Alternative:** add a `version: u32` field to
+  `/api/balance`'s response (and to `/api/info`'s `Capabilities`)
+  so wallets can detect the schema bump even if they fail to
+  re-fetch `/api/info` first. Or: ship both shapes for a
+  cutover window (`balances` and `balance` both populated for
+  N days).
+- **Trade-off:** invariant 2 (closed test environment, DEV and
+  PRD) makes the capability-flag approach safe — there are no
+  external wallets to worry about, and the wallet
+  (zk-coins/app) and server roll out together in lockstep.
+  Adding a version field is belt-and-braces that costs nothing
+  but pollutes the JSON. Recommend keeping capability-flag only
+  unless the maintainer wants the safety net.
+
+### 12.4 Unicode homograph defence beyond `to_lowercase()`?
+
+§10 picks case-insensitive normalisation via `name.to_lowercase()`.
+This defends `USDT` / `Usdt` / `usdt` but not Cyrillic-А (U+0410)
+vs Latin-A (U+0041), zero-width-joiner attacks, or other Unicode
+confusables.
+
+- **Choice in doc:** Rust's locale-independent `to_lowercase()`
+  only. Wallet UI is expected to display both `name` and
+  `asset_id` so the AssetId is the trust anchor.
+- **Alternative:** NFKC normalisation + a Unicode confusables
+  filter (e.g. `unicode-security` crate's `mixed_script_confusable`
+  detection) at the validation stage. Rejects names whose
+  script mix is suspicious; closes the most common phishing
+  vectors at registry-write time.
+- **Trade-off:** `to_lowercase()` alone is cheap and reversible
+  but trusts the wallet UX to enforce the rest. NFKC +
+  confusables is the right long-term answer but adds a
+  dependency and rejects some legitimate names (mixed-script
+  brand names). The current design takes the cheap path and
+  treats the AssetId as the trust anchor; if mainnet hardening
+  ever lands, revisit at the namespace-governance step.
+
+### 12.5 `"zkcoins:send"` domain-tag: keep, drop, or version?
+
+§4.4 introduces a `"zkcoins:send"` domain-separation prefix on
+the send-signature hash. Current `verify_send_signature` signs
+without a prefix.
+
+- **Choice in doc:** add the prefix as defense-in-depth, mirroring
+  the `"zkcoins:mint"` and `"zkcoins:asset-genesis"` prefixes
+  on the other two message types.
+- **Alternative:** keep the unprefixed shape and only add
+  `asset_id` to the existing fields. Simpler diff against the
+  current `verify_send_signature`; one fewer thing for the
+  wallet to update.
+- **Trade-off:** the prefix prevents future cross-message
+  signature reuse (e.g. a malicious peer convincing a wallet to
+  sign what looks like a send but is actually a mint over the
+  same key material). Under invariant 2 (closed environment),
+  the attack surface is low — but the prefix is free at
+  signing time and the wallet update is a single hashing tweak
+  bundled with the `asset_id` widening. Recommend keeping
+  unless the maintainer objects to the broader signature
+  shape change.
+
+### 12.6 Off-circuit vs in-circuit Schnorr for the mint branch
+
+§5.3 picks off-circuit Schnorr verify for the mint and genesis
+branches. The asset registry is server state, not on-chain state.
+
+- **Choice in doc:** off-circuit verify via existing
+  `secp.verify_schnorr`. The in-circuit branch only enforces
+  that the proof's `mint_authority_pubkey` matches the
+  registry value.
+- **Alternative:** in-circuit BIP-340 Schnorr-on-secp256k1
+  gadget. Verifies the mint signature inside the proof itself;
+  removes the server-state trust assumption.
+- **Trade-off:** in-circuit Schnorr-on-secp256k1 is non-trivial
+  in Plonky2 (`MIGRATION_RESEARCH.md` §5.4 has the analysis).
+  For the closed test environment (invariant 2), off-circuit
+  is sufficient. If a future deployment treats minting as a
+  bridge primitive or moves to a trust-minimised setting, this
+  decision flips and the gadget cost lands in the prover
+  budget.
+
+### 12.7 Key rotation for mint authority (deferred feature)
+
+If a creator loses their signing key (or wants to migrate to a
+new one), the asset is effectively frozen at its current supply.
+A rotation mechanism — signed by the old key, written as an
+`assets.rotation_pubkey` column — is the obvious extension. Out
+of scope for v1 to keep the genesis path immutable; revisit
+once a real key-loss event lands.
+
+### 12.8 Richer on-chain metadata (deferred feature)
+
+Logos, URIs, descriptions, social links. M6 explicitly excludes
+these — they live in an off-chain registry the wallet consults
+by `asset_id`. The on-chain genesis stays small.
+
+### 12.9 Cross-asset atomic swap inside zkCoins (deferred feature)
+
+M5 defers this. Trading happens on a separate DEX layer; the
+BitVM2 bridge (`BRIDGE_MVP.md`) and the Lightning atomic swap
+layer (`LIGHTNING_ATOMIC_SWAP.md`) are the canonical
+out-of-protocol paths.
+
+### 12.10 Per-asset privacy pools (deferred feature)
+
+M4 picks the shared-pool design for simplicity. A per-asset
+SMT + per-asset MMR raises anonymity-set per asset to "the
+asset's own traffic, hidden from other assets' traffic" — same
+as Tornado-style pool separation. Cost: multiplies state and
+Bitcoin-side commitment traffic by `n_assets`. Deferred.
+
+### 12.11 Hiding `asset_id` on-chain (deferred feature)
+
+Combines with the D2/D10 hiding-recipient fix in `SPEC.md` §15.
+Out of scope for v1; tracked alongside the mainnet-blocker
+privacy fixes. Closes the "asset_id is public on every
+commitment" leak at the cost of a `Commitment::commit` opening
+in every recipient's proof.
+
+### 12.12 Burn (asset deflation) (deferred feature)
+
+Not in MVP. If a future creator wants explicit burn, the
+cleanest design is a sentinel recipient address (`BURN_ADDRESS
+= HashDigest::ZERO` or a domain-separated constant) that the
+circuit treats as a coin sink with no corresponding
+`apply_coin`. Adds one branch in
+`account_server::receive_coin`. Defer until a real use case
+arrives.
+
+### 12.13 Decimals semantics (clarification)
+
+Purely UX-display. The on-chain `amount` is a `u64`; the
+wallet formats with `decimals` for display only. No on-chain
+math change. The protocol does not enforce that `amount %
+10**decimals` makes sense.
 
 ---
 
@@ -948,17 +1140,18 @@ So nobody scope-creeps:
 
 - Migrating existing single-asset state — **not in v1** (closed
   test environment, state-wipe at cutover per invariant 2).
-- Per-asset privacy pools — **deferred** (§12, decision M4).
+- Per-asset privacy pools — **deferred** (§12.10, decision M4).
 - Cross-asset atomic swaps inside zkCoins — **out of protocol**
-  (decision M5; lives in the BitVM bridge / Lightning swap docs).
+  (decision M5, §12.9; lives in the BitVM bridge / Lightning
+  swap docs).
 - Rich on-chain metadata (logo, URI, description) — **excluded**
-  (decision M6).
-- Mint-authority key rotation — **deferred** (§11, §12).
-- Burn / deflationary mechanics — **not in MVP** (§12).
+  (decision M6, §12.8).
+- Mint-authority key rotation — **deferred** (§11, §12.7).
+- Burn / deflationary mechanics — **not in MVP** (§12.12).
 - In-circuit BIP-340 Schnorr verify for the mint branch —
-  **deferred** (§5.3).
+  **open architectural call** (§5.3, §12.6).
 - Homograph-attack defence beyond `to_lowercase()` normalisation —
-  **out of scope** (§10).
+  **open architectural call** (§10, §12.4).
 
 ---
 
