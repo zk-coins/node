@@ -587,11 +587,11 @@ impl AccountServer {
 
     /// Reload an `AccountServer` from Postgres.
     ///
-    /// The faucet's bootstrap-seeded minting account is NOT created
-    /// here — `start_rest_server` does that explicitly once it has
-    /// observed an absent minting row. Returning the rebuilt map here
-    /// keeps this constructor a pure "rehydrate everything that was
-    /// persisted" call with no side effects.
+    /// The bootstrap-seeded minting account is NOT created here —
+    /// `start_rest_server` does that explicitly once it has observed an
+    /// absent minting row. Returning the rebuilt map here keeps this
+    /// constructor a pure "rehydrate everything that was persisted"
+    /// call with no side effects.
     pub async fn load_from_pg(
         state: Arc<Mutex<State>>,
         pool: &PgPool,
