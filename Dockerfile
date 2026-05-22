@@ -10,9 +10,10 @@
 #   docker build -t zkcoin/server:beta .
 #
 # Both DEV (`:beta`) and PRD (`:latest`) ship the MVP-only binary
-# (no Cargo features). The `FEATURES` build-arg below stays in place
-# as an opt-in escape hatch for self-hosters who want to compile
-# non-MVP routes locally (e.g. `--build-arg FEATURES=usernames,lnurl`).
+# (no Cargo features beyond the always-on mint route). The `FEATURES`
+# build-arg below stays in place as an opt-in escape hatch for self-
+# hosters who want to compile non-MVP routes locally (e.g.
+# `--build-arg FEATURES=usernames,lnurl`).
 # Run:
 #   docker run -p 4242:4242 \
 #     -e ESPLORA_URL=http://electrs:3000 \
