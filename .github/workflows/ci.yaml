@@ -109,10 +109,10 @@ jobs:
       - name: Run clippy (program + prover libs)
         run: cargo clippy -p zkcoins-program-plonky2 -p zkcoins-prover-plonky2 --lib -- -D warnings
 
-      - name: Build server (MVP feature set — the PRD image)
+      - name: Build server (MVP feature set — the DEV + PRD image)
         run: cargo build -p server
 
-      - name: Build server (all features — the DEV image)
+      - name: Build server (all features — self-host opt-in build)
         run: cargo build -p server --all-features
 
   server-tests:

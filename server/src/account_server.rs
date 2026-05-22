@@ -483,16 +483,8 @@ impl AccountServer {
         let history_root_extended = state.mmr.root_extended(MMR_PROOF_PATH_LEN);
         let next_public_key_bytes = next_public_key.serialize();
 
-        // When DEV_SKIP_BROADCAST_FAILURE is set, the SMT is missing
-        // entries that should have been written by previous mints
-        // (their on-chain commitment never landed because the publisher
-        // wallet was empty). Drop the existing account.proof on the
-        // floor and take the create-account branch instead. NEVER set
-        // in PRD — the cost is that previous commitment history is
-        // discarded.
-        let dev_skip = std::env::var("DEV_SKIP_BROADCAST_FAILURE").unwrap_or_default() == "true";
         let proof: Proof = match &account.proof {
-            Some(account_proof) if !dev_skip => {
+            Some(account_proof) => {
                 let account_commitment_public_key = prev_commitment_pubkey
                     .ok_or("prev_commitment_pubkey required for account update")?;
                 let prev_cmp = Self::get_merkle_proofs(
@@ -513,7 +505,7 @@ impl AccountServer {
                     )
                     .map_err(|_| "prove_account_update_with_in_and_out_coins_and_sources failed")?
             }
-            _ => self
+            None => self
                 .prover
                 .prove_initial_with_in_and_out_coins_and_sources(
                     &account_state_for_prove,

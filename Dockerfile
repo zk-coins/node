@@ -7,7 +7,12 @@
 #
 # Build:
 #   docker build -t zkcoin/server:latest .
-#   docker build -t zkcoin/server:beta --build-arg FEATURES=address-list,faucet,usernames,lnurl .
+#   docker build -t zkcoin/server:beta .
+#
+# Both DEV (`:beta`) and PRD (`:latest`) ship the MVP-only binary
+# (no Cargo features). The `FEATURES` build-arg below stays in place
+# as an opt-in escape hatch for self-hosters who want to compile
+# non-MVP routes locally (e.g. `--build-arg FEATURES=usernames,lnurl`).
 # Run:
 #   docker run -p 4242:4242 \
 #     -e ESPLORA_URL=http://electrs:3000 \
@@ -36,11 +41,13 @@ RUN rustup show
 
 COPY . .
 
-# Cargo features for non-MVP routes. Empty by default — the PRD image
-# ships only the MVP feature set. The DEV image build passes a comma-
-# separated list (e.g. `address-list,faucet,usernames,lnurl`). Features
-# not listed here are excluded from the binary at compile time, so the
-# disabled code cannot run, crash, or be exploited at runtime.
+# Cargo features for non-MVP routes. Empty by default — both DEV and
+# PRD images ship the MVP-only feature set so the two environments run
+# the identical binary. Self-hosters who want to enable non-MVP routes
+# in a local build can pass a comma-separated list
+# (e.g. `--build-arg FEATURES=usernames,lnurl`). Features not listed
+# here are excluded from the binary at compile time, so the disabled
+# code cannot run, crash, or be exploited at runtime.
 ARG FEATURES=
 RUN if [ -z "$FEATURES" ]; then \
         cargo build --release -p server; \

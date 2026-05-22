@@ -44,7 +44,7 @@ The **on-chain footprint stays private** — Plonky2 ensures that the public out
 
 ## Contributing
 
-**New PRs may only merge into `develop` if test coverage is 100% on the activated surface.** Code behind a Cargo feature (`address-list`, `faucet`, `usernames`, `lnurl`) is excluded from the MVP measurement — feature-gated routes do not need to be tested as long as the feature stays off in the PRD build. Concretely:
+**New PRs may only merge into `develop` if test coverage is 100% on the activated surface.** Code behind a Cargo feature (`address-list`, `faucet`, `usernames`, `lnurl`) is excluded from the MVP measurement — feature-gated routes do not need to be tested because both DEV and PRD ship the MVP-only binary with every Cargo feature off. Concretely:
 
 - `cargo llvm-cov -p server` (no `--all-features`) must report 100% lines + 100% functions on the activated MVP surface. CI enforces this with `--fail-under-lines 100 --fail-under-functions 100` in the `Coverage Gate (100% lines + functions)` job. The current `develop` baseline is at the gate.
 - Defensive code that genuinely cannot be reached in unit tests (e.g. the publisher's Bitcoin-broadcast path that requires a signet/regtest node, the `main.rs` runtime bootstrap) is excluded from the measured scope at the file level rather than tested.
@@ -86,12 +86,12 @@ API endpoints, background services, their activation status, and the tests that 
 
 ¹ `NETWORK_NAME` env var controls the string returned. `IS_MAINNET=true` flips the default to `"Mainnet"`.
 ² Proof generation routes through the Plonky2 cyclic-recursion circuit. Single host, single Rust process — no zkVM, no external prover service. Mac Studio M3 Ultra is the production hardware target (96 GB unified memory, no external GPU). See [Proving Strategy](#proving-strategy).
-³ Requires `PUBLISHER_KEY` set to a real funded key and `ESPLORA_URL` reachable. With the default test key the server panics on `IS_MAINNET=true` startup; on testnet it accepts the call but broadcast will fail without funded UTXOs.
+³ Requires `PUBLISHER_KEY` set to a real funded key and `ESPLORA_URL` reachable. With the default test key the server panics on `IS_MAINNET=true` startup; on testnet it accepts the call but broadcast will fail without funded UTXOs — DEV and PRD both return `503 SERVICE_UNAVAILABLE` to the client on broadcast failure (the historic `DEV_SKIP_BROADCAST_FAILURE` env-gate that silently swallowed these failures was removed once DEV and PRD were unified on the MVP-only binary; the DEV publisher wallet therefore has to be funded for E2E paths).
 ⁴ Scanner depends on `ESPLORA_URL` being reachable; on connection failure it backs off and retries.
 
 ### Cargo features
 
-All non-MVP routes are gated by Cargo features so the disabled handler functions, helper structs, and `AppState` fields are excluded from the binary at compile time. With a feature off, the route is never registered and the fallback responds with `404`. There is no runtime path that can reach a disabled handler. Defaults are empty (fail-closed): the PRD image build passes no features, the DEV image build passes all four.
+All non-MVP routes are gated by Cargo features so the disabled handler functions, helper structs, and `AppState` fields are excluded from the binary at compile time. With a feature off, the route is never registered and the fallback responds with `404`. There is no runtime path that can reach a disabled handler. Defaults are empty (fail-closed): **both the DEV and the PRD image builds pass no features**, so the two environments run the identical MVP-only binary. The Cargo flags exist for self-hosters who want to compile a binary with a specific non-MVP subset enabled, and for future per-feature rollouts when an individual feature is deemed ready for production.
 
 | Feature        | Gates                                                                                                                                                 |
 | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -100,7 +100,7 @@ All non-MVP routes are gated by Cargo features so the disabled handler functions
 | `usernames`    | `POST /api/username/claim`, `GET /api/username/resolve/:u`, `ClaimUsernameRequest`, `UsernameStore::{claim,save_to_file}`, `AppState::usernames_path` |
 | `lnurl`        | `GET /.well-known/lnurlp/:u`, `GET /lnurl/pay/:u` (depends on `usernames`)                                                                            |
 
-Build the MVP-only binary (PRD): `cargo build --release -p server`. Build with everything enabled (DEV / tests): `cargo build --release -p server --all-features`. The Docker `FEATURES` build arg accepts a comma-separated list and is forwarded to `cargo build --features`.
+Build the MVP-only binary (DEV + PRD ship this): `cargo build --release -p server`. Build with every feature enabled (CI clippy + tests + self-host opt-in): `cargo build --release -p server --all-features`. The Docker `FEATURES` build arg accepts a comma-separated list and is forwarded to `cargo build --features`; both `deploy-dev.yaml` and `deploy-prd.yaml` leave it empty.
 
 ### Triage gaps
 
@@ -234,7 +234,7 @@ Spawned from `main.rs::main`:
 
 | Stack            | Command                                       | What it covers                                                                                             |
 | ---------------- | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `cargo test`     | `cargo test -p server`                        | MVP code paths — what the PRD binary actually contains                                                     |
+| `cargo test`     | `cargo test -p server`                        | MVP code paths — what the DEV + PRD binary actually contains                                               |
 | `cargo test`     | `cargo test -p server --all-features`         | Including the gated `address-list`, `faucet`, `usernames`, and `lnurl` routes                              |
 | `cargo-llvm-cov` | `cargo llvm-cov -p server`                    | Coverage gate enforced by CI: 100% lines + functions on the activated MVP surface                          |
 

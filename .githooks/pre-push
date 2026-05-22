@@ -28,7 +28,7 @@ cargo fmt --all --check
 echo "[pre-push] cargo clippy -p server -p shared (MVP feature set)"
 cargo clippy -p server -p shared -- -D warnings
 
-echo "[pre-push] cargo clippy -p server --all-features (DEV feature set)"
+echo "[pre-push] cargo clippy -p server --all-features (self-host opt-in build)"
 cargo clippy -p server --all-features -- -D warnings
 
 echo "[pre-push] cargo clippy -p zkcoins-program-plonky2 -p zkcoins-prover-plonky2 --lib"
