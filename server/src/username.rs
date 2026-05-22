@@ -4,9 +4,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 
 use crate::db;
-use zkcoins_program::hash::digest_from_bytes;
-#[cfg(any(feature = "usernames", test))]
-use zkcoins_program::hash::digest_to_bytes;
+use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes};
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct UsernameStore {
@@ -39,7 +37,6 @@ impl UsernameStore {
     /// without a duplicate copy of the rules.
     ///
     /// Returns the normalized (lowercased) name on success.
-    #[cfg(any(feature = "usernames", test))]
     fn validate(username: &str) -> Result<String, &'static str> {
         let normalized = username.to_lowercase();
         if normalized.is_empty() || normalized.len() > 64 {
@@ -65,7 +62,6 @@ impl UsernameStore {
     /// names per address by design (a future product change might
     /// allow aliasing) and the application-level rule is the
     /// authoritative one for the MVP.
-    #[cfg(any(feature = "usernames", test))]
     pub async fn claim(
         &mut self,
         pool: &PgPool,
@@ -97,7 +93,6 @@ impl UsernameStore {
         Ok(())
     }
 
-    #[cfg(any(feature = "usernames", feature = "lnurl", test))]
     pub fn resolve(&self, username: &str) -> Option<Address> {
         self.usernames.get(&username.to_lowercase()).copied()
     }
@@ -133,11 +128,6 @@ impl UsernameStore {
 /// Error type for `UsernameStore::claim`. Wraps the validation error
 /// strings (returned to the API caller as a 4xx body) and any database
 /// error from the underlying `db::claim_username` upsert.
-///
-/// `cfg`-gated on the `usernames` feature plus `test` — the public
-/// claim handler is the only production caller of `claim`, and the
-/// unit-test suite exercises both paths unconditionally.
-#[cfg(any(feature = "usernames", test))]
 #[derive(Debug)]
 pub enum ClaimUsernameError {
     /// Caller-fixable input rejection (charset, length, duplicate).
@@ -147,7 +137,6 @@ pub enum ClaimUsernameError {
     Db(sqlx::Error),
 }
 
-#[cfg(any(feature = "usernames", test))]
 impl std::fmt::Display for ClaimUsernameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -157,7 +146,6 @@ impl std::fmt::Display for ClaimUsernameError {
     }
 }
 
-#[cfg(any(feature = "usernames", test))]
 impl std::error::Error for ClaimUsernameError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -167,7 +155,6 @@ impl std::error::Error for ClaimUsernameError {
     }
 }
 
-#[cfg(any(feature = "usernames", test))]
 impl From<sqlx::Error> for ClaimUsernameError {
     fn from(e: sqlx::Error) -> Self {
         ClaimUsernameError::Db(e)

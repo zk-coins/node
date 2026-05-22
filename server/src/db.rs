@@ -177,11 +177,6 @@ pub async fn load_all_usernames(pool: &PgPool) -> Result<Vec<(String, Vec<u8>)>,
 /// fresh claim, `Ok(false)` if the name is already taken (no row
 /// inserted, existing row left untouched). The `ON CONFLICT DO
 /// NOTHING` makes this race-free at the SQL level.
-///
-/// `cfg`-gated on the `usernames` feature plus `test`: only the
-/// gated `claim_username_handler` calls it in production. The unit
-/// tests in `db_tests.rs` exercise it unconditionally.
-#[cfg(any(feature = "usernames", test))]
 pub async fn claim_username(
     pool: &PgPool,
     name: &str,

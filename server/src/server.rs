@@ -102,7 +102,7 @@ pub struct BalanceResponse {
     username: Option<String>,
 }
 
-#[cfg(any(feature = "address-list", feature = "usernames", feature = "lnurl"))]
+#[cfg(any(feature = "address-list", feature = "lnurl"))]
 #[derive(Serialize, Deserialize)]
 pub struct AddressesResponse {
     addresses: Vec<String>,
@@ -403,7 +403,6 @@ pub struct Capabilities {
 
 // --- Username & LNURL types ---
 
-#[cfg(feature = "usernames")]
 #[derive(Deserialize)]
 pub struct ClaimUsernameRequest {
     username: String,
@@ -413,7 +412,6 @@ pub struct ClaimUsernameRequest {
     timestamp: u64,
 }
 
-#[cfg(any(feature = "usernames", feature = "lnurl"))]
 #[derive(Serialize, Deserialize)]
 pub struct UsernameResponse {
     username: String,
@@ -432,7 +430,6 @@ pub struct LnurlpResponse {
     metadata: String,
 }
 
-#[cfg(any(feature = "usernames", feature = "lnurl"))]
 #[derive(Serialize, Deserialize)]
 pub struct LnurlErrorResponse {
     status: String,
@@ -1096,7 +1093,8 @@ async fn info_handler() -> impl IntoResponse {
             address_list: cfg!(feature = "address-list"),
             // Hardcoded — mint is permanent MVP; field is back-compat only.
             faucet: true,
-            usernames: cfg!(feature = "usernames"),
+            // Hardcoded — usernames are permanent MVP; field is back-compat only.
+            usernames: true,
             lnurl: cfg!(feature = "lnurl"),
         },
         username_domain: USERNAME_DOMAIN.clone(),
@@ -1148,7 +1146,6 @@ async fn root_handler() -> impl IntoResponse {
 
 // --- Username & LNURL handlers ---
 
-#[cfg(feature = "usernames")]
 async fn claim_username_handler(
     State(state): State<AppState>,
     Json(request): Json<ClaimUsernameRequest>,
@@ -1330,8 +1327,7 @@ async fn claim_username_handler(
 
 /// Resolve an identifier to an address. Checks the username store first,
 /// then falls back to hex-prefix matching against known account addresses.
-/// Only used by the gated username and LNURL handlers.
-#[cfg(any(feature = "usernames", feature = "lnurl"))]
+/// Used by the always-on username handlers and the gated LNURL handlers.
 fn resolve_identifier(
     state: &AppState,
     identifier: &str,
@@ -1354,7 +1350,6 @@ fn resolve_identifier(
         .map(|addr| (addr, normalized))
 }
 
-#[cfg(feature = "usernames")]
 async fn resolve_username_handler(
     State(state): State<AppState>,
     Path(username): Path<String>,
@@ -1455,7 +1450,12 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/api/receive", post(receive_coin_handler))
         .route("/api/proof/:id", get(get_proof_handler))
         .route("/api/commit", post(commit_handler))
-        .route("/api/mint", post(mint_handler));
+        .route("/api/mint", post(mint_handler))
+        .route("/api/username/claim", post(claim_username_handler))
+        .route(
+            "/api/username/resolve/:username",
+            get(resolve_username_handler),
+        );
 
     // Gated routes — only compiled in when their Cargo feature is enabled.
     // With a feature off, the handler does not exist in the binary and the
@@ -1463,14 +1463,6 @@ pub(crate) fn create_router(state: AppState) -> Router {
     // and there is no code path to execute.
     #[cfg(feature = "address-list")]
     let app = app.route("/api/address", get(get_address_handler));
-
-    #[cfg(feature = "usernames")]
-    let app = app
-        .route("/api/username/claim", post(claim_username_handler))
-        .route(
-            "/api/username/resolve/:username",
-            get(resolve_username_handler),
-        );
 
     #[cfg(feature = "lnurl")]
     let app = app

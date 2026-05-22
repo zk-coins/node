@@ -60,5 +60,4 @@ rand = "0.8"
 # cannot run, crash, or be exploited at runtime.
 default = []
 address-list = []
-usernames = []
-lnurl = ["usernames"]
+lnurl = []

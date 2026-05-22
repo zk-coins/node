@@ -138,7 +138,8 @@ async fn info_returns_network_name_capabilities_and_username_domain() {
     );
     // Mint is permanent MVP — `faucet` is hardcoded `true`, not cfg-derived.
     assert!(info.capabilities.faucet);
-    assert_eq!(info.capabilities.usernames, cfg!(feature = "usernames"));
+    // Usernames are permanent MVP — `usernames` is hardcoded `true`.
+    assert!(info.capabilities.usernames);
     assert_eq!(info.capabilities.lnurl, cfg!(feature = "lnurl"));
 
     // The lazy_static defaults to "zkcoins.app" (PRD) when USERNAME_DOMAIN is unset
@@ -182,7 +183,6 @@ async fn balance_unknown_address_returns_ok_with_zero() {
     assert!(resp.username.is_none());
 }
 
-#[cfg(feature = "usernames")]
 #[tokio::test]
 async fn balance_unknown_address_with_claimed_username_returns_username() {
     let state = test_state();
@@ -372,7 +372,6 @@ async fn send_request_with_state(state: AppState, request: Request<Body>) -> (St
 
 // --- GET /api/username/resolve/{username} ---
 
-#[cfg(feature = "usernames")]
 #[tokio::test]
 async fn resolve_unknown_username_returns_404() {
     let req = Request::get("/api/username/resolve/nonexistent")
@@ -387,7 +386,6 @@ async fn resolve_unknown_username_returns_404() {
     assert!(resp.reason.contains("not found"));
 }
 
-#[cfg(feature = "usernames")]
 #[tokio::test]
 async fn resolve_minting_address_by_hex_prefix() {
     // The minting address starts with "af53a1" — a short prefix is enough
@@ -410,7 +408,6 @@ async fn resolve_minting_address_by_hex_prefix() {
 
 // --- POST /api/username/claim ---
 
-#[cfg(feature = "usernames")]
 #[tokio::test]
 async fn claim_username_empty_body_returns_422() {
     let req = Request::post("/api/username/claim")
@@ -422,7 +419,6 @@ async fn claim_username_empty_body_returns_422() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
-#[cfg(feature = "usernames")]
 #[tokio::test]
 async fn claim_username_no_content_type_returns_415() {
     let req = Request::post("/api/username/claim")
@@ -581,7 +577,6 @@ async fn concurrent_balance_reads_are_consistent() {
 
 // --- Concurrent mixed reads and username operations ---
 
-#[cfg(feature = "usernames")]
 #[tokio::test]
 async fn concurrent_reads_with_username_claim() {
     let state = test_state();
@@ -816,7 +811,6 @@ fn send_signature_rejects_wrong_signature() {
 
 // --- POST /api/username/claim with valid Schnorr signature ---
 
-#[cfg(feature = "usernames")]
 #[tokio::test]
 async fn claim_username_with_valid_signature() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -911,7 +905,6 @@ async fn claim_username_with_valid_signature() {
     assert_eq!(resp.address, format!("0x{}", address_hex));
 }
 
-#[cfg(feature = "usernames")]
 #[tokio::test]
 async fn claim_username_wrong_pubkey() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -963,7 +956,6 @@ async fn claim_username_wrong_pubkey() {
     );
 }
 
-#[cfg(feature = "usernames")]
 #[tokio::test]
 async fn claim_username_expired_timestamp() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
