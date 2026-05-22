@@ -1,19 +1,22 @@
-mod account_server;
-mod db;
-mod publisher;
-mod scanner;
-mod scanner_runtime;
-mod server;
-mod server_runtime;
-mod state;
-mod username;
+//! Binary entrypoint for `server`.
+//!
+//! Modules live in `lib.rs`; this file only wires the bootstrap
+//! (panic hook, Postgres pool, scanner task, REST listener) together.
+//! Splitting the modules out of the binary lets out-of-tree
+//! integration tests (`server/tests/api_remote.rs`) import the
+//! handler response types and the `CoinProof` struct without
+//! duplicating definitions or making the binary itself reachable
+//! from a `cargo test --test ...` target.
 
-use crate::publisher::EsploraConfig;
-use crate::scanner_runtime::scan_for_inscriptions;
-use crate::server_runtime::start_rest_server;
-use crate::state::State;
+use server::account_server;
+use server::db;
+use server::publisher::EsploraConfig;
+use server::scanner_runtime::scan_for_inscriptions;
+use server::server_runtime::start_rest_server;
+use server::state::State;
+use server::username;
+use server::{persist_state_from_sync_context, DATABASE_URL, NETWORK_CONFIG};
 use shared::commitment::Commitment;
-use sqlx::PgPool;
 use std::error::Error as StdError;
 use std::sync::{Arc, Mutex};
 
@@ -27,114 +30,12 @@ use std::sync::{Arc, Mutex};
 // `${PROOFS_DIR:-./proofs}/{id}.bin`, owned by `ProofStore` in
 // `server.rs`.
 const ACCOUNT_SERVER_ADDR: &str = "0.0.0.0:4242";
-//const START_BLOCK_HASH: &str = "000000f43ca5c99c54c4738878fe1c5cca07691dc614a2734b73aa78ca868fb8";
 
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use esplora_client::{
     r#async::DefaultSleeper, AsyncClient as EsploraAsyncClient, Builder as EsploraBuilder,
 };
-
-const DEFAULT_PUBLISHER_KEY: &str =
-    "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-
-lazy_static::lazy_static! {
-    pub static ref NETWORK_CONFIG: EsploraConfig = {
-        let url = std::env::var("ESPLORA_URL")
-            .unwrap_or_else(|_| "https://mutinynet.com/api".to_string());
-        let is_mainnet = std::env::var("IS_MAINNET")
-            .map(|v| v == "true")
-            .unwrap_or(false);
-        let network_name = std::env::var("NETWORK_NAME")
-            .unwrap_or_else(|_| if is_mainnet { "Mainnet".to_string() } else { "Mutinynet".to_string() });
-        println!("Network config: {} ({})", network_name, url);
-        EsploraConfig { url, is_mainnet, network_name }
-    };
-
-    // Domain used by the client to render `<hex|username>@<domain>`. Distinct
-    // from `network_name` because the same Bitcoin network (e.g. Mutinynet)
-    // is served from two isolated test worlds (`dev.zkcoins.app`,
-    // `zkcoins.app`) — the client needs the stage's external hostname, not
-    // the chain identifier.
-    //
-    // Required (no default). A silent fallback would let a misconfigured
-    // DEV image report the PRD domain and reproduce the cross-network
-    // routing bug this whole envelope exists to fix (see issue #95). PRD
-    // must set `USERNAME_DOMAIN=zkcoins.app` explicitly; DEV sets
-    // `USERNAME_DOMAIN=dev.zkcoins.app`.
-    pub static ref USERNAME_DOMAIN: String = {
-        let domain = std::env::var("USERNAME_DOMAIN").expect(
-            "USERNAME_DOMAIN env var must be set (e.g. `zkcoins.app` on PRD, \
-             `dev.zkcoins.app` on DEV) — see #95 for the cross-network rationale",
-        );
-        println!("Username domain: {}", domain);
-        domain
-    };
-
-    pub static ref PUBLISHER_KEY: String = {
-        let key = std::env::var("PUBLISHER_KEY")
-            .unwrap_or_else(|_| DEFAULT_PUBLISHER_KEY.to_string());
-        if NETWORK_CONFIG.is_mainnet && key == DEFAULT_PUBLISHER_KEY {
-            panic!("PUBLISHER_KEY env var must be set for mainnet");
-        }
-        key
-    };
-
-    /// Postgres connection string for the state-layer. Required; the
-    /// bootstrap refuses to start without it because there is no
-    /// sensible default for a database URL (a wrong default would
-    /// silently corrupt PRD by pointing at the local dev instance).
-    pub static ref DATABASE_URL: String = {
-        std::env::var("DATABASE_URL").expect(
-            "DATABASE_URL env var must be set (e.g. \
-             postgresql://zkcoins:<pw>@postgres:5432/zkcoins)",
-        )
-    };
-}
-
-/// Run `db::persist_state_tx` from a *synchronous* context that already
-/// lives on a tokio worker thread.
-///
-/// The scanner's `InscriptionCallback` is a sync `Fn` (see
-/// `scanner::InscriptionCallback`), but `persist_state_tx` is async
-/// and must be awaited. The naive bridge —
-/// `Handle::current().block_on(future)` — panics on the
-/// `#[tokio::main]` multi_thread flavor: from the Tokio docs,
-/// `Handle::block_on` "may panic when called from a thread that is
-/// part of the current Tokio runtime". Wrapping with
-/// `tokio::task::block_in_place` is the documented sync-in-async
-/// escape hatch for multi_thread runtimes — it tells the scheduler
-/// that this worker is about to block and migrates other tasks off
-/// it, then it is safe to drive the future to completion with
-/// `block_on`.
-///
-/// See:
-///   - <https://docs.rs/tokio/latest/tokio/task/fn.block_in_place.html>
-///   - <https://docs.rs/tokio/latest/tokio/runtime/struct.Handle.html#method.block_on>
-///
-/// **Important:** `block_in_place` requires the `rt-multi-thread`
-/// flavor. On a `current_thread` runtime it panics with
-/// "can call blocking only when running on the multi-threaded
-/// runtime". The production bootstrap uses `#[tokio::main]` (which
-/// defaults to multi_thread) and tests that exercise this helper must
-/// be annotated `#[tokio::test(flavor = "multi_thread", …)]` —
-/// `current_thread` would hit that panic before we ever reach the
-/// production code path.
-pub fn persist_state_from_sync_context(
-    pool: &PgPool,
-    smt: &[u8],
-    mmr: &[u8],
-    latest_block: &[u8; 32],
-) -> Result<(), sqlx::Error> {
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(db::persist_state_tx(
-            pool,
-            smt,
-            mmr,
-            latest_block,
-        ))
-    })
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn StdError>> {
@@ -207,6 +108,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // Esplora's current tip. The Postgres row is written atomically
     // alongside the SMT/MMR snapshot in the scanner callback, which is
     // the structural fix for issue #11.
+    let network_config: &EsploraConfig = &NETWORK_CONFIG;
     let start_block_hash = match db::load_latest_block(&pool).await? {
         Some(hash_bytes) => {
             let hash = BlockHash::from_byte_array(hash_bytes);
@@ -216,7 +118,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         None => {
             println!("No saved block hash found, fetching latest from Esplora...");
             let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(EsploraBuilder::new(
-                &NETWORK_CONFIG.url,
+                &network_config.url,
             ))?;
             let tip_hash = client.get_tip_hash().await?;
             println!("Fetched latest tip hash from Esplora: {}", tip_hash);
@@ -228,7 +130,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let pool_for_callback = Arc::clone(&pool);
     let state_for_callback = Arc::clone(&state);
 
-    scan_for_inscriptions(&NETWORK_CONFIG, start_block_hash, &move |content_bytes: Vec<u8>, current_block_hash| {
+    scan_for_inscriptions(network_config, start_block_hash, &move |content_bytes: Vec<u8>, current_block_hash| {
         println!("Received content size: {} bytes", content_bytes.len());
 
         // Try to deserialize the content as a Commitment
@@ -285,13 +187,6 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                 if let Some((new_root, smt_bytes, mmr_bytes)) = snapshot {
                     let block_hash_bytes = current_block_hash.to_byte_array();
 
-                    // `scan_for_inscriptions` defines its callback as a
-                    // sync `Fn(Vec<u8>, BlockHash)` (see
-                    // `scanner::InscriptionCallback`). Converting it to
-                    // an async trait would ripple through the scanner +
-                    // scanner_runtime + every test fixture and is well
-                    // outside PR-A2's scope.
-                    //
                     // The callback runs INSIDE the async
                     // `scan_for_inscriptions` task on a multi_thread
                     // tokio runtime, so we cannot just
@@ -303,16 +198,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                     // scanned. The fix is the documented
                     // `block_in_place(|| Handle::current().block_on(…))`
                     // pattern, encapsulated in
-                    // `persist_state_from_sync_context` so we can unit-
-                    // test that bridge end-to-end against testcontainer
-                    // Postgres without standing up the whole scanner.
-                    //
-                    // The pool itself uses a dedicated set of
-                    // connections, so the block does not stall the
-                    // worker on its own DB work; it just serializes
-                    // scanner progress against DB commit latency —
-                    // exactly the durability semantics we want for
-                    // issue #11.
+                    // `persist_state_from_sync_context`.
                     let persist_result = persist_state_from_sync_context(
                         &pool_for_callback,
                         &smt_bytes,
@@ -338,7 +224,3 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "main_tests.rs"]
-mod tests;

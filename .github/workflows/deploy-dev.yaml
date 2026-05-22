@@ -99,3 +99,49 @@ jobs:
           done
           echo "::error::DEV /api/info never returned 200 within ~5 min after deploy"
           exit 1
+
+  # Functional verification of the deployed DEV server.
+  #
+  # The smoke test in `build-and-deploy` only proves the HTTP listener
+  # is bound; this job exercises all 15 routes end-to-end (read-only,
+  # negative-path, full mint→send→commit and username-claim roundtrips
+  # against the live server). Runs on the same self-hosted M3 Ultra
+  # runner as `server-tests` / `coverage`, so sccache hits the warm
+  # cache populated by previous runs and the build itself stays
+  # well under a minute on a hot cache.
+  api-e2e:
+    name: API E2E against DEV
+    needs: build-and-deploy
+    runs-on: [self-hosted, m3-ultra]
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+      ZKCOINS_API_URL: https://dev-api.zkcoins.app
+      # The bootstrap `lazy_static`s panic if these are unset; the
+      # integration test only talks to the deployed server but the
+      # lib's panic-on-load behaviour is unconditional. Values are
+      # placeholders — nothing in the test path reads them.
+      USERNAME_DOMAIN: dev.zkcoins.app
+      ESPLORA_URL: http://127.0.0.1:1/api
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Self-hosted runner inherits a minimal PATH that hides rustup;
+      # see the matching step in `server-tests` for the rationale.
+      - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Ensure sccache + cargo-nextest are installed
+        run: |
+          command -v sccache >/dev/null || brew install sccache
+          command -v cargo-nextest >/dev/null || brew install cargo-nextest
+          sccache --start-server >/dev/null 2>&1 || true
+          sccache --show-stats
+
+      - name: Run API E2E suite against DEV
+        run: cargo test -p server --release --all-features --test api_remote -- --test-threads=1 --nocapture
+
+      - name: sccache stats (post-build)
+        if: always()
+        run: sccache --show-stats
