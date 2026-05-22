@@ -44,6 +44,14 @@ wiremock = "0.6"
 # `runner()` — see `db_tests::setup_pool` for the shape we use.
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
+# HTTP client for the `api_remote` integration test, which exercises
+# the deployed DEV server end-to-end. rustls (not native-tls) to keep
+# the test runner self-contained on CI hosts without openssl headers.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Random key + suffix generation for the `api_remote` suite so each
+# run picks a fresh wallet and avoids collisions with concurrent
+# DEV-server consumers.
+rand = "0.8"
 
 [features]
 # All non-MVP features are off by default. When a feature is not enabled, the
