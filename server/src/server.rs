@@ -811,23 +811,17 @@ async fn mint_handler(
                     eprintln!("WARNING: num_pubkeys changed unexpectedly during mint operation.");
                     num_pubkeys_to_persist = None;
                 }
-                let pis: Result<
-                    [zkcoins_program::F;
-                        zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS],
-                    _,
-                > = coin_proofs[0].proof.public_inputs
-                    [..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
-                    .try_into();
-                let proof_data = match pis {
-                    Ok(pis) => ProofData::from_field_elements(&pis),
-                    Err(e) => {
-                        eprintln!("Failed to deserialize proof public_inputs: {:?}", e);
-                        return handler_error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "prove failed",
-                        );
-                    }
-                };
+                // The slice `[..N]` panics if `public_inputs.len() < N`, so
+                // the `try_into` Err branch is structurally dead.
+                // `program-plonky2/src/circuit/main.rs` guarantees
+                // `outer_num_pis >= N_PROOF_DATA_PUBLIC_INPUTS`.
+                let pis: [zkcoins_program::F;
+                    zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] = coin_proofs[0]
+                    .proof
+                    .public_inputs[..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
+                    .try_into()
+                    .expect("prover always emits N_PROOF_DATA_PUBLIC_INPUTS field elements");
+                let proof_data = ProofData::from_field_elements(&pis);
                 coin_proofs[0].commitment = Some(minting_account_guard.create_commitment(
                     &proof_data.account_state_hash,
                     &proof_data.output_coins_root,
@@ -910,15 +904,17 @@ async fn mint_handler(
                 }
             }
 
-            let proof_id = match coin_proofs.pop() {
-                Some(proof) => state.proof_store.add_proof(proof),
-                None => {
-                    return handler_error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "prove failed",
-                    );
-                }
-            };
+            // `mint_handler` passes a single-element `vec![Invoice::new(...)]`
+            // to `send_coins`; `send_coins` builds `coin_proofs` with
+            // `out_coins.len() == coin_templates.len() == invoices.len() == 1`,
+            // so the Ok-arm Vec has length exactly 1 — `pop()` is total.
+            // Mirrors the same-file `expect("send_coins returns at least one
+            // coin_proof on Ok")` invariant pattern earlier in this function.
+            let proof_id = state.proof_store.add_proof(
+                coin_proofs
+                    .pop()
+                    .expect("send_coins returns exactly one coin_proof for single-invoice mint"),
+            );
             (
                 StatusCode::OK,
                 Json(SendCoinResponse {

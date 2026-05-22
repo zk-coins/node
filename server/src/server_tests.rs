@@ -2959,8 +2959,8 @@ async fn mint_broadcast_failure_returns_503() {
 /// commit + reveal POSTs, so `mint_handler` falls through into the
 /// post-broadcast section: `receive_coin` loop, account-snapshot
 /// builder, per-account `db::upsert_account` log-and-continue loop,
-/// and the `coin_proofs.pop()` Some arm returning 200 with a usable
-/// `proof_id`.
+/// and the `coin_proofs.pop().expect(...)` value-extraction returning
+/// 200 with a usable `proof_id`.
 ///
 /// Uses a live Postgres testcontainer so the `upsert_minting_num_pubkeys`
 /// + `upsert_account` calls hit the Ok arm of the persistence helpers
