@@ -671,20 +671,15 @@ async fn send_coin_handler(
             let ash_hex = Some(hex::encode(digest_to_bytes(&pd.account_state_hash)));
             let ocr_hex = Some(hex::encode(digest_to_bytes(&pd.output_coins_root)));
 
-            // Mint flow only — broadcasting a pre-set commitment is the
-            // server-signed minting path. User-initiated sends never
-            // pre-set `coin_proofs[0].commitment`, so this block is
-            // a no-op for the non-mint flow.
-            if let Some(commitment) = coin_proofs[0].commitment.as_ref() {
-                let commitment_data =
-                    bincode::serialize(commitment).expect("Failed to serialize commitment");
-                println!("Broadcasting commitment ({} bytes)", commitment_data.len());
-                if let Err(err) =
-                    create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG).await
-                {
-                    eprintln!("Error broadcasting inscription: {}", err);
-                }
-            }
+            // Note: User-initiated sends never pre-set
+            // `coin_proofs[0].commitment` (see
+            // `account_server::send_coins`, which always emits
+            // `commitment: None`). The mint flow constructs and
+            // broadcasts its own commitment inside `mint_handler`. The
+            // pre-MVP `if let Some(commitment) = coin_proofs[0]
+            // .commitment.as_ref() { … broadcast … }` block that used
+            // to live here was dead under both flows and has been
+            // removed; clients commit explicitly via `/api/commit`.
 
             // Persist proof FIRST (crash-safe: proof exists even if
             // account save fails). send_coins always returns a non-empty
