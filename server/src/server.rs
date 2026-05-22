@@ -83,12 +83,14 @@ pub(crate) struct AppState {
     /// cheaply via `Arc`; the underlying connections are pooled.
     pub(crate) pool: Arc<PgPool>,
     /// Esplora endpoint configuration consumed by the `/health/ready`
-    /// readiness probe (and only there — production handlers read
-    /// `NETWORK_CONFIG` directly via lazy_static). Injecting the config
-    /// through `AppState` lets the probe tests redirect Esplora calls
-    /// at a `wiremock::MockServer` without having to mutate the
-    /// process-wide `NETWORK_CONFIG`. In production
-    /// `start_rest_server` clones `NETWORK_CONFIG` into this slot.
+    /// readiness probe and by the mint-flow inscription broadcast in
+    /// `mint_handler`. Injecting the config through `AppState` lets
+    /// tests redirect Esplora calls at a `wiremock::MockServer`
+    /// without having to mutate the process-wide `NETWORK_CONFIG`
+    /// lazy_static (which is frozen on first access and shared across
+    /// every test in the binary). In production `start_rest_server`
+    /// clones `NETWORK_CONFIG` into this slot so the runtime
+    /// behaviour is unchanged.
     pub(crate) esplora_config: Arc<EsploraConfig>,
 }
 
@@ -861,8 +863,12 @@ async fn mint_handler(
             println!("Commitment data hex: {}", hex::encode(&commitment_data));
 
             // This await is now safe because no locks are held across it.
+            // Route through `state.esplora_config` (a clone of
+            // `NETWORK_CONFIG` in production via `start_rest_server`)
+            // so tests can redirect the broadcast at a wiremock without
+            // mutating the process-wide lazy_static.
             if let Err(err) =
-                create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG).await
+                create_and_broadcast_inscription(&commitment_data, &state.esplora_config).await
             {
                 eprintln!("Error broadcasting mint inscription: {}", err);
                 return handler_error_response(
