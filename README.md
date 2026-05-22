@@ -86,7 +86,7 @@ API endpoints, background services, their activation status, and the tests that 
 
 ¹ `NETWORK_NAME` env var controls the string returned. `IS_MAINNET=true` flips the default to `"Mainnet"`.
 ² Proof generation routes through the Plonky2 cyclic-recursion circuit. Single host, single Rust process — no zkVM, no external prover service. Mac Studio M3 Ultra is the production hardware target (96 GB unified memory, no external GPU). See [Proving Strategy](#proving-strategy).
-³ Requires `PUBLISHER_KEY` set to a real funded key and `ESPLORA_URL` reachable. With the default test key the server panics on `IS_MAINNET=true` startup; on testnet it accepts the call but broadcast will fail without funded UTXOs.
+³ Requires `PUBLISHER_KEY` set to a real funded key and `ESPLORA_URL` reachable. With the default test key the server panics on `IS_MAINNET=true` startup; on testnet it accepts the call but broadcast will fail without funded UTXOs — DEV and PRD both return `503 SERVICE_UNAVAILABLE` to the client on broadcast failure (the historic `DEV_SKIP_BROADCAST_FAILURE` env-gate that silently swallowed these failures was removed once DEV and PRD were unified on the MVP-only binary; the DEV publisher wallet therefore has to be funded for E2E paths).
 ⁴ Scanner depends on `ESPLORA_URL` being reachable; on connection failure it backs off and retries.
 
 ### Cargo features
@@ -234,7 +234,7 @@ Spawned from `main.rs::main`:
 
 | Stack            | Command                                       | What it covers                                                                                             |
 | ---------------- | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `cargo test`     | `cargo test -p server`                        | MVP code paths — what the PRD binary actually contains                                                     |
+| `cargo test`     | `cargo test -p server`                        | MVP code paths — what the DEV + PRD binary actually contains                                               |
 | `cargo test`     | `cargo test -p server --all-features`         | Including the gated `address-list`, `faucet`, `usernames`, and `lnurl` routes                              |
 | `cargo-llvm-cov` | `cargo llvm-cov -p server`                    | Coverage gate enforced by CI: 100% lines + functions on the activated MVP surface                          |
 
