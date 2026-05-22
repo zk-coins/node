@@ -4,10 +4,12 @@
 //! it must be reachable from out-of-tree integration tests
 //! (`server/tests/api_remote.rs` in particular). Exposing those
 //! modules through a `lib` target keeps the binary side of the crate
-//! untouched while letting the integration suite import handler
-//! response types (`SendCoinResponse`, `InfoResponse`, `Capabilities`,
-//! `BalanceResponse`) and the `CoinProof` struct used to decode the
-//! binary blobs returned by `GET /api/proof/:id`.
+//! untouched while letting the integration suite import the
+//! `Capabilities` struct (for feature-gate detection on `/api/info`)
+//! and the `CoinProof` struct used to decode the binary blobs
+//! returned by `GET /api/proof/:id`. Other response types remain
+//! reachable through their owning modules but are not currently
+//! consumed by the suite.
 //!
 //! Everything declared here is also `use`d from `main.rs` so the
 //! production binary keeps working with no change in behaviour.

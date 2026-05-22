@@ -6,8 +6,19 @@
 //! answers "do all 15 routes behave as documented?". It signs real
 //! Schnorr commitments with freshly-generated wallets, mints faucet
 //! coins, sends them, commits the resulting state, and claims a
-//! username — exercising the protocol-level happy path against the
+//! username — exercising the API contract happy path against the
 //! same backend the wallet app talks to.
+//!
+//! Scope note: the suite verifies server-visible behaviour (status
+//! codes, response shapes, balance movements). The commit message
+//! format used in `send_commit_roundtrip_moves_balance` is the
+//! 64-byte `ash || ocr` raw concat, which the server accepts via
+//! `Commitment::verify`'s SHA-256 fallback. The canonical wallet
+//! client signs the 32-byte Poseidon `hash_concat(ash, ocr)` digest
+//! (see `shared::ClientAccount::create_commitment`); the two forms
+//! produce different SMT leaves but both pass the signature check,
+//! and the suite never re-spends from the test wallet so the leaf
+//! shape is observationally indistinguishable in-scope.
 //!
 //! The DEV server is shared by other workflows (per-PR app E2E,
 //! interactive testing). To keep this suite race-free we always:
