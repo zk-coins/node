@@ -33,6 +33,7 @@ use rand::RngCore;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use server::account_server::CoinProof;
+use server::server::Capabilities;
 use sha2::{Digest, Sha256};
 use shared::commitment::Commitment;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -86,6 +87,85 @@ macro_rules! dev_skip {
         eprintln!("DEV environment skip: {}", $reason);
         return;
     }};
+}
+
+/// Helper: log a one-line "feature off" skip and return. Distinct
+/// from [`dev_skip!`] so the workflow log line clearly marks "the
+/// route is absent by design" vs. "the route is present but flaked
+/// on the network".
+macro_rules! feature_skip {
+    ($feature:expr, $test:expr) => {{
+        eprintln!(
+            "SKIP {}: feature `{}` disabled on this server",
+            $test, $feature
+        );
+        return;
+    }};
+}
+
+// ---------------------------------------------------------------------------
+// Capability detection
+//
+// The MVP deploy ships with **zero Cargo features** (no `address-list`,
+// no `faucet`, no `usernames`, no `lnurl`) — those routes are not
+// registered and the axum fallback answers 404 instead of the
+// per-handler error codes. The current DEV box happens to have all
+// four features compiled in, but the suite must work against either
+// shape. We fetch `/api/info` once per gated test, deserialise the
+// well-known `Capabilities` shape, and skip the rest of the test if
+// the relevant feature flag is `false`.
+//
+// `ZKCOINS_FORCE_DISABLE_FEATURES` (comma-separated list, e.g.
+// `faucet,usernames`) overrides any flag returned by the server to
+// `false`. This is the local dry-run hook described in the task
+// brief — point the suite at the live DEV server, force features off,
+// and confirm that every gated test prints `SKIP …` instead of
+// hitting the disabled-on-paper but actually-running endpoint.
+// ---------------------------------------------------------------------------
+
+async fn fetch_capabilities(client: &reqwest::Client) -> Capabilities {
+    let resp = client
+        .get(url("/api/info"))
+        .send()
+        .await
+        .expect("GET /api/info for capability detection");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "/api/info must answer 200 — required for capability detection"
+    );
+    // We deserialise into a transient Value first so the override hook
+    // can flip booleans without round-tripping through the strongly
+    // typed `Capabilities` (which has no setters).
+    let body: Value = resp
+        .json()
+        .await
+        .expect("/api/info body is JSON for capability detection");
+    let mut caps = Capabilities {
+        address_list: body["capabilities"]["address_list"]
+            .as_bool()
+            .unwrap_or(false),
+        faucet: body["capabilities"]["faucet"].as_bool().unwrap_or(false),
+        usernames: body["capabilities"]["usernames"].as_bool().unwrap_or(false),
+        lnurl: body["capabilities"]["lnurl"].as_bool().unwrap_or(false),
+    };
+    if let Ok(force) = std::env::var("ZKCOINS_FORCE_DISABLE_FEATURES") {
+        for flag in force.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            match flag {
+                "address_list" | "address-list" => caps.address_list = false,
+                "faucet" => caps.faucet = false,
+                "usernames" => caps.usernames = false,
+                "lnurl" => caps.lnurl = false,
+                other => {
+                    eprintln!(
+                        "ZKCOINS_FORCE_DISABLE_FEATURES: unknown flag `{}` — ignored",
+                        other
+                    );
+                }
+            }
+        }
+    }
+    caps
 }
 
 // ---------------------------------------------------------------------------
@@ -238,7 +318,14 @@ async fn health_ready_returns_ready_with_no_failures() {
 }
 
 #[tokio::test]
-async fn info_reports_all_capabilities_and_dev_username_domain() {
+async fn info_returns_well_formed_response() {
+    // Shape-only check: the MVP deploy may run with zero features and
+    // PRD may differ from DEV, so the only invariant we assert is the
+    // contract — `/api/info` returns a well-formed `InfoResponse` with
+    // a non-empty `network`, a non-empty `username_domain`, and four
+    // boolean capability flags. The per-feature `true`/`false`
+    // expectations live in the gated tests below, which short-circuit
+    // through `fetch_capabilities`.
     let resp = http_client()
         .get(url("/api/info"))
         .send()
@@ -247,33 +334,25 @@ async fn info_reports_all_capabilities_and_dev_username_domain() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body: Value = resp.json().await.expect("/api/info body is JSON");
 
-    assert!(body["network"].as_str().is_some_and(|v| !v.is_empty()));
-    assert!(body["username_domain"]
-        .as_str()
-        .is_some_and(|v| !v.is_empty()));
+    assert!(
+        body["network"].as_str().is_some_and(|v| !v.is_empty()),
+        "network must be a non-empty string, got {:?}",
+        body["network"]
+    );
+    assert!(
+        body["username_domain"]
+            .as_str()
+            .is_some_and(|v| !v.is_empty()),
+        "username_domain must be a non-empty string, got {:?}",
+        body["username_domain"]
+    );
 
-    // The DEV build is shipped with `address-list,faucet,usernames,lnurl`
-    // (see deploy-dev.yaml). The PRD build may be narrower; relax the
-    // assertion to "either all four are true (DEV) or all four are
-    // present as booleans" so the suite still validates the shape on
-    // PRD without a separate branch.
     for cap in ["address_list", "faucet", "usernames", "lnurl"] {
         assert!(
             body["capabilities"][cap].is_boolean(),
             "capability `{cap}` must be a bool, got {:?}",
             body["capabilities"][cap]
         );
-    }
-
-    if api_base().contains("dev-api.zkcoins.app") {
-        assert_eq!(body["username_domain"], "dev.zkcoins.app");
-        for cap in ["address_list", "faucet", "usernames", "lnurl"] {
-            assert_eq!(
-                body["capabilities"][cap],
-                Value::Bool(true),
-                "DEV build should have all capabilities enabled"
-            );
-        }
     }
 }
 
@@ -324,15 +403,16 @@ async fn balance_wrong_length_returns_422() {
 
 #[tokio::test]
 async fn address_list_returns_addresses() {
-    let resp = http_client()
+    let client = http_client();
+    let caps = fetch_capabilities(&client).await;
+    if !caps.address_list {
+        feature_skip!("address_list", "address_list_returns_addresses");
+    }
+    let resp = client
         .get(url("/api/address"))
         .send()
         .await
         .expect("GET /api/address");
-    // address-list is feature-gated; PRD builds may return 404.
-    if resp.status() == StatusCode::NOT_FOUND {
-        dev_skip!("address-list feature disabled on this server");
-    }
     assert_eq!(resp.status(), StatusCode::OK);
     let body: Value = resp.json().await.expect("body JSON");
     let addresses = body["addresses"].as_array().expect("addresses is an array");
@@ -387,21 +467,32 @@ async fn proof_id_one_returns_200_or_404() {
 
 #[tokio::test]
 async fn resolve_unknown_username_returns_404() {
-    let resp = http_client()
+    let client = http_client();
+    let caps = fetch_capabilities(&client).await;
+    if !caps.usernames {
+        feature_skip!("usernames", "resolve_unknown_username_returns_404");
+    }
+    let resp = client
         .get(url("/api/username/resolve/definitely_not_claimed_xyzzy"))
         .send()
         .await
         .expect("GET /api/username/resolve/<unknown>");
-    if resp.status() == StatusCode::NOT_FOUND {
-        // expected
-    } else {
-        panic!("expected 404 for unknown username, got {}", resp.status());
-    }
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "expected 404 for unknown username, got {}",
+        resp.status()
+    );
 }
 
 #[tokio::test]
 async fn lnurlp_unknown_user_returns_404() {
-    let resp = http_client()
+    let client = http_client();
+    let caps = fetch_capabilities(&client).await;
+    if !caps.lnurl {
+        feature_skip!("lnurl", "lnurlp_unknown_user_returns_404");
+    }
+    let resp = client
         .get(url("/.well-known/lnurlp/definitely_not_claimed_xyzzy"))
         .send()
         .await
@@ -411,16 +502,18 @@ async fn lnurlp_unknown_user_returns_404() {
 
 #[tokio::test]
 async fn lnurl_pay_callback_returns_phase2_stub() {
-    let resp = http_client()
+    let client = http_client();
+    let caps = fetch_capabilities(&client).await;
+    if !caps.lnurl {
+        feature_skip!("lnurl", "lnurl_pay_callback_returns_phase2_stub");
+    }
+    let resp = client
         .get(url("/lnurl/pay/anyone"))
         .send()
         .await
         .expect("GET /lnurl/pay/anyone");
     // The lnurl callback returns Json directly (no error wrapping), so
     // it always answers 200 with a body that says "Phase 2".
-    if resp.status() == StatusCode::NOT_FOUND {
-        dev_skip!("lnurl feature disabled on this server");
-    }
     assert_eq!(resp.status(), StatusCode::OK);
     let body: Value = resp.json().await.expect("body JSON");
     assert_eq!(body["status"], "ERROR");
@@ -449,45 +542,51 @@ async fn fallback_unknown_route_returns_404() {
 
 #[tokio::test]
 async fn mint_empty_body_returns_422() {
-    let resp = http_client()
+    let client = http_client();
+    let caps = fetch_capabilities(&client).await;
+    if !caps.faucet {
+        feature_skip!("faucet", "mint_empty_body_returns_422");
+    }
+    let resp = client
         .post(url("/api/mint"))
         .json(&json!({}))
         .send()
         .await
         .expect("POST /api/mint {}");
-    if resp.status() == StatusCode::NOT_FOUND {
-        dev_skip!("faucet feature disabled");
-    }
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]
 async fn mint_invalid_hex_address_returns_422() {
-    let resp = http_client()
+    let client = http_client();
+    let caps = fetch_capabilities(&client).await;
+    if !caps.faucet {
+        feature_skip!("faucet", "mint_invalid_hex_address_returns_422");
+    }
+    let resp = client
         .post(url("/api/mint"))
         .json(&json!({"account_address": "not_hex", "amount": 100}))
         .send()
         .await
         .expect("POST /api/mint bad hex");
-    if resp.status() == StatusCode::NOT_FOUND {
-        dev_skip!("faucet feature disabled");
-    }
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]
 async fn mint_wrong_address_length_returns_422() {
+    let client = http_client();
+    let caps = fetch_capabilities(&client).await;
+    if !caps.faucet {
+        feature_skip!("faucet", "mint_wrong_address_length_returns_422");
+    }
     // 16 bytes = 32 hex chars — short of the required 32 bytes
     let short_addr = format!("0x{}", "ab".repeat(16));
-    let resp = http_client()
+    let resp = client
         .post(url("/api/mint"))
         .json(&json!({"account_address": short_addr, "amount": 100}))
         .send()
         .await
         .expect("POST /api/mint short addr");
-    if resp.status() == StatusCode::NOT_FOUND {
-        dev_skip!("faucet feature disabled");
-    }
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
@@ -684,6 +783,11 @@ async fn commit_bad_message_hex_returns_422_or_404() {
 
 #[tokio::test]
 async fn claim_username_pk_mismatch_returns_401() {
+    let client = http_client();
+    let caps = fetch_capabilities(&client).await;
+    if !caps.usernames {
+        feature_skip!("usernames", "claim_username_pk_mismatch_returns_401");
+    }
     let alice = TestWallet::new();
     let mallory = TestWallet::new();
     let username = format!("mallory_{}", random_suffix());
@@ -698,20 +802,22 @@ async fn claim_username_pk_mismatch_returns_401() {
         "signature": signature,
         "timestamp": ts,
     });
-    let resp = http_client()
+    let resp = client
         .post(url("/api/username/claim"))
         .json(&body)
         .send()
         .await
         .expect("POST /api/username/claim mismatch");
-    if resp.status() == StatusCode::NOT_FOUND {
-        dev_skip!("usernames feature disabled");
-    }
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
 async fn claim_username_bad_signature_returns_401() {
+    let client = http_client();
+    let caps = fetch_capabilities(&client).await;
+    if !caps.usernames {
+        feature_skip!("usernames", "claim_username_bad_signature_returns_401");
+    }
     let alice = TestWallet::new();
     let username = format!("alice_{}", random_suffix());
     let body = json!({
@@ -721,20 +827,22 @@ async fn claim_username_bad_signature_returns_401() {
         "signature": "00".repeat(64),
         "timestamp": unix_now(),
     });
-    let resp = http_client()
+    let resp = client
         .post(url("/api/username/claim"))
         .json(&body)
         .send()
         .await
         .expect("POST /api/username/claim bad sig");
-    if resp.status() == StatusCode::NOT_FOUND {
-        dev_skip!("usernames feature disabled");
-    }
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
 async fn claim_username_stale_timestamp_returns_401() {
+    let client = http_client();
+    let caps = fetch_capabilities(&client).await;
+    if !caps.usernames {
+        feature_skip!("usernames", "claim_username_stale_timestamp_returns_401");
+    }
     let alice = TestWallet::new();
     let username = format!("alice_{}", random_suffix());
     let stale_ts = unix_now().saturating_sub(600);
@@ -746,15 +854,12 @@ async fn claim_username_stale_timestamp_returns_401() {
         "signature": signature,
         "timestamp": stale_ts,
     });
-    let resp = http_client()
+    let resp = client
         .post(url("/api/username/claim"))
         .json(&body)
         .send()
         .await
         .expect("POST /api/username/claim stale");
-    if resp.status() == StatusCode::NOT_FOUND {
-        dev_skip!("usernames feature disabled");
-    }
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -770,6 +875,10 @@ async fn claim_username_stale_timestamp_returns_401() {
 #[tokio::test]
 async fn mint_roundtrip_lands_balance_and_proof() {
     let client = http_client();
+    let caps = fetch_capabilities(&client).await;
+    if !caps.faucet {
+        feature_skip!("faucet", "mint_roundtrip_lands_balance_and_proof");
+    }
     let alice = TestWallet::new();
 
     let mint_resp = client
@@ -782,9 +891,6 @@ async fn mint_roundtrip_lands_balance_and_proof() {
         .await
         .expect("POST /api/mint");
     let mint_status = mint_resp.status();
-    if mint_status == StatusCode::NOT_FOUND {
-        dev_skip!("faucet feature disabled");
-    }
     if mint_status.is_server_error() {
         dev_skip!(format!(
             "mint returned {} — DEV environment flake",
@@ -833,6 +939,13 @@ async fn mint_roundtrip_lands_balance_and_proof() {
 #[tokio::test]
 async fn send_commit_roundtrip_moves_balance() {
     let client = http_client();
+    let caps = fetch_capabilities(&client).await;
+    // The send + commit halves are MVP-active, but this roundtrip
+    // bootstraps state via `/api/mint` — without faucet there's no
+    // way to get a freshly funded wallet to spend from. Skip if off.
+    if !caps.faucet {
+        feature_skip!("faucet", "send_commit_roundtrip_moves_balance");
+    }
     let alice = TestWallet::new();
     let bob = TestWallet::new();
 
@@ -847,9 +960,6 @@ async fn send_commit_roundtrip_moves_balance() {
         .await
         .expect("POST /api/mint");
     let mint_status = mint_resp.status();
-    if mint_status == StatusCode::NOT_FOUND {
-        dev_skip!("faucet feature disabled");
-    }
     if mint_status.is_server_error() {
         dev_skip!(format!("mint returned {} — DEV flake", mint_status));
     }
@@ -1010,6 +1120,17 @@ async fn send_commit_roundtrip_moves_balance() {
 #[tokio::test]
 async fn username_claim_resolve_lnurlp_roundtrip() {
     let client = http_client();
+    let caps = fetch_capabilities(&client).await;
+    // Claim + resolve both live behind `usernames`; the LNURLp leg
+    // additionally requires `lnurl`. If either is off we skip the
+    // whole cascade — there's no useful sub-roundtrip when the
+    // bootstrapping claim cannot land.
+    if !caps.usernames {
+        feature_skip!("usernames", "username_claim_resolve_lnurlp_roundtrip");
+    }
+    if !caps.lnurl {
+        feature_skip!("lnurl", "username_claim_resolve_lnurlp_roundtrip");
+    }
     let alice = TestWallet::new();
     let username = format!("e2e_{}", random_suffix());
     let ts = unix_now();
@@ -1028,9 +1149,6 @@ async fn username_claim_resolve_lnurlp_roundtrip() {
         .await
         .expect("POST /api/username/claim");
     let claim_status = claim_resp.status();
-    if claim_status == StatusCode::NOT_FOUND {
-        dev_skip!("usernames feature disabled");
-    }
     if claim_status == StatusCode::SERVICE_UNAVAILABLE {
         dev_skip!("username claim returned 503 — DB unavailable");
     }
@@ -1060,9 +1178,6 @@ async fn username_claim_resolve_lnurlp_roundtrip() {
         .send()
         .await
         .expect("GET lnurlp");
-    if lnurlp_resp.status() == StatusCode::NOT_FOUND {
-        dev_skip!("lnurl feature disabled");
-    }
     assert_eq!(lnurlp_resp.status(), StatusCode::OK);
     let lnurlp_body: Value = lnurlp_resp.json().await.expect("lnurlp body");
     assert_eq!(lnurlp_body["tag"], "payRequest");
