@@ -121,6 +121,29 @@ jobs:
       - name: Run clippy (program + prover libs)
         run: cargo clippy -p zkcoins-program-plonky2 -p zkcoins-prover-plonky2 --lib -- -D warnings
 
+      # Issue #84: the chain-tip wait path and the publisher's
+      # commit→reveal propagation wait must be event-driven (WS /
+      # ZMQ), not polled. The grep below fails the build if a
+      # `tokio::time::{sleep,sleep_until,interval}` or
+      # `std::thread::sleep` call sneaks back into the scanner /
+      # publisher modules without the documented opt-out marker. See
+      # CONTRIBUTING.md § "No polling — events only" for the per-line
+      # `scanner-polling-ok:` escape hatch and the rationale for each
+      # currently-grandfathered occurrence. The marker is a plain
+      # comment token (not an `#[allow(...)]` attribute) so future
+      # contributors cannot mistake it for a real lint suppression
+      # (issue #84 round-4 MINOR 4).
+      - name: Forbid polling patterns in scanner/publisher
+        run: |
+          set -e
+          FOUND=$(grep -rEn 'tokio::time::(sleep|sleep_until|interval)|std::thread::sleep' server/src/scanner.rs server/src/scanner_runtime.rs server/src/scanner_ws.rs server/src/scanner_ws_parse.rs server/src/publisher.rs 2>/dev/null | grep -v 'scanner-polling-ok:' || true)
+          if [ -n "$FOUND" ]; then
+            echo "::error::Polling pattern (tokio::time::sleep|sleep_until|interval or std::thread::sleep) detected in event-driven hot paths. See issue #84."
+            echo "$FOUND"
+            exit 1
+          fi
+          echo "Scanner/publisher polling check: OK"
+
       - name: Build server (MVP feature set — the DEV + PRD image)
         run: cargo build -p server
 
@@ -278,7 +301,7 @@ jobs:
       - name: Run llvm-cov (MVP scope, 100% line + function gate)
         run: |
           cargo llvm-cov nextest --release -p server --show-missing-lines \
-            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|server_runtime\.rs|scanner_runtime\.rs|_tests\.rs$' \
+            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|server_runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|_tests\.rs$' \
             --fail-under-lines 100 \
             --fail-under-functions 100 \
             --test-threads 1 \

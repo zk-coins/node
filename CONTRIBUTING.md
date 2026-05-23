@@ -29,6 +29,55 @@ documents in the order given below.
    — operational handoff for the migration crate: toolchain,
    build/test/lint, coverage gate, gadget-authoring pattern.
 
+### No polling — events only
+
+Bitcoin / Esplora signals on the server's hot path are subscribed to,
+never polled. The scanner consumes block events from the
+mempool.space-compatible WebSocket stream (`scanner_ws.rs`,
+`ESPLORA_WS_URL`, default `wss://mutinynet.com/api/v1/ws`); the
+publisher waits for `track-tx` events between commit and reveal
+broadcasts instead of sleeping a fixed propagation interval. The
+previous 30-s tip-poll gated `/api/mint` and `/api/send` visibility
+by up to a full block-time + poll-interval (issue #84); event-driven
+ingestion brings that down to the WS round-trip.
+
+Where it applies:
+
+- `server/src/scanner.rs` — pure inscription parsing, no polling.
+- `server/src/scanner_runtime.rs` — block-walk loop, drains the WS-fed channel.
+- `server/src/scanner_ws.rs` — WS subscriber + reconnect-with-backoff.
+- `server/src/scanner_ws_parse.rs` — pure WS frame parsers.
+- `server/src/publisher.rs` — `track-tx` wait between commit and reveal.
+
+Where it does NOT apply: integration tests
+(`server/tests/api_remote.rs`), health-readiness probes, and any
+self-host operator code outside the four files above.
+
+CI enforces this with a `grep` step inside the `Lint & Build` job in
+`.github/workflows/ci.yaml`:
+
+```bash
+grep -rEn 'tokio::time::(sleep|sleep_until|interval)|std::thread::sleep' \
+  server/src/scanner.rs \
+  server/src/scanner_runtime.rs \
+  server/src/scanner_ws.rs \
+  server/src/scanner_ws_parse.rs \
+  server/src/publisher.rs \
+  | grep -v 'scanner-polling-ok:'
+```
+
+Any match without the `scanner-polling-ok:` token on the same line
+fails the build with a pointer to issue #84. The token is a plain
+comment marker — not an `#[allow(...)]` attribute, which would have
+been mistakable for a real lint suppression — and is the documented
+per-line opt-out for genuinely justified exceptions (today: the
+WS-reconnect backoff in `scanner_ws`, the inner `track-tx`
+reconnect-with-backoff in `scanner_ws`, and the bounded HTTP-retry
+sleep in `scanner_runtime`). The same line must carry a comment
+explaining WHY this particular sleep is not a chain-tip poll. New
+uses require either changing the design or extending this section
+with the rationale.
+
 ### Project invariants (non-negotiable)
 
 The five constraints below are decided and apply across every PR on
@@ -259,6 +308,7 @@ server/
 │       ├── account_server.rs  # Account management, coin proofs, prover calls
 │       ├── state.rs       # Sparse Merkle Tree + Merkle Mountain Range
 │       ├── scanner.rs     # Bitcoin block scanner (Taproot Inscriptions)
+│       ├── scanner_ws.rs  # Esplora WebSocket subscriber (event-driven, issue #84)
 │       └── publisher.rs   # Inscription broadcaster (commit/reveal, prefix 4242)
 ├── shared/                # Shared types (Commitment, Invoice, ClientAccount)
 │   └── src/
@@ -380,15 +430,20 @@ Plonky2 prover.
 
 The server continuously scans the Bitcoin blockchain:
 
-1. `scanner.rs` polls Esplora every 30 seconds
-2. Filters transactions by prefix `4242` in Taproot witness
+1. `scanner_ws.rs` subscribes to the mempool.space-compatible WebSocket
+   (`ESPLORA_WS_URL`) and pushes block events into a channel; no
+   chain-tip polling (issue #84, see "No polling — events only" above)
+2. `scanner_runtime.rs` drains the channel and hands each block to
+   `scanner.rs`, which filters transactions by prefix `4242` in the
+   Taproot witness
 3. Deserializes `Commitment` structs (Schnorr-signed)
 4. `state.rs` inserts valid commitments into SMT, appends to MMR
 
 The publisher (`publisher.rs`) creates Taproot Inscriptions:
 - Commit/reveal pattern (two transactions)
 - Data split into 520-byte chunks (max push size)
-- Broadcasts via Esplora API
+- Broadcasts via Esplora API, then waits for the WS `track-tx` event
+  between commit and reveal instead of sleeping a fixed interval
 
 ### Plonky2 State-Transition Circuit
 
@@ -405,7 +460,8 @@ for the historical pickup record.
 
 | Variable | Default | Description |
 |---|---|---|
-| `ESPLORA_URL` | `https://mutinynet.com/api` | Esplora API endpoint (electrs or public) |
+| `ESPLORA_URL` | `https://mutinynet.com/api` | Esplora REST API endpoint (electrs or public) |
+| `ESPLORA_WS_URL` | `wss://mutinynet.com/api/v1/ws` | Esplora WebSocket endpoint consumed by `scanner_ws` (issue #84). DEV/PRD override only when the upstream WS path changes |
 | `IS_MAINNET` | `false` | `true` for Bitcoin Mainnet, `false` for Mutinynet/Signet |
 | `NETWORK_NAME` | `Mutinynet` / `Mainnet` | Human-readable name returned by `/api/info` |
 | `USERNAME_DOMAIN` | _(required, no default)_ | External hostname returned by `/api/info`; server panics on startup if unset (see PR [#36](https://github.com/zk-coins/server/pull/36) for the regression that introduced the global panic hook) |

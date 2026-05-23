@@ -25,6 +25,22 @@ pub struct EsploraConfig {
     pub url: String,
     pub is_mainnet: bool,
     pub network_name: String,
+    /// Esplora WebSocket endpoint used by the publisher's per-broadcast
+    /// `track-tx` wait (issue #84). `None` falls back to
+    /// `ESPLORA_WS_URL` (defaulting to `wss://mutinynet.com/api/v1/ws`);
+    /// tests inject an in-process URL to avoid hitting the real
+    /// upstream.
+    pub ws_url: Option<String>,
+    /// Override for the per-broadcast `track-tx` safety-net (issue
+    /// #84). `None` uses the production default
+    /// `TRACK_TX_TIMEOUT_SECS = 30`; tests pass a short Duration so
+    /// the silent-fallback assertion does not stall the suite.
+    ///
+    /// Test-injection backdoor: production callers always leave this
+    /// `None` and inherit the 30 s safety-net. Hidden from the
+    /// rustdoc index (issue #84 review round 4 MINOR 5).
+    #[doc(hidden)]
+    pub track_tx_timeout: Option<std::time::Duration>,
 }
 
 impl EsploraConfig {
@@ -42,8 +58,18 @@ pub const INSCRIPTION_MARKER_PREFIX: &str = "4242";
 
 const MAX_CHUNK_SIZE: usize = 520;
 const MAX_MINING_ATTEMPTS: u32 = 400000;
-const PROPAGATION_WAIT_SECS: u64 = 5;
 const MIN_INSCRIPTION_AMOUNT: u64 = 800;
+
+/// Safety-net deadline for the per-broadcast `track-tx` WS wait
+/// (issue #84). The publisher subscribes to the Esplora WS for the
+/// commit txid before broadcasting the reveal, and proceeds the
+/// moment the peer reports the commit as seen. If 30 s pass without
+/// any track-tx event, that is a hard error, NOT a silent fallback
+/// to "broadcast the reveal anyway" — a missing event in that window
+/// is a real upstream / network problem worth surfacing.
+const TRACK_TX_TIMEOUT_SECS: u64 = 30;
+
+use crate::scanner_ws::DEFAULT_ESPLORA_WS_URL;
 
 const COMMIT_TX_WITNESS_WEIGHT: Weight = Weight::from_wu(68);
 const REVEAL_TX_WITNESS_WEIGHT: Weight = Weight::from_wu(295);
@@ -235,7 +261,26 @@ pub fn inscription_txs(
     (commit_tx, reveal_tx)
 }
 
-/// Broadcasts the commit and reveal transactions to the Bitcoin network using Esplora API
+/// Broadcasts the commit and reveal transactions to the Bitcoin
+/// network via the Esplora REST API and waits for the commit
+/// transaction to appear in the mempool before sending the reveal.
+///
+/// The propagation gap used to be papered over by a fixed 5 s
+/// `PROPAGATION_WAIT_SECS` async sleep; issue #84 replaces
+/// that polling wait with a short-lived WebSocket subscription to
+/// `{"action":"track-tx","data":"<commit_txid>"}` against the
+/// Esplora WS endpoint, returning the moment the peer reports the
+/// commit txid as seen. A 30 s safety-net (`TRACK_TX_TIMEOUT_SECS`)
+/// surfaces as a hard `Err` rather than a silent fallback — a missed
+/// event is a real upstream / network problem worth alerting on.
+///
+/// Order of operations is load-bearing: the `track-tx` subscription
+/// MUST be established BEFORE the commit broadcast. Otherwise the
+/// upstream may finish propagating the tx between
+/// `client.broadcast(commit_tx)` and `subscribe_track_tx(...)`, and
+/// the "tx in mempool" event would fire before any subscriber is
+/// listening — wedging the wait for the full 30 s safety-net even
+/// on the happy path.
 pub async fn broadcast_inscription_txs(
     config: &EsploraConfig,
     commit_tx: &Transaction,
@@ -245,14 +290,37 @@ pub async fn broadcast_inscription_txs(
     let builder = EsploraBuilder::new(&config.url);
     let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(builder)?;
 
+    let commit_txid = commit_tx.compute_txid();
+    let ws_url = config.ws_url.clone().unwrap_or_else(|| {
+        std::env::var("ESPLORA_WS_URL").unwrap_or_else(|_| DEFAULT_ESPLORA_WS_URL.to_string())
+    });
+    let track_tx_timeout = config
+        .track_tx_timeout
+        .unwrap_or_else(|| std::time::Duration::from_secs(TRACK_TX_TIMEOUT_SECS));
+
+    // Subscribe to the `track-tx` WS BEFORE broadcasting the commit
+    // (issue #84). The previous ordering opened a race window between
+    // the REST broadcast and the WS subscribe: if the peer finished
+    // propagating the tx in that window, the event fired before any
+    // listener was attached.
+    println!(
+        "Subscribing to commit tx {} via WS ({}) before broadcast...",
+        commit_txid, ws_url
+    );
+    let stream = crate::scanner_ws::subscribe_track_tx(&ws_url, commit_txid).await?;
+
     println!("Broadcasting commit transaction...");
     client.broadcast(commit_tx).await?;
-    let commit_txid = commit_tx.compute_txid();
     println!("Commit transaction broadcast successfully: {}", commit_txid);
 
-    // Wait for commit transaction to propagate
-    println!("Waiting for commit transaction to propagate...");
-    tokio::time::sleep(std::time::Duration::from_secs(PROPAGATION_WAIT_SECS)).await;
+    // Wait for the commit txid to surface in the upstream mempool
+    // before broadcasting the reveal. Event-driven (issue #84),
+    // not a fixed sleep — see the function docstring for the design.
+    println!(
+        "Waiting for commit tx {} to appear in mempool via WS (deadline {:?})...",
+        commit_txid, track_tx_timeout
+    );
+    stream.wait(track_tx_timeout).await?;
 
     println!("Broadcasting reveal transaction...");
     client.broadcast(reveal_tx).await?;
