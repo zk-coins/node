@@ -1057,6 +1057,80 @@ async fn claim_username_raw_case_signature_rejected() {
     );
 }
 
+/// In-memory `precheck` collision must surface as `409 CONFLICT` with
+/// the verbatim collision string the wallet shows the user. Drives the
+/// claim handler's precheck `Err` branch without any DB round-trip:
+/// the in-memory mirror is pre-seeded via `insert_for_test`, the
+/// signature is valid, and the handler short-circuits before the
+/// `db::claim_username` call.
+#[tokio::test]
+async fn claim_username_precheck_conflict_returns_409() {
+    use bitcoin::secp256k1::{Keypair, SecretKey};
+
+    let secp = secp::Secp256k1::new();
+    let secret = SecretKey::from_slice(&[11u8; 32]).unwrap();
+    let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+    let address: [u8; 32] = Sha256::digest(public_key.serialize()).into();
+    let address_hex = hex::encode(address);
+
+    let username = "claimed";
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"zkcoins:claim_username");
+    hasher.update(address_hex.as_bytes());
+    hasher.update(username.as_bytes());
+    hasher.update(now.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    let msg = Message::from_digest(hash);
+    let keypair = Keypair::from_secret_key(&secp, &secret);
+    let sig = secp.sign_schnorr(&msg, &keypair);
+
+    let state = test_state();
+    {
+        let mut account_server = state.account_server.lock().unwrap();
+        account_server.import_account(
+            zkcoins_program::hash::digest_from_bytes(&address),
+            Account::new(),
+        );
+    }
+    // Pre-seed the name → arbitrary OTHER address so the precheck's
+    // `usernames.contains_key(normalized)` branch fires (rather than
+    // the address-already-has-a-username branch).
+    {
+        let mut store = state.username_store.lock().unwrap();
+        store.insert_for_test(
+            username,
+            zkcoins_program::hash::digest_from_bytes(&[99u8; 32]),
+        );
+    }
+
+    let body = serde_json::json!({
+        "username": username,
+        "address": address_hex,
+        "public_key": public_key.to_string(),
+        "signature": hex::encode(sig.serialize()),
+        "timestamp": now,
+    });
+    let req = Request::post("/api/username/claim")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let (status, resp_body) = send_request_with_state(state, req).await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "body: {}", resp_body);
+    let resp: LnurlErrorResponse = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(resp.status, "ERROR");
+    assert!(
+        resp.reason.contains("Username already taken"),
+        "unexpected reason: {}",
+        resp.reason
+    );
+}
+
 #[tokio::test]
 async fn claim_username_wrong_pubkey() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
