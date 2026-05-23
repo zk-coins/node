@@ -134,8 +134,8 @@ jobs:
     # speculative PR — apply the label when the PR is ready for the
     # authoritative test+coverage gate. The Release PR
     # (`develop -> main`) gets the label applied automatically by
-    # auto-release-pr.yaml. The `coverage` job inherits the skip via
-    # `needs: server-tests`, so no separate guard there.
+    # auto-release-pr.yaml. (See `coverage` job below for why the same
+    # guard is repeated there.)
     if: contains(github.event.pull_request.labels.*.name, 'ci:full')
     needs: lint-and-build
     runs-on: [self-hosted, m3-ultra]
@@ -219,7 +219,13 @@ jobs:
 
   coverage:
     name: Coverage Gate (100% lines + functions)
-    needs: server-tests
+    # Runs in parallel with `server-tests` (not after) — both jobs
+    # exercise the same suite (nextest vs. nextest-under-llvm-cov), so
+    # serializing them only doubled wall-clock on every Release PR.
+    # The `ci:full` label gate is duplicated explicitly here because the
+    # chain through `server-tests` (which carried the guard) is broken.
+    if: contains(github.event.pull_request.labels.*.name, 'ci:full')
+    needs: lint-and-build
     runs-on: [self-hosted, m3-ultra]
     timeout-minutes: 90
     env:
@@ -281,3 +287,27 @@ jobs:
       - name: sccache stats (post-build)
         if: always()
         run: sccache --show-stats
+
+  # Telegram alert on workflow failure. Modelled as a separate job (not
+  # an inline step) so job-level failures — timeout, OOM, runner crash —
+  # still fire the alert. `if: failure()` evaluates against the whole
+  # `needs:` group: any listed job transitioning to `failure` triggers
+  # it, while skipped jobs (server-tests / coverage on a non-ci:full PR,
+  # or all jobs on a draft PR) and manual cancellation stay silent.
+  notify-failure:
+    name: Telegram alert on failure
+    needs: [lint-and-build, server-tests, coverage]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Telegram alert
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          TEXT=$'❌ <b>'"${{ github.workflow }}"$'</b> failed\n<b>Repo:</b> '"${{ github.repository }}"$'\n<b>Branch:</b> '"${{ github.ref_name }}"$'\n<b>Run:</b> '"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+               --data-urlencode "chat_id=${TG_CHAT}" \
+               --data-urlencode "text=${TEXT}" \
+               -d "parse_mode=HTML" \
+               -d "disable_web_page_preview=true"
