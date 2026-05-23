@@ -58,12 +58,11 @@ jobs:
           # Rust workspace so cache hits cross-deploy. `type=registry`
           # over `type=gha` because GHA cache caps at 10 GB with LRU
           # eviction; Docker Hub holds the tag indefinitely.
-          # Shared buildcache tag between DEV and PRD: cache hits cross-deploy
-          # because both build from the same Rust workspace. Caveat: DEV's
-          # `cancel-in-progress: true` (above) can interrupt a concurrent
-          # DEV deploy mid-push to the cache manifest. BuildKit's `cache-from`
-          # tolerates partial manifests (falls back to a from-scratch build
-          # with a warning) so the race is self-healing on the next deploy.
+          # Caveat: DEV's `cancel-in-progress: true` (above) can interrupt
+          # a concurrent DEV deploy mid-push to the cache manifest.
+          # BuildKit's `cache-from` tolerates partial manifests (falls back
+          # to a from-scratch build with a warning) so the race is
+          # self-healing on the next deploy.
           cache-from: type=registry,ref=zkcoin/server:buildcache
           cache-to: type=registry,ref=zkcoin/server:buildcache,mode=max
 
@@ -159,12 +158,11 @@ jobs:
         if: always()
         run: sccache --show-stats
 
-  # Separate job (not an inline step) so a job-level failure — timeout,
-  # OOM, runner crash — still triggers the alert. Cheapest runner; the
-  # curl never needs to touch the self-hosted M3 Ultra.
-  #
-  # Telegram alert on workflow failure. See ci.yaml > notify-failure
-  # for the firing-matrix rationale.
+  # Telegram alert on workflow failure. Separate job (not an inline step)
+  # so job-level failures — timeout, OOM, runner crash — still fire the
+  # alert; runs on the cheapest runner since the curl never needs to touch
+  # the self-hosted M3 Ultra. See ci.yaml > notify-failure for the
+  # firing-matrix rationale.
   notify-failure:
     name: Telegram alert on failure
     needs: [build-and-deploy, api-e2e]

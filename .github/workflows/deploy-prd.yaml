@@ -133,12 +133,11 @@ jobs:
         if: always()
         run: sccache --show-stats
 
-  # Separate job (not an inline step) so a job-level failure — timeout,
-  # OOM, runner crash — still triggers the alert. Cheapest runner; the
-  # curl never needs to touch the self-hosted M3 Ultra.
-  #
-  # Telegram alert on workflow failure. See ci.yaml > notify-failure
-  # for the firing-matrix rationale.
+  # Telegram alert on workflow failure. Separate job (not an inline step)
+  # so job-level failures — timeout, OOM, runner crash — still fire the
+  # alert; runs on the cheapest runner since the curl never needs to touch
+  # the self-hosted M3 Ultra. See ci.yaml > notify-failure for the
+  # firing-matrix rationale.
   notify-failure:
     name: Telegram alert on failure
     needs: [build-and-deploy, api-e2e]
