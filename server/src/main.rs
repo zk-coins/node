@@ -12,6 +12,7 @@ use server::account_server;
 use server::db;
 use server::publisher::EsploraConfig;
 use server::scanner_runtime::scan_for_inscriptions;
+use server::scanner_ws::{run_scanner_ws, ScannerWsConfig};
 use server::server_runtime::start_rest_server;
 use server::state::State;
 use server::username;
@@ -19,6 +20,7 @@ use server::{persist_state_from_sync_context, DATABASE_URL, NETWORK_CONFIG};
 use shared::commitment::Commitment;
 use std::error::Error as StdError;
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 
 // Postgres state-layer carries every persistent slice of server state
 // after PR-A3: SMT / MMR / latest_block (PR-A2), accounts + usernames
@@ -130,6 +132,27 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let pool_for_callback = Arc::clone(&pool);
     let state_for_callback = Arc::clone(&state);
 
+    // Event-driven chain ingestion (issue #84). The previous
+    // implementation polled `get_tip_hash` every 30 s, gating
+    // visibility on `/api/mint` and `/api/send` by up to a full
+    // block-time + poll-interval. `scanner_ws::run_scanner_ws`
+    // subscribes to the Esplora WebSocket stream and publishes
+    // each new tip into the bounded channel below; the scanner
+    // runtime drains the channel and walks forward through the
+    // block-status `next_best` chain between events.
+    //
+    // Channel depth = 64: plenty of headroom for the burst the
+    // initial `blocks` seed produces on subscribe (3-15 entries
+    // observed), bounded so a stuck consumer cannot grow the
+    // queue without bound.
+    let ws_config = ScannerWsConfig::from_env();
+    println!(
+        "Event-driven scanner: WS={} (override via ESPLORA_WS_URL)",
+        ws_config.url
+    );
+    let (tip_tx, tip_rx) = mpsc::channel::<bitcoin::BlockHash>(64);
+    tokio::spawn(run_scanner_ws(ws_config, tip_tx));
+
     scan_for_inscriptions(network_config, start_block_hash, &move |content_bytes: Vec<u8>, current_block_hash| {
         println!("Received content size: {} bytes", content_bytes.len());
 
@@ -219,7 +242,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                 println!("Found inscription with our message but failed to deserialize as commitment\nError: {}", e);
             }
         }
-    })
+    }, tip_rx)
     .await?;
 
     Ok(())

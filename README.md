@@ -77,7 +77,7 @@ API endpoints, background services, their activation status, and the tests that 
 | Resolve username                     | `GET /api/username/resolve/:username` | always                   | mvp     | 100% (username)                |
 | LNURL-Pay metadata                   | `GET /.well-known/lnurlp/:username`   | feature (`lnurl`)        | gate    | 100% (server)                  |
 | LNURL-Pay callback                   | `GET /lnurl/pay/:username`            | feature (`lnurl`)        | gate    | 100% (server)                  |
-| Bitcoin block scanner (background)   | Loop in `main.rs`, 30 s poll          | env⁴                     | mvp     | 100% (scanner) · — (main, excluded) |
+| Bitcoin block scanner (background)   | WS subscription in `scanner_ws.rs`    | env⁴                     | mvp     | 100% (scanner) · — (main, excluded) |
 | State persistence (SMT/MMR write)    | Scanner callback on commitment match  | always                   | mvp     | 100% (state)                   |
 | Taproot inscription broadcast        | Called by `/api/commit`               | env³                     | mvp     | 0% (publisher)                |
 | Publisher UTXO lookup                | Internal, before broadcast            | env³                     | mvp     | 0% (publisher)                |
@@ -87,7 +87,7 @@ API endpoints, background services, their activation status, and the tests that 
 ¹ `NETWORK_NAME` env var controls the string returned. `IS_MAINNET=true` flips the default to `"Mainnet"`.
 ² Proof generation routes through the Plonky2 cyclic-recursion circuit. Single host, single Rust process — no zkVM, no external prover service. Mac Studio M3 Ultra is the production hardware target (96 GB unified memory, no external GPU). See [Proving Strategy](#proving-strategy).
 ³ Requires `PUBLISHER_KEY` set to a real funded key and `ESPLORA_URL` reachable. With the default test key the server panics on `IS_MAINNET=true` startup; on testnet it accepts the call but broadcast will fail without funded UTXOs — DEV and PRD both return `503 SERVICE_UNAVAILABLE` to the client on broadcast failure (the historic `DEV_SKIP_BROADCAST_FAILURE` env-gate that silently swallowed these failures was removed once DEV and PRD were unified on the MVP-only binary; the DEV publisher wallet therefore has to be funded for E2E paths).
-⁴ Scanner depends on `ESPLORA_URL` being reachable; on connection failure it backs off and retries.
+⁴ Scanner depends on `ESPLORA_URL` (REST, used for the per-block `get_block_txids` / `get_tx` lookups and for the post-reconnect tip anchor) AND `ESPLORA_WS_URL` (WebSocket, used by `scanner_ws` to receive new-tip events — issue #84). Both default to mutinynet endpoints; on connection failure the WS subscriber reconnects with exponential backoff capped at 30 s.
 
 ### Cargo features
 
@@ -188,7 +188,7 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 #### Bitcoin block scanner
 
 - **Module:** `scanner.rs::scan_for_inscriptions` / `InscriptionScanner::scan_from_block`. Loop spawned from `main.rs::main`. State saved between runs in `data/latest_block.bin`
-- **Behaviour:** polls Esplora; filters txs by txid prefix `4242`; extracts Taproot inscription content via `extract_inscription_content`; deserialises as `Commitment`; calls callback in `main.rs` which verifies the signature and updates state
+- **Behaviour:** subscribes to the Esplora WebSocket (`scanner_ws.rs`, `ESPLORA_WS_URL`) for new tip events; drains the resulting mpsc channel in `scanner_runtime.rs`, walking forward through `block_status.next_best`; filters txs by txid prefix `4242`; extracts Taproot inscription content via `extract_inscription_content`; deserialises as `Commitment`; calls callback in `main.rs` which verifies the signature and updates state. Polling was removed in [issue #84](https://github.com/zk-coins/server/issues/84); see [CONTRIBUTING.md § "No polling — events only"](./CONTRIBUTING.md#no-polling--events-only) for the CI lint that enforces this
 - **Tests:** `scanner.rs::tests::parse_valid_inscription_into_commitment`, `reject_invalid_inscription_data`, `verify_commitment_signature_after_deserialization`, `parse_multi_chunk_inscription`. **No integration test** with a real Bitcoin block
 
 #### State persistence (SMT/MMR write)
@@ -212,7 +212,8 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 
 | Variable        | Default                     | Effect                                                                                                                                                        |
 | --------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ESPLORA_URL`   | `https://mutinynet.com/api` | Esplora API endpoint (electrs or public)                                                                                                                      |
+| `ESPLORA_URL`   | `https://mutinynet.com/api` | Esplora REST API endpoint (electrs or public)                                                                                                                  |
+| `ESPLORA_WS_URL` | `wss://mutinynet.com/api/v1/ws` | Esplora WebSocket endpoint consumed by `scanner_ws` (issue #84). Override only when the upstream WS path changes                                       |
 | `IS_MAINNET`    | `false`                     | `true` for Bitcoin Mainnet, `false` for Mutinynet/Signet                                                                                                      |
 | `NETWORK_NAME`  | `Mutinynet` / `Mainnet`     | Human-readable name returned by `/api/info`. Default depends on `IS_MAINNET`                                                                                  |
 | `USERNAME_DOMAIN` | _(required, no default)_  | External hostname returned by `/api/info`. The client renders `<hex\|username>@<domain>` from this. **Server panics on startup if unset.** PRD sets `zkcoins.app`, DEV sets `dev.zkcoins.app` — silent fallback would let a misconfigured stage reproduce the cross-network routing bug (#95) |
@@ -226,7 +227,7 @@ Runtime config above shapes _behaviour_ of compiled-in routes. _Which_ routes ar
 Spawned from `main.rs::main`:
 
 1. **REST server** (`tokio::spawn` of `start_rest_server`) — Axum app bound to `0.0.0.0:4242`
-2. **Block scanner** (driven directly in main, not spawned) — `scan_for_inscriptions` runs an infinite loop polling Esplora every 30 s and writing state on each verified commitment
+2. **Block scanner** (driven directly in main, not spawned) — `scan_for_inscriptions` consumes new tips from the WS-fed `mpsc<BlockHash>` channel produced by `scanner_ws::run_scanner_ws` (spawned as a tokio task at startup) and writes state on each verified commitment. No fixed-interval polling — see [issue #84](https://github.com/zk-coins/server/issues/84)
 
 ### Tests
 
@@ -248,8 +249,9 @@ Per-module coverage (CI-gated):
 | `publisher.rs`      | excluded          | Bitcoin commit/reveal broadcasting — needs live signet/regtest node                |
 | `main.rs`           | excluded          | Runtime bootstrap                                                                  |
 | `*_runtime.rs`      | excluded          | Background-loop wrappers; covered indirectly via integration tests against handlers |
+| `scanner_ws.rs`     | excluded          | WS subscriber + reconnect loop; pure helpers (`parse_ws_frame`, `frame_signals_tx_seen`) are unit-tested, the I/O loop is covered indirectly via the publisher's `track-tx` round-trip |
 
-`publisher.rs`, `main.rs`, and the `*_runtime.rs` wrappers are excluded by design — they require a live Bitcoin node, a funded publisher key, or a bound TCP socket, none of which fit in a unit test. The exclusion list is encoded in the CI gate's `--ignore-filename-regex`; everything else is held at 100% lines + 100% functions. CI runs the MVP build, the all-features build, `cargo test --all-features` on the self-hosted M3 Ultra runner, and the `Coverage Gate (100% lines + functions)` job.
+`publisher.rs`, `main.rs`, the `*_runtime.rs` wrappers, and `scanner_ws.rs` are excluded by design — they require a live Bitcoin node, a funded publisher key, a bound TCP socket, or an upstream WebSocket peer, none of which fit in a unit test. The exclusion list is encoded in the CI gate's `--ignore-filename-regex`; everything else is held at 100% lines + 100% functions. CI runs the MVP build, the all-features build, `cargo test --all-features` on the self-hosted M3 Ultra runner, and the `Coverage Gate (100% lines + functions)` job.
 
 ## Running
 
@@ -279,7 +281,8 @@ server/                  # Axum REST API
 │   ├── server.rs        # REST endpoints + /health
 │   ├── account_server.rs  # Account logic, coin proofs, prover calls
 │   ├── state.rs         # Sparse Merkle Tree + Merkle Mountain Range
-│   ├── scanner.rs       # Bitcoin block scanner (30s polling, prefix 4242)
+│   ├── scanner.rs       # Bitcoin block scanner (event-driven via scanner_ws, prefix 4242)
+│   ├── scanner_ws.rs    # Esplora WebSocket subscriber (issue #84, replaces 30 s polling)
 │   └── publisher.rs     # Taproot Inscription broadcaster (commit/reveal)
 shared/                  # Shared types (Commitment, Invoice, ClientAccount)
 program-plonky2/         # Cyclic-recursion state-transition circuit (Plonky2 + Poseidon)
