@@ -1,14 +1,14 @@
--- Minting counter persistence (PR-A3).
+-- Faucet minting counter persistence (PR-A3).
 --
 -- The legacy `minting_num_pubkeys.bin` sibling file tracked the
--- monotonically increasing BIP-32 child index the minting account uses
--- to generate each mint's commitment public key. The counter MUST
--- survive process restarts; otherwise the next mint sends the wrong
+-- monotonically increasing BIP-32 child index the faucet uses to
+-- generate each mint's commitment public key. The counter MUST survive
+-- process restarts; otherwise the next mint sends the wrong
 -- `prev_commitment_pubkey` and `send_coins` rejects the transition.
 --
 -- A standalone singleton table is the simplest fit:
 --   * the row is tiny (one `BIGINT`) and updated at most once per mint
---     (a low-frequency endpoint),
+--     (a feature-gated, low-frequency endpoint),
 --   * it is logically independent of the per-address `accounts` rows,
 --   * `ON CONFLICT (id) DO UPDATE` makes the upsert race-free at the
 --     SQL layer (matches the rest of the state-layer's idempotent
