@@ -30,6 +30,8 @@ pub mod db;
 pub mod publisher;
 pub mod scanner;
 pub mod scanner_runtime;
+pub mod scanner_ws;
+pub mod scanner_ws_parse;
 pub mod server;
 pub mod server_runtime;
 pub mod state;
@@ -51,8 +53,14 @@ lazy_static! {
             .unwrap_or(false);
         let network_name = std::env::var("NETWORK_NAME")
             .unwrap_or_else(|_| if is_mainnet { "Mainnet".to_string() } else { "Mutinynet".to_string() });
-        println!("Network config: {} ({})", network_name, url);
-        EsploraConfig { url, is_mainnet, network_name }
+        let ws_url = std::env::var("ESPLORA_WS_URL").ok();
+        println!(
+            "Network config: {} ({}) ws={}",
+            network_name,
+            url,
+            ws_url.as_deref().unwrap_or(crate::scanner_ws::DEFAULT_ESPLORA_WS_URL)
+        );
+        EsploraConfig { url, is_mainnet, network_name, ws_url, track_tx_timeout: None }
     };
 
     /// Domain used by the client to render `<hex|username>@<domain>`.

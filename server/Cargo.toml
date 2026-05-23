@@ -10,7 +10,32 @@ sha2 = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 hex = "0.4.3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "net", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "net", "time", "sync"] }
+# Event-driven chain ingestion (issue #84): WebSocket subscription to
+# the Esplora-compatible block-event stream replaces the previous
+# 30-s tip polling loop. `rustls-tls-webpki-roots` keeps the TLS
+# stack self-contained on CI hosts (no system openssl), matching the
+# `reqwest` features used by `api_remote`.
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
+# `StreamExt` / `SinkExt` are used by `scanner_ws` to drive the
+# tungstenite stream inside `tokio::time::timeout(...)` on each
+# `.next()` call and to send the subscribe frame.
+futures-util = "0.3"
+# Promoted from `[dev-dependencies]` to `[dependencies]` so the
+# scanner can parse the `block` / `blocks` JSON frames returned by
+# the Esplora WS endpoint.
+serde_json = "1.0"
+# Optional ZMQ subscriber path (issue #84, dormant in this PR). When
+# `feature = "zmq"` is enabled the operator can plug a Bitcoin Core
+# ZMQ stream into the same channel the WebSocket scanner publishes
+# on — useful for self-hosters running a node directly. The MVP
+# binary keeps this off; no module references the crate yet, so a
+# missing system libzmq does not break the default build. Pinned
+# with `=` (vs. caret) because the feature is dormant — there is no
+# active integration to validate against a SemVer-compatible bump,
+# so any version drift should be a deliberate code change with
+# review, not a silent `cargo update` side-effect.
+bitcoincore-zmq = { version = "=1.5.4", optional = true }
 esplora-client = { git = "https://github.com/BitVM/rust-esplora-client", branch = "master" }
 axum = { version = "0.7.9", features = ["json", "multipart"] }
 anyhow = "1.0"
@@ -33,7 +58,6 @@ sqlx = { version = "0.8", default-features = false, features = [
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-serde_json = "1.0"
 # Used by `publisher_tests` for Esplora mocking and by `server_tests`
 # to mock the Esplora HTTP endpoint behind the `/health/ready`
 # readiness probe so the tests never hit the real
@@ -61,3 +85,9 @@ rand = "0.8"
 default = []
 address-list = []
 lnurl = []
+# Dormant self-host operator opt-in (issue #84). When enabled, a ZMQ
+# subscriber publishes block-hash events into the same channel the
+# WebSocket scanner uses. No module activates the subscriber in this
+# PR; the flag exists so the crate dependency is feature-gated and
+# the MVP binary does not require `libzmq`.
+zmq = ["dep:bitcoincore-zmq"]

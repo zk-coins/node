@@ -62,6 +62,8 @@ fn test_state() -> AppState {
             url: "http://127.0.0.1:1/api".to_string(),
             is_mainnet: false,
             network_name: "Mutinynet".to_string(),
+            ws_url: None,
+            track_tx_timeout: None,
         }),
     }
 }
@@ -2213,6 +2215,8 @@ async fn send_with_insufficient_funds_returns_422_with_error_string() {
             url: "http://127.0.0.1:1/api".to_string(),
             is_mainnet: false,
             network_name: "Mutinynet".to_string(),
+            ws_url: None,
+            track_tx_timeout: None,
         }),
     };
 
@@ -3192,6 +3196,8 @@ fn ready_state(pool: Arc<sqlx::PgPool>, esplora_url: String) -> AppState {
         url: esplora_url,
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
+        ws_url: None,
+        track_tx_timeout: None,
     });
     state
 }
@@ -3342,6 +3348,8 @@ fn mint_test_state() -> AppState {
             url: "http://127.0.0.1:1/api".to_string(),
             is_mainnet: false,
             network_name: "Mutinynet".to_string(),
+            ws_url: None,
+            track_tx_timeout: None,
         }),
     }
 }
@@ -3574,12 +3582,15 @@ async fn mint_happy_path_broadcasts_and_returns_proof_id() {
         .await;
 
     // 3. Wire the AppState to the live pool + wiremock URL.
+    let ws_url = mint_broadcast_mock_ws().await;
     let mut state = mint_test_state();
     state.pool = Arc::clone(&pool);
     state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
         url: mock_server.uri(),
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
+        ws_url: Some(ws_url),
+        track_tx_timeout: None,
     });
 
     let recipient_bytes = [9u8; 32];
@@ -3673,6 +3684,55 @@ async fn mint_with_nonzero_num_pubkeys_covers_prev_pubkey_arm() {
 /// Spin up the wiremock Esplora + matching publisher Taproot UTXO mock
 /// used by the mint happy-path test. Returned `MockServer` is kept
 /// alive by the caller; dropping it tears down the HTTP listener.
+/// Spin up an in-process WS server that emulates the mempool.space
+/// `track-tx` flow used by `publisher::broadcast_inscription_txs`
+/// (issue #84): accept the subscribe frame and echo a documented
+/// `txPosition` event for the txid the client subscribed to, so
+/// the publisher's `wait_for_tx_in_mempool` resolves immediately.
+/// Returns the `ws://` URL.
+async fn mint_broadcast_mock_ws() -> String {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("ws://{}", addr);
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut ws = match tokio_tungstenite::accept_async(stream).await {
+                Ok(w) => w,
+                Err(_) => continue,
+            };
+            let first = match ws.next().await {
+                Some(Ok(WsMessage::Text(t))) => t,
+                _ => continue,
+            };
+            let value: serde_json::Value = match serde_json::from_str(&first) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if value.get("action") == Some(&serde_json::json!("track-tx")) {
+                if let Some(txid_str) = value.get("data").and_then(|v| v.as_str()) {
+                    // Documented mempool.space `txPosition` shape;
+                    // see `scanner_ws::frame_signals_tx_seen`.
+                    let frame = format!(
+                        r#"{{"txPosition":{{"txid":"{}","position":{{"block":1,"vsize":120}}}}}}"#,
+                        txid_str
+                    );
+                    let _ = ws.send(WsMessage::Text(frame)).await;
+                }
+            }
+            let _ = tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
+    url
+}
+
 async fn mint_broadcast_mock_server() -> wiremock::MockServer {
     use bitcoin::Network;
     use bitcoin::{
@@ -3730,6 +3790,7 @@ async fn mint_broadcast_mock_server() -> wiremock::MockServer {
 #[tokio::test]
 async fn mint_upsert_account_failure_logs_and_returns_ok() {
     let mock_server = mint_broadcast_mock_server().await;
+    let ws_url = mint_broadcast_mock_ws().await;
 
     let mut state = mint_test_state();
     // dead_pool stays in place from mint_test_state; only swap the
@@ -3738,6 +3799,8 @@ async fn mint_upsert_account_failure_logs_and_returns_ok() {
         url: mock_server.uri(),
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
+        ws_url: Some(ws_url),
+        track_tx_timeout: None,
     });
 
     let recipient = "0x".to_string() + &hex::encode([4u8; 32]);
@@ -3774,6 +3837,7 @@ async fn mint_upsert_account_failure_logs_and_returns_ok() {
 #[tokio::test]
 async fn mint_receive_coin_failure_logs_and_returns_ok() {
     let mock_server = mint_broadcast_mock_server().await;
+    let ws_url = mint_broadcast_mock_ws().await;
 
     let recipient_bytes = [6u8; 32];
     let recipient = zkcoins_program::hash::digest_from_bytes(&recipient_bytes);
@@ -3783,6 +3847,8 @@ async fn mint_receive_coin_failure_logs_and_returns_ok() {
         url: mock_server.uri(),
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
+        ws_url: Some(ws_url),
+        track_tx_timeout: None,
     });
 
     // Predict the coin identifier that `send_coins` will assign to the
