@@ -276,12 +276,17 @@ impl TestWallet {
     }
 
     /// Sign the username-claim preimage:
-    /// `SHA256("zkcoins:claim_username" || address_hex_str || username_str || timestamp_le8)`.
+    /// `SHA256("zkcoins:claim_username" || address_hex_str || normalised_username_str || timestamp_le8)`.
+    ///
+    /// The server canonicalises the username with `to_lowercase()`
+    /// before hashing; wallets must sign over the same lowercase form
+    /// or verification fails. The helper mirrors that to keep the
+    /// signature path honest end-to-end.
     fn sign_username_claim(&self, address_hex: &str, username: &str, timestamp: u64) -> String {
         let mut hasher = Sha256::new();
         hasher.update(b"zkcoins:claim_username");
         hasher.update(address_hex.as_bytes());
-        hasher.update(username.as_bytes());
+        hasher.update(username.to_lowercase().as_bytes());
         hasher.update(timestamp.to_le_bytes());
         let hash: [u8; 32] = hasher.finalize().into();
         let msg = Message::from_digest(hash);

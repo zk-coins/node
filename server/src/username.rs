@@ -34,10 +34,13 @@ impl UsernameStore {
 
     /// Validate `username` against the public charset rules. Pulled
     /// out of `claim` so the same checks can run at the SQL boundary
-    /// without a duplicate copy of the rules.
+    /// without a duplicate copy of the rules, and so the
+    /// `claim_username` handler can normalise the value once at entry
+    /// — the Schnorr signature hash and the persisted name then agree
+    /// on the exact byte string, ruling out a case-mismatch squat.
     ///
     /// Returns the normalized (lowercased) name on success.
-    fn validate(username: &str) -> Result<String, &'static str> {
+    pub(crate) fn validate(username: &str) -> Result<String, &'static str> {
         let normalized = username.to_lowercase();
         if normalized.is_empty() || normalized.len() > 64 {
             return Err("Username must be 1-64 characters");
@@ -51,6 +54,39 @@ impl UsernameStore {
         Ok(normalized)
     }
 
+    /// Synchronous pre-flight check against the in-memory mirror. The
+    /// claim handler runs this under a short `std::sync::Mutex` guard,
+    /// then drops the guard before the DB round-trip — so concurrent
+    /// `resolve` / `get_username` reads never observe a blank store
+    /// while a claim is mid-flight (the bug the previous `mem::take`
+    /// approach surfaced).
+    ///
+    /// Returns the normalised name on success so the caller does not
+    /// have to re-`validate`.
+    pub(crate) fn precheck(
+        &self,
+        normalized: &str,
+        address: &Address,
+    ) -> Result<(), ClaimUsernameError> {
+        if self.usernames.contains_key(normalized) {
+            return Err(ClaimUsernameError::Validation("Username already taken"));
+        }
+        if self.usernames.values().any(|a| a == address) {
+            return Err(ClaimUsernameError::Validation(
+                "Address already has a username",
+            ));
+        }
+        Ok(())
+    }
+
+    /// In-memory commit that runs after the DB `ON CONFLICT DO NOTHING`
+    /// has reported `rows_affected == 1`. Held under the same short
+    /// sync guard as `precheck` would be — no `.await` inside, no
+    /// `mem::take`, the store is never observable as empty.
+    pub(crate) fn commit_after_db(&mut self, normalized: String, address: Address) {
+        self.usernames.insert(normalized, address);
+    }
+
     /// Claim `username` for `address`, persisting to Postgres
     /// atomically via `db::claim_username`'s `ON CONFLICT DO NOTHING`
     /// path. On success the in-memory mirror is updated too so
@@ -62,6 +98,13 @@ impl UsernameStore {
     /// names per address by design (a future product change might
     /// allow aliasing) and the application-level rule is the
     /// authoritative one for the MVP.
+    ///
+    /// This convenience wrapper composes `validate` + `precheck` +
+    /// `db::claim_username` + `commit_after_db` so the unit tests can
+    /// drive the full pipeline in one call. The production
+    /// `claim_username_handler` calls the steps directly because it
+    /// must not hold a `std::sync::Mutex` guard across the async DB
+    /// round-trip.
     pub async fn claim(
         &mut self,
         pool: &PgPool,
@@ -69,15 +112,7 @@ impl UsernameStore {
         address: Address,
     ) -> Result<(), ClaimUsernameError> {
         let normalized = Self::validate(username).map_err(ClaimUsernameError::Validation)?;
-
-        if self.usernames.contains_key(&normalized) {
-            return Err(ClaimUsernameError::Validation("Username already taken"));
-        }
-        if self.usernames.values().any(|a| *a == address) {
-            return Err(ClaimUsernameError::Validation(
-                "Address already has a username",
-            ));
-        }
+        self.precheck(&normalized, &address)?;
 
         let addr_bytes = digest_to_bytes(&address);
         let inserted = db::claim_username(pool, &normalized, &addr_bytes).await?;
@@ -89,7 +124,7 @@ impl UsernameStore {
             return Err(ClaimUsernameError::Validation("Username already taken"));
         }
 
-        self.usernames.insert(normalized, address);
+        self.commit_after_db(normalized, address);
         Ok(())
     }
 
