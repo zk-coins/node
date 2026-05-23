@@ -3133,3 +3133,172 @@ async fn mint_with_nonzero_num_pubkeys_covers_prev_pubkey_arm() {
         resp_body
     );
 }
+
+/// Spin up the wiremock Esplora + matching publisher Taproot UTXO mock
+/// used by the mint happy-path test. Returned `MockServer` is kept
+/// alive by the caller; dropping it tears down the HTTP listener.
+async fn mint_broadcast_mock_server() -> wiremock::MockServer {
+    use bitcoin::Network;
+    use bitcoin::{
+        key::Secp256k1,
+        secp256k1::{Keypair, SecretKey},
+        XOnlyPublicKey,
+    };
+    use std::str::FromStr;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let secp = Secp256k1::new();
+    let sk =
+        SecretKey::from_str("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
+            .expect("default publisher key parses");
+    let key_pair = Keypair::from_secret_key(&secp, &sk);
+    let (xonly, _) = XOnlyPublicKey::from_keypair(&key_pair);
+    let publisher_address = bitcoin::Address::p2tr(&secp, xonly, None, Network::Signet);
+
+    Mock::given(method("GET"))
+        .and(path(format!("/address/{}/utxo", publisher_address)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {
+                "txid": "3333333333333333333333333333333333333333333333333333333333333333",
+                "vout": 0,
+                "value": 100_000,
+                "status": {
+                    "confirmed": true,
+                    "block_height": 100,
+                    "block_hash": "0000000000000000000000000000000000000000000000000000000000000001",
+                    "block_time": 1_700_000_000
+                }
+            }
+        ])))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/tx"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&mock_server)
+        .await;
+
+    mock_server
+}
+
+/// Drives the Err arm of the post-broadcast `db::upsert_account` loop
+/// at the tail of `mint_handler`. The broadcast goes through (wiremock
+/// answers the UTXO + tx POSTs), so the handler walks past the early
+/// 503 branch into the lock-free upsert loop. The pool is the lazy
+/// `dead_pool` that connect-errors on first use, so both
+/// `upsert_minting_num_pubkeys` and the per-account `upsert_account`
+/// calls take their Err arms and log + continue. The handler still
+/// returns 200 OK with a `proof_id` because the upsert is best-effort.
+#[tokio::test]
+async fn mint_upsert_account_failure_logs_and_returns_ok() {
+    let mock_server = mint_broadcast_mock_server().await;
+
+    let mut state = mint_test_state();
+    // dead_pool stays in place from mint_test_state; only swap the
+    // Esplora URL so the broadcast succeeds.
+    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
+        url: mock_server.uri(),
+        is_mainnet: false,
+        network_name: "Mutinynet".to_string(),
+    });
+
+    let recipient = "0x".to_string() + &hex::encode([4u8; 32]);
+    let body = serde_json::json!({
+        "account_address": recipient,
+        "amount": 1u64,
+    });
+    let req = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, resp_body) = send_request_with_state(state, req).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {}", resp_body);
+    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(v["success"], true);
+    assert!(
+        v["proof_id"].as_u64().is_some(),
+        "proof_id missing from response: {}",
+        resp_body
+    );
+}
+
+/// Drives the Err arm of the `account_server.receive_coin` call in the
+/// post-broadcast loop of `mint_handler`. Pre-populates the recipient
+/// account's `coin_history` SMT with the identifier that `send_coins`
+/// is about to mint, so `receive_coin` returns
+/// `Err("Coin already spent (replay)")` and the handler logs the error
+/// + continues. Identifier prediction mirrors `Account::create_coins`
+/// off-circuit (canonical AccountState layout + Poseidon hash + index 0).
+/// The handler still returns 200 OK because the receive failure is
+/// best-effort, matching the project-wide log-and-continue policy for
+/// post-broadcast persistence steps.
+#[tokio::test]
+async fn mint_receive_coin_failure_logs_and_returns_ok() {
+    let mock_server = mint_broadcast_mock_server().await;
+
+    let recipient_bytes = [6u8; 32];
+    let recipient = zkcoins_program::hash::digest_from_bytes(&recipient_bytes);
+
+    let mut state = mint_test_state();
+    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
+        url: mock_server.uri(),
+        is_mainnet: false,
+        network_name: "Mutinynet".to_string(),
+    });
+
+    // Predict the coin identifier that `send_coins` will assign to the
+    // freshly-minted output coin. `Account::create_coins` builds
+    // `next_account_state` with `owner = MINTING_ADDRESS`,
+    // `balance = minting_balance - amount`, and
+    // `public_key = current minting pubkey`, then hashes it and feeds
+    // the digest into `calculate_coin_identifier(_, 0)`.
+    let amount: u64 = 1;
+    let minting_balance: u64 = 1u64 << 48;
+    let minting_pubkey_bytes = {
+        let mc = state.minting_account.lock().unwrap();
+        mc.generate_public_key(0).serialize()
+    };
+    let next_account_state = zkcoins_program::types::AccountState {
+        owner: *zkcoins_program::types::MINTING_ADDRESS,
+        balance: minting_balance - amount,
+        public_key: minting_pubkey_bytes,
+    };
+    let predicted_coin_id =
+        zkcoins_program::types::calculate_coin_identifier(next_account_state.hash(), 0);
+    let predicted_coin_id_bytes = zkcoins_program::hash::digest_to_bytes(&predicted_coin_id);
+
+    // Pre-insert the predicted identifier into the recipient's
+    // coin_history SMT so `receive_coin` sees the coin as already spent.
+    let mut recipient_account = Account::new();
+    recipient_account
+        .coin_history
+        .insert(predicted_coin_id_bytes, predicted_coin_id)
+        .expect("insert into fresh SMT must succeed");
+    {
+        let mut server = state.account_server.lock().unwrap();
+        server.import_account(recipient, recipient_account);
+    }
+
+    let recipient_hex = "0x".to_string() + &hex::encode(recipient_bytes);
+    let body = serde_json::json!({
+        "account_address": recipient_hex,
+        "amount": amount,
+    });
+    let req = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, resp_body) = send_request_with_state(state, req).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {}", resp_body);
+    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(v["success"], true);
+    assert!(
+        v["proof_id"].as_u64().is_some(),
+        "proof_id missing from response: {}",
+        resp_body
+    );
+}
