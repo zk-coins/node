@@ -4,9 +4,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 
 use crate::db;
-use zkcoins_program::hash::digest_from_bytes;
-#[cfg(any(feature = "usernames", test))]
-use zkcoins_program::hash::digest_to_bytes;
+use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes};
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct UsernameStore {
@@ -36,11 +34,13 @@ impl UsernameStore {
 
     /// Validate `username` against the public charset rules. Pulled
     /// out of `claim` so the same checks can run at the SQL boundary
-    /// without a duplicate copy of the rules.
+    /// without a duplicate copy of the rules, and so the
+    /// `claim_username` handler can normalise the value once at entry
+    /// — the Schnorr signature hash and the persisted name then agree
+    /// on the exact byte string, ruling out a case-mismatch squat.
     ///
     /// Returns the normalized (lowercased) name on success.
-    #[cfg(any(feature = "usernames", test))]
-    fn validate(username: &str) -> Result<String, &'static str> {
+    pub(crate) fn validate(username: &str) -> Result<String, &'static str> {
         let normalized = username.to_lowercase();
         if normalized.is_empty() || normalized.len() > 64 {
             return Err("Username must be 1-64 characters");
@@ -54,6 +54,36 @@ impl UsernameStore {
         Ok(normalized)
     }
 
+    /// Synchronous pre-flight check against the in-memory mirror. The
+    /// claim handler runs this under a short `std::sync::Mutex` guard,
+    /// then drops the guard before the DB round-trip — so concurrent
+    /// `resolve` / `get_username` reads never observe a blank store
+    /// while a claim is mid-flight (the bug the previous `mem::take`
+    /// approach surfaced).
+    ///
+    /// Returns a 4xx-shaped validation message on collision. The
+    /// dedicated `&'static str` return — rather than the broader
+    /// `ClaimUsernameError` — keeps the handler's error mapping a flat
+    /// `Result<(), &'static str>` with no unreachable `Db` arm; that
+    /// would otherwise read as dead code under the 100 % coverage gate.
+    pub(crate) fn precheck(&self, normalized: &str, address: &Address) -> Result<(), &'static str> {
+        if self.usernames.contains_key(normalized) {
+            return Err("Username already taken");
+        }
+        if self.usernames.values().any(|a| a == address) {
+            return Err("Address already has a username");
+        }
+        Ok(())
+    }
+
+    /// In-memory commit that runs after the DB `ON CONFLICT DO NOTHING`
+    /// has reported `rows_affected == 1`. Held under the same short
+    /// sync guard as `precheck` would be — no `.await` inside, no
+    /// `mem::take`, the store is never observable as empty.
+    pub(crate) fn commit_after_db(&mut self, normalized: String, address: Address) {
+        self.usernames.insert(normalized, address);
+    }
+
     /// Claim `username` for `address`, persisting to Postgres
     /// atomically via `db::claim_username`'s `ON CONFLICT DO NOTHING`
     /// path. On success the in-memory mirror is updated too so
@@ -65,7 +95,13 @@ impl UsernameStore {
     /// names per address by design (a future product change might
     /// allow aliasing) and the application-level rule is the
     /// authoritative one for the MVP.
-    #[cfg(any(feature = "usernames", test))]
+    ///
+    /// This convenience wrapper composes `validate` + `precheck` +
+    /// `db::claim_username` + `commit_after_db` so the unit tests can
+    /// drive the full pipeline in one call. The production
+    /// `claim_username_handler` calls the steps directly because it
+    /// must not hold a `std::sync::Mutex` guard across the async DB
+    /// round-trip.
     pub async fn claim(
         &mut self,
         pool: &PgPool,
@@ -73,15 +109,8 @@ impl UsernameStore {
         address: Address,
     ) -> Result<(), ClaimUsernameError> {
         let normalized = Self::validate(username).map_err(ClaimUsernameError::Validation)?;
-
-        if self.usernames.contains_key(&normalized) {
-            return Err(ClaimUsernameError::Validation("Username already taken"));
-        }
-        if self.usernames.values().any(|a| *a == address) {
-            return Err(ClaimUsernameError::Validation(
-                "Address already has a username",
-            ));
-        }
+        self.precheck(&normalized, &address)
+            .map_err(ClaimUsernameError::Validation)?;
 
         let addr_bytes = digest_to_bytes(&address);
         let inserted = db::claim_username(pool, &normalized, &addr_bytes).await?;
@@ -93,11 +122,10 @@ impl UsernameStore {
             return Err(ClaimUsernameError::Validation("Username already taken"));
         }
 
-        self.usernames.insert(normalized, address);
+        self.commit_after_db(normalized, address);
         Ok(())
     }
 
-    #[cfg(any(feature = "usernames", feature = "lnurl", test))]
     pub fn resolve(&self, username: &str) -> Option<Address> {
         self.usernames.get(&username.to_lowercase()).copied()
     }
@@ -114,8 +142,8 @@ impl UsernameStore {
     /// The full table is read into memory at boot so subsequent
     /// `resolve` / `get_username` calls — the hot read path — answer
     /// locally. The table is small (one row per registered user) and
-    /// only grows through the feature-gated claim endpoint, so the
-    /// memory footprint is bounded.
+    /// only grows through the `claim_username` endpoint, so the memory
+    /// footprint is bounded.
     pub async fn load_from_pg(pool: &PgPool) -> Result<Self, LoadUsernameStoreError> {
         let rows = db::load_all_usernames(pool).await?;
         let mut usernames: HashMap<String, Address> = HashMap::with_capacity(rows.len());
@@ -133,11 +161,6 @@ impl UsernameStore {
 /// Error type for `UsernameStore::claim`. Wraps the validation error
 /// strings (returned to the API caller as a 4xx body) and any database
 /// error from the underlying `db::claim_username` upsert.
-///
-/// `cfg`-gated on the `usernames` feature plus `test` — the public
-/// claim handler is the only production caller of `claim`, and the
-/// unit-test suite exercises both paths unconditionally.
-#[cfg(any(feature = "usernames", test))]
 #[derive(Debug)]
 pub enum ClaimUsernameError {
     /// Caller-fixable input rejection (charset, length, duplicate).
@@ -147,7 +170,6 @@ pub enum ClaimUsernameError {
     Db(sqlx::Error),
 }
 
-#[cfg(any(feature = "usernames", test))]
 impl std::fmt::Display for ClaimUsernameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -157,7 +179,6 @@ impl std::fmt::Display for ClaimUsernameError {
     }
 }
 
-#[cfg(any(feature = "usernames", test))]
 impl std::error::Error for ClaimUsernameError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -167,7 +188,6 @@ impl std::error::Error for ClaimUsernameError {
     }
 }
 
-#[cfg(any(feature = "usernames", test))]
 impl From<sqlx::Error> for ClaimUsernameError {
     fn from(e: sqlx::Error) -> Self {
         ClaimUsernameError::Db(e)

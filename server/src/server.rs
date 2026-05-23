@@ -102,7 +102,7 @@ pub struct BalanceResponse {
     username: Option<String>,
 }
 
-#[cfg(any(feature = "address-list", feature = "usernames", feature = "lnurl"))]
+#[cfg(any(feature = "address-list", feature = "lnurl"))]
 #[derive(Serialize, Deserialize)]
 pub struct AddressesResponse {
     addresses: Vec<String>,
@@ -403,7 +403,6 @@ pub struct Capabilities {
 
 // --- Username & LNURL types ---
 
-#[cfg(feature = "usernames")]
 #[derive(Deserialize)]
 pub struct ClaimUsernameRequest {
     username: String,
@@ -413,7 +412,6 @@ pub struct ClaimUsernameRequest {
     timestamp: u64,
 }
 
-#[cfg(any(feature = "usernames", feature = "lnurl"))]
 #[derive(Serialize, Deserialize)]
 pub struct UsernameResponse {
     username: String,
@@ -432,7 +430,6 @@ pub struct LnurlpResponse {
     metadata: String,
 }
 
-#[cfg(any(feature = "usernames", feature = "lnurl"))]
 #[derive(Serialize, Deserialize)]
 pub struct LnurlErrorResponse {
     status: String,
@@ -1096,7 +1093,8 @@ async fn info_handler() -> impl IntoResponse {
             address_list: cfg!(feature = "address-list"),
             // Hardcoded — mint is permanent MVP; field is back-compat only.
             faucet: true,
-            usernames: cfg!(feature = "usernames"),
+            // Hardcoded — usernames are permanent MVP; field is back-compat only.
+            usernames: true,
             lnurl: cfg!(feature = "lnurl"),
         },
         username_domain: USERNAME_DOMAIN.clone(),
@@ -1148,11 +1146,29 @@ async fn root_handler() -> impl IntoResponse {
 
 // --- Username & LNURL handlers ---
 
-#[cfg(feature = "usernames")]
 async fn claim_username_handler(
     State(state): State<AppState>,
     Json(request): Json<ClaimUsernameRequest>,
 ) -> impl IntoResponse {
+    // Normalise the username up-front so the Schnorr signature, the
+    // in-memory mirror, and the Postgres row all agree on the exact
+    // byte string. Hashing the raw `request.username` while persisting
+    // `to_lowercase()` lets a wallet that signs over `"Alice"` end up
+    // squatting `"alice"` — see PR #76's prod-readiness review.
+    let normalized_username = match crate::username::UsernameStore::validate(&request.username) {
+        Ok(n) => n,
+        Err(err) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(LnurlErrorResponse {
+                    status: "ERROR".into(),
+                    reason: err.into(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
     // Decode address
     let address_vec = match hex::decode(request.address.trim_start_matches("0x")) {
         Ok(a) => a,
@@ -1210,11 +1226,15 @@ async fn claim_username_handler(
             .into_response();
     }
 
-    // Verify Schnorr signature over sha256("zkcoins:claim_username" || address_hex || username || timestamp_le)
+    // Verify Schnorr signature over sha256("zkcoins:claim_username" || address_hex || normalised_username || timestamp_le).
+    // The wallet MUST sign over the lowercase form (same normalisation
+    // as `UsernameStore::validate`) — otherwise the same input that the
+    // server persists is not what the signature commits to, opening
+    // the case-mismatch squat described above.
     let mut hasher = Sha256::new();
     hasher.update(b"zkcoins:claim_username");
     hasher.update(request.address.as_bytes());
-    hasher.update(request.username.as_bytes());
+    hasher.update(normalized_username.as_bytes());
     hasher.update(request.timestamp.to_le_bytes());
     let hash: [u8; 32] = hasher.finalize().into();
 
@@ -1258,70 +1278,73 @@ async fn claim_username_handler(
             .into_response();
     }
 
-    // Claim the username. `UsernameStore::claim` is async (it persists
-    // through `db::claim_username` before mutating the in-memory map),
-    // so the lock-acquire / drop ordering matters: we must hold the
-    // store guard only synchronously, but the persistence call lives
-    // inside it. We solve this by using `tokio::sync::Mutex` would
-    // ripple through every other handler; instead we serialize the
-    // claim path application-side: take the (sync) `std::sync::Mutex`,
-    // do the in-memory pre-check + DB call + in-memory commit inside
-    // the same `claim` method, and rely on the SQL `ON CONFLICT DO
-    // NOTHING` to catch any race that slips past the in-memory
-    // pre-check. Because `claim` is `async`, we have to drop the sync
-    // guard before the `.await`, which means we cannot hold it across
-    // the persistence call. The compromise: short critical section
-    // around `std::mem::take` of the in-memory map, run the claim
-    // against a temporary, then swap it back. Simpler and equivalent
-    // for the MVP: leave the sync guard NOT held across the await by
-    // routing the claim through a clone-out / merge-back pattern.
+    // Claim path, three steps. The previous `mem::take` approach left
+    // the in-memory `UsernameStore` observable as empty for the full
+    // duration of the DB round-trip — every `resolve` / `get_username`
+    // request in that window saw a blank mirror, including
+    // `get_balance_handler`'s `username` lookup.
     //
-    // For the MVP, the username-claim endpoint is feature-gated and
-    // expected to see < 1 req/s in production. We just acquire the
-    // guard, take ownership of the store, drop the guard, run the
-    // async claim, then re-acquire and merge the result back. The
-    // brief window where the guard is dropped is bounded by the DB
-    // round-trip; concurrent claimers serialize at the SQL `ON
-    // CONFLICT DO NOTHING` boundary regardless.
-    let mut snapshot = {
-        let mut guard = lock_or_recover(&state.username_store);
-        std::mem::take(&mut *guard)
-    };
-    let claim_outcome = snapshot
-        .claim(&state.pool, &request.username, address)
-        .await;
+    // Split design:
+    //   1. short sync lock → `precheck` (read-only)
+    //   2. drop lock → async `db::claim_username` (`ON CONFLICT DO NOTHING`)
+    //   3. short sync lock → `commit_after_db` (in-memory insert)
+    //
+    // Reads concurrent with a claim now always see the full mirror.
+    // Concurrent writers race at the SQL `ON CONFLICT` boundary as
+    // before; the second writer hits `rows_affected == 0` and the
+    // handler maps that to a 409. The post-commit insert is idempotent
+    // — re-inserting the same `(normalized, address)` is a no-op.
+    if let Err(reason) =
+        lock_or_recover(&state.username_store).precheck(&normalized_username, &address)
     {
-        let mut guard = lock_or_recover(&state.username_store);
-        *guard = snapshot;
-    }
-    if let Err(e) = claim_outcome {
-        let (status, reason): (StatusCode, String) = match e {
-            crate::username::ClaimUsernameError::Validation(s) => {
-                (StatusCode::CONFLICT, s.to_string())
-            }
-            crate::username::ClaimUsernameError::Db(db_err) => {
-                eprintln!("Failed to persist username claim: {}", db_err);
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Failed to persist username claim".to_string(),
-                )
-            }
-        };
+        // `precheck` returns the static collision strings the wallet
+        // surfaces verbatim. The status is `409 CONFLICT` for either
+        // collision variant — same shape as the SQL-layer race below.
         return (
-            status,
+            StatusCode::CONFLICT,
             Json(LnurlErrorResponse {
                 status: "ERROR".into(),
-                reason,
+                reason: reason.into(),
             }),
         )
             .into_response();
     }
 
-    let normalized = request.username.to_lowercase();
+    let addr_bytes = digest_to_bytes(&address);
+    let inserted =
+        match crate::db::claim_username(&state.pool, &normalized_username, &addr_bytes).await {
+            Ok(b) => b,
+            Err(db_err) => {
+                eprintln!("Failed to persist username claim: {}", db_err);
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(LnurlErrorResponse {
+                        status: "ERROR".into(),
+                        reason: "Failed to persist username claim".into(),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+    if !inserted {
+        // Concurrent claimer won the `ON CONFLICT` race for the same
+        // name. Surface as the same 409 a precheck collision would.
+        return (
+            StatusCode::CONFLICT,
+            Json(LnurlErrorResponse {
+                status: "ERROR".into(),
+                reason: "Username already taken".into(),
+            }),
+        )
+            .into_response();
+    }
+
+    lock_or_recover(&state.username_store).commit_after_db(normalized_username.clone(), address);
+
     (
         StatusCode::OK,
         Json(UsernameResponse {
-            username: normalized,
+            username: normalized_username,
             address: format!("0x{}", hex::encode(digest_to_bytes(&address))),
         }),
     )
@@ -1330,8 +1353,7 @@ async fn claim_username_handler(
 
 /// Resolve an identifier to an address. Checks the username store first,
 /// then falls back to hex-prefix matching against known account addresses.
-/// Only used by the gated username and LNURL handlers.
-#[cfg(any(feature = "usernames", feature = "lnurl"))]
+/// Used by the always-on username handlers and the gated LNURL handlers.
 fn resolve_identifier(
     state: &AppState,
     identifier: &str,
@@ -1354,7 +1376,6 @@ fn resolve_identifier(
         .map(|addr| (addr, normalized))
 }
 
-#[cfg(feature = "usernames")]
 async fn resolve_username_handler(
     State(state): State<AppState>,
     Path(username): Path<String>,
@@ -1455,7 +1476,12 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/api/receive", post(receive_coin_handler))
         .route("/api/proof/:id", get(get_proof_handler))
         .route("/api/commit", post(commit_handler))
-        .route("/api/mint", post(mint_handler));
+        .route("/api/mint", post(mint_handler))
+        .route("/api/username/claim", post(claim_username_handler))
+        .route(
+            "/api/username/resolve/:username",
+            get(resolve_username_handler),
+        );
 
     // Gated routes — only compiled in when their Cargo feature is enabled.
     // With a feature off, the handler does not exist in the binary and the
@@ -1463,14 +1489,6 @@ pub(crate) fn create_router(state: AppState) -> Router {
     // and there is no code path to execute.
     #[cfg(feature = "address-list")]
     let app = app.route("/api/address", get(get_address_handler));
-
-    #[cfg(feature = "usernames")]
-    let app = app
-        .route("/api/username/claim", post(claim_username_handler))
-        .route(
-            "/api/username/resolve/:username",
-            get(resolve_username_handler),
-        );
 
     #[cfg(feature = "lnurl")]
     let app = app

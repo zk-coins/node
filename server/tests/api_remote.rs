@@ -117,21 +117,22 @@ macro_rules! feature_skip {
 // ---------------------------------------------------------------------------
 // Capability detection
 //
-// Mint (`/api/mint`) is part of the MVP and is always present, so it is
-// no longer gated here. The remaining post-MVP routes (`address-list`,
-// `usernames`, `lnurl`) are still optional: the default deploy ships
-// without them and the axum fallback answers 404 instead of the
-// per-handler error codes. We fetch `/api/info` once per gated test,
-// deserialise the well-known `Capabilities` shape, and skip the rest
-// of the test if the relevant feature flag is `false`.
+// Mint (`/api/mint`) and the username routes (`/api/username/claim`,
+// `/api/username/resolve/:u`) are part of the MVP and are always
+// present, so they are no longer gated here. The remaining post-MVP
+// routes (`address-list`, `lnurl`) are still optional: the default
+// deploy ships without them and the axum fallback answers 404 instead
+// of the per-handler error codes. We fetch `/api/info` once per gated
+// test, deserialise the well-known `Capabilities` shape, and skip the
+// rest of the test if the relevant feature flag is `false`.
 //
 // `ZKCOINS_FORCE_DISABLE_FEATURES` (comma-separated list, e.g.
-// `address_list,usernames`) overrides any flag returned by the server
+// `address_list,lnurl`) overrides any flag returned by the server
 // to `false`. This is the local dry-run hook — point the suite at the
 // live DEV server, force features off, and confirm that every gated
 // test prints `SKIP …` instead of hitting a disabled-on-paper but
-// actually-running endpoint. Forcing `faucet` off is a no-op (the
-// route is always registered) and the flag is ignored.
+// actually-running endpoint. Forcing `faucet` or `usernames` off is a
+// no-op (the routes are always registered) and the flags are ignored.
 // ---------------------------------------------------------------------------
 
 async fn fetch_capabilities(client: &reqwest::Client) -> Capabilities {
@@ -172,7 +173,12 @@ async fn fetch_capabilities(client: &reqwest::Client) -> Capabilities {
                         "ZKCOINS_FORCE_DISABLE_FEATURES: `faucet` is permanent MVP — ignored"
                     );
                 }
-                "usernames" => caps.usernames = false,
+                "usernames" => {
+                    // Usernames are permanent MVP — same shape as `faucet`.
+                    eprintln!(
+                        "ZKCOINS_FORCE_DISABLE_FEATURES: `usernames` is permanent MVP — ignored"
+                    );
+                }
                 "lnurl" => caps.lnurl = false,
                 other => {
                     eprintln!(
@@ -270,12 +276,17 @@ impl TestWallet {
     }
 
     /// Sign the username-claim preimage:
-    /// `SHA256("zkcoins:claim_username" || address_hex_str || username_str || timestamp_le8)`.
+    /// `SHA256("zkcoins:claim_username" || address_hex_str || normalised_username_str || timestamp_le8)`.
+    ///
+    /// The server canonicalises the username with `to_lowercase()`
+    /// before hashing; wallets must sign over the same lowercase form
+    /// or verification fails. The helper mirrors that to keep the
+    /// signature path honest end-to-end.
     fn sign_username_claim(&self, address_hex: &str, username: &str, timestamp: u64) -> String {
         let mut hasher = Sha256::new();
         hasher.update(b"zkcoins:claim_username");
         hasher.update(address_hex.as_bytes());
-        hasher.update(username.as_bytes());
+        hasher.update(username.to_lowercase().as_bytes());
         hasher.update(timestamp.to_le_bytes());
         let hash: [u8; 32] = hasher.finalize().into();
         let msg = Message::from_digest(hash);
@@ -486,10 +497,6 @@ async fn proof_id_one_returns_200_or_404() {
 #[tokio::test]
 async fn resolve_unknown_username_returns_404() {
     let client = http_client();
-    let caps = fetch_capabilities(&client).await;
-    if !caps.usernames {
-        feature_skip!("usernames", "resolve_unknown_username_returns_404");
-    }
     let resp = client
         .get(url("/api/username/resolve/definitely_not_claimed_xyzzy"))
         .send()
@@ -787,10 +794,6 @@ async fn commit_bad_message_hex_returns_422_or_404() {
 #[tokio::test]
 async fn claim_username_pk_mismatch_returns_401() {
     let client = http_client();
-    let caps = fetch_capabilities(&client).await;
-    if !caps.usernames {
-        feature_skip!("usernames", "claim_username_pk_mismatch_returns_401");
-    }
     let alice = TestWallet::new();
     let mallory = TestWallet::new();
     let username = format!("mallory_{}", random_suffix());
@@ -817,10 +820,6 @@ async fn claim_username_pk_mismatch_returns_401() {
 #[tokio::test]
 async fn claim_username_bad_signature_returns_401() {
     let client = http_client();
-    let caps = fetch_capabilities(&client).await;
-    if !caps.usernames {
-        feature_skip!("usernames", "claim_username_bad_signature_returns_401");
-    }
     let alice = TestWallet::new();
     let username = format!("alice_{}", random_suffix());
     let body = json!({
@@ -842,10 +841,6 @@ async fn claim_username_bad_signature_returns_401() {
 #[tokio::test]
 async fn claim_username_stale_timestamp_returns_401() {
     let client = http_client();
-    let caps = fetch_capabilities(&client).await;
-    if !caps.usernames {
-        feature_skip!("usernames", "claim_username_stale_timestamp_returns_401");
-    }
     let alice = TestWallet::new();
     let username = format!("alice_{}", random_suffix());
     let stale_ts = unix_now().saturating_sub(600);
@@ -1155,13 +1150,9 @@ async fn send_commit_roundtrip_moves_balance() {
 async fn username_claim_resolve_lnurlp_roundtrip() {
     let client = http_client();
     let caps = fetch_capabilities(&client).await;
-    // Claim + resolve both live behind `usernames`; the LNURLp leg
-    // additionally requires `lnurl`. If either is off we skip the
-    // whole cascade — there's no useful sub-roundtrip when the
-    // bootstrapping claim cannot land.
-    if !caps.usernames {
-        feature_skip!("usernames", "username_claim_resolve_lnurlp_roundtrip");
-    }
+    // Claim + resolve are permanent MVP. The LNURLp leg still depends
+    // on the `lnurl` Cargo feature — if it's off we skip the whole
+    // cascade because the trailing well-known probe cannot succeed.
     if !caps.lnurl {
         feature_skip!("lnurl", "username_claim_resolve_lnurlp_roundtrip");
     }

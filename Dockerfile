@@ -10,10 +10,10 @@
 #   docker build -t zkcoin/server:beta .
 #
 # Both DEV (`:beta`) and PRD (`:latest`) ship the MVP-only binary
-# (no Cargo features beyond the always-on mint route). The `FEATURES`
-# build-arg below stays in place as an opt-in escape hatch for self-
-# hosters who want to compile non-MVP routes locally (e.g.
-# `--build-arg FEATURES=usernames,lnurl`).
+# (no Cargo features beyond the always-on mint and username routes).
+# The `FEATURES` build-arg below stays in place as an opt-in escape
+# hatch for self-hosters who want to compile non-MVP routes locally
+# (e.g. `--build-arg FEATURES=address-list,lnurl`).
 # Run:
 #   docker run -p 4242:4242 \
 #     -e ESPLORA_URL=http://electrs:3000 \
@@ -46,7 +46,7 @@ COPY . .
 # PRD images ship the MVP-only feature set so the two environments run
 # the identical binary. Self-hosters who want to enable non-MVP routes
 # in a local build can pass a comma-separated list
-# (e.g. `--build-arg FEATURES=usernames,lnurl`). Features not listed
+# (e.g. `--build-arg FEATURES=address-list,lnurl`). Features not listed
 # here are excluded from the binary at compile time, so the disabled
 # code cannot run, crash, or be exploited at runtime.
 ARG FEATURES=

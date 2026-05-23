@@ -138,7 +138,8 @@ async fn info_returns_network_name_capabilities_and_username_domain() {
     );
     // Mint is permanent MVP — `faucet` is hardcoded `true`, not cfg-derived.
     assert!(info.capabilities.faucet);
-    assert_eq!(info.capabilities.usernames, cfg!(feature = "usernames"));
+    // Usernames are permanent MVP — `usernames` is hardcoded `true`.
+    assert!(info.capabilities.usernames);
     assert_eq!(info.capabilities.lnurl, cfg!(feature = "lnurl"));
 
     // The lazy_static defaults to "zkcoins.app" (PRD) when USERNAME_DOMAIN is unset
@@ -182,7 +183,6 @@ async fn balance_unknown_address_returns_ok_with_zero() {
     assert!(resp.username.is_none());
 }
 
-#[cfg(feature = "usernames")]
 #[tokio::test]
 async fn balance_unknown_address_with_claimed_username_returns_username() {
     let state = test_state();
@@ -372,7 +372,6 @@ async fn send_request_with_state(state: AppState, request: Request<Body>) -> (St
 
 // --- GET /api/username/resolve/{username} ---
 
-#[cfg(feature = "usernames")]
 #[tokio::test]
 async fn resolve_unknown_username_returns_404() {
     let req = Request::get("/api/username/resolve/nonexistent")
@@ -387,7 +386,6 @@ async fn resolve_unknown_username_returns_404() {
     assert!(resp.reason.contains("not found"));
 }
 
-#[cfg(feature = "usernames")]
 #[tokio::test]
 async fn resolve_minting_address_by_hex_prefix() {
     // The minting address starts with "af53a1" — a short prefix is enough
@@ -410,7 +408,6 @@ async fn resolve_minting_address_by_hex_prefix() {
 
 // --- POST /api/username/claim ---
 
-#[cfg(feature = "usernames")]
 #[tokio::test]
 async fn claim_username_empty_body_returns_422() {
     let req = Request::post("/api/username/claim")
@@ -422,7 +419,6 @@ async fn claim_username_empty_body_returns_422() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
-#[cfg(feature = "usernames")]
 #[tokio::test]
 async fn claim_username_no_content_type_returns_415() {
     let req = Request::post("/api/username/claim")
@@ -581,7 +577,6 @@ async fn concurrent_balance_reads_are_consistent() {
 
 // --- Concurrent mixed reads and username operations ---
 
-#[cfg(feature = "usernames")]
 #[tokio::test]
 async fn concurrent_reads_with_username_claim() {
     let state = test_state();
@@ -816,7 +811,6 @@ fn send_signature_rejects_wrong_signature() {
 
 // --- POST /api/username/claim with valid Schnorr signature ---
 
-#[cfg(feature = "usernames")]
 #[tokio::test]
 async fn claim_username_with_valid_signature() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -911,7 +905,232 @@ async fn claim_username_with_valid_signature() {
     assert_eq!(resp.address, format!("0x{}", address_hex));
 }
 
-#[cfg(feature = "usernames")]
+/// Mixed-case input is normalised to lowercase **before** the
+/// signature is hashed, so a wallet that signs over the normalised
+/// form (`"alice"`) and sends the user-typed form (`"Alice"`) is
+/// accepted and persisted under `"alice"`. Guards the case-mismatch
+/// squat fix from PR #76's prod-readiness review.
+#[tokio::test]
+async fn claim_username_mixed_case_input_normalised_before_hashing() {
+    use bitcoin::secp256k1::{Keypair, SecretKey};
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container
+        .get_host()
+        .await
+        .expect("failed to get container host");
+    let port = pg_container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("failed to get container port");
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
+    let secp = secp::Secp256k1::new();
+    let secret = SecretKey::from_slice(&[9u8; 32]).unwrap();
+    let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+    let address: [u8; 32] = Sha256::digest(public_key.serialize()).into();
+    let address_hex = hex::encode(address);
+
+    let user_input = "Alice";
+    let normalised = "alice";
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Sign over the NORMALISED form — that is the contract the server
+    // enforces by canonicalising before hashing.
+    let mut hasher = Sha256::new();
+    hasher.update(b"zkcoins:claim_username");
+    hasher.update(address_hex.as_bytes());
+    hasher.update(normalised.as_bytes());
+    hasher.update(now.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    let msg = Message::from_digest(hash);
+    let keypair = Keypair::from_secret_key(&secp, &secret);
+    let sig = secp.sign_schnorr(&msg, &keypair);
+
+    let state = live_test_state(pool);
+    {
+        let mut account_server = state.account_server.lock().unwrap();
+        account_server.import_account(
+            zkcoins_program::hash::digest_from_bytes(&address),
+            Account::new(),
+        );
+    }
+
+    // Send the mixed-case form. The server normalises, hashes over
+    // the lowercase form, and the signature verifies.
+    let body = serde_json::json!({
+        "username": user_input,
+        "address": address_hex,
+        "public_key": public_key.to_string(),
+        "signature": hex::encode(sig.serialize()),
+        "timestamp": now,
+    });
+    let req = Request::post("/api/username/claim")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let (status, resp_body) = send_request_with_state(state, req).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "claim should succeed: {}",
+        resp_body
+    );
+    let resp: UsernameResponse = serde_json::from_str(&resp_body).expect("valid JSON");
+    // Response echoes the canonical lowercase name, NOT the raw input.
+    assert_eq!(resp.username, normalised);
+}
+
+/// Counterpart to the test above: a wallet that signs over the RAW
+/// mixed-case input (legacy/buggy behaviour) must be rejected by the
+/// server, because the server hashes the normalised form. Without
+/// this, the case-mismatch squat is reachable: attacker signs `"Bob"`,
+/// server persists `"bob"`, the legitimate `bob` owner is locked out.
+#[tokio::test]
+async fn claim_username_raw_case_signature_rejected() {
+    use bitcoin::secp256k1::{Keypair, SecretKey};
+
+    let secp = secp::Secp256k1::new();
+    let secret = SecretKey::from_slice(&[10u8; 32]).unwrap();
+    let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+    let address: [u8; 32] = Sha256::digest(public_key.serialize()).into();
+    let address_hex = hex::encode(address);
+
+    let user_input = "Bob";
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Sign over the RAW form — the bug we are fixing.
+    let mut hasher = Sha256::new();
+    hasher.update(b"zkcoins:claim_username");
+    hasher.update(address_hex.as_bytes());
+    hasher.update(user_input.as_bytes());
+    hasher.update(now.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    let msg = Message::from_digest(hash);
+    let keypair = Keypair::from_secret_key(&secp, &secret);
+    let sig = secp.sign_schnorr(&msg, &keypair);
+
+    let state = test_state();
+    {
+        let mut account_server = state.account_server.lock().unwrap();
+        account_server.import_account(
+            zkcoins_program::hash::digest_from_bytes(&address),
+            Account::new(),
+        );
+    }
+
+    let body = serde_json::json!({
+        "username": user_input,
+        "address": address_hex,
+        "public_key": public_key.to_string(),
+        "signature": hex::encode(sig.serialize()),
+        "timestamp": now,
+    });
+    let req = Request::post("/api/username/claim")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let (status, _resp_body) = send_request_with_state(state, req).await;
+
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "raw-case signature must fail; server hashes normalised form"
+    );
+}
+
+/// In-memory `precheck` collision must surface as `409 CONFLICT` with
+/// the verbatim collision string the wallet shows the user. Drives the
+/// claim handler's precheck `Err` branch without any DB round-trip:
+/// the in-memory mirror is pre-seeded via `insert_for_test`, the
+/// signature is valid, and the handler short-circuits before the
+/// `db::claim_username` call.
+#[tokio::test]
+async fn claim_username_precheck_conflict_returns_409() {
+    use bitcoin::secp256k1::{Keypair, SecretKey};
+
+    let secp = secp::Secp256k1::new();
+    let secret = SecretKey::from_slice(&[11u8; 32]).unwrap();
+    let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+    let address: [u8; 32] = Sha256::digest(public_key.serialize()).into();
+    let address_hex = hex::encode(address);
+
+    let username = "claimed";
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"zkcoins:claim_username");
+    hasher.update(address_hex.as_bytes());
+    hasher.update(username.as_bytes());
+    hasher.update(now.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    let msg = Message::from_digest(hash);
+    let keypair = Keypair::from_secret_key(&secp, &secret);
+    let sig = secp.sign_schnorr(&msg, &keypair);
+
+    let state = test_state();
+    {
+        let mut account_server = state.account_server.lock().unwrap();
+        account_server.import_account(
+            zkcoins_program::hash::digest_from_bytes(&address),
+            Account::new(),
+        );
+    }
+    // Pre-seed the name → arbitrary OTHER address so the precheck's
+    // `usernames.contains_key(normalized)` branch fires (rather than
+    // the address-already-has-a-username branch).
+    {
+        let mut store = state.username_store.lock().unwrap();
+        store.insert_for_test(
+            username,
+            zkcoins_program::hash::digest_from_bytes(&[99u8; 32]),
+        );
+    }
+
+    let body = serde_json::json!({
+        "username": username,
+        "address": address_hex,
+        "public_key": public_key.to_string(),
+        "signature": hex::encode(sig.serialize()),
+        "timestamp": now,
+    });
+    let req = Request::post("/api/username/claim")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let (status, resp_body) = send_request_with_state(state, req).await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "body: {}", resp_body);
+    let resp: LnurlErrorResponse = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(resp.status, "ERROR");
+    assert!(
+        resp.reason.contains("Username already taken"),
+        "unexpected reason: {}",
+        resp.reason
+    );
+}
+
 #[tokio::test]
 async fn claim_username_wrong_pubkey() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -963,7 +1182,6 @@ async fn claim_username_wrong_pubkey() {
     );
 }
 
-#[cfg(feature = "usernames")]
 #[tokio::test]
 async fn claim_username_expired_timestamp() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -1013,6 +1231,324 @@ async fn claim_username_expired_timestamp() {
         StatusCode::UNAUTHORIZED,
         "Claim with expired timestamp must be rejected"
     );
+}
+
+/// `UsernameStore::validate` rejects names outside `[a-z0-9._-]{1,64}`.
+/// Drives the handler's first early-return arm (the `validate` `Err`
+/// branch), so no DB round-trip and no signature work is needed.
+#[tokio::test]
+async fn claim_username_invalid_format_returns_422() {
+    let body = serde_json::json!({
+        "username": "alice@evil",
+        "address": hex::encode([0u8; 32]),
+        "public_key": bitcoin::secp256k1::PublicKey::from_secret_key(
+            &secp::Secp256k1::new(),
+            &bitcoin::secp256k1::SecretKey::from_slice(&[1u8; 32]).unwrap(),
+        )
+        .to_string(),
+        "signature": hex::encode([0u8; 64]),
+        "timestamp": 0u64,
+    });
+
+    let req = Request::post("/api/username/claim")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let (status, resp_body) = send_request(req).await;
+
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {resp_body}"
+    );
+    let resp: LnurlErrorResponse = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(resp.status, "ERROR");
+    assert_eq!(resp.reason, "Username may only contain a-z, 0-9, -, _, .");
+}
+
+/// Non-hex address payload triggers the `hex::decode` early-return arm.
+#[tokio::test]
+async fn claim_username_invalid_address_hex_returns_422() {
+    let body = serde_json::json!({
+        "username": "alice",
+        "address": "z".repeat(64),
+        "public_key": bitcoin::secp256k1::PublicKey::from_secret_key(
+            &secp::Secp256k1::new(),
+            &bitcoin::secp256k1::SecretKey::from_slice(&[1u8; 32]).unwrap(),
+        )
+        .to_string(),
+        "signature": hex::encode([0u8; 64]),
+        "timestamp": 0u64,
+    });
+
+    let req = Request::post("/api/username/claim")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let (status, resp_body) = send_request(req).await;
+
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {resp_body}"
+    );
+    let resp: LnurlErrorResponse = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(resp.status, "ERROR");
+    assert_eq!(resp.reason, "Invalid address hex");
+}
+
+/// Valid hex address but not 32 bytes triggers the length-check arm.
+#[tokio::test]
+async fn claim_username_wrong_address_length_returns_422() {
+    let body = serde_json::json!({
+        "username": "alice",
+        "address": hex::encode([0u8; 30]),
+        "public_key": bitcoin::secp256k1::PublicKey::from_secret_key(
+            &secp::Secp256k1::new(),
+            &bitcoin::secp256k1::SecretKey::from_slice(&[1u8; 32]).unwrap(),
+        )
+        .to_string(),
+        "signature": hex::encode([0u8; 64]),
+        "timestamp": 0u64,
+    });
+
+    let req = Request::post("/api/username/claim")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let (status, resp_body) = send_request(req).await;
+
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {resp_body}"
+    );
+    let resp: LnurlErrorResponse = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(resp.status, "ERROR");
+    assert_eq!(resp.reason, "Address must be 32 bytes");
+}
+
+/// Address matches `sha256(pubkey)` and the timestamp is fresh, so the
+/// handler reaches the signature-hex decode step before bailing on the
+/// non-hex `signature` field.
+#[tokio::test]
+async fn claim_username_invalid_signature_hex_returns_422() {
+    use bitcoin::secp256k1::SecretKey;
+
+    let secp = secp::Secp256k1::new();
+    let secret = SecretKey::from_slice(&[12u8; 32]).unwrap();
+    let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+    let address: [u8; 32] = Sha256::digest(public_key.serialize()).into();
+    let address_hex = hex::encode(address);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let body = serde_json::json!({
+        "username": "sighex",
+        "address": address_hex,
+        "public_key": public_key.to_string(),
+        "signature": "zz",
+        "timestamp": now,
+    });
+
+    let req = Request::post("/api/username/claim")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let (status, resp_body) = send_request(req).await;
+
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {resp_body}"
+    );
+    let resp: LnurlErrorResponse = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(resp.status, "ERROR");
+    assert_eq!(resp.reason, "Invalid signature hex");
+}
+
+/// Signature is valid hex but the wrong length for a BIP-340 Schnorr
+/// signature (64 bytes), so `SchnorrSignature::from_slice` rejects it.
+#[tokio::test]
+async fn claim_username_invalid_signature_format_returns_422() {
+    use bitcoin::secp256k1::SecretKey;
+
+    let secp = secp::Secp256k1::new();
+    let secret = SecretKey::from_slice(&[13u8; 32]).unwrap();
+    let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+    let address: [u8; 32] = Sha256::digest(public_key.serialize()).into();
+    let address_hex = hex::encode(address);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // 63 bytes of zeros — valid hex, wrong Schnorr length.
+    let body = serde_json::json!({
+        "username": "sigfmt",
+        "address": address_hex,
+        "public_key": public_key.to_string(),
+        "signature": hex::encode([0u8; 63]),
+        "timestamp": now,
+    });
+
+    let req = Request::post("/api/username/claim")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let (status, resp_body) = send_request(req).await;
+
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {resp_body}"
+    );
+    let resp: LnurlErrorResponse = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(resp.status, "ERROR");
+    assert_eq!(resp.reason, "Invalid signature format");
+}
+
+/// Pool with no reachable server: `db::claim_username` returns an error
+/// after the in-memory `precheck` passes. The handler must map that
+/// onto a 503. Mirrors `claim_propagates_db_error_when_pool_is_dead`
+/// from `username_tests.rs`, but exercises the handler's error arm.
+#[tokio::test]
+async fn claim_username_db_error_returns_503() {
+    use bitcoin::secp256k1::{Keypair, SecretKey};
+
+    let secp = secp::Secp256k1::new();
+    let secret = SecretKey::from_slice(&[14u8; 32]).unwrap();
+    let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+    let address: [u8; 32] = Sha256::digest(public_key.serialize()).into();
+    let address_hex = hex::encode(address);
+
+    let username = "dberr";
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"zkcoins:claim_username");
+    hasher.update(address_hex.as_bytes());
+    hasher.update(username.as_bytes());
+    hasher.update(now.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    let msg = Message::from_digest(hash);
+    let keypair = Keypair::from_secret_key(&secp, &secret);
+    let sig = secp.sign_schnorr(&msg, &keypair);
+
+    // `test_state()` already plugs in `dead_pool` — a lazy PgPool
+    // pointing at 127.0.0.1:1 that fails fast with a connect error.
+    let body = serde_json::json!({
+        "username": username,
+        "address": address_hex,
+        "public_key": public_key.to_string(),
+        "signature": hex::encode(sig.serialize()),
+        "timestamp": now,
+    });
+
+    let req = Request::post("/api/username/claim")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let (status, resp_body) = send_request(req).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {resp_body}");
+    let resp: LnurlErrorResponse = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(resp.status, "ERROR");
+    assert_eq!(resp.reason, "Failed to persist username claim");
+}
+
+/// Concurrent-claim SQL race: plant the row directly via SQL so the
+/// in-memory `precheck` mirror stays empty (passes) but the
+/// `INSERT ... ON CONFLICT DO NOTHING` reports `rows_affected == 0`.
+/// The handler must map that onto a 409 with the SQL-race reason
+/// string. Mirrors `claim_falls_back_to_validation_when_sql_layer_catches_race`
+/// from `username_tests.rs`, but exercises the handler's `!inserted`
+/// arm rather than the `UsernameStore::claim` wrapper.
+#[tokio::test]
+async fn claim_username_sql_race_returns_409() {
+    use bitcoin::secp256k1::{Keypair, SecretKey};
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container
+        .get_host()
+        .await
+        .expect("failed to get container host");
+    let port = pg_container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("failed to get container port");
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
+    // Plant the username row bound to a different address, without
+    // touching the in-memory mirror — so `precheck` passes and
+    // `db::claim_username` returns `Ok(false)`.
+    sqlx::query("INSERT INTO usernames (name, address) VALUES ($1, $2)")
+        .bind("racename")
+        .bind(vec![0xAAu8; 32])
+        .execute(pool.as_ref())
+        .await
+        .expect("failed to plant username row");
+
+    let secp = secp::Secp256k1::new();
+    let secret = SecretKey::from_slice(&[15u8; 32]).unwrap();
+    let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+    let address: [u8; 32] = Sha256::digest(public_key.serialize()).into();
+    let address_hex = hex::encode(address);
+
+    let username = "racename";
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"zkcoins:claim_username");
+    hasher.update(address_hex.as_bytes());
+    hasher.update(username.as_bytes());
+    hasher.update(now.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    let msg = Message::from_digest(hash);
+    let keypair = Keypair::from_secret_key(&secp, &secret);
+    let sig = secp.sign_schnorr(&msg, &keypair);
+
+    let state = live_test_state(pool);
+
+    let body = serde_json::json!({
+        "username": username,
+        "address": address_hex,
+        "public_key": public_key.to_string(),
+        "signature": hex::encode(sig.serialize()),
+        "timestamp": now,
+    });
+
+    let req = Request::post("/api/username/claim")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let (status, resp_body) = send_request_with_state(state, req).await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "body: {resp_body}");
+    let resp: LnurlErrorResponse = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(resp.status, "ERROR");
+    assert_eq!(resp.reason, "Username already taken");
 }
 
 #[test]
