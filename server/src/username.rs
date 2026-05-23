@@ -61,20 +61,17 @@ impl UsernameStore {
     /// while a claim is mid-flight (the bug the previous `mem::take`
     /// approach surfaced).
     ///
-    /// Returns the normalised name on success so the caller does not
-    /// have to re-`validate`.
-    pub(crate) fn precheck(
-        &self,
-        normalized: &str,
-        address: &Address,
-    ) -> Result<(), ClaimUsernameError> {
+    /// Returns a 4xx-shaped validation message on collision. The
+    /// dedicated `&'static str` return — rather than the broader
+    /// `ClaimUsernameError` — keeps the handler's error mapping a flat
+    /// `Result<(), &'static str>` with no unreachable `Db` arm; that
+    /// would otherwise read as dead code under the 100 % coverage gate.
+    pub(crate) fn precheck(&self, normalized: &str, address: &Address) -> Result<(), &'static str> {
         if self.usernames.contains_key(normalized) {
-            return Err(ClaimUsernameError::Validation("Username already taken"));
+            return Err("Username already taken");
         }
         if self.usernames.values().any(|a| a == address) {
-            return Err(ClaimUsernameError::Validation(
-                "Address already has a username",
-            ));
+            return Err("Address already has a username");
         }
         Ok(())
     }
@@ -112,7 +109,8 @@ impl UsernameStore {
         address: Address,
     ) -> Result<(), ClaimUsernameError> {
         let normalized = Self::validate(username).map_err(ClaimUsernameError::Validation)?;
-        self.precheck(&normalized, &address)?;
+        self.precheck(&normalized, &address)
+            .map_err(ClaimUsernameError::Validation)?;
 
         let addr_bytes = digest_to_bytes(&address);
         let inserted = db::claim_username(pool, &normalized, &addr_bytes).await?;
@@ -144,8 +142,8 @@ impl UsernameStore {
     /// The full table is read into memory at boot so subsequent
     /// `resolve` / `get_username` calls — the hot read path — answer
     /// locally. The table is small (one row per registered user) and
-    /// only grows through the feature-gated claim endpoint, so the
-    /// memory footprint is bounded.
+    /// only grows through the `claim_username` endpoint, so the memory
+    /// footprint is bounded.
     pub async fn load_from_pg(pool: &PgPool) -> Result<Self, LoadUsernameStoreError> {
         let rows = db::load_all_usernames(pool).await?;
         let mut usernames: HashMap<String, Address> = HashMap::with_capacity(rows.len());

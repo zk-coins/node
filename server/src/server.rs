@@ -1294,29 +1294,17 @@ async fn claim_username_handler(
     // before; the second writer hits `rows_affected == 0` and the
     // handler maps that to a 409. The post-commit insert is idempotent
     // — re-inserting the same `(normalized, address)` is a no-op.
-    if let Err(e) = lock_or_recover(&state.username_store).precheck(&normalized_username, &address)
+    if let Err(reason) =
+        lock_or_recover(&state.username_store).precheck(&normalized_username, &address)
     {
-        let (status, reason): (StatusCode, String) = match e {
-            crate::username::ClaimUsernameError::Validation(s) => {
-                (StatusCode::CONFLICT, s.to_string())
-            }
-            // `precheck` is sync and never produces a `Db` variant,
-            // but the match is exhaustive against the shared error
-            // enum so the compiler keeps us honest if a new variant
-            // gets added.
-            crate::username::ClaimUsernameError::Db(db_err) => {
-                eprintln!("precheck returned unexpected Db error: {}", db_err);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "precheck failed".to_string(),
-                )
-            }
-        };
+        // `precheck` returns the static collision strings the wallet
+        // surfaces verbatim. The status is `409 CONFLICT` for either
+        // collision variant — same shape as the SQL-layer race below.
         return (
-            status,
+            StatusCode::CONFLICT,
             Json(LnurlErrorResponse {
                 status: "ERROR".into(),
-                reason,
+                reason: reason.into(),
             }),
         )
             .into_response();
