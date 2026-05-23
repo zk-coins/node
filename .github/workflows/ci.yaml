@@ -17,10 +17,12 @@ on:
   # `synchronize` event runs CI on the new HEAD, and because the
   # Release PR carries the `ci:full` label the heavy gate runs too.
   # Adding `on: push: branches: [develop]` would queue a second
-  # workflow instance on the same SHA, which the concurrency-group
-  # below cancels immediately — producing permanent "(push) cancelled"
-  # checks that look like failures in the PR UI without protecting
-  # anything.
+  # workflow instance on the same SHA, doubling self-hosted-runner
+  # load on a check the Release PR's `synchronize` already provides.
+  # (Under the PR-number grouping in the concurrency block below the
+  # two runs would land in DIFFERENT groups — push keyed by
+  # `refs/heads/develop`, PR keyed by the Release PR's number — so
+  # the block would not deduplicate them.)
   #
   # `ready_for_review` is added so the workflow fires the moment a
   # draft PR is marked ready — drafts themselves skip CI via the
@@ -34,20 +36,30 @@ on:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
 concurrency:
-  # Group by SHA so a new push cancels the in-flight run for the
-  # outdated commit. Label events (`labeled` / `unlabeled`) get their
-  # own isolated group keyed by run-id, so toggling a label on a PR
-  # does NOT cancel an in-flight 60-90-min Heavy run on the same SHA
-  # — most label toggles are unrelated (`bug`, `priority/*`, …) and
-  # killing the Heavy run for them would be a footgun. Trade-off:
-  # removing `ci:full` mid-run does NOT auto-stop a Heavy run that
-  # is already executing; cancel it manually with `gh run cancel`
-  # if you really need to free the runner.
+  # Group by PR number so a new push to the same PR cancels the
+  # in-flight Heavy run on the outdated commit. M3 Ultra self-hosted
+  # runner capacity is scarce — letting an obsolete 60-90-min run
+  # finish wastes a runner slot the new commit needs. Grouping by
+  # SHA (the previous approach) put every commit in its own group,
+  # so `cancel-in-progress: true` never fired and back-to-back pushes
+  # queued sequentially.
+  # Falls back to `github.ref` for push/dispatch events (where there
+  # is no `pull_request.number`), so e.g. a `workflow_dispatch` on
+  # the same ref serializes too.
+  #
+  # Label events (`labeled` / `unlabeled`) get their own isolated
+  # group keyed by `run_id`, so toggling a label on a PR does NOT
+  # cancel an in-flight 60-90-min Heavy run on the same PR — most
+  # label toggles are unrelated (`bug`, `priority/*`, …) and killing
+  # the Heavy run for them would be a footgun. Trade-off: removing
+  # `ci:full` mid-run does NOT auto-stop a Heavy run that is already
+  # executing; cancel it manually with `gh run cancel` if you really
+  # need to free the runner.
   group: >-
     ${{
       (github.event.action == 'labeled' || github.event.action == 'unlabeled')
-        && format('ci-label-{0}', github.run_id)
-        || format('ci-{0}', github.event.pull_request.head.sha || github.sha)
+        && format('ci-{0}-label-{1}', github.workflow, github.run_id)
+        || format('ci-{0}-{1}', github.workflow, github.event.pull_request.number || github.ref)
     }}
   cancel-in-progress: true
 
