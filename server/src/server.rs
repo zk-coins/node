@@ -749,7 +749,7 @@ async fn mint_handler(
     let account_address = digest_from_bytes(&account_address_bytes);
 
     // Generate keys and get necessary info while holding the minting_account lock briefly
-    let (minting_pubkey, next_minting_pubkey, prev_commitment_pubkey, num_pubkeys_before_mint) = {
+    let (minting_pubkey, next_minting_pubkey, prev_commitment_pubkey) = {
         let minting_account_guard = lock_or_recover(&state.minting_account);
         let current_num_pubkeys = minting_account_guard.num_pubkeys;
         let prev_pk = if current_num_pubkeys > 0 {
@@ -761,7 +761,6 @@ async fn mint_handler(
             minting_account_guard.generate_public_key(current_num_pubkeys),
             minting_account_guard.generate_public_key(current_num_pubkeys + 1),
             prev_pk,
-            current_num_pubkeys,
         )
     };
 
@@ -797,20 +796,19 @@ async fn mint_handler(
             // Increment num_pubkeys *after* successful send and snapshot
             // the new counter value so the Postgres upsert can run after
             // the lock is released (sync mutex must not be held across
-            // `.await`).
-            let num_pubkeys_to_persist: Option<u32>;
+            // `.await`). The earlier `num_pubkeys_before_mint == current`
+            // race check has been removed: `mint_handler` is the only
+            // writer of `minting_account.num_pubkeys`, and a concurrent
+            // mint that interleaved between the lock drop at the top of
+            // the handler and the re-acquire here would fail inside
+            // `send_coins` (stale `prev_commitment_pubkey`) and never
+            // reach this Ok arm. Skipping the check keeps the bump
+            // total, so the post-mint persistence below is unconditional.
+            let num_pubkeys_to_persist: u32;
             {
                 let mut minting_account_guard = lock_or_recover(&state.minting_account);
-                // Ensure we only increment if the send was successful and based on the state *before* the send
-                if minting_account_guard.num_pubkeys == num_pubkeys_before_mint {
-                    minting_account_guard.num_pubkeys += 1;
-                    num_pubkeys_to_persist = Some(minting_account_guard.num_pubkeys);
-                } else {
-                    // This case might indicate a race condition or unexpected state change.
-                    // Handle appropriately, maybe log an error or return a specific response.
-                    eprintln!("WARNING: num_pubkeys changed unexpectedly during mint operation.");
-                    num_pubkeys_to_persist = None;
-                }
+                minting_account_guard.num_pubkeys += 1;
+                num_pubkeys_to_persist = minting_account_guard.num_pubkeys;
                 // The slice `[..N]` panics if `public_inputs.len() < N`, so
                 // the `try_into` Err branch is structurally dead.
                 // `program-plonky2/src/circuit/main.rs` guarantees
@@ -837,10 +835,10 @@ async fn mint_handler(
             // hiccup leaves the in-memory counter ahead of the
             // persistent row, which the next successful mint will
             // re-sync.
-            if let Some(n) = num_pubkeys_to_persist {
-                if let Err(e) = db::upsert_minting_num_pubkeys(&state.pool, n).await {
-                    eprintln!("Failed to upsert minting num_pubkeys to Postgres: {}", e);
-                }
+            if let Err(e) =
+                db::upsert_minting_num_pubkeys(&state.pool, num_pubkeys_to_persist).await
+            {
+                eprintln!("Failed to upsert minting num_pubkeys to Postgres: {}", e);
             }
 
             let commitment = coin_proofs[0]
