@@ -58,6 +58,12 @@ jobs:
           # Rust workspace so cache hits cross-deploy. `type=registry`
           # over `type=gha` because GHA cache caps at 10 GB with LRU
           # eviction; Docker Hub holds the tag indefinitely.
+          # Shared buildcache tag between DEV and PRD: cache hits cross-deploy
+          # because both build from the same Rust workspace. Caveat: DEV's
+          # `cancel-in-progress: true` (above) can interrupt a concurrent
+          # DEV deploy mid-push to the cache manifest. BuildKit's `cache-from`
+          # tolerates partial manifests (falls back to a from-scratch build
+          # with a warning) so the race is self-healing on the next deploy.
           cache-from: type=registry,ref=zkcoin/server:buildcache
           cache-to: type=registry,ref=zkcoin/server:buildcache,mode=max
 
@@ -156,6 +162,9 @@ jobs:
   # Separate job (not an inline step) so a job-level failure — timeout,
   # OOM, runner crash — still triggers the alert. Cheapest runner; the
   # curl never needs to touch the self-hosted M3 Ultra.
+  #
+  # Telegram alert on workflow failure. See ci.yaml > notify-failure
+  # for the firing-matrix rationale.
   notify-failure:
     name: Telegram alert on failure
     needs: [build-and-deploy, api-e2e]
@@ -167,9 +176,9 @@ jobs:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          TEXT="❌ <b>${{ github.workflow }}</b> failed%0A<b>Repo:</b> ${{ github.repository }}%0A<b>Branch:</b> ${{ github.ref_name }}%0A<b>Run:</b> ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TEXT=$'❌ <b>'"${{ github.workflow }}"$'</b> failed\n<b>Repo:</b> '"${{ github.repository }}"$'\n<b>Branch:</b> '"${{ github.ref_name }}"$'\n<b>Run:</b> '"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-               -d "chat_id=${TG_CHAT}" \
-               -d "text=${TEXT}" \
+               --data-urlencode "chat_id=${TG_CHAT}" \
+               --data-urlencode "text=${TEXT}" \
                -d "parse_mode=HTML" \
                -d "disable_web_page_preview=true"

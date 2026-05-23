@@ -99,7 +99,7 @@ jobs:
   # only test names matching are the three mint/send-commit/username
   # roundtrips (verified via grep against the suite).
   api-e2e:
-    name: API E2E against PRD (read-only subset)
+    name: API E2E against PRD (non-mutating subset)
     needs: build-and-deploy
     runs-on: [self-hosted, m3-ultra]
     timeout-minutes: 30
@@ -136,6 +136,9 @@ jobs:
   # Separate job (not an inline step) so a job-level failure — timeout,
   # OOM, runner crash — still triggers the alert. Cheapest runner; the
   # curl never needs to touch the self-hosted M3 Ultra.
+  #
+  # Telegram alert on workflow failure. See ci.yaml > notify-failure
+  # for the firing-matrix rationale.
   notify-failure:
     name: Telegram alert on failure
     needs: [build-and-deploy, api-e2e]
@@ -147,9 +150,9 @@ jobs:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          TEXT="❌ <b>${{ github.workflow }}</b> failed%0A<b>Repo:</b> ${{ github.repository }}%0A<b>Branch:</b> ${{ github.ref_name }}%0A<b>Run:</b> ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TEXT=$'❌ <b>'"${{ github.workflow }}"$'</b> failed\n<b>Repo:</b> '"${{ github.repository }}"$'\n<b>Branch:</b> '"${{ github.ref_name }}"$'\n<b>Run:</b> '"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-               -d "chat_id=${TG_CHAT}" \
-               -d "text=${TEXT}" \
+               --data-urlencode "chat_id=${TG_CHAT}" \
+               --data-urlencode "text=${TEXT}" \
                -d "parse_mode=HTML" \
                -d "disable_web_page_preview=true"
