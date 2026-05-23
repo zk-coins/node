@@ -44,6 +44,13 @@ jobs:
           push: true
           tags: ${{ env.DOCKER_TAGS }}
           platforms: linux/arm64
+          # Registry-backed buildx cache. Same `zkcoin/server:buildcache`
+          # tag is shared with Deploy DEV — DEV and PRD compile the same
+          # Rust workspace so cache hits cross-deploy. `type=registry`
+          # over `type=gha` because GHA cache caps at 10 GB with LRU
+          # eviction; Docker Hub holds the tag indefinitely.
+          cache-from: type=registry,ref=zkcoin/server:buildcache
+          cache-to: type=registry,ref=zkcoin/server:buildcache,mode=max
 
       - name: Install cloudflared
         run: |
@@ -84,3 +91,65 @@ jobs:
           done
           echo "::error::PRD /api/info never returned 200 within ~5 min after deploy"
           exit 1
+
+  # Functional verification of the deployed PRD server. Mirrors the
+  # Deploy DEV api-e2e job, but excludes the three roundtrip tests —
+  # they would consume real publisher UTXOs and write coins into the
+  # production SMT/MMR. `--skip _roundtrip_` is a substring match; the
+  # only test names matching are the three mint/send-commit/username
+  # roundtrips (verified via grep against the suite).
+  api-e2e:
+    name: API E2E against PRD (read-only subset)
+    needs: build-and-deploy
+    runs-on: [self-hosted, m3-ultra]
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+      ZKCOINS_API_URL: https://api.zkcoins.app
+      # The bootstrap `lazy_static`s panic if these are unset; the
+      # integration test only talks to the deployed server but the
+      # lib's panic-on-load behaviour is unconditional. Values are
+      # placeholders — nothing in the read-only test path reads them.
+      USERNAME_DOMAIN: zkcoins.app
+      ESPLORA_URL: http://127.0.0.1:1/api
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Ensure sccache + cargo-nextest are installed
+        run: |
+          command -v sccache >/dev/null || brew install sccache
+          command -v cargo-nextest >/dev/null || brew install cargo-nextest
+          sccache --start-server >/dev/null 2>&1 || true
+          sccache --show-stats
+
+      - name: Run API E2E suite against PRD (skip roundtrips)
+        run: cargo test -p server --release --all-features --test api_remote -- --test-threads=1 --nocapture --skip _roundtrip_
+
+      - name: sccache stats (post-build)
+        if: always()
+        run: sccache --show-stats
+
+  # Separate job (not an inline step) so a job-level failure — timeout,
+  # OOM, runner crash — still triggers the alert. Cheapest runner; the
+  # curl never needs to touch the self-hosted M3 Ultra.
+  notify-failure:
+    name: Telegram alert on failure
+    needs: [build-and-deploy, api-e2e]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Telegram alert
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          TEXT="❌ <b>${{ github.workflow }}</b> failed%0A<b>Repo:</b> ${{ github.repository }}%0A<b>Branch:</b> ${{ github.ref_name }}%0A<b>Run:</b> ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+               -d "chat_id=${TG_CHAT}" \
+               -d "text=${TEXT}" \
+               -d "parse_mode=HTML" \
+               -d "disable_web_page_preview=true"
