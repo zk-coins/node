@@ -7,3 +7,10 @@ target/
 
 # accidentally-tracked tmp file
 .tmp
+
+# Claude-specific tooling artifacts — keep project tool-agnostic.
+# Project conventions belong in CONTRIBUTING.md (a generic Markdown
+# standard readable by every team member and every AI tool), not in
+# CLAUDE.md or .claude/ directories.
+CLAUDE.md
+.claude/
