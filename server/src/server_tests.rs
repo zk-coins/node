@@ -40,7 +40,6 @@ fn test_state() -> AppState {
     account_server.import_account(*zkcoins_program::types::MINTING_ADDRESS, minting_account);
 
     // Create a dummy minting ClientAccount from a deterministic key
-    #[cfg(feature = "faucet")]
     let minting_client = {
         let secret = include_bytes!("../minting_secret.bin");
         let private_key = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Signet, secret)
@@ -51,7 +50,6 @@ fn test_state() -> AppState {
     AppState {
         account_server: Arc::new(Mutex::new(account_server)),
         proof_store: Arc::new(ProofStore::new("/tmp/zkcoins-test-proofs")),
-        #[cfg(feature = "faucet")]
         minting_account: Arc::new(Mutex::new(minting_client)),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
         pool: dead_pool(),
@@ -138,7 +136,8 @@ async fn info_returns_network_name_capabilities_and_username_domain() {
         info.capabilities.address_list,
         cfg!(feature = "address-list")
     );
-    assert_eq!(info.capabilities.faucet, cfg!(feature = "faucet"));
+    // Mint is permanent MVP — `faucet` is hardcoded `true`, not cfg-derived.
+    assert!(info.capabilities.faucet);
     assert_eq!(info.capabilities.usernames, cfg!(feature = "usernames"));
     assert_eq!(info.capabilities.lnurl, cfg!(feature = "lnurl"));
 
@@ -314,7 +313,6 @@ async fn send_no_content_type_returns_error() {
 
 // --- POST /api/mint with missing fields ---
 
-#[cfg(feature = "faucet")]
 #[tokio::test]
 async fn mint_missing_body_returns_error() {
     let req = Request::post("/api/mint")
@@ -1663,7 +1661,6 @@ async fn send_with_insufficient_funds_returns_422_with_error_string() {
     let mut empty_minting = Account::new();
     empty_minting.balance = 0;
     account_server.import_account(*zkcoins_program::types::MINTING_ADDRESS, empty_minting);
-    #[cfg(feature = "faucet")]
     let minting_client = {
         let secret = include_bytes!("../minting_secret.bin");
         let private_key = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Signet, secret)
@@ -1673,7 +1670,6 @@ async fn send_with_insufficient_funds_returns_422_with_error_string() {
     let state = AppState {
         account_server: Arc::new(Mutex::new(account_server)),
         proof_store: Arc::new(ProofStore::new("/tmp/zkcoins-test-proofs-empty")),
-        #[cfg(feature = "faucet")]
         minting_account: Arc::new(Mutex::new(minting_client)),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
         pool: dead_pool(),
@@ -2748,4 +2744,561 @@ async fn ready_returns_503_when_esplora_unreachable() {
         .map(|s| s.as_str().unwrap().to_string())
         .collect();
     assert_eq!(failures, vec!["esplora".to_string()]);
+}
+
+// =======================================================================
+// POST /api/mint — handler coverage
+// =======================================================================
+//
+// Before #480300b the mint endpoint was gated behind the `faucet` Cargo
+// feature, so `mint_handler` was excluded from the MVP-scope coverage
+// gate. After the gate removal (mint is now permanent MVP) every line
+// of the handler counts toward `--fail-under-lines 100 --fail-under-
+// functions 100`. The tests below cover each reachable arm:
+//
+// - request validation (422 invalid hex / 422 wrong length)
+// - bootstrap failure (500 missing minting account)
+// - `send_coins` failure mapping (422 via the slot-count guard, which
+//   fires before the prover so the test is cheap)
+// - the post-`send_coins` Ok arm: num_pubkeys increment, ProofData
+//   reconstruction, commitment build, `db::upsert_minting_num_pubkeys`,
+//   and the inscription broadcast.
+//
+// The happy-path tests run the real prover; one mint takes ~seconds on
+// the M3-Ultra runner but compiles cheaply, so they stay in the unit-
+// test suite rather than moving to `tests/`.
+
+/// Build an `AppState` configured for mint tests: minting account
+/// seeded with `1u64 << 48` (Goldilocks-safe — see `server_runtime
+/// ::start_rest_server`'s bootstrap comment), real prover wired
+/// through the default `AccountServer`, dead Postgres pool by default
+/// (callers swap it for a live pool via the second return value).
+fn mint_test_state() -> AppState {
+    let state_inner = Arc::new(Mutex::new(State::new()));
+    let mut account_server = AccountServer::new(Arc::clone(&state_inner));
+
+    // The Plonky2 state-transition circuit packs the running balance
+    // as `balance_hi * 2^32 + balance_lo`; keeping the seed below 2^48
+    // matches the production bootstrap in `start_rest_server`.
+    let mut minting_account = Account::new();
+    minting_account.balance = 1u64 << 48;
+    account_server.import_account(*zkcoins_program::types::MINTING_ADDRESS, minting_account);
+
+    // Mirror the production bootstrap: the wallet's address is forced
+    // to the canonical `MINTING_ADDRESS` constant, regardless of what
+    // `ClientAccount::new` would otherwise derive from the secret.
+    let minting_client = {
+        let secret = include_bytes!("../minting_secret.bin");
+        let private_key = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Signet, secret)
+            .expect("Failed to create test private key");
+        let mut c = shared::ClientAccount::new(private_key);
+        c.address = *zkcoins_program::types::MINTING_ADDRESS;
+        c
+    };
+
+    AppState {
+        account_server: Arc::new(Mutex::new(account_server)),
+        proof_store: Arc::new(ProofStore::new("/tmp/zkcoins-mint-test-proofs")),
+        minting_account: Arc::new(Mutex::new(minting_client)),
+        username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
+        pool: dead_pool(),
+        esplora_config: Arc::new(crate::publisher::EsploraConfig {
+            url: "http://127.0.0.1:1/api".to_string(),
+            is_mainnet: false,
+            network_name: "Mutinynet".to_string(),
+        }),
+    }
+}
+
+/// Variant of [`mint_test_state`] that DROPS the minting account so
+/// `get_minting_account_address` returns Err — drives the 500
+/// "Minting account not configured" arm in `mint_handler`.
+fn mint_test_state_without_minting_account() -> AppState {
+    let state = mint_test_state();
+    {
+        let mut server = state.account_server.lock().unwrap();
+        // Reset to a brand-new server with no accounts at all. The
+        // `Arc<Mutex<State>>` inside `server` is replaced too, but the
+        // shared `state_inner` is dropped on overwrite which is fine
+        // — nothing else holds it after `mint_test_state` returns.
+        *server = AccountServer::new(Arc::new(Mutex::new(State::new())));
+    }
+    state
+}
+
+#[tokio::test]
+async fn mint_invalid_hex_address_returns_422() {
+    let body = serde_json::json!({
+        "account_address": "not_hex",
+        "amount": 100u64,
+    });
+    let req = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, resp_body) = send_request_with_state(mint_test_state(), req).await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(v["success"], false);
+    assert_eq!(v["error"], "account_address is not valid hex");
+}
+
+#[tokio::test]
+async fn mint_wrong_address_length_returns_422() {
+    // 16 bytes of hex (32 chars) — well-formed hex but not 32 bytes,
+    // so the length check fires.
+    let body = serde_json::json!({
+        "account_address": "0x".to_string() + &"ab".repeat(16),
+        "amount": 100u64,
+    });
+    let req = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, resp_body) = send_request_with_state(mint_test_state(), req).await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(v["success"], false);
+    assert_eq!(
+        v["error"],
+        "account_address must be 32 bytes (64 hex chars)"
+    );
+}
+
+#[tokio::test]
+async fn mint_without_minting_account_returns_500() {
+    let body = serde_json::json!({
+        "account_address": "0x".to_string() + &hex::encode([1u8; 32]),
+        "amount": 100u64,
+    });
+    let req = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, resp_body) =
+        send_request_with_state(mint_test_state_without_minting_account(), req).await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(v["success"], false);
+    assert_eq!(v["error"], "Minting account not configured");
+}
+
+#[tokio::test]
+async fn mint_insufficient_funds_returns_422() {
+    // Replace the minting account's balance with zero so `send_coins`
+    // bails out on the balance check (Err arm of `mint_handler`'s
+    // outer match) before paying the prover cost. Maps to 422 via
+    // `send_coins_error_response`.
+    let state = mint_test_state();
+    {
+        let mut server = state.account_server.lock().unwrap();
+        // Re-import the minting account with balance=0. The previous
+        // import is overwritten by HashMap semantics inside
+        // `import_account`.
+        let mut empty = Account::new();
+        empty.balance = 0;
+        server.import_account(*zkcoins_program::types::MINTING_ADDRESS, empty);
+    }
+
+    let body = serde_json::json!({
+        "account_address": "0x".to_string() + &hex::encode([1u8; 32]),
+        "amount": 100u64,
+    });
+    let req = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, resp_body) = send_request_with_state(state, req).await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(v["success"], false);
+    assert_eq!(v["error"], "Insufficient funds");
+}
+
+/// Drives `mint_handler` through the full Ok arm of `send_coins`
+/// (real prover, commitment construction, `num_pubkeys` increment,
+/// `db::upsert_minting_num_pubkeys` log-and-continue against
+/// `dead_pool`) and stops at the inscription broadcast: the default
+/// `esplora_config` points at 127.0.0.1:1 so
+/// `create_and_broadcast_inscription` fails and the handler returns
+/// 503 "Failed to broadcast mint inscription on-chain". This covers
+/// everything up to and including the broadcast Err arm; the
+/// post-broadcast happy path is exercised by the wiremock test below.
+#[tokio::test]
+async fn mint_broadcast_failure_returns_503() {
+    let state = mint_test_state();
+
+    let recipient = "0x".to_string() + &hex::encode([7u8; 32]);
+    let body = serde_json::json!({
+        "account_address": recipient,
+        "amount": 1u64,
+    });
+    let req = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, resp_body) = send_request_with_state(state, req).await;
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "body: {}",
+        resp_body
+    );
+    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(v["success"], false);
+    assert_eq!(v["error"], "Failed to broadcast mint inscription on-chain");
+}
+
+/// Companion to `mint_broadcast_failure_returns_503` that drives the
+/// inscription broadcast through a wiremock Esplora that ACCEPTS the
+/// commit + reveal POSTs, so `mint_handler` falls through into the
+/// post-broadcast section: `receive_coin` loop, account-snapshot
+/// builder, per-account `db::upsert_account` log-and-continue loop,
+/// and the `coin_proofs.pop().expect(...)` value-extraction returning
+/// 200 with a usable `proof_id`.
+///
+/// Uses a live Postgres testcontainer so the `upsert_minting_num_pubkeys`
+/// + `upsert_account` calls hit the Ok arm of the persistence helpers
+/// (rather than the dead-pool Err arm, which the broadcast-failure test
+/// above covers). Together the two tests pin every line of the
+/// mint_handler Ok branch.
+#[tokio::test]
+async fn mint_happy_path_broadcasts_and_returns_proof_id() {
+    use bitcoin::Network;
+    use bitcoin::{
+        key::Secp256k1,
+        secp256k1::{Keypair, SecretKey},
+        XOnlyPublicKey,
+    };
+    use std::str::FromStr;
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // 1. Spin up a real Postgres so the upsert helpers run their Ok
+    //    arms (the dead-pool test above already covers the Err arms).
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container.get_host().await.unwrap();
+    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
+    // 2. Spin up wiremock and answer the publisher's UTXO + broadcast
+    //    requests. The publisher key in unit tests is the default
+    //    `DEFAULT_PUBLISHER_KEY` from lib.rs (PUBLISHER_KEY env var
+    //    unset in CI) — derive the matching Taproot address so the
+    //    `/address/<addr>/utxo` mock matches.
+    let mock_server = MockServer::start().await;
+    let secp = Secp256k1::new();
+    let sk =
+        SecretKey::from_str("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
+            .expect("default publisher key parses");
+    let key_pair = Keypair::from_secret_key(&secp, &sk);
+    let (xonly, _) = XOnlyPublicKey::from_keypair(&key_pair);
+    let publisher_address = bitcoin::Address::p2tr(&secp, xonly, None, Network::Signet);
+
+    // 100_000 sats covers the commit + reveal fees (mirrors the
+    // publisher_tests::create_and_broadcast_inscription_succeeds_end_to_end
+    // setup).
+    Mock::given(method("GET"))
+        .and(path(format!("/address/{}/utxo", publisher_address)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {
+                "txid": "3333333333333333333333333333333333333333333333333333333333333333",
+                "vout": 0,
+                "value": 100_000,
+                "status": {
+                    "confirmed": true,
+                    "block_height": 100,
+                    "block_hash": "0000000000000000000000000000000000000000000000000000000000000001",
+                    "block_time": 1_700_000_000
+                }
+            }
+        ])))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/tx"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&mock_server)
+        .await;
+
+    // 3. Wire the AppState to the live pool + wiremock URL.
+    let mut state = mint_test_state();
+    state.pool = Arc::clone(&pool);
+    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
+        url: mock_server.uri(),
+        is_mainnet: false,
+        network_name: "Mutinynet".to_string(),
+    });
+
+    let recipient_bytes = [9u8; 32];
+    let recipient_hex = "0x".to_string() + &hex::encode(recipient_bytes);
+    let body = serde_json::json!({
+        "account_address": recipient_hex,
+        "amount": 1u64,
+    });
+    let req = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, resp_body) = send_request_with_state(state, req).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {}", resp_body);
+    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(v["success"], true);
+    assert!(
+        v["proof_id"].as_u64().is_some(),
+        "proof_id missing from response: {}",
+        resp_body
+    );
+    // Per the mint_handler contract, the mint response intentionally
+    // omits `account_state_hash` and `output_coins_root` (those are
+    // returned by /api/send instead).
+    assert!(v["account_state_hash"].is_null());
+    assert!(v["output_coins_root"].is_null());
+
+    // 4. Verify the persistence side-effects of the Ok arm: the
+    //    accounts row for the MINTING address was upserted, and the
+    //    minting_meta.num_pubkeys counter was bumped from 0 to 1.
+    let minting_addr_bytes =
+        zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS);
+    let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT data FROM accounts WHERE address = $1")
+        .bind(&minting_addr_bytes[..])
+        .fetch_optional(&*pool)
+        .await
+        .expect("select minting accounts row");
+    let (data,) = row.expect("upsert wrote the minting account row");
+    assert!(!data.is_empty(), "minting account blob must be non-empty");
+
+    let minting_num: Option<u32> = crate::db::load_minting_num_pubkeys(&pool)
+        .await
+        .expect("load_minting_num_pubkeys ok");
+    assert_eq!(
+        minting_num,
+        Some(1),
+        "num_pubkeys must be bumped to 1 after a successful mint"
+    );
+}
+
+/// Covers the `current_num_pubkeys > 0` arm of the
+/// `prev_commitment_pubkey` derivation at the top of `mint_handler`.
+/// The default mint state has `num_pubkeys = 0`, so the
+/// `mint_broadcast_failure_returns_503` / happy-path tests above hit
+/// the `None` arm of that `if`. Pre-bumping `num_pubkeys` to `1` here
+/// drives the `Some(prev_pk)` arm — `account.proof` is still `None`
+/// (no prior mint has actually run on this AppState), so the
+/// downstream `send_coins` stays on the initial-prove path and the
+/// handler reaches the broadcast call. The broadcast then fails
+/// against the default unreachable Esplora URL and the handler
+/// returns 503, but the key-generation arm we wanted is already
+/// covered by that point.
+#[tokio::test]
+async fn mint_with_nonzero_num_pubkeys_covers_prev_pubkey_arm() {
+    let state = mint_test_state();
+    {
+        let mut mc = state.minting_account.lock().unwrap();
+        mc.num_pubkeys = 1;
+    }
+
+    let recipient = "0x".to_string() + &hex::encode([5u8; 32]);
+    let body = serde_json::json!({
+        "account_address": recipient,
+        "amount": 1u64,
+    });
+    let req = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, resp_body) = send_request_with_state(state, req).await;
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "body: {}",
+        resp_body
+    );
+}
+
+/// Spin up the wiremock Esplora + matching publisher Taproot UTXO mock
+/// used by the mint happy-path test. Returned `MockServer` is kept
+/// alive by the caller; dropping it tears down the HTTP listener.
+async fn mint_broadcast_mock_server() -> wiremock::MockServer {
+    use bitcoin::Network;
+    use bitcoin::{
+        key::Secp256k1,
+        secp256k1::{Keypair, SecretKey},
+        XOnlyPublicKey,
+    };
+    use std::str::FromStr;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let secp = Secp256k1::new();
+    let sk =
+        SecretKey::from_str("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
+            .expect("default publisher key parses");
+    let key_pair = Keypair::from_secret_key(&secp, &sk);
+    let (xonly, _) = XOnlyPublicKey::from_keypair(&key_pair);
+    let publisher_address = bitcoin::Address::p2tr(&secp, xonly, None, Network::Signet);
+
+    Mock::given(method("GET"))
+        .and(path(format!("/address/{}/utxo", publisher_address)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {
+                "txid": "3333333333333333333333333333333333333333333333333333333333333333",
+                "vout": 0,
+                "value": 100_000,
+                "status": {
+                    "confirmed": true,
+                    "block_height": 100,
+                    "block_hash": "0000000000000000000000000000000000000000000000000000000000000001",
+                    "block_time": 1_700_000_000
+                }
+            }
+        ])))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/tx"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&mock_server)
+        .await;
+
+    mock_server
+}
+
+/// Drives the Err arm of the post-broadcast `db::upsert_account` loop
+/// at the tail of `mint_handler`. The broadcast goes through (wiremock
+/// answers the UTXO + tx POSTs), so the handler walks past the early
+/// 503 branch into the lock-free upsert loop. The pool is the lazy
+/// `dead_pool` that connect-errors on first use, so both
+/// `upsert_minting_num_pubkeys` and the per-account `upsert_account`
+/// calls take their Err arms and log + continue. The handler still
+/// returns 200 OK with a `proof_id` because the upsert is best-effort.
+#[tokio::test]
+async fn mint_upsert_account_failure_logs_and_returns_ok() {
+    let mock_server = mint_broadcast_mock_server().await;
+
+    let mut state = mint_test_state();
+    // dead_pool stays in place from mint_test_state; only swap the
+    // Esplora URL so the broadcast succeeds.
+    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
+        url: mock_server.uri(),
+        is_mainnet: false,
+        network_name: "Mutinynet".to_string(),
+    });
+
+    let recipient = "0x".to_string() + &hex::encode([4u8; 32]);
+    let body = serde_json::json!({
+        "account_address": recipient,
+        "amount": 1u64,
+    });
+    let req = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, resp_body) = send_request_with_state(state, req).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {}", resp_body);
+    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(v["success"], true);
+    assert!(
+        v["proof_id"].as_u64().is_some(),
+        "proof_id missing from response: {}",
+        resp_body
+    );
+}
+
+/// Drives the Err arm of the `account_server.receive_coin` call in the
+/// post-broadcast loop of `mint_handler`. Pre-populates the recipient
+/// account's `coin_history` SMT with the identifier that `send_coins`
+/// is about to mint, so `receive_coin` returns
+/// `Err("Coin already spent (replay)")` and the handler logs the error
+/// + continues. Identifier prediction mirrors `Account::create_coins`
+/// off-circuit (canonical AccountState layout + Poseidon hash + index 0).
+/// The handler still returns 200 OK because the receive failure is
+/// best-effort, matching the project-wide log-and-continue policy for
+/// post-broadcast persistence steps.
+#[tokio::test]
+async fn mint_receive_coin_failure_logs_and_returns_ok() {
+    let mock_server = mint_broadcast_mock_server().await;
+
+    let recipient_bytes = [6u8; 32];
+    let recipient = zkcoins_program::hash::digest_from_bytes(&recipient_bytes);
+
+    let mut state = mint_test_state();
+    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
+        url: mock_server.uri(),
+        is_mainnet: false,
+        network_name: "Mutinynet".to_string(),
+    });
+
+    // Predict the coin identifier that `send_coins` will assign to the
+    // freshly-minted output coin. `Account::create_coins` builds
+    // `next_account_state` with `owner = MINTING_ADDRESS`,
+    // `balance = minting_balance - amount`, and
+    // `public_key = current minting pubkey`, then hashes it and feeds
+    // the digest into `calculate_coin_identifier(_, 0)`.
+    let amount: u64 = 1;
+    let minting_balance: u64 = 1u64 << 48;
+    let minting_pubkey_bytes = {
+        let mc = state.minting_account.lock().unwrap();
+        mc.generate_public_key(0).serialize()
+    };
+    let next_account_state = zkcoins_program::types::AccountState {
+        owner: *zkcoins_program::types::MINTING_ADDRESS,
+        balance: minting_balance - amount,
+        public_key: minting_pubkey_bytes,
+    };
+    let predicted_coin_id =
+        zkcoins_program::types::calculate_coin_identifier(next_account_state.hash(), 0);
+    let predicted_coin_id_bytes = zkcoins_program::hash::digest_to_bytes(&predicted_coin_id);
+
+    // Pre-insert the predicted identifier into the recipient's
+    // coin_history SMT so `receive_coin` sees the coin as already spent.
+    let mut recipient_account = Account::new();
+    recipient_account
+        .coin_history
+        .insert(predicted_coin_id_bytes, predicted_coin_id)
+        .expect("insert into fresh SMT must succeed");
+    {
+        let mut server = state.account_server.lock().unwrap();
+        server.import_account(recipient, recipient_account);
+    }
+
+    let recipient_hex = "0x".to_string() + &hex::encode(recipient_bytes);
+    let body = serde_json::json!({
+        "account_address": recipient_hex,
+        "amount": amount,
+    });
+    let req = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, resp_body) = send_request_with_state(state, req).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {}", resp_body);
+    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(v["success"], true);
+    assert!(
+        v["proof_id"].as_u64().is_some(),
+        "proof_id missing from response: {}",
+        resp_body
+    );
 }

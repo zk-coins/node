@@ -10,7 +10,6 @@ use bitcoin::secp256k1::{self as secp, schnorr::Signature as SchnorrSignature, M
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shared::commitment::Commitment;
-#[cfg(feature = "faucet")]
 use shared::ClientAccount;
 use shared::{Invoice, ProofData};
 use sqlx::PgPool;
@@ -23,7 +22,6 @@ use zkcoins_prover::Proof;
 
 use crate::account_server::{AccountServer, CoinProof};
 use crate::db;
-#[cfg(feature = "faucet")]
 use crate::publisher::create_and_broadcast_inscription;
 use crate::publisher::EsploraConfig;
 use crate::username::UsernameStore;
@@ -78,20 +76,21 @@ pub(crate) fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(crate) struct AppState {
     pub(crate) account_server: Arc<Mutex<AccountServer>>,
     pub(crate) proof_store: Arc<ProofStore>,
-    #[cfg(feature = "faucet")]
     pub(crate) minting_account: Arc<Mutex<ClientAccount>>,
     pub(crate) username_store: Arc<Mutex<UsernameStore>>,
     /// Postgres pool for per-account upserts (accounts table) and the
-    /// faucet's `minting_meta.num_pubkeys` counter. Cloned cheaply via
-    /// `Arc`; the underlying connections are pooled.
+    /// minting account's `minting_meta.num_pubkeys` counter. Cloned
+    /// cheaply via `Arc`; the underlying connections are pooled.
     pub(crate) pool: Arc<PgPool>,
     /// Esplora endpoint configuration consumed by the `/health/ready`
-    /// readiness probe (and only there — production handlers read
-    /// `NETWORK_CONFIG` directly via lazy_static). Injecting the config
-    /// through `AppState` lets the probe tests redirect Esplora calls
-    /// at a `wiremock::MockServer` without having to mutate the
-    /// process-wide `NETWORK_CONFIG`. In production
-    /// `start_rest_server` clones `NETWORK_CONFIG` into this slot.
+    /// readiness probe and by the mint-flow inscription broadcast in
+    /// `mint_handler`. Injecting the config through `AppState` lets
+    /// tests redirect Esplora calls at a `wiremock::MockServer`
+    /// without having to mutate the process-wide `NETWORK_CONFIG`
+    /// lazy_static (which is frozen on first access and shared across
+    /// every test in the binary). In production `start_rest_server`
+    /// clones `NETWORK_CONFIG` into this slot so the runtime
+    /// behaviour is unchanged.
     pub(crate) esplora_config: Arc<EsploraConfig>,
 }
 
@@ -121,7 +120,6 @@ pub struct SendCoinRequest {
     timestamp: Option<u64>,
 }
 
-#[cfg(feature = "faucet")]
 #[derive(Deserialize)]
 pub struct MintRequest {
     account_address: String,
@@ -388,10 +386,16 @@ pub struct InfoResponse {
 
 /// Server-side feature gates exposed to clients so the app can render
 /// capability-driven UI without a parallel build-time env-flag set.
-/// Each bool reflects a compile-time Cargo feature on the server binary.
+/// Each bool reflects a compile-time Cargo feature on the server binary,
+/// except `faucet`: mint is part of the MVP and is always available, so
+/// the field is hardcoded `true`. It is kept on the struct for API
+/// back-compat with wallet clients that introspect `/api/info`.
 #[derive(Serialize, Deserialize)]
 pub struct Capabilities {
     pub address_list: bool,
+    /// Always `true`. Mint is permanently part of the MVP binary; the
+    /// field is retained only so existing wallet clients deserialising
+    /// `/api/info` don't break.
     pub faucet: bool,
     pub usernames: bool,
     pub lnurl: bool,
@@ -669,21 +673,15 @@ async fn send_coin_handler(
             let ash_hex = Some(hex::encode(digest_to_bytes(&pd.account_state_hash)));
             let ocr_hex = Some(hex::encode(digest_to_bytes(&pd.output_coins_root)));
 
-            // Mint flow only — broadcasting a pre-set commitment is the
-            // server-signed minting path. The mint endpoint is feature-
-            // gated, so in the MVP build coin_proofs[0].commitment is
-            // always None and this block is excluded entirely.
-            #[cfg(feature = "faucet")]
-            if let Some(commitment) = coin_proofs[0].commitment.as_ref() {
-                let commitment_data =
-                    bincode::serialize(commitment).expect("Failed to serialize commitment");
-                println!("Broadcasting commitment ({} bytes)", commitment_data.len());
-                if let Err(err) =
-                    create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG).await
-                {
-                    eprintln!("Error broadcasting inscription: {}", err);
-                }
-            }
+            // Note: User-initiated sends never pre-set
+            // `coin_proofs[0].commitment` (see
+            // `account_server::send_coins`, which always emits
+            // `commitment: None`). The mint flow constructs and
+            // broadcasts its own commitment inside `mint_handler`. The
+            // pre-MVP `if let Some(commitment) = coin_proofs[0]
+            // .commitment.as_ref() { … broadcast … }` block that used
+            // to live here was dead under both flows and has been
+            // removed; clients commit explicitly via `/api/commit`.
 
             // Persist proof FIRST (crash-safe: proof exists even if
             // account save fails). send_coins always returns a non-empty
@@ -724,7 +722,6 @@ async fn send_coin_handler(
     }
 }
 
-#[cfg(feature = "faucet")]
 async fn mint_handler(
     State(state): State<AppState>,
     Json(request): Json<MintRequest>,
@@ -752,7 +749,7 @@ async fn mint_handler(
     let account_address = digest_from_bytes(&account_address_bytes);
 
     // Generate keys and get necessary info while holding the minting_account lock briefly
-    let (minting_pubkey, next_minting_pubkey, prev_commitment_pubkey, num_pubkeys_before_mint) = {
+    let (minting_pubkey, next_minting_pubkey, prev_commitment_pubkey) = {
         let minting_account_guard = lock_or_recover(&state.minting_account);
         let current_num_pubkeys = minting_account_guard.num_pubkeys;
         let prev_pk = if current_num_pubkeys > 0 {
@@ -764,7 +761,6 @@ async fn mint_handler(
             minting_account_guard.generate_public_key(current_num_pubkeys),
             minting_account_guard.generate_public_key(current_num_pubkeys + 1),
             prev_pk,
-            current_num_pubkeys,
         )
     };
 
@@ -800,37 +796,30 @@ async fn mint_handler(
             // Increment num_pubkeys *after* successful send and snapshot
             // the new counter value so the Postgres upsert can run after
             // the lock is released (sync mutex must not be held across
-            // `.await`).
-            let num_pubkeys_to_persist: Option<u32>;
+            // `.await`). The earlier `num_pubkeys_before_mint == current`
+            // race check has been removed: `mint_handler` is the only
+            // writer of `minting_account.num_pubkeys`, and a concurrent
+            // mint that interleaved between the lock drop at the top of
+            // the handler and the re-acquire here would fail inside
+            // `send_coins` (stale `prev_commitment_pubkey`) and never
+            // reach this Ok arm. Skipping the check keeps the bump
+            // total, so the post-mint persistence below is unconditional.
+            let num_pubkeys_to_persist: u32;
             {
                 let mut minting_account_guard = lock_or_recover(&state.minting_account);
-                // Ensure we only increment if the send was successful and based on the state *before* the send
-                if minting_account_guard.num_pubkeys == num_pubkeys_before_mint {
-                    minting_account_guard.num_pubkeys += 1;
-                    num_pubkeys_to_persist = Some(minting_account_guard.num_pubkeys);
-                } else {
-                    // This case might indicate a race condition or unexpected state change.
-                    // Handle appropriately, maybe log an error or return a specific response.
-                    eprintln!("WARNING: num_pubkeys changed unexpectedly during mint operation.");
-                    num_pubkeys_to_persist = None;
-                }
-                let pis: Result<
-                    [zkcoins_program::F;
-                        zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS],
-                    _,
-                > = coin_proofs[0].proof.public_inputs
-                    [..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
-                    .try_into();
-                let proof_data = match pis {
-                    Ok(pis) => ProofData::from_field_elements(&pis),
-                    Err(e) => {
-                        eprintln!("Failed to deserialize proof public_inputs: {:?}", e);
-                        return handler_error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "prove failed",
-                        );
-                    }
-                };
+                minting_account_guard.num_pubkeys += 1;
+                num_pubkeys_to_persist = minting_account_guard.num_pubkeys;
+                // The slice `[..N]` panics if `public_inputs.len() < N`, so
+                // the `try_into` Err branch is structurally dead.
+                // `program-plonky2/src/circuit/main.rs` guarantees
+                // `outer_num_pis >= N_PROOF_DATA_PUBLIC_INPUTS`.
+                let pis: [zkcoins_program::F;
+                    zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] = coin_proofs[0]
+                    .proof
+                    .public_inputs[..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
+                    .try_into()
+                    .expect("prover always emits N_PROOF_DATA_PUBLIC_INPUTS field elements");
+                let proof_data = ProofData::from_field_elements(&pis);
                 coin_proofs[0].commitment = Some(minting_account_guard.create_commitment(
                     &proof_data.account_state_hash,
                     &proof_data.output_coins_root,
@@ -846,10 +835,10 @@ async fn mint_handler(
             // hiccup leaves the in-memory counter ahead of the
             // persistent row, which the next successful mint will
             // re-sync.
-            if let Some(n) = num_pubkeys_to_persist {
-                if let Err(e) = db::upsert_minting_num_pubkeys(&state.pool, n).await {
-                    eprintln!("Failed to upsert minting num_pubkeys to Postgres: {}", e);
-                }
+            if let Err(e) =
+                db::upsert_minting_num_pubkeys(&state.pool, num_pubkeys_to_persist).await
+            {
+                eprintln!("Failed to upsert minting num_pubkeys to Postgres: {}", e);
             }
 
             let commitment = coin_proofs[0]
@@ -866,8 +855,12 @@ async fn mint_handler(
             println!("Commitment data hex: {}", hex::encode(&commitment_data));
 
             // This await is now safe because no locks are held across it.
+            // Route through `state.esplora_config` (a clone of
+            // `NETWORK_CONFIG` in production via `start_rest_server`)
+            // so tests can redirect the broadcast at a wiremock without
+            // mutating the process-wide lazy_static.
             if let Err(err) =
-                create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG).await
+                create_and_broadcast_inscription(&commitment_data, &state.esplora_config).await
             {
                 eprintln!("Error broadcasting mint inscription: {}", err);
                 return handler_error_response(
@@ -878,7 +871,7 @@ async fn mint_handler(
             // Snapshot the mutated accounts (the minting account and
             // every recipient) so the post-mint upserts run lock-free.
             // The set of affected addresses is the recipient(s) plus
-            // the faucet's MINTING_ADDRESS (the source side of the
+            // the well-known MINTING_ADDRESS (the source side of the
             // transition).
             let accounts_to_persist: Vec<(zkcoins_program::hash::HashDigest, Vec<u8>)> = {
                 let mut account_server_guard = lock_or_recover(&state.account_server);
@@ -909,15 +902,17 @@ async fn mint_handler(
                 }
             }
 
-            let proof_id = match coin_proofs.pop() {
-                Some(proof) => state.proof_store.add_proof(proof),
-                None => {
-                    return handler_error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "prove failed",
-                    );
-                }
-            };
+            // `mint_handler` passes a single-element `vec![Invoice::new(...)]`
+            // to `send_coins`; `send_coins` builds `coin_proofs` with
+            // `out_coins.len() == coin_templates.len() == invoices.len() == 1`,
+            // so the Ok-arm Vec has length exactly 1 — `pop()` is total.
+            // Mirrors the same-file `expect("send_coins returns at least one
+            // coin_proof on Ok")` invariant pattern earlier in this function.
+            let proof_id = state.proof_store.add_proof(
+                coin_proofs
+                    .pop()
+                    .expect("send_coins returns exactly one coin_proof for single-invoice mint"),
+            );
             (
                 StatusCode::OK,
                 Json(SendCoinResponse {
@@ -1099,7 +1094,8 @@ async fn info_handler() -> impl IntoResponse {
         network: NETWORK_CONFIG.network_name.clone(),
         capabilities: Capabilities {
             address_list: cfg!(feature = "address-list"),
-            faucet: cfg!(feature = "faucet"),
+            // Hardcoded — mint is permanent MVP; field is back-compat only.
+            faucet: true,
             usernames: cfg!(feature = "usernames"),
             lnurl: cfg!(feature = "lnurl"),
         },
@@ -1458,7 +1454,8 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/api/send", post(send_coin_handler))
         .route("/api/receive", post(receive_coin_handler))
         .route("/api/proof/:id", get(get_proof_handler))
-        .route("/api/commit", post(commit_handler));
+        .route("/api/commit", post(commit_handler))
+        .route("/api/mint", post(mint_handler));
 
     // Gated routes — only compiled in when their Cargo feature is enabled.
     // With a feature off, the handler does not exist in the binary and the
@@ -1466,9 +1463,6 @@ pub(crate) fn create_router(state: AppState) -> Router {
     // and there is no code path to execute.
     #[cfg(feature = "address-list")]
     let app = app.route("/api/address", get(get_address_handler));
-
-    #[cfg(feature = "faucet")]
-    let app = app.route("/api/mint", post(mint_handler));
 
     #[cfg(feature = "usernames")]
     let app = app

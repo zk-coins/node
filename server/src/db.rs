@@ -218,7 +218,7 @@ pub async fn resolve_username(pool: &PgPool, name: &str) -> Result<Option<Vec<u8
 
 // ---- Minting metadata (PR-A3) ---------------------------------------------
 
-/// Load the faucet's monotonic `num_pubkeys` counter from the
+/// Load the minting account's monotonic `num_pubkeys` counter from the
 /// `minting_meta` singleton row.
 ///
 /// Returns `Ok(None)` when the row has never been written (fresh
@@ -226,12 +226,6 @@ pub async fn resolve_username(pool: &PgPool, name: &str) -> Result<Option<Vec<u8
 /// `0..=u32::MAX` range are rejected as a decode error — the in-
 /// memory counter is `u32` (BIP-32 child indices wrap at 2^31, so
 /// `u32` is already more head-room than the derivation path supports).
-///
-/// `cfg`-gated on the `faucet` feature plus `test`: in non-faucet
-/// production builds the function has no caller, and the
-/// Coverage-Gate would flag it as uncovered. The unit-test suite
-/// in `db_tests.rs` exercises it unconditionally.
-#[cfg(any(feature = "faucet", test))]
 pub async fn load_minting_num_pubkeys(pool: &PgPool) -> Result<Option<u32>, sqlx::Error> {
     let row: Option<(i64,)> = sqlx::query_as("SELECT num_pubkeys FROM minting_meta WHERE id = 1")
         .fetch_optional(pool)
@@ -258,11 +252,9 @@ pub async fn load_minting_num_pubkeys(pool: &PgPool) -> Result<Option<u32>, sqlx
     }
 }
 
-/// Upsert the faucet's monotonic `num_pubkeys` counter. Idempotent
-/// on conflict — the singleton row is keyed on `id = 1`. See
-/// `load_minting_num_pubkeys` for the matching read and the rationale
-/// behind the `faucet`-feature gate.
-#[cfg(any(feature = "faucet", test))]
+/// Upsert the minting account's monotonic `num_pubkeys` counter.
+/// Idempotent on conflict — the singleton row is keyed on `id = 1`.
+/// See `load_minting_num_pubkeys` for the matching read.
 pub async fn upsert_minting_num_pubkeys(pool: &PgPool, n: u32) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO minting_meta (id, num_pubkeys, updated_at) \

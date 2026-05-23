@@ -25,9 +25,7 @@ use crate::publisher::create_and_broadcast_inscription;
 use crate::server::{lock_or_recover, SendCoinResponse};
 use crate::NETWORK_CONFIG;
 
-#[cfg(feature = "faucet")]
 use bitcoin::bip32::Xpriv;
-#[cfg(feature = "faucet")]
 use shared::ClientAccount;
 
 use crate::account_server::AccountServer;
@@ -55,7 +53,6 @@ pub async fn start_rest_server(
     let proofs_dir = std::env::var("PROOFS_DIR").unwrap_or_else(|_| "./proofs".to_string());
     let proof_store = Arc::new(ProofStore::new(&proofs_dir));
 
-    #[cfg(feature = "faucet")]
     let minting_account = {
         let secret = include_bytes!("../minting_secret.bin");
         let private_key = Xpriv::new_master(NETWORK_CONFIG.network(), secret)
@@ -95,13 +92,14 @@ pub async fn start_rest_server(
         // is now a well-known constant derived from `hash_bytes(b"zkcoins:
         // minting-address:placeholder:v1")`, NOT from minting_secret.bin.
         // ClientAccount::new derives `address` from the privkey's first
-        // child pubkey for ordinary wallets; for the faucet wallet that
+        // child pubkey for ordinary wallets; for the minting wallet that
         // derivation is meaningless — only the wallet's commitment-signing
         // side is used. Force the address to the canonical constant so
         // the rest of the server (which reads minting_account.address as
-        // the on-chain identity of the faucet) is internally consistent.
-        // The test harness already constructs the minting account this
-        // way (see server_tests.rs::TestAccountData::new_minting_account).
+        // the on-chain identity of the minting wallet) is internally
+        // consistent. The test harness already constructs the minting
+        // account this way (see
+        // server_tests.rs::TestAccountData::new_minting_account).
         minting_client.address = *zkcoins_program::types::MINTING_ADDRESS;
         Arc::new(Mutex::new(minting_client))
     };
@@ -111,7 +109,6 @@ pub async fn start_rest_server(
     let state = AppState {
         account_server: shared_account_server,
         proof_store,
-        #[cfg(feature = "faucet")]
         minting_account,
         username_store: shared_username_store,
         pool: Arc::clone(&pool),

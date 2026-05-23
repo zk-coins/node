@@ -4,10 +4,10 @@
 //! `.github/workflows/deploy-dev.yaml` (which only probes `/api/info`).
 //! Where the smoke test answers "is the listener bound?", this suite
 //! answers "do all 15 routes behave as documented?". It signs real
-//! Schnorr commitments with freshly-generated wallets, mints faucet
-//! coins, sends them, commits the resulting state, and claims a
-//! username — exercising the API contract happy path against the
-//! same backend the wallet app talks to.
+//! Schnorr commitments with freshly-generated wallets, mints coins,
+//! sends them, commits the resulting state, and claims a username —
+//! exercising the API contract happy path against the same backend
+//! the wallet app talks to.
 //!
 //! Scope note: the suite verifies server-visible behaviour (status
 //! codes, response shapes, balance movements). The commit message
@@ -117,21 +117,21 @@ macro_rules! feature_skip {
 // ---------------------------------------------------------------------------
 // Capability detection
 //
-// The MVP deploy ships with **zero Cargo features** (no `address-list`,
-// no `faucet`, no `usernames`, no `lnurl`) — those routes are not
-// registered and the axum fallback answers 404 instead of the
-// per-handler error codes. The current DEV box happens to have all
-// four features compiled in, but the suite must work against either
-// shape. We fetch `/api/info` once per gated test, deserialise the
-// well-known `Capabilities` shape, and skip the rest of the test if
-// the relevant feature flag is `false`.
+// Mint (`/api/mint`) is part of the MVP and is always present, so it is
+// no longer gated here. The remaining post-MVP routes (`address-list`,
+// `usernames`, `lnurl`) are still optional: the default deploy ships
+// without them and the axum fallback answers 404 instead of the
+// per-handler error codes. We fetch `/api/info` once per gated test,
+// deserialise the well-known `Capabilities` shape, and skip the rest
+// of the test if the relevant feature flag is `false`.
 //
 // `ZKCOINS_FORCE_DISABLE_FEATURES` (comma-separated list, e.g.
-// `faucet,usernames`) overrides any flag returned by the server to
-// `false`. This is the local dry-run hook described in the task
-// brief — point the suite at the live DEV server, force features off,
-// and confirm that every gated test prints `SKIP …` instead of
-// hitting the disabled-on-paper but actually-running endpoint.
+// `address_list,usernames`) overrides any flag returned by the server
+// to `false`. This is the local dry-run hook — point the suite at the
+// live DEV server, force features off, and confirm that every gated
+// test prints `SKIP …` instead of hitting a disabled-on-paper but
+// actually-running endpoint. Forcing `faucet` off is a no-op (the
+// route is always registered) and the flag is ignored.
 // ---------------------------------------------------------------------------
 
 async fn fetch_capabilities(client: &reqwest::Client) -> Capabilities {
@@ -164,7 +164,14 @@ async fn fetch_capabilities(client: &reqwest::Client) -> Capabilities {
         for flag in force.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
             match flag {
                 "address_list" | "address-list" => caps.address_list = false,
-                "faucet" => caps.faucet = false,
+                "faucet" => {
+                    // Mint is permanent MVP. The route is always
+                    // registered, so forcing it "off" cannot disable
+                    // it — log + ignore to keep callers honest.
+                    eprintln!(
+                        "ZKCOINS_FORCE_DISABLE_FEATURES: `faucet` is permanent MVP — ignored"
+                    );
+                }
                 "usernames" => caps.usernames = false,
                 "lnurl" => caps.lnurl = false,
                 other => {
@@ -553,12 +560,7 @@ async fn fallback_unknown_route_returns_404() {
 
 #[tokio::test]
 async fn mint_empty_body_returns_422() {
-    let client = http_client();
-    let caps = fetch_capabilities(&client).await;
-    if !caps.faucet {
-        feature_skip!("faucet", "mint_empty_body_returns_422");
-    }
-    let resp = client
+    let resp = http_client()
         .post(url("/api/mint"))
         .json(&json!({}))
         .send()
@@ -569,12 +571,7 @@ async fn mint_empty_body_returns_422() {
 
 #[tokio::test]
 async fn mint_invalid_hex_address_returns_422() {
-    let client = http_client();
-    let caps = fetch_capabilities(&client).await;
-    if !caps.faucet {
-        feature_skip!("faucet", "mint_invalid_hex_address_returns_422");
-    }
-    let resp = client
+    let resp = http_client()
         .post(url("/api/mint"))
         .json(&json!({"account_address": "not_hex", "amount": 100}))
         .send()
@@ -585,14 +582,9 @@ async fn mint_invalid_hex_address_returns_422() {
 
 #[tokio::test]
 async fn mint_wrong_address_length_returns_422() {
-    let client = http_client();
-    let caps = fetch_capabilities(&client).await;
-    if !caps.faucet {
-        feature_skip!("faucet", "mint_wrong_address_length_returns_422");
-    }
     // 16 bytes = 32 hex chars — short of the required 32 bytes
     let short_addr = format!("0x{}", "ab".repeat(16));
-    let resp = client
+    let resp = http_client()
         .post(url("/api/mint"))
         .json(&json!({"account_address": short_addr, "amount": 100}))
         .send()
@@ -886,10 +878,6 @@ async fn claim_username_stale_timestamp_returns_401() {
 #[tokio::test]
 async fn mint_roundtrip_lands_balance_and_proof() {
     let client = http_client();
-    let caps = fetch_capabilities(&client).await;
-    if !caps.faucet {
-        feature_skip!("faucet", "mint_roundtrip_lands_balance_and_proof");
-    }
     let alice = TestWallet::new();
 
     let mint_resp = client
@@ -945,18 +933,11 @@ async fn mint_roundtrip_lands_balance_and_proof() {
 /// Roundtrip B — full mint → send → commit pipeline.
 ///
 /// The send half requires the previous commitment's signing key as
-/// `prev_commitment_pubkey`. After a mint that's the faucet's
-/// minting pubkey, embedded in the mint's `CoinProof.commitment`.
+/// `prev_commitment_pubkey`. After a mint that's the server's minting
+/// pubkey, embedded in the mint's `CoinProof.commitment`.
 #[tokio::test]
 async fn send_commit_roundtrip_moves_balance() {
     let client = http_client();
-    let caps = fetch_capabilities(&client).await;
-    // The send + commit halves are MVP-active, but this roundtrip
-    // bootstraps state via `/api/mint` — without faucet there's no
-    // way to get a freshly funded wallet to spend from. Skip if off.
-    if !caps.faucet {
-        feature_skip!("faucet", "send_commit_roundtrip_moves_balance");
-    }
     let alice = TestWallet::new();
     let bob = TestWallet::new();
 

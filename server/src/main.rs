@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 // Postgres state-layer carries every persistent slice of server state
 // after PR-A3: SMT / MMR / latest_block (PR-A2), accounts + usernames
-// (PR-A3), and the faucet's `minting_meta.num_pubkeys` counter
+// (PR-A3), and the minting account's `minting_meta.num_pubkeys` counter
 // (PR-A3). The `accounts.bin`, `usernames.bin`, and
 // `minting_num_pubkeys.bin` sibling files no longer exist, and the
 // `atomic_write` helper that supported them is removed — the only
