@@ -30,12 +30,12 @@ pub fn parse_ws_frame(text: &str) -> Vec<BlockHash> {
     };
 
     if let Some(block) = value.get("block") {
-        if let Some(hash) = block.get("id").and_then(|v| v.as_str()) {
-            if let Ok(h) = BlockHash::from_str(hash) {
-                return vec![h];
-            }
-        }
-        return Vec::new();
+        return block
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| BlockHash::from_str(s).ok())
+            .map(|h| vec![h])
+            .unwrap_or_default();
     }
 
     if let Some(blocks) = value.get("blocks").and_then(|v| v.as_array()) {
