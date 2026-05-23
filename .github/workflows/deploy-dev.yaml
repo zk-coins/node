@@ -66,9 +66,13 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           echo "${{ secrets.DEPLOY_DEV_SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
 
+          # The deploy host runs a forced-command restricted shell that only
+          # accepts whitelisted command names — arbitrary inline shell is
+          # rejected. Both branches must resolve to a single allowlisted
+          # command; the reset variant is implemented host-side.
           DEPLOY_CMD="zkcoins-server"
           if [ "${{ inputs.reset_state }}" == "true" ]; then
-            DEPLOY_CMD="cd ~/zkcoins && docker compose stop zkcoins-server && docker compose rm -f zkcoins-server && docker volume rm zkcoins_server-data 2>/dev/null; zkcoins-server"
+            DEPLOY_CMD="reset-zkcoins-server"
           fi
 
           ssh -i ~/.ssh/deploy_key \
