@@ -3463,20 +3463,48 @@ async fn mint_insufficient_funds_returns_422() {
     assert_eq!(v["error"], "Insufficient funds");
 }
 
-/// Drives `mint_handler` through the full Ok arm of `send_coins`
-/// (real prover, commitment construction, `num_pubkeys` increment,
-/// `db::upsert_minting_num_pubkeys` log-and-continue against
-/// `dead_pool`) and stops at the inscription broadcast: the default
-/// `esplora_config` points at 127.0.0.1:1 so
-/// `create_and_broadcast_inscription` fails and the handler returns
-/// 503 "Failed to broadcast mint inscription on-chain". This covers
-/// everything up to and including the broadcast Err arm; the
-/// post-broadcast happy path is exercised by the wiremock test below.
+/// Drives `mint_handler` through the prepare-then-broadcast phases:
+/// `prepare_mint` runs the full prover, builds the commitment, then
+/// the inscription broadcast fails against the default unreachable
+/// `esplora_config` (127.0.0.1:1) and the handler returns 503.
+///
+/// **zk-coins/server#89 regression guard.** The asserts below pin the
+/// no-state-advance contract that the prepare-then-commit refactor
+/// introduced: after a broadcast failure the in-memory
+/// `minting_account.num_pubkeys` MUST still be 0, the minting
+/// `Account` in the server's map MUST still have an empty
+/// `coin_queue`, `proof = None`, and the unchanged seed balance, and
+/// the recipient account MUST NOT exist yet. Before this PR the
+/// handler had already bumped the counter + mutated the minting
+/// `Account` + (in the soft-fail DEV flavour) returned 200 — see the
+/// issue text for the production manifestation.
 #[tokio::test]
 async fn mint_broadcast_failure_returns_503() {
     let state = mint_test_state();
+    let recipient_bytes = [7u8; 32];
+    let recipient_addr = zkcoins_program::hash::digest_from_bytes(&recipient_bytes);
 
-    let recipient = "0x".to_string() + &hex::encode([7u8; 32]);
+    // Snapshot the pre-mint minting Account so we can prove the
+    // failed-broadcast path leaves it byte-identical.
+    let minting_balance_before: u64;
+    let minting_coin_queue_len_before: usize;
+    let minting_proof_some_before: bool;
+    {
+        let server_guard = state.account_server.lock().unwrap();
+        let acct = server_guard
+            .get_account(&zkcoins_program::types::MINTING_ADDRESS)
+            .expect("minting account seeded by mint_test_state");
+        minting_balance_before = acct.balance;
+        minting_coin_queue_len_before = acct.coin_queue.len();
+        minting_proof_some_before = acct.proof.is_some();
+    }
+    let num_pubkeys_before = state.minting_account.lock().unwrap().num_pubkeys;
+    assert_eq!(
+        num_pubkeys_before, 0,
+        "fresh mint_test_state starts with num_pubkeys=0"
+    );
+
+    let recipient = "0x".to_string() + &hex::encode(recipient_bytes);
     let body = serde_json::json!({
         "account_address": recipient,
         "amount": 1u64,
@@ -3485,7 +3513,7 @@ async fn mint_broadcast_failure_returns_503() {
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
-    let (status, resp_body) = send_request_with_state(state, req).await;
+    let (status, resp_body) = send_request_with_state(state.clone(), req).await;
 
     assert_eq!(
         status,
@@ -3496,6 +3524,38 @@ async fn mint_broadcast_failure_returns_503() {
     let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
     assert_eq!(v["success"], false);
     assert_eq!(v["error"], "Failed to broadcast mint inscription on-chain");
+
+    // No-state-advance asserts: every persistent + in-memory side of
+    // the mint flow must look exactly as it did before the request.
+    let num_pubkeys_after = state.minting_account.lock().unwrap().num_pubkeys;
+    assert_eq!(
+        num_pubkeys_after, 0,
+        "in-memory minting_account.num_pubkeys must NOT advance on broadcast failure (zk-coins/server#89)"
+    );
+    {
+        let server_guard = state.account_server.lock().unwrap();
+        let acct_after = server_guard
+            .get_account(&zkcoins_program::types::MINTING_ADDRESS)
+            .expect("minting account still present after failed mint");
+        assert_eq!(
+            acct_after.balance, minting_balance_before,
+            "minting Account balance must NOT change on broadcast failure"
+        );
+        assert_eq!(
+            acct_after.coin_queue.len(),
+            minting_coin_queue_len_before,
+            "minting Account coin_queue must NOT change on broadcast failure"
+        );
+        assert_eq!(
+            acct_after.proof.is_some(),
+            minting_proof_some_before,
+            "minting Account proof must NOT be set by a failed-broadcast mint"
+        );
+        assert!(
+            server_guard.get_account(&recipient_addr).is_none(),
+            "recipient account must NOT be created when broadcast fails"
+        );
+    }
 }
 
 /// Companion to `mint_broadcast_failure_returns_503` that drives the
@@ -3779,16 +3839,18 @@ async fn mint_broadcast_mock_server() -> wiremock::MockServer {
     mock_server
 }
 
-/// Drives the Err arm of the post-broadcast `db::upsert_account` loop
+/// Drives the Err arm of the post-broadcast `db::commit_mint_tx` call
 /// at the tail of `mint_handler`. The broadcast goes through (wiremock
-/// answers the UTXO + tx POSTs), so the handler walks past the early
-/// 503 branch into the lock-free upsert loop. The pool is the lazy
-/// `dead_pool` that connect-errors on first use, so both
-/// `upsert_minting_num_pubkeys` and the per-account `upsert_account`
-/// calls take their Err arms and log + continue. The handler still
-/// returns 200 OK with a `proof_id` because the upsert is best-effort.
+/// answers the UTXO + tx POSTs), the handler walks past the early
+/// 503 broadcast-failure branch into the commit-tx phase. The pool is
+/// the lazy `dead_pool` that connect-errors on first use, so the
+/// transaction fails to begin and the handler returns
+/// `503 SERVICE_UNAVAILABLE` "Failed to persist mint commit
+/// transaction". The in-memory state was guarded by the same commit
+/// path, so per zk-coins/server#89 `num_pubkeys` MUST still be 0
+/// after the failed commit.
 #[tokio::test]
-async fn mint_upsert_account_failure_logs_and_returns_ok() {
+async fn mint_commit_tx_failure_returns_503() {
     let mock_server = mint_broadcast_mock_server().await;
     let ws_url = mint_broadcast_mock_ws().await;
 
@@ -3802,6 +3864,8 @@ async fn mint_upsert_account_failure_logs_and_returns_ok() {
         ws_url: Some(ws_url),
         track_tx_timeout: None,
     });
+    let minting_account = Arc::clone(&state.minting_account);
+    let account_server = Arc::clone(&state.account_server);
 
     let recipient = "0x".to_string() + &hex::encode([4u8; 32]);
     let body = serde_json::json!({
@@ -3814,28 +3878,62 @@ async fn mint_upsert_account_failure_logs_and_returns_ok() {
         .unwrap();
     let (status, resp_body) = send_request_with_state(state, req).await;
 
-    assert_eq!(status, StatusCode::OK, "body: {}", resp_body);
-    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
-    assert_eq!(v["success"], true);
-    assert!(
-        v["proof_id"].as_u64().is_some(),
-        "proof_id missing from response: {}",
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "body: {}",
         resp_body
     );
+    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(v["success"], false);
+    assert_eq!(v["error"], "Failed to persist mint commit transaction");
+
+    // No in-memory advance — the commit fence held.
+    assert_eq!(minting_account.lock().unwrap().num_pubkeys, 0);
+    {
+        let server_guard = account_server.lock().unwrap();
+        let acct = server_guard
+            .get_account(&zkcoins_program::types::MINTING_ADDRESS)
+            .expect("minting account still present");
+        assert!(
+            acct.coin_queue.is_empty() && acct.proof.is_none(),
+            "in-memory minting Account must NOT mutate when commit_mint_tx fails"
+        );
+    }
 }
 
-/// Drives the Err arm of the `account_server.receive_coin` call in the
-/// post-broadcast loop of `mint_handler`. Pre-populates the recipient
-/// account's `coin_history` SMT with the identifier that `send_coins`
-/// is about to mint, so `receive_coin` returns
-/// `Err("Coin already spent (replay)")` and the handler logs the error
-/// + continues. Identifier prediction mirrors `Account::create_coins`
-/// off-circuit (canonical AccountState layout + Poseidon hash + index 0).
-/// The handler still returns 200 OK because the receive failure is
-/// best-effort, matching the project-wide log-and-continue policy for
-/// post-broadcast persistence steps.
+/// Drives the Err arm of `AccountServer::receive_coin_into` inside
+/// the commit phase of `mint_handler`. Pre-populates the recipient
+/// account's `coin_history` SMT with the identifier that
+/// `prepare_mint` is about to produce, so `receive_coin_into` returns
+/// `Err("Coin already spent (replay)")` on the cloned recipient.
+/// Identifier prediction mirrors `Account::create_coins` off-circuit
+/// (canonical AccountState layout + Poseidon hash + index 0).
+///
+/// Per the prepare-then-commit refactor (zk-coins/server#89) the
+/// receive error is logged and the unchanged recipient clone still
+/// participates in `commit_mint_tx`. With a live Postgres the
+/// transaction commits, the handler returns 200 OK, and
+/// `minting_meta.num_pubkeys` advances to 1.
 #[tokio::test]
 async fn mint_receive_coin_failure_logs_and_returns_ok() {
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container.get_host().await.unwrap();
+    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
     let mock_server = mint_broadcast_mock_server().await;
     let ws_url = mint_broadcast_mock_ws().await;
 
@@ -3843,6 +3941,7 @@ async fn mint_receive_coin_failure_logs_and_returns_ok() {
     let recipient = zkcoins_program::hash::digest_from_bytes(&recipient_bytes);
 
     let mut state = mint_test_state();
+    state.pool = Arc::clone(&pool);
     state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
         url: mock_server.uri(),
         is_mainnet: false,
@@ -3851,8 +3950,8 @@ async fn mint_receive_coin_failure_logs_and_returns_ok() {
         track_tx_timeout: None,
     });
 
-    // Predict the coin identifier that `send_coins` will assign to the
-    // freshly-minted output coin. `Account::create_coins` builds
+    // Predict the coin identifier that `prepare_mint` will assign to
+    // the freshly-minted output coin. `Account::create_coins` builds
     // `next_account_state` with `owner = MINTING_ADDRESS`,
     // `balance = minting_balance - amount`, and
     // `public_key = current minting pubkey`, then hashes it and feeds
@@ -3873,7 +3972,8 @@ async fn mint_receive_coin_failure_logs_and_returns_ok() {
     let predicted_coin_id_bytes = zkcoins_program::hash::digest_to_bytes(&predicted_coin_id);
 
     // Pre-insert the predicted identifier into the recipient's
-    // coin_history SMT so `receive_coin` sees the coin as already spent.
+    // coin_history SMT so `receive_coin_into` sees the coin as
+    // already spent.
     let mut recipient_account = Account::new();
     recipient_account
         .coin_history
@@ -3903,4 +4003,351 @@ async fn mint_receive_coin_failure_logs_and_returns_ok() {
         "proof_id missing from response: {}",
         resp_body
     );
+}
+
+/// Retry-after-broadcast-failure (zk-coins/server#89).
+///
+/// First mint runs against an unreachable Esplora (the default
+/// `mint_test_state` config points at 127.0.0.1:1) — the handler
+/// fails the broadcast and returns 503. The in-memory and persisted
+/// state must be untouched: `num_pubkeys` still 0, no
+/// `minting_meta` row, the minting Account still has `proof = None`
+/// and `coin_queue` empty. Second mint reuses the same `AppState`
+/// but swaps in a working wiremock Esplora; the broadcast succeeds,
+/// `commit_mint_tx` writes the bundle in one transaction, and the
+/// handler returns 200. After the second call `num_pubkeys = 1`,
+/// the recipient account exists, and the proofs Vec was popped once.
+///
+/// **Idempotent-retry caveat (documented in `mint_handler`).** On a
+/// real broadcast failure where the first commit + reveal pair
+/// actually landed on chain but the response was lost, a retry
+/// produces an identical inscription txid and Bitcoin returns
+/// `txn-already-known`. The handler returns 503 again; reconciliation
+/// happens on the next scanner sweep. This test does NOT cover that
+/// branch — it only proves the "broadcast genuinely failed, no chain
+/// effect, retry succeeds" flow.
+#[tokio::test]
+async fn mint_retry_after_broadcast_failure_succeeds() {
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container.get_host().await.unwrap();
+    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
+    // ---- First mint: dead Esplora → 503 ---------------------------------
+    let mut state = mint_test_state();
+    state.pool = Arc::clone(&pool);
+    // Keep the default unreachable URL so the broadcast fails.
+    let cloned_state_first = state.clone();
+
+    let recipient_bytes = [9u8; 32];
+    let recipient = "0x".to_string() + &hex::encode(recipient_bytes);
+    let body = serde_json::json!({
+        "account_address": recipient,
+        "amount": 1u64,
+    });
+    let req = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status1, _body1) = send_request_with_state(cloned_state_first, req).await;
+    assert_eq!(status1, StatusCode::SERVICE_UNAVAILABLE);
+
+    // Confirm no DB row + no in-memory advance.
+    let minting_num_first: Option<u32> = crate::db::load_minting_num_pubkeys(&pool)
+        .await
+        .expect("load minting_meta after first mint");
+    assert!(
+        minting_num_first.is_none() || minting_num_first == Some(0),
+        "minting_meta row must not show advance after broadcast failure, got {:?}",
+        minting_num_first
+    );
+    assert_eq!(state.minting_account.lock().unwrap().num_pubkeys, 0);
+
+    // ---- Second mint: working Esplora → 200 -----------------------------
+    let mock_server = mint_broadcast_mock_server().await;
+    let ws_url = mint_broadcast_mock_ws().await;
+    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
+        url: mock_server.uri(),
+        is_mainnet: false,
+        network_name: "Mutinynet".to_string(),
+        ws_url: Some(ws_url),
+        track_tx_timeout: None,
+    });
+    let cloned_state_second = state.clone();
+    let body2 = serde_json::json!({
+        "account_address": recipient,
+        "amount": 1u64,
+    });
+    let req2 = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(body2.to_string()))
+        .unwrap();
+    let (status2, resp_body2) = send_request_with_state(cloned_state_second, req2).await;
+    assert_eq!(status2, StatusCode::OK, "body: {}", resp_body2);
+
+    // Final state: counter at 1, recipient account exists.
+    let minting_num_after: Option<u32> = crate::db::load_minting_num_pubkeys(&pool)
+        .await
+        .expect("load minting_meta after second mint");
+    assert_eq!(
+        minting_num_after,
+        Some(1),
+        "num_pubkeys must be 1 after successful retry"
+    );
+    assert_eq!(state.minting_account.lock().unwrap().num_pubkeys, 1);
+    let recipient_digest = zkcoins_program::hash::digest_from_bytes(&recipient_bytes);
+    {
+        let server_guard = state.account_server.lock().unwrap();
+        assert!(
+            server_guard.get_account(&recipient_digest).is_some(),
+            "recipient account must be created on successful mint"
+        );
+    }
+}
+
+/// Concurrent-mint serialization (zk-coins/server#89).
+///
+/// Pins the optimistic-UPDATE loser branch of `commit_mint_tx`
+/// deterministically by pre-seeding a stale `minting_meta.num_pubkeys
+/// = 1` row while the in-memory `minting_account.num_pubkeys` is
+/// still 0. A truly-parallel two-mint race would land
+/// probabilistically (the proof phase serializes on the shared
+/// `Arc<Mutex<AccountServer>>`, the broadcast races against the DB
+/// tx) and would be flaky in CI; the deterministic shape here
+/// exercises the same exit branch — `expected_prev = 0`, stored = 1,
+/// `INSERT ... ON CONFLICT DO UPDATE ... WHERE minting_meta.num_pubkeys
+/// = 0` rejects on the WHERE predicate, `rows_affected == 0`, tx
+/// rolls back, handler returns `503 "Concurrent mint detected"`.
+///
+/// In production this is exactly what the loser observes when two
+/// requests both snapshotted `num_pubkeys = N` and the winner won the
+/// race to UPDATE the counter to N+1: the loser's `expected_prev = N`
+/// no longer matches the stored value, the WHERE clause filters out
+/// the UPDATE, and the loser surfaces 503 with no state advance.
+/// The optimistic lock guarantees that the in-memory `num_pubkeys`
+/// cannot diverge from the persisted counter even on the loser.
+#[tokio::test]
+async fn concurrent_mints_only_one_commits() {
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container.get_host().await.unwrap();
+    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
+    let mock_server = mint_broadcast_mock_server().await;
+    let ws_url = mint_broadcast_mock_ws().await;
+
+    let mut state = mint_test_state();
+    state.pool = Arc::clone(&pool);
+    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
+        url: mock_server.uri(),
+        is_mainnet: false,
+        network_name: "Mutinynet".to_string(),
+        ws_url: Some(ws_url),
+        track_tx_timeout: None,
+    });
+
+    // Force the optimistic UPDATE to race even when the in-memory
+    // proof phase has already serialized: pre-insert a stale
+    // `minting_meta` row with `num_pubkeys = 1` while the in-memory
+    // `minting_account.num_pubkeys` is still 0. The first concurrent
+    // mint will observe the in-memory `0`, derive pubkey index 0,
+    // broadcast successfully, then try
+    // `UPDATE minting_meta SET num_pubkeys = 1 WHERE num_pubkeys = 0`
+    // — but the row is already at 1, so `rows_affected == 0` and the
+    // commit_mint_tx returns Ok(false). The handler maps that to 503
+    // "Concurrent mint detected". This pins the race-loser branch
+    // deterministically (a real concurrent-mint race would land
+    // probabilistically, which is not portable to CI).
+    crate::db::upsert_minting_num_pubkeys(&pool, 1)
+        .await
+        .expect("seed stale minting_meta row");
+
+    let recipient = "0x".to_string() + &hex::encode([3u8; 32]);
+    let body = serde_json::json!({
+        "account_address": recipient,
+        "amount": 1u64,
+    });
+    let req = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, resp_body) = send_request_with_state(state, req).await;
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "concurrent_mint must surface 503, got body: {}",
+        resp_body
+    );
+    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(v["success"], false);
+    assert_eq!(v["error"], "Concurrent mint detected");
+
+    // The stale row survives untouched.
+    let minting_num: Option<u32> = crate::db::load_minting_num_pubkeys(&pool)
+        .await
+        .expect("load minting_meta after concurrent-mint");
+    assert_eq!(
+        minting_num,
+        Some(1),
+        "loser must not bump the counter; stale row stays at 1"
+    );
+}
+
+/// Drives the post-proof "concurrent mint detected during proof phase"
+/// branch of `mint_handler` (server.rs:854-858 / zk-coins/server#90)
+/// against the pure helper.
+///
+/// Pairs with `mint_handler_concurrent_mint_during_proof_returns_503`
+/// below, which drives the SAME branch end-to-end through
+/// `mint_handler` so the call site itself (the
+/// `return concurrent_mint_during_proof_response(...)` invocation)
+/// is covered, not just the helper.
+#[tokio::test]
+async fn concurrent_mint_during_proof_response_returns_503() {
+    let (status, Json(body)) = crate::server::concurrent_mint_during_proof_response(0, 1);
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "concurrent-mint-during-proof must surface 503"
+    );
+    assert!(!body.success);
+    assert_eq!(body.error.as_deref(), Some("Concurrent mint detected"));
+}
+
+/// End-to-end race that drives the post-proof "concurrent mint
+/// detected during proof phase" branch of `mint_handler` through the
+/// HTTP layer so the `return concurrent_mint_during_proof_response(...)`
+/// call site (server.rs ~L891) is covered, not just the helper.
+///
+/// Synchronisation strategy (deterministic, not time-based): the test
+/// pre-acquires the `state.account_server` mutex BEFORE issuing the
+/// `/api/mint` request. The handler completes phase 1 (lock
+/// `minting_account`, snapshot `expected_num_pubkeys = 0`, release)
+/// and then blocks at phase 2 trying to lock `account_server`. While
+/// the handler is parked on that lock, the test acquires
+/// `state.minting_account` and bumps `num_pubkeys` to a non-matching
+/// value, then drops the `account_server` guard. The handler proceeds
+/// through phase 2 (prover work), reaches phase 3, re-locks
+/// `minting_account`, observes the bumped counter, and returns 503
+/// before ever touching the broadcast / Esplora / Postgres paths —
+/// so the bare `mint_test_state()` (dead pool, unreachable Esplora)
+/// is sufficient.
+///
+/// Requires the multi-thread runtime: phase 2's `prepare_mint` is
+/// blocking CPU work that would otherwise stall the single-threaded
+/// executor and prevent the test thread from running the bump step.
+///
+/// `clippy::await_holding_lock` is silenced because holding the
+/// `account_server` `MutexGuard` across the `sleep().await` IS the
+/// synchronisation primitive — releasing it earlier would defeat the
+/// test by letting phase 2 finish before the bump.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mint_handler_concurrent_mint_during_proof_returns_503() {
+    let state = mint_test_state();
+
+    // Pre-acquire the account_server lock so phase 2 of mint_handler
+    // parks until we release it. Phase 1 only touches
+    // `state.minting_account`, so the handler can still complete its
+    // snapshot (capturing expected_num_pubkeys = 0) before parking.
+    let account_server_guard = state.account_server.lock().unwrap();
+
+    let recipient = "0x".to_string() + &hex::encode([7u8; 32]);
+    let body = serde_json::json!({
+        "account_address": recipient,
+        "amount": 1u64,
+    });
+    let req = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+
+    // Drive the request on a worker so we can manipulate state from
+    // this task while the handler is parked on the account_server
+    // mutex inside phase 2.
+    let state_for_request = state.clone();
+    let request_task =
+        tokio::spawn(async move { send_request_with_state(state_for_request, req).await });
+
+    // Give the handler a generous window to enter phase 2 and park on
+    // the account_server lock. Phase 1 is microseconds of work; 200ms
+    // is overkill but cheap. Note: we cannot rely on `lock().is_locked`
+    // because std::sync::Mutex offers no such API — but holding the
+    // guard here is enough, because phase 2 will block until we drop
+    // it regardless of when the handler arrives.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Now bump num_pubkeys on the minting_account. Phase 1 already
+    // captured expected_num_pubkeys = 0, so any non-zero value here
+    // trips the phase-3 inequality check.
+    {
+        let mut minting = state.minting_account.lock().unwrap();
+        minting.num_pubkeys = 1;
+    }
+
+    // Release the account_server lock so phase 2 can proceed. The
+    // handler now runs the prover, re-locks minting_account, observes
+    // num_pubkeys = 1 != expected 0, and returns 503 via
+    // `concurrent_mint_during_proof_response`.
+    drop(account_server_guard);
+
+    let (status, resp_body) = request_task.await.expect("request task panicked");
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "concurrent-mint-during-proof must surface 503, body: {}",
+        resp_body
+    );
+    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(v["success"], false);
+    assert_eq!(v["error"], "Concurrent mint detected");
+}
+
+/// Drives the Err arm of `upsert_mint_recipient_or_log`
+/// (server.rs:1025-1028 / zk-coins/server#90). The recipient upsert
+/// loop in `mint_handler` is best-effort log-and-continue: the
+/// minting_meta + minting-account bump already committed inside
+/// `commit_mint_tx`, so a recipient-row upsert failure only delays the
+/// row until the next receive on the same address. The Err branch is
+/// otherwise only reachable on a pool-dead failure timed exactly
+/// between `commit_mint_tx` returning Ok and the loop iterating —
+/// which is intractable to orchestrate against a single shared
+/// `PgPool`. Factoring the upsert-or-log into a helper lets us pin
+/// the branch with a deterministic `dead_pool` call (the same pattern
+/// the rest of the suite uses for the parallel send/receive
+/// best-effort upserts).
+#[tokio::test]
+async fn upsert_mint_recipient_or_log_swallows_pool_dead_error() {
+    // dead_pool's lazy connect fails fast on first use; the helper
+    // logs the error and returns without panicking.
+    let pool = dead_pool();
+    let addr = [0u8; 32];
+    let bytes = [0u8; 16];
+    crate::server::upsert_mint_recipient_or_log(&pool, &addr, &bytes).await;
 }

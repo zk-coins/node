@@ -11,7 +11,9 @@
 //! is measured normally.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
 use axum::Json;
@@ -32,11 +34,34 @@ use crate::account_server::AccountServer;
 use crate::server::{create_router, AppState, ProofStore};
 use crate::username::UsernameStore;
 
+/// Default cap on how long the startup invariant check waits for the
+/// scanner to ingest at least one block before evaluating the SMT
+/// membership predicate. See [`check_minting_state_invariant`] for the
+/// trade-off this knob bounds. Overridable via the
+/// `SCANNER_INITIAL_SETTLE_TIMEOUT_MS` env var (set to `0` in unit tests
+/// that drive the invariant check without a running scanner).
+const SCANNER_INITIAL_SETTLE_TIMEOUT_MS_DEFAULT: u64 = 90_000;
+
+/// Poll cadence for the scanner-progress wait inside
+/// [`check_minting_state_invariant`]. Small enough that a settled
+/// scanner unblocks the bootstrap within ~50 ms, large enough to keep
+/// the busy-wait cost negligible.
+const SCANNER_PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+fn scanner_initial_settle_timeout() -> Duration {
+    let ms = std::env::var("SCANNER_INITIAL_SETTLE_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(SCANNER_INITIAL_SETTLE_TIMEOUT_MS_DEFAULT);
+    Duration::from_millis(ms)
+}
+
 pub async fn start_rest_server(
     account_server: AccountServer,
     username_store: UsernameStore,
     addr: &str,
     pool: Arc<PgPool>,
+    scanner_progress: Option<Arc<AtomicU64>>,
 ) -> anyhow::Result<()> {
     let socket_addr = addr
         .parse::<SocketAddr>()
@@ -166,6 +191,29 @@ pub async fn start_rest_server(
         }
     }
 
+    // Startup invariant check (zk-coins/server#89): every persisted
+    // minting-account pubkey index in `0..num_pubkeys` MUST have a
+    // commitment in the SMT. A mismatch means the legacy
+    // write-ahead-of-broadcast mint flow advanced the counter past a
+    // failed inscription — every subsequent `/api/mint` and `/api/send`
+    // for the minting account would 422 on the missing merkle proof.
+    // The fix lives in `mint_handler` itself; this check is the second
+    // line of defence — it refuses to start the listener until the
+    // operator runs the `reset_state` workflow to restore the
+    // invariant.
+    //
+    // NO break-glass flag. Strict by default. Operator override is a
+    // code patch, not an env var.
+    {
+        let starting_num_pubkeys = {
+            let guard = lock_or_recover(&state.minting_account);
+            guard.num_pubkeys
+        };
+        check_minting_state_invariant(&state, starting_num_pubkeys, scanner_progress.as_deref())
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+
     let app = create_router(state);
 
     println!("REST server started at {}", socket_addr);
@@ -175,12 +223,126 @@ pub async fn start_rest_server(
     Ok(())
 }
 
+/// Verify every persisted minting-account pubkey index `0..num_pubkeys`
+/// is anchored by a commitment in the SMT.
+///
+/// Returns `Ok(())` on a fresh state (`num_pubkeys == 0`) or after every
+/// index has been verified. Returns `Err(CRITICAL log message)` on the
+/// first miss — the caller propagates the error up so the bootstrap
+/// fails with a non-zero exit code, matching the project's no-degraded-
+/// mode startup policy.
+///
+/// **Scanner-settle wait (zk-coins/server#89 round-2 MAJOR 2).** Before
+/// declaring a desync the function waits up to
+/// [`scanner_initial_settle_timeout`] (default 90 s, overridable via
+/// `SCANNER_INITIAL_SETTLE_TIMEOUT_MS`) for the scanner to ingest at
+/// least one block. The signal is the `scanner_progress` `AtomicU64`
+/// fed by `main.rs`'s scanner callback (incremented on every
+/// `state.update` call). Without this wait, a fresh-state restart whose
+/// scanner has not yet caught the latest mint inscription would
+/// false-positive — the minting_meta counter is already at `N` from the
+/// pre-restart `commit_mint_tx`, but the SMT has not yet seen the
+/// inscription for pubkey index `N-1`. The trade-off: a real desync now
+/// takes up to 90 s to surface, but transient restart desyncs no longer
+/// crash-loop the container indefinitely waiting for an operator to
+/// notice. If the timeout expires the invariant check still runs — a
+/// genuine desync where the scanner is healthy but the inscription was
+/// never persisted will fail loudly, just 90 s later than before.
+///
+/// When `scanner_progress` is `None` (unit tests, fresh-state
+/// `num_pubkeys = 0` bootstraps) the wait is skipped.
+///
+/// **No break-glass flag.** Strict by default. If an operator needs
+/// to start the server with a known state desync (e.g. to inspect the
+/// damage), they must patch this function out. The lack of an env
+/// override is intentional — the previous `DEV_SKIP_BROADCAST_FAILURE`
+/// pattern is exactly the kind of silent-soft-fail that this check
+/// is here to prevent (see zk-coins/server#89).
+pub(crate) async fn check_minting_state_invariant(
+    state: &AppState,
+    num_pubkeys: u32,
+    scanner_progress: Option<&AtomicU64>,
+) -> Result<(), String> {
+    if num_pubkeys == 0 {
+        println!("Startup invariant: minting num_pubkeys=0, no SMT membership to verify");
+        return Ok(());
+    }
+
+    // Wait for the scanner to ingest at least one inscription before
+    // declaring a desync. See doc-comment above for the trade-off.
+    if let Some(progress) = scanner_progress {
+        let timeout = scanner_initial_settle_timeout();
+        if timeout.is_zero() {
+            println!(
+                "Startup invariant: scanner-settle wait skipped (SCANNER_INITIAL_SETTLE_TIMEOUT_MS=0)"
+            );
+        } else {
+            let deadline = Instant::now() + timeout;
+            let mut settled = false;
+            loop {
+                if progress.load(Ordering::Relaxed) > 0 {
+                    println!("Startup invariant: scanner reported progress within settle window");
+                    settled = true;
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(SCANNER_PROGRESS_POLL_INTERVAL).await;
+            }
+            if !settled {
+                println!(
+                    "Startup invariant: scanner settle timeout ({} ms) elapsed without progress, \
+                     evaluating SMT membership against current state",
+                    timeout.as_millis()
+                );
+            }
+        }
+    }
+
+    let minting_pubkeys: Vec<bitcoin::secp256k1::PublicKey> = {
+        let guard = lock_or_recover(&state.minting_account);
+        (0..num_pubkeys)
+            .map(|i| guard.generate_public_key(i))
+            .collect()
+    };
+    let account_server_guard = lock_or_recover(&state.account_server);
+    let state_arc = account_server_guard.state().clone();
+    drop(account_server_guard);
+    let state_guard = lock_or_recover(&state_arc);
+    for (i, pk) in minting_pubkeys.iter().enumerate() {
+        if state_guard.get_commitment_proof(pk).is_err() {
+            let msg = format!(
+                "CRITICAL: minting state desync at pubkey_idx={}: commitment not in SMT. \
+                 Operator action: dispatch reset_state workflow or repair manually. \
+                 See zk-coins/server#89.",
+                i
+            );
+            eprintln!("{}", msg);
+            return Err(msg);
+        }
+    }
+    println!(
+        "Startup invariant: all {} minting pubkeys have commitments in SMT",
+        num_pubkeys
+    );
+    Ok(())
+}
+
 /// Broadcast the commit inscription and, on success, deliver the coin
 /// to the recipient and persist the account state. This contains the
 /// network call (Bitcoin broadcast) and the post-broadcast bookkeeping,
 /// plus the success/failure response dispatch — all of which cannot be
 /// exercised by unit tests, so the whole function lives in the runtime
 /// module that is excluded from the coverage scope.
+///
+/// **Invariant (zk-coins/server#89).** The broadcast `if let Err(...)
+/// { return 503 }` MUST stay above every `receive_coin`/`upsert_account`
+/// line. The mint flow had to be refactored to prepare-then-commit
+/// because its old shape advanced state ahead of broadcast; this
+/// function does not have that bug because its broadcast is already
+/// the first effect. Any future refactor that moves a state mutation
+/// above the broadcast re-introduces the state-desync class — do not.
 pub(crate) async fn broadcast_commit_and_deliver(
     state: &AppState,
     commitment: Commitment,

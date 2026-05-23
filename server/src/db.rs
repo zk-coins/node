@@ -263,6 +263,98 @@ pub async fn upsert_minting_num_pubkeys(pool: &PgPool, n: u32) -> Result<(), sql
     Ok(())
 }
 
+/// Atomically commit a successful mint to Postgres.
+///
+/// One transaction performs three steps in order:
+///
+/// 1. **Optimistic counter bump.** The minting_meta row's
+///    `num_pubkeys` is moved from `expected_prev` to `new_count`. The
+///    statement is shaped so the UPDATE only fires when the stored
+///    value matches `expected_prev` (concurrent-mint guard, see
+///    zk-coins/server#89). When the row does not exist yet and
+///    `expected_prev = 0` the INSERT branch fires instead (fresh DB).
+///    Returns `Ok(false)` if neither branch affected a row — the
+///    caller MUST treat that as "another writer already committed
+///    `num_pubkeys = expected_prev + 1`; abort with 503 concurrent
+///    mint detected" and roll back any in-memory mutations.
+///
+/// 2. **UPSERT every affected account.** The `accounts` slice is
+///    treated as an unordered set; each `(address, bincode-encoded
+///    Account)` pair is written via the same `INSERT ... ON CONFLICT
+///    DO UPDATE` shape used by [`upsert_account`].
+///
+/// All three steps share the same transaction, so either everything
+/// commits or nothing does. The optimistic-lock branch in (1) is the
+/// load-bearing safety net: it prevents two concurrent broadcasters
+/// from both succeeding (the second's UPDATE matches 0 rows, the tx
+/// rolls back, the in-memory state stays clean).
+pub async fn commit_mint_tx(
+    pool: &PgPool,
+    expected_prev: u32,
+    new_count: u32,
+    accounts: &[(&[u8], &[u8])],
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    // Two strict-mode branches keyed on `expected_prev`:
+    //   - `expected_prev == 0`: allow the fresh-DB INSERT (no row).
+    //     The ON CONFLICT branch also fires only when the stored
+    //     value is 0, so a stale operator INSERT that left the row
+    //     at a non-zero value can never be silently overwritten.
+    //   - `expected_prev > 0`: the row MUST already exist with stored
+    //     value `expected_prev`. Use a strict UPDATE with a WHERE
+    //     predicate; no INSERT fallback because the in-memory counter
+    //     advanced past a DB row that was never written, which is a
+    //     desync we must surface as Ok(false).
+    //
+    // When two mints race to bump the counter from N to N+1, only one
+    // wins the UPDATE; the other observes 0 rows affected and the
+    // caller aborts.
+    let result = if expected_prev == 0 {
+        sqlx::query(
+            "INSERT INTO minting_meta (id, num_pubkeys, updated_at) \
+             VALUES (1, $1, NOW()) \
+             ON CONFLICT (id) DO UPDATE \
+             SET num_pubkeys = EXCLUDED.num_pubkeys, updated_at = EXCLUDED.updated_at \
+             WHERE minting_meta.num_pubkeys = 0",
+        )
+        .bind(i64::from(new_count))
+        .execute(&mut *tx)
+        .await?
+    } else {
+        sqlx::query(
+            "UPDATE minting_meta SET num_pubkeys = $1, updated_at = NOW() \
+             WHERE id = 1 AND num_pubkeys = $2",
+        )
+        .bind(i64::from(new_count))
+        .bind(i64::from(expected_prev))
+        .execute(&mut *tx)
+        .await?
+    };
+    if result.rows_affected() == 0 {
+        // Roll back — neither the fresh-DB INSERT nor the UPDATE-with-
+        // expected branch matched. Another concurrent committer must
+        // have already moved the counter (or, if `expected_prev = 0`,
+        // a stale operator INSERT preloaded a non-zero row). Either
+        // way, our caller's snapshot is stale.
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    for (address, data) in accounts {
+        sqlx::query(
+            "INSERT INTO accounts (address, data, updated_at) \
+             VALUES ($1, $2, NOW()) \
+             ON CONFLICT (address) DO UPDATE \
+             SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at",
+        )
+        .bind(*address)
+        .bind(*data)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
 #[cfg(test)]
 #[path = "db_tests.rs"]
 mod tests;

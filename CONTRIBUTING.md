@@ -117,6 +117,22 @@ The five constraints below are decided and apply across every PR on
    But we do not preemptively adopt BabyBear / Poseidon2 inside this
    migration — see `MIGRATION_RESEARCH.md` §5 (decisions) and ROADMAP
    "Considered alternative".
+6. **`num_pubkeys` only advances after on-chain broadcast — never
+   before.** The mint and commit flows must follow prepare → broadcast
+   → commit ordering: build the prover witness on a clone, attempt
+   the inscription broadcast first, and only on broadcast success
+   commit the bumped `minting_meta.num_pubkeys` (with an optimistic
+   `... WHERE num_pubkeys = $expected_prev` clause) together with the
+   mutated account snapshots in a single sqlx transaction. The
+   broadcast-then-commit ordering is load-bearing; any future
+   refactor that moves a `minting_meta` UPDATE, an `accounts` UPSERT,
+   or an in-memory `receive_coin` above the broadcast call re-
+   introduces the state-desync class fixed in
+   [zk-coins/server#89](https://github.com/zk-coins/server/issues/89).
+   Startup invariant check in `server_runtime::check_minting_state_invariant`
+   enforces the corollary at boot: every `pubkey_idx ∈
+   0..num_pubkeys` MUST have a commitment in the SMT, no flag
+   override — operator recovery is via the `reset_state` workflow.
 
 ### Decision recipe — should this go in the MVP?
 
