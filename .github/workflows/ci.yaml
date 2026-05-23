@@ -288,16 +288,12 @@ jobs:
         if: always()
         run: sccache --show-stats
 
-  # Separate job (not an inline step) so a job-level failure — timeout,
-  # OOM, runner crash — still triggers the alert. `if: failure()` here
-  # evaluates against the whole `needs:` group.
-  #
-  # Telegram alert on workflow failure. `needs:` lists every other job
-  # so any of them transitioning to `failure` triggers the alert via
-  # `if: failure()`. Skipped jobs (e.g. server-tests / coverage on a
-  # non-ci:full PR, or all jobs on a draft PR) leave failure() as false,
-  # so the alert correctly stays silent. Manual cancellation also stays
-  # silent (cancelled() would be a separate condition).
+  # Telegram alert on workflow failure. Modelled as a separate job (not
+  # an inline step) so job-level failures — timeout, OOM, runner crash —
+  # still fire the alert. `if: failure()` evaluates against the whole
+  # `needs:` group: any listed job transitioning to `failure` triggers
+  # it, while skipped jobs (server-tests / coverage on a non-ci:full PR,
+  # or all jobs on a draft PR) and manual cancellation stay silent.
   notify-failure:
     name: Telegram alert on failure
     needs: [lint-and-build, server-tests, coverage]
