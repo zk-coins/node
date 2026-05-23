@@ -321,6 +321,80 @@ async fn connect_and_migrate_propagates_connect_failure() {
     );
 }
 
+/// Drives the `expected_prev > 0` UPDATE branch of `commit_mint_tx`.
+/// The fresh-DB INSERT branch (`expected_prev == 0`) is covered by the
+/// happy-path mint tests in `server_tests.rs`; the UPDATE branch only
+/// fires on the second-and-later mint where a `minting_meta` row
+/// already exists with a non-zero counter. Pre-seeds the row with
+/// `num_pubkeys = 1`, calls `commit_mint_tx(expected_prev=1,
+/// new_count=2, ...)`, asserts `Ok(true)` and that the row advanced
+/// to 2.
+#[tokio::test]
+async fn commit_mint_tx_updates_existing_row_when_expected_prev_matches() {
+    let (pool, _container) = setup_pool().await;
+    upsert_minting_num_pubkeys(&pool, 1)
+        .await
+        .expect("seed minting_meta row at num_pubkeys=1");
+
+    let addr = [0xAAu8; 32];
+    let data = [0xBBu8; 16];
+    let accounts: Vec<(&[u8], &[u8])> = vec![(&addr[..], &data[..])];
+    let ok = commit_mint_tx(&pool, 1, 2, &accounts)
+        .await
+        .expect("commit_mint_tx UPDATE branch must succeed");
+    assert!(ok, "commit_mint_tx must return Ok(true) on UPDATE success");
+
+    assert_eq!(
+        load_minting_num_pubkeys(&pool).await.unwrap(),
+        Some(2),
+        "minting_meta.num_pubkeys must advance to 2 after UPDATE"
+    );
+}
+
+/// Companion to the UPDATE-happy-path test: drives the
+/// `expected_prev > 0` branch with a stale `expected_prev` that no
+/// longer matches the stored value, so the WHERE predicate filters
+/// the UPDATE out and `rows_affected == 0`. The transaction rolls
+/// back, the function returns `Ok(false)`, and neither the
+/// `minting_meta` row nor the `accounts` row is touched.
+#[tokio::test]
+async fn commit_mint_tx_returns_false_when_update_branch_loses_race() {
+    let (pool, _container) = setup_pool().await;
+    upsert_minting_num_pubkeys(&pool, 5)
+        .await
+        .expect("seed minting_meta row at num_pubkeys=5");
+
+    let addr = [0xCCu8; 32];
+    let data = [0xDDu8; 16];
+    let accounts: Vec<(&[u8], &[u8])> = vec![(&addr[..], &data[..])];
+    // expected_prev = 3 but the stored value is 5 → WHERE predicate
+    // filters the UPDATE out.
+    let ok = commit_mint_tx(&pool, 3, 4, &accounts)
+        .await
+        .expect("commit_mint_tx must surface the loser as Ok(false)");
+    assert!(
+        !ok,
+        "commit_mint_tx must return Ok(false) when UPDATE matches 0 rows"
+    );
+
+    assert_eq!(
+        load_minting_num_pubkeys(&pool).await.unwrap(),
+        Some(5),
+        "minting_meta.num_pubkeys must NOT change when UPDATE loses"
+    );
+    // The accounts upsert is inside the same transaction, so it must
+    // have rolled back too.
+    let row_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts WHERE address = $1")
+        .bind(&addr[..])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        row_count, 0,
+        "accounts row must be rolled back when UPDATE loses"
+    );
+}
+
 #[tokio::test]
 async fn connect_and_migrate_propagates_migration_failure() {
     // Apply our migrations, then poison the `_sqlx_migrations` table

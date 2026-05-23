@@ -40,6 +40,40 @@ pub struct Account {
 }
 
 impl Account {
+    /// Deep-clone an `Account` via bincode round-trip.
+    ///
+    /// `SparseMerkleTree` is not `Clone` (the upstream type in
+    /// `program-plonky2` deliberately keeps the API minimal), so we go
+    /// through the serialisation boundary the rest of this module
+    /// already exercises for persistence. The serialiser is the same
+    /// one [`AccountServer::serialize_account`] uses, so any future
+    /// change to the on-disk shape continues to be a single point of
+    /// truth.
+    ///
+    /// Returns the deserialised twin or a `bincode::Error` from the
+    /// round-trip. Both fallible arms are propagated up to the caller
+    /// (`AccountServer::prepare_mint`) which surfaces them as the
+    /// caller-facing "Failed to snapshot minting account" error.
+    pub(crate) fn try_deep_clone(&self) -> Result<Self, bincode::Error> {
+        let bytes = bincode::serialize(self)?;
+        bincode::deserialize(&bytes)
+    }
+}
+
+/// Result of [`AccountServer::prepare_mint`]: the tentative mutated
+/// minting account (clone — not yet swapped into `self.accounts`)
+/// together with the freshly-generated coin proofs the mint flow needs
+/// to inscribe and deliver. The caller commits the mutation atomically
+/// via [`AccountServer::commit_mint`] once the on-chain broadcast and
+/// the optimistic `minting_meta.num_pubkeys` UPDATE have both
+/// succeeded.
+#[derive(Debug)]
+pub struct MintingPrepared {
+    pub mutated_minting: Account,
+    pub coin_proofs: Vec<CoinProof>,
+}
+
+impl Account {
     pub fn new() -> Self {
         Account {
             proof: None,
@@ -150,6 +184,27 @@ impl AccountServer {
     }
 
     pub fn receive_coin(&mut self, coin_proof: CoinProof) -> Result<(), &'static str> {
+        let recipient = coin_proof.coin.recipient;
+        let mut account = self
+            .accounts
+            .remove(&recipient)
+            .unwrap_or_else(Account::new);
+        Self::receive_coin_into(&mut account, coin_proof)?;
+        self.accounts.insert(recipient, account);
+        Ok(())
+    }
+
+    /// Pure-by-account variant of [`Self::receive_coin`]. Validates
+    /// the supplied proof + inclusion proof against the recipient
+    /// account and, on success, pushes the coin into the recipient's
+    /// `coin_queue`. The caller owns the `&mut Account` lifecycle —
+    /// used by the mint flow's prepare-then-commit path to apply
+    /// receives on cloned recipients before the on-chain broadcast
+    /// commit window.
+    pub fn receive_coin_into(
+        account: &mut Account,
+        coin_proof: CoinProof,
+    ) -> Result<(), &'static str> {
         // PLONKY2 MIGRATION (Step 7): The SP1-era `proof.public_values`
         // (a writable byte stream) is replaced by Plonky2's
         // `proof.public_inputs: Vec<F>` (field elements). The
@@ -176,24 +231,6 @@ impl AccountServer {
             "Receiving coin for address: {:02x}{:02x}…",
             addr_bytes[0], addr_bytes[1]
         );
-        // Get the recipient account
-        let mut account = self
-            .accounts
-            .remove(&coin_proof.coin.recipient)
-            .unwrap_or_else(Account::new);
-
-        // Check if we could generate updated account proof. (e.g. the coin is valid)
-        // TODO: Check if the public key is not included in our accumulator yet (or belongs to the
-        // same account state hash -> what is stored for the public key has to be the preimage to
-        // the coin identifier)
-        //let _ = self.prover.update_account(
-        //    &account.state,
-        //    &None,
-        //    account.proof.clone(),
-        //    vec![proof.clone()],
-        //    // Note: account public_key is not updated when only receiving.
-        //    &account.state.public_key,
-        //);
 
         // Reject duplicate coins (replay protection)
         let coin_id = coin_proof.coin.identifier;
@@ -212,9 +249,7 @@ impl AccountServer {
             return Err("Coin already spent (replay)");
         }
 
-        let address = coin_proof.coin.recipient;
         account.coin_queue.push(coin_proof);
-        self.accounts.insert(address, account);
         Ok(())
     }
 
@@ -295,14 +330,63 @@ impl AccountServer {
         next_public_key: PublicKey,
         prev_commitment_pubkey: Option<PublicKey>,
     ) -> Result<Vec<CoinProof>, &'static str> {
-        let state = &self
-            .state
+        // Thin wrapper: borrow the account out of the map, run the
+        // shared `send_coins_inner` body against it, and write it back
+        // on success. The Err arm leaves the map untouched.
+        let mut account = self
+            .accounts
+            .remove(&account_address)
+            .ok_or("Unknown account address")?;
+        match Self::send_coins_inner(
+            &self.prover,
+            &self.state,
+            &mut account,
+            invoices,
+            account_address,
+            public_key,
+            next_public_key,
+            prev_commitment_pubkey,
+        ) {
+            Ok(coin_proofs) => {
+                self.accounts.insert(account_address, account);
+                Ok(coin_proofs)
+            }
+            Err(e) => {
+                // Restore the account untouched. `send_coins_inner` does
+                // not commit mutations until the prove step succeeds, so
+                // the value we put back equals what we removed.
+                self.accounts.insert(account_address, account);
+                Err(e)
+            }
+        }
+    }
+
+    /// Pure-by-account variant of [`Self::send_coins`]. Runs the full
+    /// state-transition (witness assembly, prove, post-prove account
+    /// mutation) against an externally-owned `&mut Account` and returns
+    /// the produced coin proofs. The caller is responsible for deciding
+    /// whether to commit the mutated account back into the server
+    /// (e.g. after on-chain broadcast succeeded — see
+    /// [`Self::prepare_mint`] + [`Self::commit_mint`]).
+    ///
+    /// Identical body to the pre-refactor `send_coins`; the only change
+    /// is that the `account_address` lookup is the caller's
+    /// responsibility (the account is passed in). The "Unknown account
+    /// address" check therefore lives at the wrapper site.
+    #[allow(clippy::too_many_arguments)]
+    fn send_coins_inner(
+        prover: &Prover,
+        state: &Mutex<State>,
+        account: &mut Account,
+        invoices: Vec<Invoice>,
+        account_address: Address,
+        public_key: PublicKey,
+        next_public_key: PublicKey,
+        prev_commitment_pubkey: Option<PublicKey>,
+    ) -> Result<Vec<CoinProof>, &'static str> {
+        let state = &state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let account = self
-            .accounts
-            .get_mut(&account_address)
-            .ok_or("Unknown account address")?;
 
         // Slot-count guards. Done up-front before the expensive
         // get_merkle_proofs / coin-history-SMT loop so a caller
@@ -491,7 +575,7 @@ impl AccountServer {
                     account_commitment_public_key,
                     state,
                 )?;
-                self.prover
+                prover
                     .prove_account_update_with_in_and_out_coins_and_sources(
                         &account_state_for_prove,
                         history_root_extended,
@@ -504,8 +588,7 @@ impl AccountServer {
                     )
                     .map_err(|_| "prove_account_update_with_in_and_out_coins_and_sources failed")?
             }
-            None => self
-                .prover
+            None => prover
                 .prove_initial_with_in_and_out_coins_and_sources(
                     &account_state_for_prove,
                     history_root_extended,
@@ -554,6 +637,77 @@ impl AccountServer {
             Some(_) => Ok(*zkcoins_program::types::MINTING_ADDRESS),
             None => Err("Minting account not created"),
         }
+    }
+
+    /// Prepare a mint transition WITHOUT mutating `self.accounts`.
+    ///
+    /// Used by the mint flow's prepare-then-commit refactor (see
+    /// [`crate::server::mint_handler`] + zk-coins/server#89): the
+    /// caller produces the prover output and the recipient coin proofs
+    /// here, then attempts the on-chain inscription broadcast, then —
+    /// only on broadcast success — commits the mutated minting account
+    /// via [`Self::commit_mint`] inside the same Postgres transaction
+    /// that bumps `minting_meta.num_pubkeys`.
+    ///
+    /// The clone of the minting `Account` is the unit of "tentative
+    /// state": any partial mutation `send_coins_inner` would perform on
+    /// the real account (coin_queue clear, proof set, coin_history SMT
+    /// insert) lives on the clone instead. If the broadcast fails the
+    /// clone is dropped and `self.accounts` is byte-identical to what
+    /// it was before the call.
+    ///
+    /// Returns `Err("Minting account not created")` if the minting
+    /// account has not been bootstrapped yet — the wrapper site already
+    /// guards this via `get_minting_account_address`, but the check is
+    /// kept inline so this method is sound to call standalone.
+    pub fn prepare_mint(
+        &self,
+        invoices: Vec<Invoice>,
+        public_key: PublicKey,
+        next_public_key: PublicKey,
+        prev_commitment_pubkey: Option<PublicKey>,
+    ) -> Result<MintingPrepared, &'static str> {
+        let minting_address = *zkcoins_program::types::MINTING_ADDRESS;
+        let live = self
+            .accounts
+            .get(&minting_address)
+            .ok_or("Minting account not created")?;
+        let mut snapshot = live
+            .try_deep_clone()
+            .map_err(|_| "Failed to snapshot minting account")?;
+        let coin_proofs = Self::send_coins_inner(
+            &self.prover,
+            &self.state,
+            &mut snapshot,
+            invoices,
+            minting_address,
+            public_key,
+            next_public_key,
+            prev_commitment_pubkey,
+        )?;
+        Ok(MintingPrepared {
+            mutated_minting: snapshot,
+            coin_proofs,
+        })
+    }
+
+    /// Atomically swap a prepared minting-account snapshot into the
+    /// in-memory map. Pair of [`Self::prepare_mint`]; the caller MUST
+    /// have observed a successful on-chain broadcast + a successful
+    /// optimistic `UPDATE minting_meta` before invoking this — see
+    /// `mint_handler` for the canonical call site.
+    pub fn commit_mint(&mut self, mutated_minting: Account) {
+        self.accounts
+            .insert(*zkcoins_program::types::MINTING_ADDRESS, mutated_minting);
+    }
+
+    /// Read-only handle on the shared [`State`] (SMT + MMR). Exposed so
+    /// the startup invariant check in `server_runtime` can verify
+    /// every persisted minting-account pubkey has a corresponding SMT
+    /// commitment without round-tripping through a dedicated
+    /// `AppState` field.
+    pub fn state(&self) -> &Arc<Mutex<State>> {
+        &self.state
     }
 
     /// Borrow a single account by address. Returned for read-only
@@ -844,6 +998,14 @@ mod inline_tests {
             None,
         );
         assert_eq!(result.unwrap_err(), "Insufficient funds");
+    }
+
+    #[test]
+    fn prepare_mint_errors_when_minting_account_absent() {
+        let server = fresh_server();
+        let pk = dummy_secp_public_key();
+        let result = server.prepare_mint(vec![], pk, pk, None);
+        assert_eq!(result.unwrap_err(), "Minting account not created");
     }
 
     #[test]
