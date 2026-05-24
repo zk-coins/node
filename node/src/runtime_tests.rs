@@ -146,6 +146,23 @@ async fn start_rest_node_binds_and_serves_health() {
                     "expected 200 on /health, got: {}",
                     &resp[..resp.len().min(300)]
                 );
+                // `/health` is the documented liveness probe whose
+                // body is the literal string "ok" (see the route
+                // registration in `server::create_router`). A 200
+                // status with a different body would still satisfy
+                // the old assertion but signal a regression in the
+                // contract Kuma watches.
+                let body = resp
+                    .split("\r\n\r\n")
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim_end_matches('\0')
+                    .trim();
+                assert!(
+                    body.starts_with("ok"),
+                    "expected /health body to start with `ok`, got: {:?}",
+                    body
+                );
                 return;
             }
             Err(e) => last_err = Some(e),

@@ -65,6 +65,7 @@ fn test_state() -> AppState {
             ws_url: None,
             track_tx_timeout: None,
         }),
+        phase2_reached: Arc::new(tokio::sync::Notify::new()),
     }
 }
 
@@ -1591,7 +1592,9 @@ fn send_signature_accepts_valid_signature() {
         signature: Some(hex::encode(sig.serialize())),
         timestamp: Some(now),
     };
-    assert!(verify_send_signature(&request).is_ok());
+    // `.expect` surfaces the actual error string on failure; the
+    // previous `is_ok()` shape silently swallowed it.
+    verify_send_signature(&request).expect("valid Schnorr signature must verify");
 }
 
 // --- POST /api/send (happy path, exercises the full handler) ---
@@ -1678,17 +1681,34 @@ async fn send_with_valid_signature_returns_proof_id_and_hashes() {
     let response_json: serde_json::Value =
         serde_json::from_str(&body).expect("response is valid JSON");
     assert_eq!(response_json["success"], true);
+    let proof_id = response_json["proof_id"]
+        .as_u64()
+        .expect("proof_id missing from response");
+    assert!(proof_id > 0, "proof_id must be a positive u64");
+
+    // Value-bearing assertions on the send response payload. The
+    // previous `.as_str().is_some()` shape passed for any non-null
+    // string — including the all-zero placeholder a buggy handler
+    // could emit, or a truncated hex string. Decoding to bytes and
+    // asserting 32-byte length + non-zero pins both regressions.
+    let account_state_hash_hex = response_json["account_state_hash"]
+        .as_str()
+        .expect("account_state_hash present");
+    let ash_bytes = hex::decode(account_state_hash_hex).expect("ash is hex");
+    assert_eq!(ash_bytes.len(), 32, "account_state_hash must be 32 bytes");
     assert!(
-        response_json["proof_id"].as_u64().is_some(),
-        "proof_id missing from response: {body}"
+        ash_bytes.iter().any(|&b| b != 0),
+        "account_state_hash must be non-zero"
     );
+
+    let output_coins_root_hex = response_json["output_coins_root"]
+        .as_str()
+        .expect("output_coins_root present");
+    let ocr_bytes = hex::decode(output_coins_root_hex).expect("ocr is hex");
+    assert_eq!(ocr_bytes.len(), 32, "output_coins_root must be 32 bytes");
     assert!(
-        response_json["account_state_hash"].as_str().is_some(),
-        "account_state_hash missing: {body}"
-    );
-    assert!(
-        response_json["output_coins_root"].as_str().is_some(),
-        "output_coins_root missing: {body}"
+        ocr_bytes.iter().any(|&b| b != 0),
+        "output_coins_root must be non-zero"
     );
 }
 
@@ -2218,6 +2238,7 @@ async fn send_with_insufficient_funds_returns_422_with_error_string() {
             ws_url: None,
             track_tx_timeout: None,
         }),
+        phase2_reached: Arc::new(tokio::sync::Notify::new()),
     };
 
     let secret_bytes = include_bytes!("../minting_secret.bin");
@@ -2348,6 +2369,26 @@ async fn send_with_non_hex_recipient_returns_422() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+// -----------------------------------------------------------------
+// `lock_or_recover_*` tests — nextest per-test process isolation note
+// -----------------------------------------------------------------
+//
+// The three `lock_or_recover_*_poisoned` tests below intentionally
+// panic inside a spawned thread to poison the mutex they hold, then
+// call `lock_or_recover` on the same `Arc<Mutex<_>>` to assert that
+// the helper recovers the inner value via `into_inner`. Each test
+// MUST run in its own process — under the default `cargo test`
+// runner (single binary, threadpool) the second-test poison setup
+// can race against the first test's recovery path because both
+// share the libtest thread that observes panics. We rely on
+// `cargo-nextest`'s per-test process isolation (see `CONTRIBUTING.md`
+// > "Tests" and `.config/nextest.toml`) to give each test a fresh
+// process. Running these tests outside nextest is supported (the
+// project's CI uses `cargo nextest run`); a bare `cargo test` will
+// occasionally surface a spurious "double panic" diagnostic in the
+// shared libtest panic handler. Switch to nextest if you reproduce
+// this locally.
+
 #[test]
 fn lock_or_recover_recovers_from_poisoned_mutex() {
     let mutex = Arc::new(Mutex::new(42i32));
@@ -2374,7 +2415,60 @@ fn lock_or_recover_recovers_from_poisoned_mutex() {
 async fn commit_with_valid_signature_fails_broadcast_returns_503() {
     use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
     use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
-    let state = test_state();
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Spin up a wiremock Esplora that returns the publisher's UTXOs
+    // (so `get_publisher_utxo` finds inputs) but FAILS the broadcast
+    // with a 400. This pins the test to "valid signature, broadcast
+    // genuinely fails → 503" instead of "valid signature, broadcast
+    // might or might not succeed against a public Mutinynet". The
+    // previous accept-either assertion masked a hypothetical
+    // regression where the handler returned 200 without actually
+    // broadcasting.
+    let mock_server = MockServer::start().await;
+    let secp = secp::Secp256k1::new();
+    let publisher_sk = SecretKey::from_slice(
+        &hex::decode("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef").unwrap(),
+    )
+    .expect("default publisher key parses");
+    let publisher_kp = Keypair::from_secret_key(&secp, &publisher_sk);
+    let (publisher_xonly, _) = bitcoin::secp256k1::XOnlyPublicKey::from_keypair(&publisher_kp);
+    let publisher_address =
+        bitcoin::Address::p2tr(&secp, publisher_xonly, None, bitcoin::Network::Signet);
+    Mock::given(method("GET"))
+        .and(path(format!("/address/{}/utxo", publisher_address)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {
+                "txid": "4444444444444444444444444444444444444444444444444444444444444444",
+                "vout": 0,
+                "value": 100_000,
+                "status": {
+                    "confirmed": true,
+                    "block_height": 100,
+                    "block_hash": "0000000000000000000000000000000000000000000000000000000000000001",
+                    "block_time": 1_700_000_000
+                }
+            }
+        ])))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/tx"))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_string("sendrawtransaction RPC error -25"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let mut state = test_state();
+    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
+        url: mock_server.uri(),
+        is_mainnet: false,
+        network_name: "Mutinynet".to_string(),
+        ws_url: None,
+        track_tx_timeout: None,
+    });
 
     let secret_bytes = include_bytes!("../minting_secret.bin");
     let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
@@ -2459,14 +2553,16 @@ async fn commit_with_valid_signature_fails_broadcast_returns_503() {
         .body(Body::from(commit_body.to_string()))
         .unwrap();
     let (status, _) = send_request_with_state(state, commit_req).await;
-    // The commitment verifies, the handler proceeds to broadcast. Without
-    // a reachable Bitcoin node in the unit test environment, that call
-    // fails and the handler returns SERVICE_UNAVAILABLE. We accept either
-    // 503 (broadcast attempted and failed) or 200 (network was reachable
-    // and broadcast happened to succeed against a public Mutinynet).
-    assert!(
-        status == StatusCode::SERVICE_UNAVAILABLE || status == StatusCode::OK,
-        "expected 503 or 200, got {status}"
+    // The commitment verifies, the handler proceeds to broadcast. The
+    // wiremock Esplora rejects the broadcast (400) so the handler MUST
+    // return SERVICE_UNAVAILABLE. Anything else means the handler
+    // either bypassed the broadcast (a regression — it should always
+    // attempt it on a valid commitment) or fabricated a 200 response
+    // despite the upstream failure (a worse regression).
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "expected 503 from valid-commit + broken-broadcast, got {status}"
     );
 }
 
@@ -2488,14 +2584,10 @@ fn proof_store_proof_path_returns_none_for_nonexistent_directory() {
 
 #[test]
 fn proof_store_new_picks_up_max_id_from_existing_files() {
-    let dir = std::env::temp_dir().join(format!(
-        "zkcoins-proof-store-max-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    // `tempfile::tempdir` removes the directory on Drop even when the
+    // test panics, so no /tmp/zkcoins-* tree leaks on failure.
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let dir = tmp.path();
     // Drop a few well-formed and one malformed filename.
     std::fs::write(dir.join("3.bin"), b"placeholder").unwrap();
     std::fs::write(dir.join("17.bin"), b"placeholder").unwrap();
@@ -2506,8 +2598,6 @@ fn proof_store_new_picks_up_max_id_from_existing_files() {
     // next_id starts at max(3, 17) + 1 = 18; the malformed names are skipped.
     let id = store.next_id.load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(id, 18);
-
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -2524,18 +2614,11 @@ fn persist_proof_bytes_logs_error_when_write_fails() {
 #[test]
 fn persist_proof_bytes_succeeds_when_write_succeeds() {
     // Mirror test for the Ok arm so the helper is fully exercised.
-    let dir = std::env::temp_dir().join(format!(
-        "zkcoins-persist-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("99.bin");
+    // `tempfile::tempdir` cleans up on Drop, even on test panic.
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let path = tmp.path().join("99.bin");
     ProofStore::persist_proof_bytes(&path, b"payload", 99);
     assert_eq!(std::fs::read(&path).unwrap(), b"payload");
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
@@ -3351,6 +3434,7 @@ fn mint_test_state() -> AppState {
             ws_url: None,
             track_tx_timeout: None,
         }),
+        phase2_reached: Arc::new(tokio::sync::Notify::new()),
     }
 }
 
@@ -3668,11 +3752,15 @@ async fn mint_happy_path_broadcasts_and_returns_proof_id() {
     assert_eq!(status, StatusCode::OK, "body: {}", resp_body);
     let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
     assert_eq!(v["success"], true);
-    assert!(
-        v["proof_id"].as_u64().is_some(),
-        "proof_id missing from response: {}",
-        resp_body
-    );
+    // Fresh-state pinning: this is the FIRST proof emitted by the
+    // ProofStore in this test, so the id must be exactly 1. A drift
+    // (e.g. ProofStore counter not reset between tests, or proof_id
+    // generator reordered) would slip through a shape-only
+    // `is_some()` check.
+    let proof_id = v["proof_id"]
+        .as_u64()
+        .expect("proof_id missing from response");
+    assert_eq!(proof_id, 1, "fresh-state mint must emit proof_id == 1");
     // Per the mint_handler contract, the mint response intentionally
     // omits `account_state_hash` and `output_coins_root` (those are
     // returned by /api/send instead).
@@ -3998,11 +4086,13 @@ async fn mint_receive_coin_failure_logs_and_returns_ok() {
     assert_eq!(status, StatusCode::OK, "body: {}", resp_body);
     let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
     assert_eq!(v["success"], true);
-    assert!(
-        v["proof_id"].as_u64().is_some(),
-        "proof_id missing from response: {}",
-        resp_body
-    );
+    // Fresh-state pinning: this test's mint is the first to write a
+    // proof, so the id must be exactly 1. See the matching note in
+    // the happy-path mint test above.
+    let proof_id = v["proof_id"]
+        .as_u64()
+        .expect("proof_id missing from response");
+    assert_eq!(proof_id, 1, "fresh-state mint must emit proof_id == 1");
 }
 
 /// Retry-after-broadcast-failure (zk-coins/node#89).
@@ -4109,10 +4199,19 @@ async fn mint_retry_after_broadcast_failure_succeeds() {
     assert_eq!(state.minting_account.lock().unwrap().num_pubkeys, 1);
     let recipient_digest = zkcoins_program::hash::digest_from_bytes(&recipient_bytes);
     {
-        let server_guard = state.account_node.lock().unwrap();
-        assert!(
-            server_guard.get_account(&recipient_digest).is_some(),
-            "recipient account must be created on successful mint"
+        let node_guard = state.account_node.lock().unwrap();
+        let recipient_account = node_guard
+            .get_account(&recipient_digest)
+            .expect("recipient account must be created on successful mint");
+        // The second mint above credits `1u64`; the recipient's
+        // coin_queue must reflect exactly that single inflow. A
+        // shape-only `is_some()` previously masked a bug where the
+        // account row was inserted with an empty queue.
+        assert_eq!(
+            recipient_account.coin_queue.len(),
+            1,
+            "recipient coin_queue must hold exactly the minted coin, got {:?}",
+            recipient_account.coin_queue.len()
         );
     }
 }
@@ -4242,40 +4341,42 @@ async fn concurrent_mint_during_proof_response_returns_503() {
 /// End-to-end race that drives the post-proof "concurrent mint
 /// detected during proof phase" branch of `mint_handler` through the
 /// HTTP layer so the `return concurrent_mint_during_proof_response(...)`
-/// call site (router.rs ~L891) is covered, not just the helper.
+/// call site (router.rs) is covered, not just the helper.
 ///
-/// Synchronisation strategy (deterministic, not time-based): the test
-/// pre-acquires the `state.account_node` mutex BEFORE issuing the
-/// `/api/mint` request. The handler completes phase 1 (lock
-/// `minting_account`, snapshot `expected_num_pubkeys = 0`, release)
-/// and then blocks at phase 2 trying to lock `account_node`. While
-/// the handler is parked on that lock, the test acquires
-/// `state.minting_account` and bumps `num_pubkeys` to a non-matching
-/// value, then drops the `account_node` guard. The handler proceeds
-/// through phase 2 (prover work), reaches phase 3, re-locks
+/// Synchronisation strategy (deterministic, NOT time-based): the
+/// handler signals it has acquired the `state.account_node` guard
+/// at the top of phase 2 via the test-only
+/// `state.phase2_reached: Arc<tokio::sync::Notify>` field; the test
+/// `.notified().await`s on it, then acquires `state.minting_account`
+/// and bumps `num_pubkeys` to a non-matching value. The handler
+/// proceeds through phase 2 (prover work), reaches phase 3, re-locks
 /// `minting_account`, observes the bumped counter, and returns 503
 /// before ever touching the broadcast / Esplora / Postgres paths —
 /// so the bare `mint_test_state()` (dead pool, unreachable Esplora)
 /// is sufficient.
 ///
+/// Previously this test used a 200 ms `tokio::time::sleep`, which
+/// was both racy (a slow CI scheduler could let phase 2 enter and
+/// finish before the bump landed) and opaque (a failure mode looked
+/// like "test occasionally returns 200 instead of 503"). The Notify
+/// barrier is a hard happens-before edge: the bump cannot run until
+/// the handler has reached phase 2.
+///
 /// Requires the multi-thread runtime: phase 2's `prepare_mint` is
 /// blocking CPU work that would otherwise stall the single-threaded
 /// executor and prevent the test thread from running the bump step.
-///
-/// `clippy::await_holding_lock` is silenced because holding the
-/// `account_node` `MutexGuard` across the `sleep().await` IS the
-/// synchronisation primitive — releasing it earlier would defeat the
-/// test by letting phase 2 finish before the bump.
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mint_handler_concurrent_mint_during_proof_returns_503() {
     let state = mint_test_state();
 
-    // Pre-acquire the account_node lock so phase 2 of mint_handler
-    // parks until we release it. Phase 1 only touches
-    // `state.minting_account`, so the handler can still complete its
-    // snapshot (capturing expected_num_pubkeys = 0) before parking.
-    let account_node_guard = state.account_node.lock().unwrap();
+    // Pre-subscribe to the phase-2 notify BEFORE spawning the request
+    // so a fast handler that acquires `account_node` and fires
+    // `notify_one()` immediately cannot lose the signal. `Notified` is
+    // a future created up-front; the `notify_one` call buffers the
+    // wake-up even when no one is currently awaiting, so dropping the
+    // `Notified` before the await would be unsound here.
+    let notified = state.phase2_reached.notified();
+    tokio::pin!(notified);
 
     let recipient = "0x".to_string() + &hex::encode([7u8; 32]);
     let body = serde_json::json!({
@@ -4288,33 +4389,28 @@ async fn mint_handler_concurrent_mint_during_proof_returns_503() {
         .unwrap();
 
     // Drive the request on a worker so we can manipulate state from
-    // this task while the handler is parked on the account_node
-    // mutex inside phase 2.
+    // this task while the handler runs.
     let state_for_request = state.clone();
     let request_task =
         tokio::spawn(async move { send_request_with_state(state_for_request, req).await });
 
-    // Give the handler a generous window to enter phase 2 and park on
-    // the account_node lock. Phase 1 is microseconds of work; 200ms
-    // is overkill but cheap. Note: we cannot rely on `lock().is_locked`
-    // because std::sync::Mutex offers no such API — but holding the
-    // guard here is enough, because phase 2 will block until we drop
-    // it regardless of when the handler arrives.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Wait until the handler signals it has acquired the
+    // `account_node` guard at the top of phase 2. Phase 1
+    // (`minting_account` snapshot of `num_pubkeys = 0`) has finished
+    // by this point because it runs BEFORE phase 2 in `mint_handler`.
+    // This is a hard happens-before edge: the bump below cannot run
+    // until the handler is observably past the phase-1 snapshot.
+    notified.as_mut().await;
 
     // Now bump num_pubkeys on the minting_account. Phase 1 already
     // captured expected_num_pubkeys = 0, so any non-zero value here
-    // trips the phase-3 inequality check.
+    // trips the phase-3 inequality check. Phase 3 acquires the
+    // `minting_account` lock after the prover finishes; we hold the
+    // bump-mutating guard only briefly.
     {
         let mut minting = state.minting_account.lock().unwrap();
         minting.num_pubkeys = 1;
     }
-
-    // Release the account_node lock so phase 2 can proceed. The
-    // handler now runs the prover, re-locks minting_account, observes
-    // num_pubkeys = 1 != expected 0, and returns 503 via
-    // `concurrent_mint_during_proof_response`.
-    drop(account_node_guard);
 
     let (status, resp_body) = request_task.await.expect("request task panicked");
 

@@ -97,10 +97,12 @@ async fn run_scanner_ws_publishes_blocks_from_server() {
         );
         ws.send(WsMessage::Text(initial)).await.unwrap();
         ws.send(WsMessage::Text(tip)).await.unwrap();
-        // Hold the socket open so the scanner's anchor-on-reconnect
-        // path does not race; the test asserts on the channel and
-        // then drops the task.
-        let _ = tokio::time::sleep(Duration::from_secs(60)).await;
+        // Hold the socket open until the test aborts the task. A
+        // bounded `sleep(60s)` would silently expire on a slow CI
+        // runner and let the scanner observe a clean close, masking
+        // any race the test is trying to pin. `pending` has the
+        // identical "hold forever" semantic without the bound.
+        std::future::pending::<()>().await;
     })
     .await;
 
@@ -156,7 +158,9 @@ async fn run_scanner_ws_reconnects_after_server_close() {
             SAMPLE_BLOCK_HASH_HEX_2
         );
         ws2.send(WsMessage::Text(m2)).await.unwrap();
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        // Hold forever until the test aborts (see the matching note
+        // on the first sleep replacement above).
+        std::future::pending::<()>().await;
     });
 
     let (tx, mut rx) = mpsc::channel::<BlockHash>(8);
@@ -229,7 +233,9 @@ async fn run_scanner_ws_force_reconnects_on_liveness_timeout() {
             SAMPLE_BLOCK_HASH_HEX_2
         );
         ws2.send(WsMessage::Text(m2)).await.unwrap();
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        // Hold forever until the test aborts (see the matching note
+        // on the first sleep replacement above).
+        std::future::pending::<()>().await;
     });
 
     let (tx, mut rx) = mpsc::channel::<BlockHash>(8);
@@ -298,7 +304,8 @@ async fn subscribe_track_tx_then_wait_returns_when_peer_emits_txid() {
                 txid_for_handler
             );
             ws.send(WsMessage::Text(frame)).await.unwrap();
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            // Hold forever until the test aborts.
+            std::future::pending::<()>().await;
         })
         .await
     };
@@ -319,7 +326,8 @@ async fn track_tx_wait_returns_timeout_when_event_never_arrives() {
     let url = spawn_ws_server(|mut ws| async move {
         // Consume the subscribe frame but never echo the event.
         let _ = ws.next().await;
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        // Hold forever until the test aborts.
+        std::future::pending::<()>().await;
     })
     .await;
 

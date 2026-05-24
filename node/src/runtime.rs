@@ -140,6 +140,8 @@ pub async fn start_rest_node(
         // The readiness probe uses this to ping Esplora; in production
         // it points at the same `ESPLORA_URL` as the scanner / publisher.
         esplora_config: Arc::new(NETWORK_CONFIG.clone()),
+        #[cfg(test)]
+        phase2_reached: Arc::new(tokio::sync::Notify::new()),
     };
 
     // Bootstrap the minting account if it isn't already in the DB.

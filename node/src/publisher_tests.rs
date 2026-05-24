@@ -96,10 +96,12 @@ async fn spawn_track_tx_ws(mode: &'static str) -> String {
                     }
                 }
             }
-            // Hold the connection open so the publisher does not see
-            // a clean close before consuming the echo frame; the
-            // publisher's helper exits after the event arrives.
-            let _ = tokio::time::sleep(Duration::from_secs(60)).await;
+            // Hold the connection open until the test aborts the
+            // task. `std::future::pending` keeps the socket alive
+            // indefinitely so a slow CI runner can never let the
+            // helper observe a clean close before the event arrives;
+            // a bounded `sleep(60s)` could expire and mask a race.
+            std::future::pending::<()>().await;
         }
     });
     url

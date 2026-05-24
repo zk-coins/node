@@ -155,6 +155,46 @@ jobs:
           sccache --start-server >/dev/null 2>&1 || true
           sccache --show-stats
 
+      # Operational preflight: hit /health/ready and /health/publisher
+      # BEFORE running the API E2E suite, so an empty publisher wallet
+      # or a non-ready DB fails THIS step with a clear "top up the
+      # publisher" / "DB not ready" message instead of cascading
+      # through the test suite as opaque 503s.
+      #
+      # Historically a green E2E run masked an empty publisher wallet
+      # because the suite silently dev_skip!()'d 5xx errors; PR
+      # "test: harden suite" (this PR) removed the masking and added
+      # this preflight as the load-bearing operational gate.
+      #
+      # 50_000 sats is a conservative floor: a single inscription
+      # commit + reveal pair at typical Mutinynet fee rates needs
+      # ~1_500 sats; 50_000 buys ~30 mints before the next top-up.
+      # Adjust upward if the suite grows.
+      - name: Preflight — publisher wallet has UTXOs
+        env:
+          DEV_API: https://dev-api.zkcoins.app
+        run: |
+          set -euo pipefail
+          ready=$(curl -sS --max-time 10 "$DEV_API/health/ready")
+          if ! echo "$ready" | jq -e '.ready == true' > /dev/null; then
+            echo "::error::/health/ready not ready: $ready"
+            exit 1
+          fi
+          pub=$(curl -sS --max-time 15 -w '|%{http_code}' "$DEV_API/health/publisher")
+          code="${pub##*|}"
+          body="${pub%|*}"
+          if [ "$code" != "200" ]; then
+            echo "::error::/health/publisher returned $code: $body"
+            exit 1
+          fi
+          utxos=$(echo "$body" | jq -r '.utxo_count')
+          sats=$(echo "$body" | jq -r '.total_sats')
+          if [ "$utxos" -lt 1 ] || [ "$sats" -lt 50000 ]; then
+            echo "::error::publisher wallet too low (utxos=$utxos, sats=$sats) — top up before re-running"
+            exit 1
+          fi
+          echo "publisher OK: utxos=$utxos, sats=$sats"
+
       - name: Run API E2E suite against DEV
         run: cargo test -p node --release --all-features --test api_remote -- --test-threads=1 --nocapture
 

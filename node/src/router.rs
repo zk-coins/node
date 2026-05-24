@@ -92,6 +92,15 @@ pub(crate) struct AppState {
     /// clones `NETWORK_CONFIG` into this slot so the runtime
     /// behaviour is unchanged.
     pub(crate) esplora_config: Arc<EsploraConfig>,
+    /// Test-only synchronisation primitive used by
+    /// `mint_handler_concurrent_mint_during_proof_returns_503`. The
+    /// production code path notifies via `notify_one()` after entering
+    /// phase 2 of `mint_handler` (after the `account_node` guard is
+    /// acquired) so the test can `.notified().await` deterministically
+    /// instead of `tokio::time::sleep(200ms)`. Hidden behind
+    /// `cfg(test)` so the field does not exist in release builds.
+    #[cfg(test)]
+    pub(crate) phase2_reached: Arc<tokio::sync::Notify>,
 }
 
 // Response types for our API
@@ -846,6 +855,13 @@ async fn mint_handler(
     // ---- 2. PROOF phase (no mutation, clone-based) -----------------------
     let prepared = {
         let account_node_guard = lock_or_recover(&state.account_node);
+        // Test-only barrier: notify any test waiting on
+        // `state.phase2_reached` that the handler has acquired the
+        // account_node guard and is about to invoke `prepare_mint`.
+        // Production builds compile this out entirely (the field does
+        // not exist in release).
+        #[cfg(test)]
+        state.phase2_reached.notify_one();
         // get_minting_account_address borrows immutably below, fine.
         if account_node_guard
             .get_account(&zkcoins_program::types::MINTING_ADDRESS)
@@ -1245,6 +1261,83 @@ async fn check_esplora(
     Ok(())
 }
 
+/// JSON body returned by `GET /health/publisher`. Surface enough state
+/// for the deploy-dev preflight (and a curious operator) to make the
+/// "should I top up the publisher wallet?" decision without scraping
+/// Esplora directly. `address` is the publisher's Taproot bech32 — log-
+/// only, NOT a secret (the matching key lives in `PUBLISHER_KEY`).
+#[derive(Serialize)]
+struct PublisherHealthResponse {
+    address: String,
+    utxo_count: u64,
+    total_sats: u64,
+}
+
+/// Operational preflight (`GET /health/publisher`).
+///
+/// Reads the publisher Taproot wallet's UTXO set via the configured
+/// Esplora endpoint and reports `(address, utxo_count, total_sats)`.
+/// The deploy-dev workflow probes this BEFORE running the API E2E
+/// suite — an empty wallet would otherwise cause every mint to 503
+/// and historically masked as a "green" run because the E2E suite
+/// itself silently treated 5xx as a skip. Returning 503 on an
+/// Esplora-side error is intentional: the operator should see the
+/// failure mode, not a fabricated empty response.
+async fn publisher_health_handler(State(state): State<AppState>) -> impl IntoResponse {
+    use bitcoin::secp256k1::{Secp256k1, SecretKey, XOnlyPublicKey};
+    use std::str::FromStr;
+
+    let publisher_key = &*crate::PUBLISHER_KEY;
+    let secp = Secp256k1::new();
+    let sk = match SecretKey::from_str(publisher_key) {
+        Ok(sk) => sk,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "invalid PUBLISHER_KEY",
+                    "detail": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let key_pair = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &sk);
+    let (xonly, _parity) = XOnlyPublicKey::from_keypair(&key_pair);
+    let network = state.esplora_config.network();
+    let publisher_address = bitcoin::Address::p2tr(&secp, xonly, None, network);
+
+    match crate::publisher::get_publisher_utxo(&publisher_address, &state.esplora_config, None)
+        .await
+    {
+        Ok(utxos) => {
+            let utxo_count = utxos.len() as u64;
+            let total_sats: u64 = utxos.iter().map(|(_, sats)| sats).sum();
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::to_value(PublisherHealthResponse {
+                        address: publisher_address.to_string(),
+                        utxo_count,
+                        total_sats,
+                    })
+                    .expect("publisher health response serializes"),
+                ),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "Esplora-side error fetching publisher UTXOs",
+                "detail": e.to_string(),
+                "address": publisher_address.to_string(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
 async fn info_handler() -> impl IntoResponse {
     Json(InfoResponse {
         network: NETWORK_CONFIG.network_name.clone(),
@@ -1629,6 +1722,7 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/", get(root_handler))
         .route("/health", get(|| async { "ok" }))
         .route("/health/ready", get(ready_handler))
+        .route("/health/publisher", get(publisher_health_handler))
         .route("/api/info", get(info_handler))
         .route("/api/balance", get(get_balance_handler))
         .route("/api/send", post(send_coin_handler))
