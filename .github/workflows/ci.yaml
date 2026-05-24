@@ -112,10 +112,10 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: Run clippy (server + shared, MVP feature set)
+      - name: Run clippy (node + shared, MVP feature set)
         run: cargo clippy -p node -p shared -- -D warnings
 
-      - name: Run clippy (server, all features)
+      - name: Run clippy (node, all features)
         run: cargo clippy -p node --all-features -- -D warnings
 
       - name: Run clippy (program + prover libs)
@@ -144,14 +144,14 @@ jobs:
           fi
           echo "Scanner/publisher polling check: OK"
 
-      - name: Build server (MVP feature set — the DEV + PRD image)
+      - name: Build node (MVP feature set — the DEV + PRD image)
         run: cargo build -p node
 
-      - name: Build server (all features — self-host opt-in build)
+      - name: Build node (all features — self-host opt-in build)
         run: cargo build -p node --all-features
 
   node-tests:
-    name: Server + Shared Tests (M3 Ultra)
+    name: Node + Shared Tests (M3 Ultra)
     # Heavy job (~60-90 min on the single self-hosted M3 Ultra). Gated
     # behind the `ci:full` label so we don't burn runner time on every
     # speculative PR — apply the label when the PR is ready for the
@@ -233,7 +233,7 @@ jobs:
       # while a PR is still open. Excluding it here keeps `node-tests`
       # hermetic: only unit + non-remote integration tests run; remote
       # verification fires post-deploy as the merge-then-deploy gate.
-      - name: Run server + shared tests (release, all features)
+      - name: Run node + shared tests (release, all features)
         run: cargo nextest run -p node -p shared --release --all-features --test-threads 1 -E 'not binary(api_remote)'
 
       - name: sccache stats (post-build)
