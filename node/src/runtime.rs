@@ -4,10 +4,10 @@
 //! function below cannot be exercised by unit tests — it owns the
 //! process lifecycle (port binding, signal-driven shutdown via axum)
 //! and exists purely to wire the dependency graph defined in
-//! `server.rs` to a real network socket.
+//! `router.rs` to a real network socket.
 //!
 //! Anything that is testable in isolation (handlers, helpers, the
-//! router construction in `create_router`) stays in `server.rs` and
+//! router construction in `create_router`) stays in `router.rs` and
 //! is measured normally.
 
 use std::net::SocketAddr;
@@ -21,17 +21,17 @@ use shared::commitment::Commitment;
 use sqlx::PgPool;
 use tokio::net::TcpListener;
 
-use crate::account_server::{persist_account, CoinProof};
+use crate::account_node::{persist_account, CoinProof};
 use crate::db;
 use crate::publisher::create_and_broadcast_inscription;
-use crate::server::{lock_or_recover, SendCoinResponse};
+use crate::router::{lock_or_recover, SendCoinResponse};
 use crate::NETWORK_CONFIG;
 
 use bitcoin::bip32::Xpriv;
 use shared::ClientAccount;
 
-use crate::account_server::AccountServer;
-use crate::server::{create_router, AppState, ProofStore};
+use crate::account_node::AccountNode;
+use crate::router::{create_router, AppState, ProofStore};
 use crate::username::UsernameStore;
 
 /// Default cap on how long the startup invariant check waits for the
@@ -56,8 +56,8 @@ fn scanner_initial_settle_timeout() -> Duration {
     Duration::from_millis(ms)
 }
 
-pub async fn start_rest_server(
-    account_server: AccountServer,
+pub async fn start_rest_node(
+    account_node: AccountNode,
     username_store: UsernameStore,
     addr: &str,
     pool: Arc<PgPool>,
@@ -67,7 +67,7 @@ pub async fn start_rest_server(
         .parse::<SocketAddr>()
         .map_err(|e| anyhow::anyhow!("Failed to parse address: {}", e))?;
 
-    let shared_account_server = Arc::new(Mutex::new(account_server));
+    let shared_account_node = Arc::new(Mutex::new(account_node));
 
     // Proof files keep using a local directory — the proof store is
     // append-only and the proofs themselves are large (bincode-
@@ -124,7 +124,7 @@ pub async fn start_rest_server(
         // the on-chain identity of the minting wallet) is internally
         // consistent. The test harness already constructs the minting
         // account this way (see
-        // server_tests.rs::TestAccountData::new_minting_account).
+        // router_tests.rs::TestAccountData::new_minting_account).
         minting_client.address = *zkcoins_program::types::MINTING_ADDRESS;
         Arc::new(Mutex::new(minting_client))
     };
@@ -132,7 +132,7 @@ pub async fn start_rest_server(
     let shared_username_store = Arc::new(Mutex::new(username_store));
 
     let state = AppState {
-        account_server: shared_account_server,
+        account_node: shared_account_node,
         proof_store,
         minting_account,
         username_store: shared_username_store,
@@ -147,9 +147,9 @@ pub async fn start_rest_server(
     // mutation under the sync guard, then drop the guard before the
     // async upsert.
     let bootstrap_snapshot: Option<(zkcoins_program::hash::HashDigest, Vec<u8>)> = {
-        let mut account_server_guard = state.account_server.lock().unwrap();
-        if account_server_guard.get_minting_account_address().is_err() {
-            let mut minting_server_account = crate::account_server::Account::new();
+        let mut account_node_guard = state.account_node.lock().unwrap();
+        if account_node_guard.get_minting_account_address().is_err() {
+            let mut minting_server_account = crate::account_node::Account::new();
             // The Plonky2 state-transition circuit packs the running
             // balance as a Goldilocks field element via
             // `balance_hi * 2^32 + balance_lo`. Values >= p (the
@@ -159,13 +159,13 @@ pub async fn start_rest_server(
             // safely below 2^48 so the circuit-vs-witness sides agree
             // even after many mint operations.
             minting_server_account.balance = 1u64 << 48;
-            account_server_guard.import_account(
+            account_node_guard.import_account(
                 *zkcoins_program::types::MINTING_ADDRESS,
                 minting_server_account,
             );
-            account_server_guard
+            account_node_guard
                 .get_account(&zkcoins_program::types::MINTING_ADDRESS)
-                .map(AccountServer::serialize_account)
+                .map(AccountNode::serialize_account)
                 .map(|bytes| (*zkcoins_program::types::MINTING_ADDRESS, bytes))
         } else {
             None
@@ -178,10 +178,10 @@ pub async fn start_rest_server(
         // the lock again only briefly; the second snapshot reads the
         // same row we just inserted so it is guaranteed to be present.
         let acct_clone = {
-            let guard = state.account_server.lock().unwrap();
+            let guard = state.account_node.lock().unwrap();
             guard.get_account(address).and_then(|a| {
-                let b = AccountServer::serialize_account(a);
-                bincode::deserialize::<crate::account_server::Account>(&b).ok()
+                let b = AccountNode::serialize_account(a);
+                bincode::deserialize::<crate::account_node::Account>(&b).ok()
             })
         };
         if let Some(account) = acct_clone {
@@ -191,7 +191,7 @@ pub async fn start_rest_server(
         }
     }
 
-    // Startup invariant check (zk-coins/server#89): every persisted
+    // Startup invariant check (zk-coins/node#89): every persisted
     // minting-account pubkey index in `0..num_pubkeys` MUST have a
     // commitment in the SMT. A mismatch means the legacy
     // write-ahead-of-broadcast mint flow advanced the counter past a
@@ -232,7 +232,7 @@ pub async fn start_rest_server(
 /// fails with a non-zero exit code, matching the project's no-degraded-
 /// mode startup policy.
 ///
-/// **Scanner-settle wait (zk-coins/server#89 round-2 MAJOR 2).** Before
+/// **Scanner-settle wait (zk-coins/node#89 round-2 MAJOR 2).** Before
 /// declaring a desync the function waits up to
 /// [`scanner_initial_settle_timeout`] (default 90 s, overridable via
 /// `SCANNER_INITIAL_SETTLE_TIMEOUT_MS`) for the scanner to ingest at
@@ -257,7 +257,7 @@ pub async fn start_rest_server(
 /// damage), they must patch this function out. The lack of an env
 /// override is intentional — the previous `DEV_SKIP_BROADCAST_FAILURE`
 /// pattern is exactly the kind of silent-soft-fail that this check
-/// is here to prevent (see zk-coins/server#89).
+/// is here to prevent (see zk-coins/node#89).
 pub(crate) async fn check_minting_state_invariant(
     state: &AppState,
     num_pubkeys: u32,
@@ -306,16 +306,16 @@ pub(crate) async fn check_minting_state_invariant(
             .map(|i| guard.generate_public_key(i))
             .collect()
     };
-    let account_server_guard = lock_or_recover(&state.account_server);
-    let state_arc = account_server_guard.state().clone();
-    drop(account_server_guard);
+    let account_node_guard = lock_or_recover(&state.account_node);
+    let state_arc = account_node_guard.state().clone();
+    drop(account_node_guard);
     let state_guard = lock_or_recover(&state_arc);
     for (i, pk) in minting_pubkeys.iter().enumerate() {
         if state_guard.get_commitment_proof(pk).is_err() {
             let msg = format!(
                 "CRITICAL: minting state desync at pubkey_idx={}: commitment not in SMT. \
                  Operator action: dispatch reset_state workflow or repair manually. \
-                 See zk-coins/server#89.",
+                 See zk-coins/node#89.",
                 i
             );
             eprintln!("{}", msg);
@@ -336,7 +336,7 @@ pub(crate) async fn check_minting_state_invariant(
 /// exercised by unit tests, so the whole function lives in the runtime
 /// module that is excluded from the coverage scope.
 ///
-/// **Invariant (zk-coins/server#89).** The broadcast `if let Err(...)
+/// **Invariant (zk-coins/node#89).** The broadcast `if let Err(...)
 /// { return 503 }` MUST stay above every `receive_coin`/`upsert_account`
 /// line. The mint flow had to be refactored to prepare-then-commit
 /// because its old shape advanced state ahead of broadcast; this
@@ -356,7 +356,7 @@ pub(crate) async fn broadcast_commit_and_deliver(
     );
     if let Err(err) = create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG).await {
         eprintln!("Error broadcasting commit inscription: {}", err);
-        return crate::server::handler_error_response(
+        return crate::router::handler_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "Failed to broadcast commitment inscription on-chain",
         );
@@ -366,13 +366,13 @@ pub(crate) async fn broadcast_commit_and_deliver(
     updated_proof.commitment = Some(commitment);
     let recipient = updated_proof.coin.recipient;
     let snapshot: Option<Vec<u8>> = {
-        let mut account_server_guard = lock_or_recover(&state.account_server);
-        if let Err(e) = account_server_guard.receive_coin(updated_proof) {
+        let mut account_node_guard = lock_or_recover(&state.account_node);
+        if let Err(e) = account_node_guard.receive_coin(updated_proof) {
             eprintln!("Failed to receive coin after commit: {}", e);
         }
-        account_server_guard
+        account_node_guard
             .get_account(&recipient)
-            .map(AccountServer::serialize_account)
+            .map(AccountNode::serialize_account)
     };
     if let Some(bytes) = snapshot {
         let addr_bytes = zkcoins_program::hash::digest_to_bytes(&recipient);
@@ -394,5 +394,5 @@ pub(crate) async fn broadcast_commit_and_deliver(
 }
 
 #[cfg(test)]
-#[path = "server_runtime_tests.rs"]
+#[path = "runtime_tests.rs"]
 mod tests;

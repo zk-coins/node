@@ -1,13 +1,13 @@
 //! Smoke tests that exercise the runtime bootstrap end-to-end.
 //!
-//! `server_runtime.rs` itself is excluded from the coverage scope (it
+//! `runtime.rs` itself is excluded from the coverage scope (it
 //! binds a real socket and owns the process lifecycle), but its
 //! bootstrap path carries regressions that the 100% MVP-scope gate
 //! cannot catch. Each test here covers a specific failure mode that
 //! production has hit (or would hit on the next migration in the same
 //! class):
 //!
-//! - `start_rest_server_binds_and_serves_health` — the Plonky2-migration
+//! - `start_rest_node_binds_and_serves_health` — the Plonky2-migration
 //!   outage. An `assert_eq!` against `MINTING_ADDRESS` panicked the
 //!   tokio worker that owned the HTTP listener while the scanner worker
 //!   kept running. Container stayed `Up`, Cloudflare served 502s for
@@ -33,9 +33,9 @@ use sqlx::PgPool;
 use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 
-use crate::account_server::AccountServer;
+use crate::account_node::AccountNode;
 use crate::db::connect_and_migrate;
-use crate::server_runtime::start_rest_server;
+use crate::runtime::start_rest_node;
 use crate::state::State;
 use crate::username::UsernameStore;
 use zkcoins_program::hash::digest_to_bytes;
@@ -49,7 +49,7 @@ use zkcoins_program::types::MINTING_ADDRESS;
 /// Each test gets its own container — the same isolation model as
 /// `db_tests::setup_pool`. The shape is duplicated here rather than
 /// re-exported across modules to keep `db_tests` and
-/// `server_runtime_tests` independently runnable (a shared helper
+/// `runtime_tests` independently runnable (a shared helper
 /// would have to live in a `pub(crate)` module guarded with `#[cfg
 /// (test)]` and pulled in by both test files via `#[path = ...]`,
 /// which is heavier than the few lines below). The PR-A3 cleanup may
@@ -76,7 +76,7 @@ async fn setup_pool() -> (Arc<PgPool>, ContainerAsync<Postgres>) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn start_rest_server_binds_and_serves_health() {
+async fn start_rest_node_binds_and_serves_health() {
     // Pick a free ephemeral port by binding/dropping a probe listener.
     // The race window between drop and rebind is irrelevant in CI and
     // pre-push (no other process listens on this port); a collision
@@ -99,7 +99,7 @@ async fn start_rest_server_binds_and_serves_health() {
     // PR-A3 moved all sibling-file state (accounts.bin, usernames.bin,
     // minting_num_pubkeys.bin) into Postgres; the bootstrap only needs
     // a proofs directory now, which is configured via the `PROOFS_DIR`
-    // env var read inside `start_rest_server`. PID + port keeps the
+    // env var read inside `start_rest_node`. PID + port keeps the
     // tempdir unique across parallel runs even though pre-push uses
     // --test-threads=1.
     let tmp = std::env::temp_dir().join(format!(
@@ -110,17 +110,17 @@ async fn start_rest_server_binds_and_serves_health() {
     std::fs::create_dir_all(&tmp).expect("create tempdir");
     std::env::set_var("PROOFS_DIR", tmp.to_string_lossy().into_owned());
 
-    // Mimic main.rs wiring: fresh State and empty AccountServer /
+    // Mimic main.rs wiring: fresh State and empty AccountNode /
     // UsernameStore, so the bootstrap exercises the "no saved state"
     // branch that was the production failure mode.
     let state = Arc::new(Mutex::new(State::new()));
-    let account_server = AccountServer::new(Arc::clone(&state));
+    let account_node = AccountNode::new(Arc::clone(&state));
     let username_store = UsernameStore::new();
 
     let (pool, _pg_container) = setup_pool().await;
 
     let handle = tokio::spawn(async move {
-        start_rest_server(account_server, username_store, &addr, pool, None).await
+        start_rest_node(account_node, username_store, &addr, pool, None).await
     });
 
     // Wait for the listener to come up. axum binds within ~hundreds of
@@ -154,7 +154,7 @@ async fn start_rest_server_binds_and_serves_health() {
     handle.abort();
     std::fs::remove_dir_all(&tmp).ok();
     panic!(
-        "start_rest_server never bound on 127.0.0.1:{} within 5 s; last connect error: {:?}",
+        "start_rest_node never bound on 127.0.0.1:{} within 5 s; last connect error: {:?}",
         port, last_err
     );
 }
@@ -197,13 +197,13 @@ async fn bootstrap_initial_minting_account_balance_is_goldilocks_safe() {
     std::env::set_var("PROOFS_DIR", tmp.to_string_lossy().into_owned());
 
     let state = Arc::new(Mutex::new(State::new()));
-    let account_server = AccountServer::new(Arc::clone(&state));
+    let account_node = AccountNode::new(Arc::clone(&state));
     let username_store = UsernameStore::new();
 
     let (pool, _pg_container) = setup_pool().await;
 
     let handle = tokio::spawn(async move {
-        start_rest_server(account_server, username_store, &addr, pool, None).await
+        start_rest_node(account_node, username_store, &addr, pool, None).await
     });
 
     let minting_hex = hex::encode(digest_to_bytes(&MINTING_ADDRESS));
@@ -264,19 +264,19 @@ async fn bootstrap_initial_minting_account_balance_is_goldilocks_safe() {
     handle.abort();
     std::fs::remove_dir_all(&tmp).ok();
     panic!(
-        "start_rest_server never bound on 127.0.0.1:{} within 5 s; last connect error: {:?}",
+        "start_rest_node never bound on 127.0.0.1:{} within 5 s; last connect error: {:?}",
         port, last_err
     );
 }
 
-/// Startup invariant guard (zk-coins/server#89).
+/// Startup invariant guard (zk-coins/node#89).
 ///
 /// Seed a `minting_meta.num_pubkeys = 5` row into a fresh Postgres
 /// with NO SMT commitments. Bootstrap reads the counter, then the
 /// startup invariant check enumerates `pubkey_idx ∈ 0..5` and looks
 /// each up via `State::get_commitment_proof`. The first lookup fails
 /// (empty SMT → "MMR leaf count = 0"), the check returns Err with the
-/// CRITICAL log line, and `start_rest_server` propagates the error
+/// CRITICAL log line, and `start_rest_node` propagates the error
 /// without ever binding the listener.
 ///
 /// The assertion is text-shape on the CRITICAL message (verbatim,
@@ -305,23 +305,23 @@ async fn startup_invariant_rejects_when_num_pubkeys_exceeds_smt() {
 
     let (pool, _pg_container) = setup_pool().await;
 
-    // Seed the desynced row BEFORE building AccountServer + start_rest_server.
+    // Seed the desynced row BEFORE building AccountNode + start_rest_node.
     crate::db::upsert_minting_num_pubkeys(&pool, 5)
         .await
         .expect("seed stale minting_meta.num_pubkeys=5");
 
     let state = Arc::new(Mutex::new(State::new()));
-    let account_server = AccountServer::new(Arc::clone(&state));
+    let account_node = AccountNode::new(Arc::clone(&state));
     let username_store = UsernameStore::new();
 
     // No scanner running in this test; pass `None` so the invariant
     // check skips the settle wait and evaluates the SMT membership
     // predicate immediately (the desync is permanent — no real
     // scanner would unblock it).
-    let result = start_rest_server(account_server, username_store, &addr, pool, None).await;
+    let result = start_rest_node(account_node, username_store, &addr, pool, None).await;
     std::fs::remove_dir_all(&tmp).ok();
 
-    let err = result.expect_err("start_rest_server must reject a desynced state");
+    let err = result.expect_err("start_rest_node must reject a desynced state");
     let msg = format!("{:#}", err);
     assert!(
         msg.contains("CRITICAL: minting state desync at pubkey_idx=0"),

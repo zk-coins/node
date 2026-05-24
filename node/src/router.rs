@@ -20,7 +20,7 @@ use tower_http::cors::CorsLayer;
 use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes};
 use zkcoins_prover::Proof;
 
-use crate::account_server::{AccountServer, CoinProof};
+use crate::account_node::{AccountNode, CoinProof};
 use crate::db;
 use crate::publisher::create_and_broadcast_inscription;
 use crate::publisher::EsploraConfig;
@@ -74,7 +74,7 @@ pub(crate) fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 // Define a struct for our application state
 #[derive(Clone)]
 pub(crate) struct AppState {
-    pub(crate) account_server: Arc<Mutex<AccountServer>>,
+    pub(crate) account_node: Arc<Mutex<AccountNode>>,
     pub(crate) proof_store: Arc<ProofStore>,
     pub(crate) minting_account: Arc<Mutex<ClientAccount>>,
     pub(crate) username_store: Arc<Mutex<UsernameStore>>,
@@ -88,7 +88,7 @@ pub(crate) struct AppState {
     /// tests redirect Esplora calls at a `wiremock::MockServer`
     /// without having to mutate the process-wide `NETWORK_CONFIG`
     /// lazy_static (which is frozen on first access and shared across
-    /// every test in the binary). In production `start_rest_server`
+    /// every test in the binary). In production `start_rest_node`
     /// clones `NETWORK_CONFIG` into this slot so the runtime
     /// behaviour is unchanged.
     pub(crate) esplora_config: Arc<EsploraConfig>,
@@ -366,7 +366,7 @@ pub(crate) fn handler_error_response(
 /// post-proof re-acquisition of the `minting_account` guard reveals
 /// that another concurrent mint already bumped `num_pubkeys`. Extracted
 /// from `mint_handler` so the (otherwise hard-to-race) branch can be
-/// covered by a deterministic unit test in `server_tests.rs` without
+/// covered by a deterministic unit test in `router_tests.rs` without
 /// having to orchestrate a real concurrent-mint race against the live
 /// prover.
 pub(crate) fn concurrent_mint_during_proof_response(
@@ -478,7 +478,7 @@ async fn get_balance_handler(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let account_server = lock_or_recover(&state.account_server);
+    let account_node = lock_or_recover(&state.account_node);
 
     // Check if an address parameter was provided
     if let Some(address_hex) = params.get("address") {
@@ -516,7 +516,7 @@ async fn get_balance_handler(
             let username_store = lock_or_recover(&state.username_store);
             username_store.get_username(&address).map(String::from)
         };
-        match account_server.get_account_balance(&address) {
+        match account_node.get_account_balance(&address) {
             Ok(balance) => (StatusCode::OK, Json(BalanceResponse { balance, username })),
             // Unobserved address: canonical zero-balance state, not a not-found condition.
             Err(_) => (
@@ -543,10 +543,10 @@ async fn get_balance_handler(
 
 #[cfg(feature = "address-list")]
 async fn get_address_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let account_server = lock_or_recover(&state.account_server);
+    let account_node = lock_or_recover(&state.account_node);
 
     // Convert addresses to hex strings
-    let hex_addresses: Vec<String> = account_server
+    let hex_addresses: Vec<String> = account_node
         .get_addresses()
         .iter()
         .map(|addr| format!("0x{}", hex::encode(digest_to_bytes(addr))))
@@ -574,11 +574,11 @@ async fn receive_coin_handler(
     // scope so the post-receive Postgres upsert runs without holding
     // the guard across an `.await` point.
     let snapshot: Option<Vec<u8>> = {
-        let mut account_server = lock_or_recover(&state.account_server);
-        match account_server.receive_coin(coin_proof) {
-            Ok(_) => account_server
+        let mut account_node = lock_or_recover(&state.account_node);
+        match account_node.receive_coin(coin_proof) {
+            Ok(_) => account_node
                 .get_account(&recipient)
-                .map(AccountServer::serialize_account),
+                .map(AccountNode::serialize_account),
             Err(_) => None,
         }
     };
@@ -650,7 +650,7 @@ async fn send_coin_handler(
     let to_address = digest_from_bytes(&to_address_bytes);
 
     // TODO: Provide the correct public keys from the client
-    // Acquire the account_server lock only for the duration of sending
+    // Acquire the account_node lock only for the duration of sending
     // coins, and snapshot the resulting account bincode bytes *inside*
     // the lock scope so the post-send Postgres upsert runs without
     // holding the (sync) `std::sync::Mutex` guard across the `.await`.
@@ -668,8 +668,8 @@ async fn send_coin_handler(
     let send_result: Result<Vec<CoinProof>, &str>;
     let updated_account_bytes: Vec<u8>;
     {
-        let mut account_server_lock = lock_or_recover(&state.account_server);
-        let res = account_server_lock.send_coins(
+        let mut account_node_lock = lock_or_recover(&state.account_node);
+        let res = account_node_lock.send_coins(
             vec![Invoice::new(request.amount, to_address)],
             from_address,
             request.public_key,
@@ -677,8 +677,8 @@ async fn send_coin_handler(
             request.prev_commitment_pubkey,
         );
         updated_account_bytes = match &res {
-            Ok(_) => AccountServer::serialize_account(
-                account_server_lock
+            Ok(_) => AccountNode::serialize_account(
+                account_node_lock
                     .get_account(&from_address)
                     .expect("send_coins Ok implies the sender account is in memory"),
             ),
@@ -709,7 +709,7 @@ async fn send_coin_handler(
 
             // Note: User-initiated sends never pre-set
             // `coin_proofs[0].commitment` (see
-            // `account_server::send_coins`, which always emits
+            // `account_node::send_coins`, which always emits
             // `commitment: None`). The mint flow constructs and
             // broadcasts its own commitment inside `mint_handler`. The
             // pre-MVP `if let Some(commitment) = coin_proofs[0]
@@ -761,14 +761,14 @@ async fn send_coin_handler(
 /// inscription broadcast succeeds AND no concurrent mint beat us to
 /// the Postgres commit.
 ///
-/// **Four phases, load-bearing ordering** (zk-coins/server#89):
+/// **Four phases, load-bearing ordering** (zk-coins/node#89):
 ///
 /// 1. **SNAPSHOT.** Briefly take the `minting_account` (ClientAccount)
 ///    guard, read `N = num_pubkeys`, derive the three pubkeys the
 ///    prover witness needs (`pk_N`, `pk_{N+1}`, optional `pk_{N-1}`).
 ///    Release the guard. No mutation.
-/// 2. **PROOF.** Briefly take the `account_server` guard, call
-///    [`AccountServer::prepare_mint`] (clone-based, pure). Release
+/// 2. **PROOF.** Briefly take the `account_node` guard, call
+///    [`AccountNode::prepare_mint`] (clone-based, pure). Release
 ///    the guard. Build the signed `Commitment` over the prover's
 ///    output_coins_root + account_state_hash using a transient
 ///    ClientAccount clone with `num_pubkeys = N + 1` (so
@@ -797,7 +797,7 @@ async fn send_coin_handler(
 /// caller observes a second 503 here even though the chain has the
 /// commitment. The scanner-on-next-boot reconciliation path closes
 /// this window: the inscription is ingested into the SMT on the next
-/// scanner sweep, the startup invariant check in `server_runtime`
+/// scanner sweep, the startup invariant check in `runtime`
 /// then accepts the state, and the wallet's retry semantics drive
 /// progress. Document-only — no in-handler retry.
 async fn mint_handler(
@@ -845,9 +845,9 @@ async fn mint_handler(
 
     // ---- 2. PROOF phase (no mutation, clone-based) -----------------------
     let prepared = {
-        let account_server_guard = lock_or_recover(&state.account_server);
+        let account_node_guard = lock_or_recover(&state.account_node);
         // get_minting_account_address borrows immutably below, fine.
-        if account_server_guard
+        if account_node_guard
             .get_account(&zkcoins_program::types::MINTING_ADDRESS)
             .is_none()
         {
@@ -856,7 +856,7 @@ async fn mint_handler(
                 "Minting account not configured",
             );
         }
-        account_server_guard.prepare_mint(
+        account_node_guard.prepare_mint(
             vec![Invoice::new(request.amount, account_address)],
             minting_pubkey,
             next_minting_pubkey,
@@ -918,7 +918,7 @@ async fn mint_handler(
         commitment_data.len()
     );
     println!("Commitment data hex: {}", hex::encode(&commitment_data));
-    // NOTE (idempotent retry, zk-coins/server#89): on a retry after a
+    // NOTE (idempotent retry, zk-coins/node#89): on a retry after a
     // transient broadcast failure the publisher wallet's UTXO set has
     // changed (`get_publisher_utxo` selects fresh inputs every call),
     // so the new `commit_tx` has different inputs → different
@@ -953,7 +953,7 @@ async fn mint_handler(
     // `db::upsert_account` shape that `broadcast_commit_and_deliver`
     // uses for the send flow.
     //
-    // Rationale (zk-coins/server#89 round-2 MAJOR 1): a previous shape
+    // Rationale (zk-coins/node#89 round-2 MAJOR 1): a previous shape
     // of this block snapshot-cloned each recipient under the lock,
     // mutated the clone, then `import_account`'d the clone back after
     // the tx commit. Between the snapshot read and the post-tx
@@ -968,7 +968,7 @@ async fn mint_handler(
     // swap pattern on `mutated_minting` is sound.
     let minting_addr_bytes =
         zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS);
-    let minting_snapshot_bytes = AccountServer::serialize_account(&prepared.mutated_minting);
+    let minting_snapshot_bytes = AccountNode::serialize_account(&prepared.mutated_minting);
     let commit_rows: Vec<(&[u8], &[u8])> =
         vec![(&minting_addr_bytes[..], &minting_snapshot_bytes[..])];
     let new_num_pubkeys = expected_num_pubkeys + 1;
@@ -992,12 +992,12 @@ async fn mint_handler(
             // preserved because we never overwrite — `receive_coin`
             // appends to the recipient's `coin_queue`.
             let snapshots: Vec<(zkcoins_program::hash::HashDigest, Vec<u8>)> = {
-                let mut account_server_guard = lock_or_recover(&state.account_server);
-                account_server_guard.commit_mint(prepared.mutated_minting);
+                let mut account_node_guard = lock_or_recover(&state.account_node);
+                account_node_guard.commit_mint(prepared.mutated_minting);
                 let mut snaps = Vec::with_capacity(prepared.coin_proofs.len());
                 for coin_proof in &prepared.coin_proofs {
                     let recipient = coin_proof.coin.recipient;
-                    if let Err(e) = account_server_guard.receive_coin(coin_proof.clone()) {
+                    if let Err(e) = account_node_guard.receive_coin(coin_proof.clone()) {
                         // Best-effort: a duplicate / replay error here
                         // means the recipient already has this coin
                         // (e.g. scanner-replay after restart). Log and
@@ -1005,8 +1005,8 @@ async fn mint_handler(
                         // looks like so the DB row stays current.
                         eprintln!("Failed to receive minted coin into live recipient: {}", e);
                     }
-                    if let Some(acct) = account_server_guard.get_account(&recipient) {
-                        snaps.push((recipient, AccountServer::serialize_account(acct)));
+                    if let Some(acct) = account_node_guard.get_account(&recipient) {
+                        snaps.push((recipient, AccountNode::serialize_account(acct)));
                     }
                 }
                 snaps
@@ -1113,17 +1113,17 @@ async fn get_proof_handler(
 /// Accepts a client-signed commitment for a previously generated proof.
 /// Broadcasts the commitment as a Taproot inscription and delivers the coin to the recipient.
 ///
-/// **Broadcast-then-deliver invariant (zk-coins/server#89).** Unlike
+/// **Broadcast-then-deliver invariant (zk-coins/node#89).** Unlike
 /// the mint flow, the `/api/commit` endpoint receives a *proof_id* the
 /// server already generated (in an earlier `/api/send` call), looks up
 /// the persisted `CoinProof`, broadcasts its commitment, and only then
 /// hands the proof to `receive_coin` for the recipient mutation. The
 /// in-memory mutation lives in [`broadcast_commit_and_deliver`] in
-/// `server_runtime.rs`; the broadcast call sits at the very top of
+/// `runtime.rs`; the broadcast call sits at the very top of
 /// that function and returns 503 on failure with NO subsequent state
 /// mutation, so there is no analogue of the mint state-desync class
 /// here. DO NOT reorder the broadcast and the `receive_coin` call —
-/// the audit in zk-coins/server#89 verified this ordering is correct
+/// the audit in zk-coins/node#89 verified this ordering is correct
 /// and any future refactor must preserve it.
 async fn commit_handler(
     State(state): State<AppState>,
@@ -1177,13 +1177,8 @@ async fn commit_handler(
         return handler_error_response(StatusCode::UNAUTHORIZED, "Commitment signature invalid");
     }
 
-    crate::server_runtime::broadcast_commit_and_deliver(
-        &state,
-        commitment,
-        coin_proof,
-        request.proof_id,
-    )
-    .await
+    crate::runtime::broadcast_commit_and_deliver(&state, commitment, coin_proof, request.proof_id)
+        .await
 }
 
 /// JSON body returned by `GET /health/ready`. `failures` is empty on a
@@ -1203,7 +1198,7 @@ struct ReadyResponse {
 /// long as the HTTP listener is bound and the tokio runtime is alive.
 /// It deliberately does NOT touch the database or Esplora, so an
 /// upstream blip never restarts the process — losing the in-memory
-/// `account_server` and `state` to a restart would lose every mint /
+/// `account_node` and `state` to a restart would lose every mint /
 /// send the scanner has not yet checkpointed.
 ///
 /// `/health/ready` is the complementary readiness probe: it actively
@@ -1292,7 +1287,7 @@ struct RootEndpoints {
 /// "is this the right host?" question without surfacing a bare 404.
 async fn root_handler() -> impl IntoResponse {
     Json(RootResponse {
-        service: "zkcoins-server",
+        service: "zkcoins-node",
         version: env!("CARGO_PKG_VERSION"),
         network: NETWORK_CONFIG.network_name.clone(),
         endpoints: RootEndpoints {
@@ -1532,8 +1527,8 @@ fn resolve_identifier(
     drop(username_store);
 
     // 2. Check hex prefix against known addresses
-    let account_server = lock_or_recover(&state.account_server);
-    account_server
+    let account_node = lock_or_recover(&state.account_node);
+    account_node
         .get_addresses()
         .into_iter()
         .find(|addr| hex::encode(digest_to_bytes(addr)).starts_with(&normalized))
@@ -1665,5 +1660,5 @@ pub(crate) fn create_router(state: AppState) -> Router {
 }
 
 #[cfg(test)]
-#[path = "server_tests.rs"]
+#[path = "router_tests.rs"]
 mod tests;

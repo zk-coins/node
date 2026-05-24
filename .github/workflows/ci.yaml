@@ -31,7 +31,7 @@ on:
   #
   # `labeled` / `unlabeled` are added so toggling the `ci:full`
   # label triggers (or removes) the heavy self-hosted-runner jobs
-  # on demand — see the `server-tests` job below.
+  # on demand — see the `node-tests` job below.
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
@@ -72,7 +72,7 @@ env:
 # `lint-and-build` catches what GitHub-hosted Linux can cheaply catch:
 # cross-platform compile bitrot and lint regressions.
 #
-# `server-tests` + `coverage` are the authoritative test + coverage gate.
+# `node-tests` + `coverage` are the authoritative test + coverage gate.
 # They run on a self-hosted M3 Ultra runner (label `m3-ultra`) — the
 # documented hardware target (CONTRIBUTING.md § "Working on the Plonky2
 # Migration"). On `ubuntu-latest` the full suite repeatedly hit the
@@ -113,10 +113,10 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Run clippy (server + shared, MVP feature set)
-        run: cargo clippy -p server -p shared -- -D warnings
+        run: cargo clippy -p node -p shared -- -D warnings
 
       - name: Run clippy (server, all features)
-        run: cargo clippy -p server --all-features -- -D warnings
+        run: cargo clippy -p node --all-features -- -D warnings
 
       - name: Run clippy (program + prover libs)
         run: cargo clippy -p zkcoins-program-plonky2 -p zkcoins-prover-plonky2 --lib -- -D warnings
@@ -145,12 +145,12 @@ jobs:
           echo "Scanner/publisher polling check: OK"
 
       - name: Build server (MVP feature set — the DEV + PRD image)
-        run: cargo build -p server
+        run: cargo build -p node
 
       - name: Build server (all features — self-host opt-in build)
-        run: cargo build -p server --all-features
+        run: cargo build -p node --all-features
 
-  server-tests:
+  node-tests:
     name: Server + Shared Tests (M3 Ultra)
     # Heavy job (~60-90 min on the single self-hosted M3 Ultra). Gated
     # behind the `ci:full` label so we don't burn runner time on every
@@ -230,11 +230,11 @@ jobs:
       # (server/tests/api_remote.rs). It targets `https://dev-api.zkcoins.app`
       # by default and is meant to run AFTER a deploy, from the `api-e2e`
       # job in deploy-dev.yaml — not against whatever DEV currently runs
-      # while a PR is still open. Excluding it here keeps `server-tests`
+      # while a PR is still open. Excluding it here keeps `node-tests`
       # hermetic: only unit + non-remote integration tests run; remote
       # verification fires post-deploy as the merge-then-deploy gate.
       - name: Run server + shared tests (release, all features)
-        run: cargo nextest run -p server -p shared --release --all-features --test-threads 1 -E 'not binary(api_remote)'
+        run: cargo nextest run -p node -p shared --release --all-features --test-threads 1 -E 'not binary(api_remote)'
 
       - name: sccache stats (post-build)
         if: always()
@@ -242,11 +242,11 @@ jobs:
 
   coverage:
     name: Coverage Gate (100% lines + functions)
-    # Runs in parallel with `server-tests` (not after) — both jobs
+    # Runs in parallel with `node-tests` (not after) — both jobs
     # exercise the same suite (nextest vs. nextest-under-llvm-cov), so
     # serializing them only doubled wall-clock on every Release PR.
     # The `ci:full` label gate is duplicated explicitly here because the
-    # chain through `server-tests` (which carried the guard) is broken.
+    # chain through `node-tests` (which carried the guard) is broken.
     if: contains(github.event.pull_request.labels.*.name, 'ci:full')
     needs: lint-and-build
     runs-on: [self-hosted, m3-ultra]
@@ -262,7 +262,7 @@ jobs:
       # — same value the `docker info` step picks up implicitly via the
       # default `docker` context.
       DOCKER_HOST: unix:///Users/dfx01/.colima/default/docker.sock
-      # Same sccache wrapper as `server-tests`; reuses the same on-disk
+      # Same sccache wrapper as `node-tests`; reuses the same on-disk
       # cache populated by the previous job in the same workflow run.
       RUSTC_WRAPPER: sccache
     steps:
@@ -272,7 +272,7 @@ jobs:
       - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      # Same install gate as `server-tests`. Idempotent: no-op on a
+      # Same install gate as `node-tests`. Idempotent: no-op on a
       # warm runner where both tools already exist.
       - name: Ensure sccache + cargo-nextest are installed
         run: |
@@ -281,9 +281,9 @@ jobs:
           sccache --start-server >/dev/null 2>&1 || true
           sccache --show-stats
 
-      # Coverage runs the same `db_tests` as `server-tests` and so
+      # Coverage runs the same `db_tests` as `node-tests` and so
       # needs Docker reachable for testcontainers. See the matching
-      # check in the `server-tests` job for the rationale.
+      # check in the `node-tests` job for the rationale.
       - name: Verify Docker is reachable (testcontainers dependency)
         run: docker info > /dev/null
 
@@ -293,14 +293,14 @@ jobs:
       # single binary run (same as the old `cargo llvm-cov -- ...` form).
       #
       # The `api_remote` integration test (server/tests/api_remote.rs)
-      # is excluded for the same reason as in `server-tests` above: it
+      # is excluded for the same reason as in `node-tests` above: it
       # targets the live DEV server and belongs in the post-deploy
       # `api-e2e` job, not the hermetic coverage gate. The MVP coverage
       # scope is measured by the rest of the suite, which covers the
       # in-process axum handlers via oneshot().
       - name: Run llvm-cov (MVP scope, 100% line + function gate)
         run: |
-          cargo llvm-cov nextest --release -p server --show-missing-lines \
+          cargo llvm-cov nextest --release -p node --show-missing-lines \
             --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|server_runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|_tests\.rs$' \
             --fail-under-lines 100 \
             --fail-under-functions 100 \
@@ -315,11 +315,11 @@ jobs:
   # an inline step) so job-level failures — timeout, OOM, runner crash —
   # still fire the alert. `if: failure()` evaluates against the whole
   # `needs:` group: any listed job transitioning to `failure` triggers
-  # it, while skipped jobs (server-tests / coverage on a non-ci:full PR,
+  # it, while skipped jobs (node-tests / coverage on a non-ci:full PR,
   # or all jobs on a draft PR) and manual cancellation stay silent.
   notify-failure:
     name: Telegram alert on failure
-    needs: [lint-and-build, server-tests, coverage]
+    needs: [lint-and-build, node-tests, coverage]
     if: failure()
     runs-on: ubuntu-latest
     steps:

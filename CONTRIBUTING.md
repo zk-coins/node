@@ -1,4 +1,4 @@
-# Contributing to zkCoins Server
+# Contributing to zkCoins Node
 
 This guide covers everything you need to develop, test, and deploy the zkCoins backend.
 
@@ -9,7 +9,7 @@ The first section, "Working on the Plonky2 Migration", documents the project inv
 ## Working on the Plonky2 Migration
 
 Canonical entry point for any session (agent or human) picking up the
-codebase without prior context. The Plonky2 migration (PR [#17](https://github.com/zk-coins/server/pull/17))
+codebase without prior context. The Plonky2 migration (PR [#17](https://github.com/zk-coins/node/pull/17))
 merged on 2026-05-18; this section captures the project invariants that
 survive the migration. Read this section, then dive into the linked
 documents in the order given below.
@@ -91,7 +91,7 @@ The five constraints below are decided and apply across every PR on
 2. **Closed test environment** — DEV *and* PRD. No external users, no
    real money, no migration of existing state. Step 7 of the ROADMAP
    deleted the SP1 path outright; no Cargo feature flag, no dual
-   backend. At cutover (PR [#17](https://github.com/zk-coins/server/pull/17), 2026-05-18) the server state files
+   backend. At cutover (PR [#17](https://github.com/zk-coins/node/pull/17), 2026-05-18) the server state files
    were wiped and the new Plonky2 server started fresh.
 3. **Hardware target: Mac Studio M3 Ultra, 96 GB unified RAM, single
    host.** All on-box compute resources are available (Performance +
@@ -128,8 +128,8 @@ The five constraints below are decided and apply across every PR on
    refactor that moves a `minting_meta` UPDATE, an `accounts` UPSERT,
    or an in-memory `receive_coin` above the broadcast call re-
    introduces the state-desync class fixed in
-   [zk-coins/server#89](https://github.com/zk-coins/server/issues/89).
-   Startup invariant check in `server_runtime::check_minting_state_invariant`
+   [zk-coins/node#89](https://github.com/zk-coins/node/issues/89).
+   Startup invariant check in `runtime::check_minting_state_invariant`
    enforces the corollary at boot: every `pubkey_idx ∈
    0..num_pubkeys` MUST have a commitment in the SMT, no flag
    override — operator recovery is via the `reset_state` workflow.
@@ -166,7 +166,7 @@ the terminal on the suite.
 
 When touching `program-plonky2/` specifically, also run the local
 sweep + coverage gate **before** opening / updating the PR — the
-cyclic-recursion sweep is not in CI yet (decision tracked in [issue #50](https://github.com/zk-coins/server/issues/50)):
+cyclic-recursion sweep is not in CI yet (decision tracked in [issue #50](https://github.com/zk-coins/node/issues/50)):
 
 ```bash
 cd program-plonky2
@@ -226,7 +226,7 @@ Condensed pointers into [`MIGRATION_RESEARCH.md`](./MIGRATION_RESEARCH.md) §7:
 ## Quick Start
 
 ```bash
-git clone https://github.com/zk-coins/server.git
+git clone https://github.com/zk-coins/node.git
 cd server
 USERNAME_DOMAIN=test.zkcoins.local cargo run -p server
 # Server starts on http://0.0.0.0:4242
@@ -295,7 +295,7 @@ Wall budgets on warm cache:
 
 When preparing a release PR to `main`, run the circuit sweep manually
 — only the `server` + `shared` test sweep is gated in CI (decision
-on the cyclic sweep is tracked in [issue #50](https://github.com/zk-coins/server/issues/50)):
+on the cyclic sweep is tracked in [issue #50](https://github.com/zk-coins/node/issues/50)):
 
 ```bash
 cargo test -p zkcoins-program-plonky2 --release --lib -- --test-threads=1
@@ -321,7 +321,7 @@ server/
 │   └── src/
 │       ├── main.rs        # Entry point, chain scanner, bind address
 │       ├── server.rs      # REST endpoints (mint, send, balance, proof)
-│       ├── account_server.rs  # Account management, coin proofs, prover calls
+│       ├── account_node.rs  # Account management, coin proofs, prover calls
 │       ├── state.rs       # Sparse Merkle Tree + Merkle Mountain Range
 │       ├── scanner.rs     # Bitcoin block scanner (Taproot Inscriptions)
 │       ├── scanner_ws.rs  # Esplora WebSocket subscriber (event-driven, issue #84)
@@ -389,7 +389,7 @@ update
 | Item | Convention | Example |
 |---|---|---|
 | Crate | kebab-case | `zkcoins-program-plonky2` |
-| Module | snake_case | `account_server` |
+| Module | snake_case | `account_node` |
 | Struct | PascalCase | `AccountState`, `CoinProof` |
 | Function | snake_case | `process_block`, `send_coins` |
 | Constant | SCREAMING_SNAKE | `ACCOUNT_SERVER_ADDR` |
@@ -415,7 +415,7 @@ let block = fetch_block(hash).unwrap();
 ### Request Flow
 
 ```
-Client Request → Axum Router → server.rs (endpoint) → account_server.rs (logic)
+Client Request → Axum Router → server.rs (endpoint) → account_node.rs (logic)
                                                           ├── Prover (Plonky2)
                                                           ├── State (SMT + MMR)
                                                           └── Publisher (Bitcoin)
@@ -480,19 +480,19 @@ for the historical pickup record.
 | `ESPLORA_WS_URL` | `wss://mutinynet.com/api/v1/ws` | Esplora WebSocket endpoint consumed by `scanner_ws` (issue #84). DEV/PRD override only when the upstream WS path changes |
 | `IS_MAINNET` | `false` | `true` for Bitcoin Mainnet, `false` for Mutinynet/Signet |
 | `NETWORK_NAME` | `Mutinynet` / `Mainnet` | Human-readable name returned by `/api/info` |
-| `USERNAME_DOMAIN` | _(required, no default)_ | External hostname returned by `/api/info`; server panics on startup if unset (see PR [#36](https://github.com/zk-coins/server/pull/36) for the regression that introduced the global panic hook) |
+| `USERNAME_DOMAIN` | _(required, no default)_ | External hostname returned by `/api/info`; server panics on startup if unset (see PR [#36](https://github.com/zk-coins/node/pull/36) for the regression that introduced the global panic hook) |
 | `PUBLISHER_KEY` | test key | 32-byte hex private key for inscription publishing. **Required on mainnet** |
 | `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
 
 ## Docker
 
 ```bash
-docker build -t zkcoin/server .
+docker build -t zkcoin/node .
 docker run -p 4242:4242 \
   --network bitcoin \
   -e ESPLORA_URL=http://electrs-mainnet:3000 \
   -e USERNAME_DOMAIN=zkcoins.app \
-  zkcoin/server
+  zkcoin/node
 ```
 
 Docker builds use nightly Rust auto-installed via the workspace `rust-toolchain` — no Succinct toolchain, no zkVM target.
@@ -519,14 +519,14 @@ If the DEV server gets into a bad state (panic loop, mint failures with `prev_co
 
 ```bash
 # On the host running the server (DEV or PRD):
-docker stop zkcoins-server
+docker stop zkcoins-node
 # Truncate every state-layer table. _sqlx_migrations is intentionally
 # left in place so connect_and_migrate skips re-applying the schema.
 docker exec -i zkcoins-postgres psql -U zkcoins -d zkcoins -c \
   'TRUNCATE accounts, usernames, smt_state, mmr_state, latest_block, minting_meta;'
 # Drop the per-proof files (proof_id state resets at next boot).
 docker run --rm -v zkcoins_server-data:/data alpine sh -c 'rm -rf /data/proofs'
-docker start zkcoins-server
+docker start zkcoins-node
 ```
 
 The server starts from genesis on next boot: `Loaded State from Postgres` (empty), `Loaded AccountServer from Postgres` (empty), `No saved block hash found, fetching latest from Esplora`. Past test wallets are abandoned on-chain (they're random) but the SMT is re-built from the chain tip onwards. This is **destructive** — never run it on PRD without a known-needed reason.
@@ -549,8 +549,8 @@ See [docs.zkcoins.app/infrastructure/backend](https://docs.zkcoins.app/infrastru
 | `ci.yaml` (Lint & Build) | Ready PR → develop, push to develop | `cargo fmt --check`, clippy (MVP + all-features + program lib), build (MVP + all-features) on `ubuntu-latest`. |
 | `ci.yaml` (Server + Shared Tests) | Ready PR → develop with `ci:full` label, push to develop | `cargo test -p server -p shared --release --all-features` on a self-hosted M3 Ultra runner (issue #40). |
 | `ci.yaml` (Coverage Gate) | Ready PR → develop with `ci:full` label, push to develop | `cargo llvm-cov` with the 100% line + function gate, MVP scope, on the same self-hosted runner. |
-| `deploy-dev.yaml` | Push to develop | Docker build (ARM64) → push `zkcoin/server:beta` → deploy to DEV |
-| `deploy-prd.yaml` | Push to main | Docker build (ARM64) → push `zkcoin/server:latest` → deploy to PRD |
+| `deploy-dev.yaml` | Push to develop | Docker build (ARM64) → push `zkcoin/node:beta` → deploy to DEV |
+| `deploy-prd.yaml` | Push to main | Docker build (ARM64) → push `zkcoin/node:latest` → deploy to PRD |
 | `auto-release-pr.yaml` | Push to develop | Creates Release PR (develop → main) |
 
 **Draft PRs** skip every `ci.yaml` job — the workflow fires once the

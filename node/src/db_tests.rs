@@ -323,7 +323,7 @@ async fn connect_and_migrate_propagates_connect_failure() {
 
 /// Drives the `expected_prev > 0` UPDATE branch of `commit_mint_tx`.
 /// The fresh-DB INSERT branch (`expected_prev == 0`) is covered by the
-/// happy-path mint tests in `server_tests.rs`; the UPDATE branch only
+/// happy-path mint tests in `router_tests.rs`; the UPDATE branch only
 /// fires on the second-and-later mint where a `minting_meta` row
 /// already exists with a non-zero counter. Pre-seeds the row with
 /// `num_pubkeys = 1`, calls `commit_mint_tx(expected_prev=1,

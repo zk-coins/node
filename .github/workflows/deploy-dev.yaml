@@ -14,7 +14,7 @@ on:
 # Serialize DEV deploys per branch. Multiple develop pushes in quick
 # succession (e.g. three PRs merged back-to-back) used to fire three
 # parallel deploys that raced on `docker compose recreate` on the
-# host and left the zkcoins-server container half-renamed in
+# host and left the zkcoins-node container half-renamed in
 # `Created` state, blocking the next `up -d` with a name conflict.
 # `cancel-in-progress: true` keeps the newest commit's deploy; the
 # older deploy is irrelevant the moment its commit is no longer the
@@ -24,7 +24,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  DOCKER_TAGS: zkcoin/server:beta
+  DOCKER_TAGS: zkcoin/node:beta
 
 permissions:
   contents: read
@@ -53,7 +53,7 @@ jobs:
           push: true
           tags: ${{ env.DOCKER_TAGS }}
           platforms: linux/arm64
-          # Registry-backed buildx cache. Same `zkcoin/server:buildcache`
+          # Registry-backed buildx cache. Same `zkcoin/node:buildcache`
           # tag is reused by Deploy PRD — DEV and PRD compile the same
           # Rust workspace so cache hits cross-deploy. `type=registry`
           # over `type=gha` because GHA cache caps at 10 GB with LRU
@@ -63,8 +63,8 @@ jobs:
           # BuildKit's `cache-from` tolerates partial manifests (falls back
           # to a from-scratch build with a warning) so the race is
           # self-healing on the next deploy.
-          cache-from: type=registry,ref=zkcoin/server:buildcache
-          cache-to: type=registry,ref=zkcoin/server:buildcache,mode=max
+          cache-from: type=registry,ref=zkcoin/node:buildcache
+          cache-to: type=registry,ref=zkcoin/node:buildcache,mode=max
 
       - name: Install cloudflared
         run: |
@@ -82,9 +82,9 @@ jobs:
           # accepts whitelisted command names — arbitrary inline shell is
           # rejected. Both branches must resolve to a single allowlisted
           # command; the reset variant is implemented host-side.
-          DEPLOY_CMD="zkcoins-server"
+          DEPLOY_CMD="zkcoins-node"
           if [ "${{ inputs.reset_state }}" == "true" ]; then
-            DEPLOY_CMD="reset-zkcoins-server"
+            DEPLOY_CMD="reset-zkcoins-node"
           fi
 
           ssh -i ~/.ssh/deploy_key \
@@ -122,7 +122,7 @@ jobs:
   # is bound; this job exercises all 15 routes end-to-end (read-only,
   # negative-path, full mint→send→commit and username-claim roundtrips
   # against the live server). Runs on the same self-hosted M3 Ultra
-  # runner as `server-tests` / `coverage`, so sccache hits the warm
+  # runner as `node-tests` / `coverage`, so sccache hits the warm
   # cache populated by previous runs and the build itself stays
   # well under a minute on a hot cache.
   api-e2e:
@@ -144,7 +144,7 @@ jobs:
         uses: actions/checkout@v4
 
       # Self-hosted runner inherits a minimal PATH that hides rustup;
-      # see the matching step in `server-tests` for the rationale.
+      # see the matching step in `node-tests` for the rationale.
       - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
@@ -156,7 +156,7 @@ jobs:
           sccache --show-stats
 
       - name: Run API E2E suite against DEV
-        run: cargo test -p server --release --all-features --test api_remote -- --test-threads=1 --nocapture
+        run: cargo test -p node --release --all-features --test api_remote -- --test-threads=1 --nocapture
 
       - name: sccache stats (post-build)
         if: always()

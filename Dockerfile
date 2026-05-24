@@ -1,4 +1,4 @@
-# Multi-stage Docker build for the zkCoins server post Plonky2 migration.
+# Multi-stage Docker build for the zkCoins node post Plonky2 migration.
 #
 # The Plonky2 toolchain pin is `nightly` (see `rust-toolchain` at the
 # repo root). rustup respects that file and installs the right channel
@@ -6,8 +6,8 @@
 # step needed.
 #
 # Build:
-#   docker build -t zkcoin/server:latest .
-#   docker build -t zkcoin/server:beta .
+#   docker build -t zkcoin/node:latest .
+#   docker build -t zkcoin/node:beta .
 #
 # Both DEV (`:beta`) and PRD (`:latest`) ship the MVP-only binary
 # (no Cargo features beyond the always-on mint and username routes).
@@ -19,7 +19,7 @@
 #     -e ESPLORA_URL=http://electrs:3000 \
 #     -e PUBLISHER_KEY=<hex> \
 #     -v zkcoins-data:/data \
-#     zkcoin/server:latest
+#     zkcoin/node:latest
 
 FROM rust:bookworm AS builder
 WORKDIR /app
@@ -51,19 +51,19 @@ COPY . .
 # code cannot run, crash, or be exploited at runtime.
 ARG FEATURES=
 RUN if [ -z "$FEATURES" ]; then \
-        cargo build --release -p server; \
+        cargo build --release -p node; \
     else \
-        cargo build --release -p server --features "$FEATURES"; \
+        cargo build --release -p node --features "$FEATURES"; \
     fi
 
 FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates wget \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/server /usr/local/bin/zkcoins-server
+COPY --from=builder /app/target/release/node /usr/local/bin/zkcoins-node
 
 ENV RUST_LOG=info
 WORKDIR /data
 EXPOSE 4242
 
-ENTRYPOINT ["zkcoins-server"]
+ENTRYPOINT ["zkcoins-node"]

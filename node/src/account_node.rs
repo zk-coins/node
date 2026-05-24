@@ -46,13 +46,13 @@ impl Account {
     /// `program-plonky2` deliberately keeps the API minimal), so we go
     /// through the serialisation boundary the rest of this module
     /// already exercises for persistence. The serialiser is the same
-    /// one [`AccountServer::serialize_account`] uses, so any future
+    /// one [`AccountNode::serialize_account`] uses, so any future
     /// change to the on-disk shape continues to be a single point of
     /// truth.
     ///
     /// Returns the deserialised twin or a `bincode::Error` from the
     /// round-trip. Both fallible arms are propagated up to the caller
-    /// (`AccountServer::prepare_mint`) which surfaces them as the
+    /// (`AccountNode::prepare_mint`) which surfaces them as the
     /// caller-facing "Failed to snapshot minting account" error.
     pub(crate) fn try_deep_clone(&self) -> Result<Self, bincode::Error> {
         let bytes = bincode::serialize(self)?;
@@ -60,11 +60,11 @@ impl Account {
     }
 }
 
-/// Result of [`AccountServer::prepare_mint`]: the tentative mutated
+/// Result of [`AccountNode::prepare_mint`]: the tentative mutated
 /// minting account (clone — not yet swapped into `self.accounts`)
 /// together with the freshly-generated coin proofs the mint flow needs
 /// to inscribe and deliver. The caller commits the mutation atomically
-/// via [`AccountServer::commit_mint`] once the on-chain broadcast and
+/// via [`AccountNode::commit_mint`] once the on-chain broadcast and
 /// the optimistic `minting_meta.num_pubkeys` UPDATE have both
 /// succeeded.
 #[derive(Debug)]
@@ -135,28 +135,28 @@ impl Account {
     }
 }
 
-pub struct AccountServer {
+pub struct AccountNode {
     accounts: HashMap<Address, Account>,
     prover: Prover,
     state: Arc<Mutex<State>>,
 }
 
-impl AccountServer {
+impl AccountNode {
     /// Get the keypair to the pubkey this account commited to (which is derived key num_pubkeys -
     /// 1)
     // TODO: Move to client.
     ///
     /// Test-only after PR-A3 — the production bootstrap rehydrates the
     /// server from Postgres via `load_from_pg`, never `new`. Kept
-    /// because every test in `account_server_tests.rs`,
-    /// `server_tests.rs`, and `server_runtime_tests.rs` uses it to
+    /// because every test in `account_node_tests.rs`,
+    /// `router_tests.rs`, and `runtime_tests.rs` uses it to
     /// build a known-empty server before importing fixture accounts.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(state: Arc<Mutex<State>>) -> Self {
         let accounts = HashMap::new();
         let prover = Prover::new();
 
-        AccountServer {
+        AccountNode {
             accounts,
             prover,
             state,
@@ -642,7 +642,7 @@ impl AccountServer {
     /// Prepare a mint transition WITHOUT mutating `self.accounts`.
     ///
     /// Used by the mint flow's prepare-then-commit refactor (see
-    /// [`crate::server::mint_handler`] + zk-coins/server#89): the
+    /// [`crate::router::mint_handler`] + zk-coins/node#89): the
     /// caller produces the prover output and the recipient coin proofs
     /// here, then attempts the on-chain inscription broadcast, then —
     /// only on broadcast success — commits the mutated minting account
@@ -702,7 +702,7 @@ impl AccountServer {
     }
 
     /// Read-only handle on the shared [`State`] (SMT + MMR). Exposed so
-    /// the startup invariant check in `server_runtime` can verify
+    /// the startup invariant check in `runtime` can verify
     /// every persisted minting-account pubkey has a corresponding SMT
     /// commitment without round-tripping through a dedicated
     /// `AppState` field.
@@ -721,7 +721,7 @@ impl AccountServer {
     ///
     /// Pulled out as an associated function (no `&self` borrow) so
     /// handlers can take an account snapshot, drop the
-    /// `Arc<Mutex<AccountServer>>` lock, and persist the bytes outside
+    /// `Arc<Mutex<AccountNode>>` lock, and persist the bytes outside
     /// the lock — required because the upsert is `async` and a
     /// `std::sync::MutexGuard` may not be held across an `.await`.
     ///
@@ -738,30 +738,30 @@ impl AccountServer {
             .expect("bincode::serialize cannot fail for the current Account shape")
     }
 
-    /// Reload an `AccountServer` from Postgres.
+    /// Reload an `AccountNode` from Postgres.
     ///
     /// The bootstrap-seeded minting account is NOT created here —
-    /// `start_rest_server` does that explicitly once it has observed an
+    /// `start_rest_node` does that explicitly once it has observed an
     /// absent minting row. Returning the rebuilt map here keeps this
     /// constructor a pure "rehydrate everything that was persisted"
     /// call with no side effects.
     pub async fn load_from_pg(
         state: Arc<Mutex<State>>,
         pool: &PgPool,
-    ) -> Result<Self, LoadAccountServerError> {
+    ) -> Result<Self, LoadAccountNodeError> {
         let rows = db::load_all_accounts(pool).await?;
         let mut accounts: HashMap<Address, Account> = HashMap::with_capacity(rows.len());
         for (addr_bytes, data_bytes) in rows {
             let addr_arr: [u8; 32] = addr_bytes
                 .as_slice()
                 .try_into()
-                .map_err(|_| LoadAccountServerError::BadAddressLength(addr_bytes.len()))?;
+                .map_err(|_| LoadAccountNodeError::BadAddressLength(addr_bytes.len()))?;
             let address = digest_from_bytes(&addr_arr);
             let account: Account = bincode::deserialize(&data_bytes)?;
             accounts.insert(address, account);
         }
         let prover = Prover::new();
-        Ok(AccountServer {
+        Ok(AccountNode {
             accounts,
             prover,
             state,
@@ -769,12 +769,12 @@ impl AccountServer {
     }
 }
 
-/// Error type for `AccountServer::load_from_pg`. Mirrors the
+/// Error type for `AccountNode::load_from_pg`. Mirrors the
 /// `state::LoadStateError` split so the bootstrap caller can react
 /// differently to "database is unreachable" (retry, fail loud) vs.
 /// "the persisted blob is corrupt" (no useful retry — escalate).
 #[derive(Debug)]
-pub enum LoadAccountServerError {
+pub enum LoadAccountNodeError {
     /// The Postgres call itself failed (connect, query, decode).
     Db(sqlx::Error),
     /// A row's `address` column was not the expected 32 bytes.
@@ -783,53 +783,53 @@ pub enum LoadAccountServerError {
     Deserialize(bincode::Error),
 }
 
-impl std::fmt::Display for LoadAccountServerError {
+impl std::fmt::Display for LoadAccountNodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LoadAccountServerError::Db(e) => write!(f, "database error: {}", e),
-            LoadAccountServerError::BadAddressLength(n) => write!(
+            LoadAccountNodeError::Db(e) => write!(f, "database error: {}", e),
+            LoadAccountNodeError::BadAddressLength(n) => write!(
                 f,
                 "accounts.address has unexpected length {} (expected 32)",
                 n
             ),
-            LoadAccountServerError::Deserialize(e) => {
+            LoadAccountNodeError::Deserialize(e) => {
                 write!(f, "account blob deserialize: {}", e)
             }
         }
     }
 }
 
-impl std::error::Error for LoadAccountServerError {
+impl std::error::Error for LoadAccountNodeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            LoadAccountServerError::Db(e) => Some(e),
-            LoadAccountServerError::BadAddressLength(_) => None,
-            LoadAccountServerError::Deserialize(e) => Some(e),
+            LoadAccountNodeError::Db(e) => Some(e),
+            LoadAccountNodeError::BadAddressLength(_) => None,
+            LoadAccountNodeError::Deserialize(e) => Some(e),
         }
     }
 }
 
-impl From<sqlx::Error> for LoadAccountServerError {
+impl From<sqlx::Error> for LoadAccountNodeError {
     fn from(e: sqlx::Error) -> Self {
-        LoadAccountServerError::Db(e)
+        LoadAccountNodeError::Db(e)
     }
 }
 
-impl From<bincode::Error> for LoadAccountServerError {
+impl From<bincode::Error> for LoadAccountNodeError {
     fn from(e: bincode::Error) -> Self {
-        LoadAccountServerError::Deserialize(e)
+        LoadAccountNodeError::Deserialize(e)
     }
 }
 
 /// Helper used by both the bootstrap and the handlers: serialize the
 /// account at `address` and persist it via `db::upsert_account`.
 ///
-/// Holds an `&AccountServer` to snapshot the bincode bytes
+/// Holds an `&AccountNode` to snapshot the bincode bytes
 /// *synchronously*, then runs the `async` upsert with no live mutex
 /// guard. Callers MUST acquire the snapshot before the `.await` (i.e.
 /// inside a `{ ... }` scope that releases the
-/// `MutexGuard<'_, AccountServer>`) — see the handler sites in
-/// `server.rs` for the pattern.
+/// `MutexGuard<'_, AccountNode>`) — see the handler sites in
+/// `router.rs` for the pattern.
 ///
 /// Returns the bincode-encoded bytes on success so the caller can log
 /// the byte length without re-serializing.
@@ -838,7 +838,7 @@ pub async fn persist_account(
     address: &Address,
     account: &Account,
 ) -> Result<usize, PersistAccountError> {
-    let bytes = AccountServer::serialize_account(account);
+    let bytes = AccountNode::serialize_account(account);
     let addr_bytes = digest_to_bytes(address);
     db::upsert_account(pool, &addr_bytes, &bytes).await?;
     Ok(bytes.len())
@@ -884,18 +884,18 @@ mod inline_tests {
     //! single-line lookup paths in `get_minting_account_address`,
     //! `get_account`, and `get_account_balance`. The Postgres-based
     //! `load_from_pg` and `persist_account` paths are tested against a
-    //! real Postgres 17 container in `account_server_tests.rs`. The
+    //! real Postgres 17 container in `account_node_tests.rs`. The
     //! richer prover-driven fixtures also live there.
 
     use super::*;
 
-    fn fresh_server() -> AccountServer {
-        AccountServer::new(Arc::new(Mutex::new(State::new())))
+    fn fresh_node() -> AccountNode {
+        AccountNode::new(Arc::new(Mutex::new(State::new())))
     }
 
     #[test]
     fn get_minting_account_address_errors_when_not_imported() {
-        let mut server = fresh_server();
+        let mut server = fresh_node();
         assert_eq!(
             server.get_minting_account_address().unwrap_err(),
             "Minting account not created"
@@ -904,7 +904,7 @@ mod inline_tests {
 
     #[test]
     fn get_minting_account_address_returns_minting_address_when_present() {
-        let mut server = fresh_server();
+        let mut server = fresh_node();
         server.import_account(*zkcoins_program::types::MINTING_ADDRESS, Account::new());
         assert_eq!(
             server.get_minting_account_address().unwrap(),
@@ -914,7 +914,7 @@ mod inline_tests {
 
     #[test]
     fn get_account_balance_errors_for_unknown_address() {
-        let server = fresh_server();
+        let server = fresh_node();
         let unknown = zkcoins_program::hash::digest_from_bytes(&[7u8; 32]);
         assert_eq!(
             server.get_account_balance(&unknown).unwrap_err(),
@@ -924,7 +924,7 @@ mod inline_tests {
 
     #[test]
     fn get_account_balance_returns_zero_for_empty_account() {
-        let mut server = fresh_server();
+        let mut server = fresh_node();
         let address = zkcoins_program::hash::digest_from_bytes(&[1u8; 32]);
         server.import_account(address, Account::new());
         assert_eq!(server.get_account_balance(&address).unwrap(), 0);
@@ -932,7 +932,7 @@ mod inline_tests {
 
     #[test]
     fn get_account_returns_some_for_known_address() {
-        let mut server = fresh_server();
+        let mut server = fresh_node();
         let address = zkcoins_program::hash::digest_from_bytes(&[1u8; 32]);
         let mut account = Account::new();
         account.balance = 42;
@@ -943,7 +943,7 @@ mod inline_tests {
 
     #[test]
     fn get_account_returns_none_for_unknown_address() {
-        let server = fresh_server();
+        let server = fresh_node();
         let unknown = zkcoins_program::hash::digest_from_bytes(&[9u8; 32]);
         assert!(server.get_account(&unknown).is_none());
     }
@@ -952,7 +952,7 @@ mod inline_tests {
     fn serialize_account_roundtrips_via_bincode() {
         let mut a = Account::new();
         a.balance = 7;
-        let bytes = AccountServer::serialize_account(&a);
+        let bytes = AccountNode::serialize_account(&a);
         let back: Account = bincode::deserialize(&bytes).expect("deserialize ok");
         assert_eq!(back.balance, 7);
     }
@@ -969,7 +969,7 @@ mod inline_tests {
 
     #[test]
     fn send_coins_errors_for_unknown_account() {
-        let mut server = fresh_server();
+        let mut server = fresh_node();
         let recipient = zkcoins_program::hash::digest_from_bytes(&[2u8; 32]);
         let account_address = zkcoins_program::hash::digest_from_bytes(&[3u8; 32]);
         let pk = dummy_secp_public_key();
@@ -985,7 +985,7 @@ mod inline_tests {
 
     #[test]
     fn send_coins_errors_on_insufficient_funds() {
-        let mut server = fresh_server();
+        let mut server = fresh_node();
         let account_address = zkcoins_program::hash::digest_from_bytes(&[4u8; 32]);
         server.import_account(account_address, Account::new());
         let recipient = zkcoins_program::hash::digest_from_bytes(&[5u8; 32]);
@@ -1002,7 +1002,7 @@ mod inline_tests {
 
     #[test]
     fn prepare_mint_errors_when_minting_account_absent() {
-        let server = fresh_server();
+        let server = fresh_node();
         let pk = dummy_secp_public_key();
         let result = server.prepare_mint(vec![], pk, pk, None);
         assert_eq!(result.unwrap_err(), "Minting account not created");
@@ -1017,20 +1017,19 @@ mod inline_tests {
     }
 
     #[test]
-    fn load_account_server_error_display_and_source() {
+    fn load_account_node_error_display_and_source() {
         // Display and `source()` coverage for all three error variants.
         // The Db variant wraps the simplest sqlx::Error we can construct:
         // ColumnNotFound is a unit-ish variant taking only the column name.
-        let db_err =
-            LoadAccountServerError::from(sqlx::Error::ColumnNotFound("address".to_string()));
+        let db_err = LoadAccountNodeError::from(sqlx::Error::ColumnNotFound("address".to_string()));
         assert!(format!("{}", db_err).contains("database error"));
         assert!(std::error::Error::source(&db_err).is_some());
 
-        let bad = LoadAccountServerError::BadAddressLength(7);
+        let bad = LoadAccountNodeError::BadAddressLength(7);
         assert!(format!("{}", bad).contains("expected 32"));
         assert!(std::error::Error::source(&bad).is_none());
 
-        let de_err = LoadAccountServerError::from(bincode::Error::new(bincode::ErrorKind::Custom(
+        let de_err = LoadAccountNodeError::from(bincode::Error::new(bincode::ErrorKind::Custom(
             "boom".into(),
         )));
         assert!(format!("{}", de_err).contains("account blob deserialize"));
@@ -1072,25 +1071,25 @@ mod inline_tests {
             .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/postgres")
             .expect("connect_lazy never fails");
         let state = Arc::new(Mutex::new(State::new()));
-        // `AccountServer` is intentionally not `Debug` (it owns a
+        // `AccountNode` is intentionally not `Debug` (it owns a
         // `Prover` which is itself non-Debug), so `expect_err` is not
         // available. Use `.err()` + `.expect()` instead of a `match`
         // with an `Ok(_) => panic!` arm — that arm is structurally
         // unreachable in a passing test, which leaves the Coverage
-        // Gate (`account_server.rs` is in scope, only `_tests.rs$`
+        // Gate (`account_node.rs` is in scope, only `_tests.rs$`
         // files are ignored) at 99.83% on the dead match arm.
-        let err = AccountServer::load_from_pg(state, &pool)
+        let err = AccountNode::load_from_pg(state, &pool)
             .await
             .err()
             .expect("load_from_pg should fail when DB is unreachable");
         assert!(
-            matches!(err, LoadAccountServerError::Db(_)),
+            matches!(err, LoadAccountNodeError::Db(_)),
             "unexpected: {:?}",
             err
         );
     }
 
-    /// Mirror of `server_tests::lock_or_recover_recovers_from_poisoned_mutex`
+    /// Mirror of `router_tests::lock_or_recover_recovers_from_poisoned_mutex`
     /// for the `send_coins` site: poisoning the shared `state` mutex
     /// must NOT crash the handler — the `unwrap_or_else(PoisonError::
     /// into_inner)` recovery branch returns the inner guard so the
@@ -1112,7 +1111,7 @@ mod inline_tests {
         .join();
         assert!(state.is_poisoned(), "state mutex must be poisoned");
 
-        let mut server = AccountServer::new(Arc::clone(&state));
+        let mut server = AccountNode::new(Arc::clone(&state));
         let recipient = zkcoins_program::hash::digest_from_bytes(&[2u8; 32]);
         let account_address = zkcoins_program::hash::digest_from_bytes(&[3u8; 32]);
         let pk = dummy_secp_public_key();
@@ -1130,5 +1129,5 @@ mod inline_tests {
 }
 
 #[cfg(test)]
-#[path = "account_server_tests.rs"]
+#[path = "account_node_tests.rs"]
 mod tests;

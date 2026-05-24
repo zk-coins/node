@@ -68,7 +68,7 @@ impl TestAccountData {
 
     fn execute_send_coins(
         &mut self,
-        server: &mut AccountServer,
+        server: &mut AccountNode,
         invoices: Vec<Invoice>,
     ) -> Result<Vec<CoinProof>, String> {
         let current_pk = generate_test_public_key(&self.xpriv, self.num_pubkeys);
@@ -118,7 +118,7 @@ impl TestAccountData {
 #[test]
 fn test_wallet_operations() {
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut server = AccountServer::new(Arc::clone(&state_arc));
+    let mut server = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting_account_data = TestAccountData::new_minting_account();
     server.import_account(
@@ -252,7 +252,7 @@ fn test_wallet_operations() {
 #[test]
 fn test_create_minting_account() {
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut server = AccountServer::new(state_arc);
+    let mut server = AccountNode::new(state_arc);
 
     let minting_account_data = TestAccountData::new_minting_account();
 
@@ -279,7 +279,7 @@ fn test_create_minting_account() {
 #[test]
 fn test_mint_single_invoice() {
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut server = AccountServer::new(Arc::clone(&state_arc));
+    let mut server = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting_account_data = TestAccountData::new_minting_account();
     server.import_account(
@@ -305,7 +305,7 @@ fn test_mint_single_invoice() {
 #[test]
 fn test_receive_duplicate_coin_rejected() {
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut server = AccountServer::new(Arc::clone(&state_arc));
+    let mut server = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting_account_data = TestAccountData::new_minting_account();
     server.import_account(
@@ -352,7 +352,7 @@ fn test_receive_duplicate_coin_rejected() {
 #[test]
 fn test_receive_updates_balance() {
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut server = AccountServer::new(Arc::clone(&state_arc));
+    let mut server = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting_account_data = TestAccountData::new_minting_account();
     server.import_account(
@@ -408,7 +408,7 @@ fn test_receive_updates_balance() {
 #[test]
 fn test_mint_repro_live_setup() {
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut server = AccountServer::new(Arc::clone(&state_arc));
+    let mut server = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting_account_data = TestAccountData::new_minting_account();
     server.import_account(
@@ -433,7 +433,7 @@ fn test_mint_repro_live_setup() {
 
 /// PR-A3 replacement for the previous file-based `save_and_load_roundtrip`:
 /// persist an imported account via `persist_account` (the same helper
-/// the handler sites call), then rebuild a fresh `AccountServer` via
+/// the handler sites call), then rebuild a fresh `AccountNode` via
 /// `load_from_pg` and assert the imported account survived round-trip.
 #[tokio::test]
 async fn test_persist_and_load_from_pg_roundtrip() {
@@ -453,7 +453,7 @@ async fn test_persist_and_load_from_pg_roundtrip() {
         .expect("connect_and_migrate failed");
 
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut server = AccountServer::new(Arc::clone(&state_arc));
+    let mut server = AccountNode::new(Arc::clone(&state_arc));
 
     let address: HashDigest = digest_from_bytes(&[42u8; 32]);
     let mut acct = Account::new();
@@ -462,12 +462,12 @@ async fn test_persist_and_load_from_pg_roundtrip() {
 
     // Snapshot + upsert mirrors the handler-site pattern.
     let account_snapshot = server.get_account(&address).cloned_via_bincode();
-    crate::account_server::persist_account(&pool, &address, &account_snapshot)
+    crate::account_node::persist_account(&pool, &address, &account_snapshot)
         .await
         .expect("persist_account ok");
 
     // Rebuild from PG and verify the row came back.
-    let loaded = AccountServer::load_from_pg(state_arc, &pool)
+    let loaded = AccountNode::load_from_pg(state_arc, &pool)
         .await
         .expect("load_from_pg ok");
     assert_eq!(loaded.get_account_balance(&address).unwrap(), 11);
@@ -493,21 +493,21 @@ impl CloneViaBincode for Option<&Account> {
 #[test]
 fn test_get_minting_account_address_returns_err_when_not_imported() {
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut server = AccountServer::new(state_arc);
+    let mut server = AccountNode::new(state_arc);
     assert!(server.get_minting_account_address().is_err());
 }
 
 #[test]
 fn test_get_account_balance_returns_err_for_unknown_address() {
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let server = AccountServer::new(state_arc);
+    let server = AccountNode::new(state_arc);
     let unknown: Address = digest_from_bytes(&[7u8; 32]);
     assert!(server.get_account_balance(&unknown).is_err());
 }
 
 /// PR-A3 replacement for the previous `test_load_from_file_rejects_corrupted_bytes`:
 /// plant a row whose `data` blob is not valid bincode and assert
-/// `load_from_pg` surfaces the corruption as `LoadAccountServerError
+/// `load_from_pg` surfaces the corruption as `LoadAccountNodeError
 /// ::Deserialize` rather than panicking or silently dropping the row.
 #[tokio::test]
 async fn test_load_from_pg_rejects_corrupted_blob() {
@@ -535,14 +535,14 @@ async fn test_load_from_pg_rejects_corrupted_blob() {
         .unwrap();
 
     let state_arc = Arc::new(Mutex::new(State::new()));
-    // `AccountServer` is intentionally not `Debug`, so `expect_err`
+    // `AccountNode` is intentionally not `Debug`, so `expect_err`
     // isn't available; match the Result instead.
-    match AccountServer::load_from_pg(state_arc, &pool).await {
+    match AccountNode::load_from_pg(state_arc, &pool).await {
         Ok(_) => panic!("expected deserialize error"),
         Err(err) => assert!(
             matches!(
                 err,
-                crate::account_server::LoadAccountServerError::Deserialize(_)
+                crate::account_node::LoadAccountNodeError::Deserialize(_)
             ),
             "unexpected: {:?}",
             err
@@ -552,7 +552,7 @@ async fn test_load_from_pg_rejects_corrupted_blob() {
 
 /// PR-A3 negative test: plant a row whose `address` column is not the
 /// expected 32 bytes and assert the loader surfaces the mismatch as
-/// `LoadAccountServerError::BadAddressLength`.
+/// `LoadAccountNodeError::BadAddressLength`.
 #[tokio::test]
 async fn test_load_from_pg_rejects_wrong_address_length() {
     use testcontainers::{runners::AsyncRunner, ImageExt};
@@ -578,12 +578,12 @@ async fn test_load_from_pg_rejects_wrong_address_length() {
         .unwrap();
 
     let state_arc = Arc::new(Mutex::new(State::new()));
-    match AccountServer::load_from_pg(state_arc, &pool).await {
+    match AccountNode::load_from_pg(state_arc, &pool).await {
         Ok(_) => panic!("expected bad-address length"),
         Err(err) => assert!(
             matches!(
                 err,
-                crate::account_server::LoadAccountServerError::BadAddressLength(7)
+                crate::account_node::LoadAccountNodeError::BadAddressLength(7)
             ),
             "unexpected: {:?}",
             err
@@ -594,7 +594,7 @@ async fn test_load_from_pg_rejects_wrong_address_length() {
 #[test]
 fn test_send_coins_returns_err_for_unknown_account() {
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut server = AccountServer::new(state_arc);
+    let mut server = AccountNode::new(state_arc);
     let account_data = TestAccountData::new_generic(&[1u8; 32], Network::Bitcoin);
 
     let recipient: Address = digest_from_bytes(&[2u8; 32]);
@@ -616,7 +616,7 @@ fn test_send_coins_returns_err_for_unknown_account() {
 #[test]
 fn test_send_coins_returns_err_insufficient_funds() {
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut server = AccountServer::new(state_arc);
+    let mut server = AccountNode::new(state_arc);
     let account_data = TestAccountData::new_generic(&[1u8; 32], Network::Bitcoin);
     server.import_account(account_data.address, Account::new());
 
@@ -639,7 +639,7 @@ fn test_send_coins_returns_err_insufficient_funds() {
 #[test]
 fn test_receive_coin_rejects_invalid_inclusion_proof() {
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut server = AccountServer::new(Arc::clone(&state_arc));
+    let mut server = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting_account_data = TestAccountData::new_minting_account();
     server.import_account(
@@ -674,7 +674,7 @@ fn test_receive_coin_rejects_invalid_inclusion_proof() {
 #[test]
 fn test_send_coins_twice_from_same_account_uses_update_account() {
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut server = AccountServer::new(Arc::clone(&state_arc));
+    let mut server = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting = TestAccountData::new_minting_account();
     server.import_account(
@@ -716,7 +716,7 @@ fn test_send_coins_twice_from_same_account_uses_update_account() {
 #[test]
 fn test_receive_coin_rejects_replay_via_coin_history() {
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut server = AccountServer::new(Arc::clone(&state_arc));
+    let mut server = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting = TestAccountData::new_minting_account();
     server.import_account(
@@ -774,7 +774,7 @@ fn test_receive_coin_rejects_replay_via_coin_history() {
 #[test]
 fn test_send_coins_rejects_tampered_source_proof_inclusion() {
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut server = AccountServer::new(Arc::clone(&state_arc));
+    let mut server = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting = TestAccountData::new_minting_account();
     server.import_account(
@@ -857,7 +857,7 @@ fn test_send_coins_rejects_tampered_source_proof_inclusion() {
 fn test_send_coins_rejects_too_many_invoices() {
     use zkcoins_program::circuit::main::MAX_OUT_COINS;
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut server = AccountServer::new(Arc::clone(&state_arc));
+    let mut server = AccountNode::new(Arc::clone(&state_arc));
     let minting = TestAccountData::new_minting_account();
     server.import_account(
         minting.address,
@@ -888,7 +888,7 @@ fn test_send_coins_rejects_too_many_invoices() {
 fn test_send_coins_rejects_too_many_coins_in_queue() {
     use zkcoins_program::circuit::main::MAX_IN_COINS;
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut server = AccountServer::new(Arc::clone(&state_arc));
+    let mut server = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting = TestAccountData::new_minting_account();
     server.import_account(
@@ -962,7 +962,7 @@ fn test_send_coins_rejects_too_many_coins_in_queue() {
 #[test]
 fn test_send_coins_errors_when_state_lacks_commitment_for_in_coin() {
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut server = AccountServer::new(Arc::clone(&state_arc));
+    let mut server = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting = TestAccountData::new_minting_account();
     server.import_account(
@@ -1012,7 +1012,7 @@ fn test_send_coins_errors_when_state_lacks_commitment_for_in_coin() {
 #[test]
 fn test_send_coins_errors_when_state_lacks_commitment_for_prev_account_proof() {
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut server = AccountServer::new(Arc::clone(&state_arc));
+    let mut server = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting = TestAccountData::new_minting_account();
     server.import_account(
@@ -1090,7 +1090,7 @@ fn test_send_coins_errors_when_state_lacks_commitment_for_prev_account_proof() {
 #[test]
 fn test_send_coins_rejects_coin_queue_entry_without_commitment() {
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut server = AccountServer::new(Arc::clone(&state_arc));
+    let mut server = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting = TestAccountData::new_minting_account();
     server.import_account(
@@ -1130,7 +1130,7 @@ fn test_send_coins_rejects_coin_queue_entry_without_commitment() {
 }
 
 /// In-coin loop: when the off-circuit pre-check at
-/// `account_server.rs:419` rebuilds a source `CommitmentMerkleProofs`
+/// `account_node.rs:419` rebuilds a source `CommitmentMerkleProofs`
 /// whose `commitment_root_mmr_sibling` does not match the actual
 /// MMR leaf for that source, `verify_commitment` returns false and
 /// `send_coins` surfaces "Source commitment not present in history
@@ -1157,7 +1157,7 @@ fn test_send_coins_rejects_coin_queue_entry_without_commitment() {
 #[test]
 fn test_send_coins_rejects_source_commitment_missing_from_history_mmr() {
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut server = AccountServer::new(Arc::clone(&state_arc));
+    let mut server = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting = TestAccountData::new_minting_account();
     server.import_account(
@@ -1214,6 +1214,6 @@ fn test_send_coins_rejects_source_commitment_missing_from_history_mmr() {
     assert_eq!(
         result.unwrap_err(),
         "Source commitment not present in history MMR",
-        "desynced `state.prev_mmr_root` must surface the off-circuit history-MMR rejection at account_server.rs:419",
+        "desynced `state.prev_mmr_root` must surface the off-circuit history-MMR rejection at account_node.rs:419",
     );
 }

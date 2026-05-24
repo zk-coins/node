@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  DOCKER_TAGS: zkcoin/server:latest
+  DOCKER_TAGS: zkcoin/node:latest
 
 permissions:
   contents: read
@@ -44,13 +44,13 @@ jobs:
           push: true
           tags: ${{ env.DOCKER_TAGS }}
           platforms: linux/arm64
-          # Registry-backed buildx cache. Same `zkcoin/server:buildcache`
+          # Registry-backed buildx cache. Same `zkcoin/node:buildcache`
           # tag is shared with Deploy DEV — DEV and PRD compile the same
           # Rust workspace so cache hits cross-deploy. `type=registry`
           # over `type=gha` because GHA cache caps at 10 GB with LRU
           # eviction; Docker Hub holds the tag indefinitely.
-          cache-from: type=registry,ref=zkcoin/server:buildcache
-          cache-to: type=registry,ref=zkcoin/server:buildcache,mode=max
+          cache-from: type=registry,ref=zkcoin/node:buildcache
+          cache-to: type=registry,ref=zkcoin/node:buildcache,mode=max
 
       - name: Install cloudflared
         run: |
@@ -66,7 +66,7 @@ jobs:
           ssh -i ~/.ssh/deploy_key \
             -o ProxyCommand="cloudflared access ssh --hostname ${{ secrets.DEPLOY_PRD_HOST }}" \
             ${{ secrets.DEPLOY_PRD_USER }}@${{ secrets.DEPLOY_PRD_HOST }} \
-            "zkcoins-server"
+            "zkcoins-node"
 
       # Post-deploy smoke test: hit the public PRD endpoint until
       # /api/info answers 200 or we give up. Mirrors the Deploy DEV
@@ -127,7 +127,7 @@ jobs:
           sccache --show-stats
 
       - name: Run API E2E suite against PRD (skip roundtrips)
-        run: cargo test -p server --release --all-features --test api_remote -- --test-threads=1 --nocapture --skip _roundtrip_
+        run: cargo test -p node --release --all-features --test api_remote -- --test-threads=1 --nocapture --skip _roundtrip_
 
       - name: sccache stats (post-build)
         if: always()

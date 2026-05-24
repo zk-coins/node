@@ -195,7 +195,7 @@ impl From<sqlx::Error> for ClaimUsernameError {
 }
 
 /// Error type for `UsernameStore::load_from_pg`. Same split as
-/// `state::LoadStateError` and `account_server::LoadAccountServerError`
+/// `state::LoadStateError` and `account_node::LoadAccountNodeError`
 /// — bootstrap callers branch on these.
 #[derive(Debug)]
 pub enum LoadUsernameStoreError {
