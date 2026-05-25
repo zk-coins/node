@@ -51,7 +51,7 @@ The **on-chain footprint stays private** — Plonky2 ensures that the public out
 
 **New PRs may only merge into `develop` if test coverage is 100% on the activated surface.** Code behind a Cargo feature (`address-list`, `lnurl`) is excluded from the MVP measurement — feature-gated routes do not need to be tested because both DEV and PRD ship the MVP-only binary with every Cargo feature off. (Mint and usernames are part of the MVP and are permanently compiled in — no Cargo feature gate.) Concretely:
 
-- `cargo llvm-cov -p server` (no `--all-features`) must report 100% lines + 100% functions on the activated MVP surface. CI enforces this with `--fail-under-lines 100 --fail-under-functions 100` in the `Coverage Gate (100% lines + functions)` job. The current `develop` baseline is at the gate.
+- `cargo llvm-cov -p node` (no `--all-features`) must report 100% lines + 100% functions on the activated MVP surface. CI enforces this with `--fail-under-lines 100 --fail-under-functions 100` in the `Coverage Gate (100% lines + functions)` job. The current `develop` baseline is at the gate.
 - Defensive code that genuinely cannot be reached in unit tests (e.g. the publisher's Bitcoin-broadcast path that requires a signet/regtest node, the `main.rs` runtime bootstrap) is excluded from the measured scope at the file level rather than tested.
 - The branch is protected on GitHub: a PR cannot be merged while CI is red.
 
@@ -103,7 +103,7 @@ All non-MVP routes are gated by Cargo features so the disabled handler functions
 | `address-list` | `GET /api/address`                                                                                                                                    |
 | `lnurl`        | `GET /.well-known/lnurlp/:u`, `GET /lnurl/pay/:u`                                                                                                     |
 
-Build the MVP-only binary (DEV + PRD ship this): `cargo build --release -p server`. Build with every feature enabled (CI clippy + tests + self-host opt-in): `cargo build --release -p node --all-features`. The Docker `FEATURES` build arg accepts a comma-separated list and is forwarded to `cargo build --features`; both `deploy-dev.yaml` and `deploy-prd.yaml` leave it empty.
+Build the MVP-only binary (DEV + PRD ship this): `cargo build --release -p node`. Build with every feature enabled (CI clippy + tests + self-host opt-in): `cargo build --release -p node --all-features`. The Docker `FEATURES` build arg accepts a comma-separated list and is forwarded to `cargo build --features`; both `deploy-dev.yaml` and `deploy-prd.yaml` leave it empty.
 
 ### Triage gaps
 
@@ -240,7 +240,7 @@ Spawned from `main.rs::main`:
 | ---------------- | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
 | `cargo test`     | `cargo test -p node`                        | MVP code paths — what the DEV + PRD binary actually contains                                               |
 | `cargo test`     | `cargo test -p node --all-features`         | Including the gated `address-list` and `lnurl` routes                                                      |
-| `cargo-llvm-cov` | `cargo llvm-cov -p server`                    | Coverage gate enforced by CI: 100% lines + functions on the activated MVP surface                          |
+| `cargo-llvm-cov` | `cargo llvm-cov -p node`                    | Coverage gate enforced by CI: 100% lines + functions on the activated MVP surface                          |
 
 Per-module coverage (CI-gated):
 

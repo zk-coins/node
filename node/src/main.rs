@@ -32,7 +32,7 @@ use tokio::sync::mpsc;
 // remaining on-disk writes are the per-proof files under
 // `${PROOFS_DIR:-./proofs}/{id}.bin`, owned by `ProofStore` in
 // `router.rs`.
-const ACCOUNT_SERVER_ADDR: &str = "0.0.0.0:4242";
+const ACCOUNT_NODE_ADDR: &str = "0.0.0.0:4242";
 
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
@@ -117,7 +117,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         if let Err(e) = start_rest_node(
             account_node,
             username_store,
-            ACCOUNT_SERVER_ADDR,
+            ACCOUNT_NODE_ADDR,
             pool_for_rest,
             Some(scanner_progress_for_rest),
         )
