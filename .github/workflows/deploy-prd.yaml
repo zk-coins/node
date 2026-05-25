@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  DOCKER_TAGS: zkcoin/node:latest
+  DOCKER_TAGS: zkcoins/node:latest
 
 permissions:
   contents: read
@@ -44,13 +44,13 @@ jobs:
           push: true
           tags: ${{ env.DOCKER_TAGS }}
           platforms: linux/arm64
-          # Registry-backed buildx cache. Same `zkcoin/node:buildcache`
+          # Registry-backed buildx cache. Same `zkcoins/node:buildcache`
           # tag is shared with Deploy DEV — DEV and PRD compile the same
           # Rust workspace so cache hits cross-deploy. `type=registry`
           # over `type=gha` because GHA cache caps at 10 GB with LRU
           # eviction; Docker Hub holds the tag indefinitely.
-          cache-from: type=registry,ref=zkcoin/node:buildcache
-          cache-to: type=registry,ref=zkcoin/node:buildcache,mode=max
+          cache-from: type=registry,ref=zkcoins/node:buildcache
+          cache-to: type=registry,ref=zkcoins/node:buildcache,mode=max
 
       - name: Install cloudflared
         run: |
