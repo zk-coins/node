@@ -289,6 +289,11 @@ pub fn inscription_txs(
 /// no-polling invariant from the `CONTRIBUTING.md` "No polling —
 /// events only" section is preserved.
 ///
+/// The fallback fires on the OUTER `TRACK_TX_TIMEOUT_SECS` budget
+/// (exposed via `TrackTxStream::wait` in `scanner_ws.rs`) — the
+/// inner per-frame `TRACK_TX_FRAME_WATCHDOG` reconnect loop in
+/// `scanner_ws.rs` is untouched.
+///
 /// Order of operations is load-bearing: the `track-tx` subscription
 /// MUST be established BEFORE the commit broadcast. Otherwise the
 /// upstream may finish propagating the tx between
