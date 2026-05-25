@@ -16,10 +16,7 @@ use node::scanner_runtime::scan_for_inscriptions;
 use node::scanner_ws::{run_scanner_ws, ScannerWsConfig};
 use node::state::State;
 use node::username;
-use node::{
-    insert_root_index_from_sync_context, persist_state_from_sync_context, DATABASE_URL,
-    NETWORK_CONFIG,
-};
+use node::{persist_state_from_sync_context, DATABASE_URL, NETWORK_CONFIG};
 use shared::commitment::Commitment;
 use std::error::Error as StdError;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -275,11 +272,32 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                     // `block_in_place(|| Handle::current().block_on(…))`
                     // pattern, encapsulated in
                     // `persist_state_from_sync_context`.
+                    //
+                    // The freshly-inserted `mmr_root_index` row rides
+                    // along in the SAME transaction (Phase C). Folding
+                    // it in here closes the crash window the previous
+                    // two-call shape opened: a crash between the state
+                    // snapshot and the standalone root_index INSERT
+                    // resumed the scanner from a `latest_block` whose
+                    // MMR already contained the new leaf, so the
+                    // re-scanned commit advanced the MMR a second
+                    // time, the new `prev_mmr_root` diverged, and the
+                    // originally-missing row was never healed. With
+                    // both writes atomic, a crash before COMMIT leaves
+                    // the saved `latest_block` BEFORE this block; the
+                    // re-scan replays `state.update` against the same
+                    // unchanged MMR and writes the same row again
+                    // (ON CONFLICT DO NOTHING is a no-op when it
+                    // already landed).
+                    let root_index_ref = root_index_entry
+                        .as_ref()
+                        .map(|(p, s, i)| (p, s, *i as u64));
                     let persist_result = persist_state_from_sync_context(
                         &pool_for_callback,
                         &smt_bytes,
                         &mmr_bytes,
                         &block_hash_bytes,
+                        root_index_ref,
                     );
                     match persist_result {
                         Ok(()) => println!(
@@ -287,29 +305,6 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                             hex::encode(zkcoins_program::hash::digest_to_bytes(&new_root))
                         ),
                         Err(e) => eprintln!("persist_state_tx failed: {}", e),
-                    }
-
-                    // Persist the freshly-inserted `root_indices` entry
-                    // (Phase C, fix for /api/mint 422 after restart).
-                    // The write is intentionally OUTSIDE the
-                    // SMT/MMR/latest_block transaction: a failure here
-                    // does not corrupt the canonical state, and the
-                    // missing row will be re-derived on a future
-                    // re-scan (the scanner replays past blocks on
-                    // restart, and `update()` is idempotent on
-                    // duplicate commitments at the SMT level — the
-                    // root_index INSERT is itself ON CONFLICT DO
-                    // NOTHING). Logging the failure is sufficient.
-                    if let Some((prev_root, smt_root, leaf_index)) = root_index_entry {
-                        match insert_root_index_from_sync_context(
-                            &pool_for_callback,
-                            &prev_root,
-                            &smt_root,
-                            leaf_index as u64,
-                        ) {
-                            Ok(()) => {}
-                            Err(e) => eprintln!("insert_root_index failed: {}", e),
-                        }
                     }
                 }
             }

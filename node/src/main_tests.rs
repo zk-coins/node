@@ -81,7 +81,7 @@ async fn persist_state_from_sync_context_works_from_sync_closure_on_multi_thread
     // runs on that same worker thread — exactly the topology where
     // bare `Handle::current().block_on(...)` panics.
     let persist_from_sync_closure = || -> Result<(), sqlx::Error> {
-        persist_state_from_sync_context(&pool, &smt, &mmr, &block)
+        persist_state_from_sync_context(&pool, &smt, &mmr, &block, None)
     };
     persist_from_sync_closure()
         .expect("persist_state_from_sync_context returned Err (regression: did block_in_place get removed?)");

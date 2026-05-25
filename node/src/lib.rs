@@ -123,11 +123,17 @@ lazy_static! {
 /// `Handle::current().block_on(future)` — panics on the multi_thread
 /// flavor. `block_in_place` is the documented sync-in-async escape
 /// hatch for multi_thread runtimes.
+///
+/// `root_index_entry` carries the freshly-inserted `mmr_root_index`
+/// row so the Phase-C write lands in the SAME Postgres transaction as
+/// the SMT/MMR/latest_block snapshot — see the doc-comment on
+/// `db::persist_state_tx` for the heal-on-restart rationale.
 pub fn persist_state_from_sync_context(
     pool: &PgPool,
     smt: &[u8],
     mmr: &[u8],
     latest_block: &[u8; 32],
+    root_index_entry: Option<(&HashDigest, &HashDigest, u64)>,
 ) -> Result<(), sqlx::Error> {
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(db::persist_state_tx(
@@ -135,6 +141,7 @@ pub fn persist_state_from_sync_context(
             smt,
             mmr,
             latest_block,
+            root_index_entry,
         ))
     })
 }

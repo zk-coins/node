@@ -86,21 +86,65 @@ pub async fn load_latest_block(pool: &PgPool) -> Result<Option<[u8; 32]>, sqlx::
     }
 }
 
-/// Atomically write SMT, MMR, and `latest_block` in one transaction.
+/// Atomically write SMT, MMR, `latest_block`, and (optionally) the
+/// freshly-inserted `mmr_root_index` row in one transaction.
 ///
-/// The whole point of moving these three blobs into Postgres is the
+/// The whole point of moving these blobs into Postgres is the
 /// transactional guarantee — issue #11 documents the file-based
 /// failure mode where a crash between `smt.bin`, `mmr.bin`, and
 /// `latest_block.bin` leaves the three out of sync, and the next
 /// start-up either replays already-processed commitments (dup
 /// inserts into the SMT) or loses commitments outright. A single
-/// `BEGIN; UPSERT; UPSERT; UPSERT; COMMIT` removes that window.
+/// `BEGIN; UPSERT; UPSERT; UPSERT; INSERT; COMMIT` removes that window.
+///
+/// The Phase-C `mmr_root_index` write is part of the SAME transaction
+/// because a crash between the state snapshot and the root_index INSERT
+/// is catastrophic for replay healing: on restart the scanner resumes
+/// from the saved `latest_block` and re-scans the same commit tx →
+/// `state.update` runs again → SMT insert is idempotent but `mmr.append`
+/// is NOT → MMR diverges → `prev_mmr_root` becomes a NEW key → fresh
+/// `root_indices` entry written under the new key → the original
+/// missing entry is never healed. Folding the INSERT into the same tx
+/// means either both land or neither does; on a crash before COMMIT,
+/// the next start-up re-runs `state.update` against the SAME unchanged
+/// MMR and writes the SAME `(prev_mmr_root, smt_root, leaf_index)` —
+/// `ON CONFLICT (prev_mmr_root) DO NOTHING` makes that a no-op on the
+/// row that did land, or a fresh insert on the row that did not.
+///
+/// `root_index_entry` is `Option<…>` because the first call from a
+/// fresh database (no `State::update` has fired yet) has nothing to
+/// write — only the bootstrap path which seeds an empty SMT/MMR would
+/// hit that case in practice. Today every scanner-callback caller
+/// passes `Some(...)`.
 pub async fn persist_state_tx(
     pool: &PgPool,
     smt: &[u8],
     mmr: &[u8],
     latest_block: &[u8; 32],
+    root_index_entry: Option<(&HashDigest, &HashDigest, u64)>,
 ) -> Result<(), sqlx::Error> {
+    // Pre-encode the optional root_index columns OUTSIDE the tx so a
+    // bad `leaf_index` (e.g. > i64::MAX in some hypothetical future)
+    // surfaces before we open a Postgres connection. Today the value
+    // comes from `mmr.leaf_count()` so the conversion is infallible in
+    // practice; keep the defensive error for symmetry with the
+    // standalone `insert_root_index` helper.
+    let root_index_bytes = match root_index_entry {
+        None => None,
+        Some((prev_root, smt_root, leaf_index)) => {
+            let leaf_i64 = i64::try_from(leaf_index).map_err(|_| {
+                sqlx::Error::Encode(
+                    format!("leaf_index {} does not fit in i64 (BIGINT)", leaf_index).into(),
+                )
+            })?;
+            Some((
+                digest_to_bytes(prev_root),
+                digest_to_bytes(smt_root),
+                leaf_i64,
+            ))
+        }
+    };
+
     let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO smt_state (id, data, updated_at) \
@@ -129,6 +173,18 @@ pub async fn persist_state_tx(
     .bind(&latest_block[..])
     .execute(&mut *tx)
     .await?;
+    if let Some((prev_bytes, smt_bytes, leaf_i64)) = root_index_bytes {
+        sqlx::query(
+            "INSERT INTO mmr_root_index (prev_mmr_root, smt_root, leaf_index, created_at) \
+             VALUES ($1, $2, $3, NOW()) \
+             ON CONFLICT (prev_mmr_root) DO NOTHING",
+        )
+        .bind(&prev_bytes[..])
+        .bind(&smt_bytes[..])
+        .bind(leaf_i64)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await
 }
 

@@ -134,7 +134,7 @@ async fn test_persist_and_load_state_roundtrip() {
     // Serialize + persist atomically.
     let (smt_bytes, mmr_bytes) = original_state.serialize_for_persist().unwrap();
     let block_hash = [0xABu8; 32];
-    persist_state_tx(&pool, &smt_bytes, &mmr_bytes, &block_hash)
+    persist_state_tx(&pool, &smt_bytes, &mmr_bytes, &block_hash, None)
         .await
         .expect("persist_state_tx failed");
 
@@ -252,7 +252,7 @@ async fn test_serialize_for_persist_roundtrip() {
 
     let (pool, _container) = setup_pool().await;
     let (smt_bytes, mmr_bytes) = state.serialize_for_persist().unwrap();
-    persist_state_tx(&pool, &smt_bytes, &mmr_bytes, &[0u8; 32])
+    persist_state_tx(&pool, &smt_bytes, &mmr_bytes, &[0u8; 32], None)
         .await
         .unwrap();
     let loaded = State::load_from_pg(&pool).await.unwrap();
@@ -499,7 +499,7 @@ async fn test_get_commitment_proof_returns_err_when_smt_has_key_but_mmr_empty() 
     // row with the freshly-constructed empty tree).
     let smt_bytes = bincode::serialize(&populated.smt).unwrap();
     let empty_mmr_bytes = bincode::serialize(&MerkleMountainRange::new()).unwrap();
-    persist_state_tx(&pool, &smt_bytes, &empty_mmr_bytes, &[0u8; 32])
+    persist_state_tx(&pool, &smt_bytes, &empty_mmr_bytes, &[0u8; 32], None)
         .await
         .unwrap();
 
@@ -510,9 +510,10 @@ async fn test_get_commitment_proof_returns_err_when_smt_has_key_but_mmr_empty() 
 
 // ---- Phase C: mmr_root_index persistence ----------------------------------
 
-/// Drive `State::update` N times and persist each freshly-inserted
-/// `root_indices` entry via [`insert_root_index`]. Returns the populated
-/// state for the caller to inspect / re-load.
+/// Drive `State::update` N times and persist each step atomically via
+/// the extended [`persist_state_tx`] (SMT/MMR/latest_block +
+/// `mmr_root_index` in one transaction). Mirrors the production
+/// scanner-callback shape after the Phase-C atomicity fix.
 async fn populate_state_with_persistence(pool: &PgPool, count: usize) -> State {
     let mut state = State::new();
     for i in 0..count {
@@ -523,17 +524,16 @@ async fn populate_state_with_persistence(pool: &PgPool, count: usize) -> State {
             .root_indices
             .get(&state.prev_mmr_root)
             .expect("update inserted root_indices entry keyed by prev_mmr_root");
-        insert_root_index(pool, &state.prev_mmr_root, &smt_root, leaf_index as u64)
-            .await
-            .expect("insert_root_index");
-        // Also persist SMT + MMR so `load_from_pg` sees a consistent
-        // tree alongside the root_index rows (otherwise the trees come
-        // back empty, which is a less interesting failure mode for
-        // these tests).
         let (smt_bytes, mmr_bytes) = state.serialize_for_persist().unwrap();
-        persist_state_tx(pool, &smt_bytes, &mmr_bytes, &[0u8; 32])
-            .await
-            .expect("persist_state_tx");
+        persist_state_tx(
+            pool,
+            &smt_bytes,
+            &mmr_bytes,
+            &[0u8; 32],
+            Some((&state.prev_mmr_root, &smt_root, leaf_index as u64)),
+        )
+        .await
+        .expect("persist_state_tx");
     }
     state
 }
@@ -615,13 +615,16 @@ async fn test_get_mmr_inclusion_proof_after_restart_succeeds() {
             .root_indices
             .get(&state.prev_mmr_root)
             .expect("update inserted root_indices entry");
-        insert_root_index(&pool, &state.prev_mmr_root, &smt_root, leaf_index as u64)
-            .await
-            .expect("insert_root_index");
         let (smt_bytes, mmr_bytes) = state.serialize_for_persist().unwrap();
-        persist_state_tx(&pool, &smt_bytes, &mmr_bytes, &[0u8; 32])
-            .await
-            .expect("persist_state_tx");
+        persist_state_tx(
+            &pool,
+            &smt_bytes,
+            &mmr_bytes,
+            &[0u8; 32],
+            Some((&state.prev_mmr_root, &smt_root, leaf_index as u64)),
+        )
+        .await
+        .expect("persist_state_tx");
     }
     let final_mmr_root_extended = state.mmr.root_extended(MMR_PROOF_PATH_LEN);
     drop(state);
