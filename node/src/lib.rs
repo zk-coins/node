@@ -2,7 +2,7 @@
 //!
 //! The server is primarily a binary (`main.rs`), but a few pieces of
 //! it must be reachable from out-of-tree integration tests
-//! (`server/tests/api_remote.rs` in particular). Exposing those
+//! (`node/tests/api_remote.rs` in particular). Exposing those
 //! modules through a `lib` target keeps the binary side of the crate
 //! untouched while letting the integration suite import the
 //! `Capabilities` struct (for feature-gate detection on `/api/info`)

@@ -135,14 +135,14 @@ pub struct CoinTemplate {
 }
 ```
 
-`Account` (in `server/src/account_node.rs`) gains a per-asset
+`Account` (in `node/src/account_node.rs`) gains a per-asset
 balance map; the old `balance: u64` collapses to "balance of the
 default asset" only for the migration window (see §6.3 — there is
 no migration window because state is wiped at cutover, so the field
 is replaced outright).
 
 ```rust
-// server/src/account_node.rs
+// node/src/account_node.rs
 
 pub struct Account {
     pub proof:        Option<Proof>,
@@ -248,7 +248,7 @@ The server:
    `mint_authority_pubkey`.
 3. Rejects if the timestamp is older than 300 s or in the future —
    matches the existing replay window in
-   `verify_send_signature` (`server/src/server.rs`).
+   `verify_send_signature` (`node/src/server.rs`).
 4. Runs the prover to produce a state-transition proof that moves
    `amount` units of `asset_id` from the asset's mint-authority
    account into a fresh coin for `recipient`. The same circuit
@@ -278,7 +278,7 @@ H("zkcoins:send"
 
 Existing wallets sign over `SHA256(account_address || recipient
 || amount_le || timestamp_le)` with **no** domain prefix — see
-`verify_send_signature` in `server/src/server.rs`. The multi-asset
+`verify_send_signature` in `node/src/server.rs`. The multi-asset
 upgrade does two things to this hash:
 
 1. **Adds `asset_id`** between `amount_le` and `timestamp_le`.
@@ -302,7 +302,7 @@ Both changes are breaking for the wallet signature shape; bump
 **Single-asset invariant.** In a single transition, all input coins
 and all output coins share the same `asset_id`. This is enforced
 twice — defense in depth, matching the pattern in
-`server/src/account_node.rs::send_coins` (off-circuit pre-check)
+`node/src/account_node.rs::send_coins` (off-circuit pre-check)
 and `program-plonky2/src/circuit/main.rs` (in-circuit constraint):
 
 - **Off-circuit (server pre-check):** before paying prove cost,
@@ -426,7 +426,7 @@ Two viable architectures, mirroring the recurring trade-off in
 1. **Off-circuit Schnorr verify (preferred for v1).** The server
    verifies the BIP-340 Schnorr signature with the existing
    `secp.verify_schnorr` call (the same path used by
-   `verify_send_signature` in `server/src/server.rs`), and the
+   `verify_send_signature` in `node/src/server.rs`), and the
    in-circuit branch only enforces that the proof's
    `mint_authority_pubkey` public input matches the
    asset-registry-stored value. The asset registry is server state,
@@ -631,7 +631,7 @@ The handler:
    already taken — return 409. Otherwise, run the prover to
    produce the `AssetGenesisProof`, persist the proof file, and
    advance the SMT. This matches the existing
-   `UsernameStore::claim` pattern in `server/src/username.rs`
+   `UsernameStore::claim` pattern in `node/src/username.rs`
    (`ON CONFLICT (username) DO NOTHING` + post-check on the
    returned row count).
 6. Returns `{ asset_id, name }`.
@@ -872,7 +872,7 @@ that exactly one writer wins the unique-key race; the others'
 `INSERT ... ON CONFLICT (name) DO NOTHING` returns zero affected
 rows, which the handler translates to HTTP 409. This avoids the
 need to catch and re-classify a `23505 unique_violation` —
-matches `db::claim_username` in `server/src/db.rs`.
+matches `db::claim_username` in `node/src/db.rs`.
 
 ---
 
@@ -887,7 +887,7 @@ The mechanics behind decision M2.
   `SHA256("zkcoins:mint" || asset_id || recipient || amount_le ||
   timestamp_le)`, verified against the asset's
   `mint_authority_pubkey`. Same secp256k1 primitive as the send
-  signature (`verify_send_signature` in `server/src/server.rs`); no
+  signature (`verify_send_signature` in `node/src/server.rs`); no
   new crypto primitive.
 - **Replay protection.** 5-minute timestamp window
   (`now.abs_diff(timestamp) > 300 → reject`), matching the
@@ -1182,10 +1182,10 @@ So nobody scope-creeps:
 - `program-plonky2/src/types.rs` — `Coin`, `CoinTemplate`,
   `AccountState`, `ProofData`, `calculate_coin_identifier`.
 - `shared/src/lib.rs` — `Invoice`, `ClientAccount::create_commitment`.
-- `server/src/account_node.rs` — `Account`, `send_coins`, the
+- `node/src/account_node.rs` — `Account`, `send_coins`, the
   off-circuit pre-check pattern that the new single-asset
   invariant follows.
-- `server/src/server.rs` — `verify_send_signature` (mint signature
+- `node/src/server.rs` — `verify_send_signature` (mint signature
   follows the same 5-minute replay window and message-hash
   pattern), `Capabilities`.
 

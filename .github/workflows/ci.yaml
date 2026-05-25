@@ -136,7 +136,7 @@ jobs:
       - name: Forbid polling patterns in scanner/publisher
         run: |
           set -e
-          FOUND=$(grep -rEn 'tokio::time::(sleep|sleep_until|interval)|std::thread::sleep' server/src/scanner.rs server/src/scanner_runtime.rs server/src/scanner_ws.rs server/src/scanner_ws_parse.rs server/src/publisher.rs 2>/dev/null | grep -v 'scanner-polling-ok:' || true)
+          FOUND=$(grep -rEn 'tokio::time::(sleep|sleep_until|interval)|std::thread::sleep' node/src/scanner.rs node/src/scanner_runtime.rs node/src/scanner_ws.rs node/src/scanner_ws_parse.rs node/src/publisher.rs 2>/dev/null | grep -v 'scanner-polling-ok:' || true)
           if [ -n "$FOUND" ]; then
             echo "::error::Polling pattern (tokio::time::sleep|sleep_until|interval or std::thread::sleep) detected in event-driven hot paths. See issue #84."
             echo "$FOUND"
@@ -170,7 +170,7 @@ jobs:
       # test. Mirrors the pre-push hook.
       ESPLORA_URL: http://127.0.0.1:1/api
       # `USERNAME_DOMAIN` is required by the server bootstrap (no
-      # default — see server/src/main.rs and issue #95). The test value
+      # default — see node/src/main.rs and issue #95). The test value
       # is irrelevant for the `info_returns_*` assertions (they only
       # check non-empty + shape).
       USERNAME_DOMAIN: test.zkcoins.local
@@ -244,7 +244,7 @@ jobs:
       # is preserved — the repo invariant is that tests run serially to
       # avoid testcontainers port races and shared-state pollution.
       # `api_remote` is the live-DEV-server verification integration test
-      # (server/tests/api_remote.rs). It targets `https://dev-api.zkcoins.app`
+      # (node/tests/api_remote.rs). It targets `https://dev-api.zkcoins.app`
       # by default and is meant to run AFTER a deploy, from the `api-e2e`
       # job in deploy-dev.yaml — not against whatever DEV currently runs
       # while a PR is still open. Excluding it here keeps `node-tests`
@@ -315,7 +315,7 @@ jobs:
       # so the 100% line/function gate and the test execution share a
       # single binary run (same as the old `cargo llvm-cov -- ...` form).
       #
-      # The `api_remote` integration test (server/tests/api_remote.rs)
+      # The `api_remote` integration test (node/tests/api_remote.rs)
       # is excluded for the same reason as in `node-tests` above: it
       # targets the live DEV server and belongs in the post-deploy
       # `api-e2e` job, not the hermetic coverage gate. The MVP coverage

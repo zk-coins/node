@@ -636,7 +636,7 @@ fallback for non-cooperative resolution.
 The commit tx of the inscription pair must have txid hex starting with
 `4242`. This is a 2-byte prefix, so on average 65k brute-force attempts
 to find a matching nonce. zkCoins's existing publisher
-(`server/src/publisher.rs`) handles this by varying the commit tx's
+(`node/src/publisher.rs`) handles this by varying the commit tx's
 output amount (sat-level) until the prefix matches.
 
 For the swap design, the variable that can be ground is the commit
@@ -1100,7 +1100,7 @@ A draft sequence; not a commitment.
   flows)
 - Watcher: monitor U_lock UTXOs, commit txs, reveal txs, refund-window
 - Vanity-grinder for `4242` prefix (or reuse existing
-  `server/src/publisher.rs` logic if it can be extracted)
+  `node/src/publisher.rs` logic if it can be extracted)
 - Inscription payload generator that can produce a `Commitment` for a
   *specified* recipient and amount, signed by the operator key,
   *without* publishing on-chain — Step 2 of Flow A
