@@ -4492,3 +4492,145 @@ async fn mint_handler_concurrent_mint_during_proof_returns_503() {
 // was a standalone best-effort step after the commit and is gone, so
 // the dead-pool branch test that pinned it is gone too — failure of
 // `commit_mint_tx` itself is covered by `mint_commit_tx_failure_returns_503`.
+
+/// Phase E: `mint_handler` advances `state.update` synchronously after
+/// a successful broadcast — the SMT contains the freshly-minted
+/// pubkey BEFORE the response returns, and the corresponding
+/// `pending_inscriptions` row is `complete`, both observable from
+/// outside the handler immediately after the request finishes.
+///
+/// Closes the regression that motivated Phase E: a second `/api/mint`
+/// issued in the ~20-30 s scanner-observation window for the first
+/// mint walked an un-updated SMT, derived `num_pubkeys = 0` again,
+/// and surfaced `Unable to get mmr inclusion proof for the previous
+/// root` at the prover. Synchronous state.update closes that window.
+#[tokio::test]
+async fn mint_handler_advances_state_synchronously_with_broadcast() {
+    use bitcoin::hashes::Hash as _;
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container.get_host().await.unwrap();
+    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
+    let mock_server = mint_broadcast_mock_server().await;
+    let ws_url = mint_broadcast_mock_ws().await;
+
+    let mut state = mint_test_state();
+    state.pool = Arc::clone(&pool);
+    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
+        url: mock_server.uri(),
+        is_mainnet: false,
+        network_name: "Mutinynet".to_string(),
+        ws_url: Some(ws_url),
+        track_tx_timeout: None,
+    });
+
+    // Sanity: the SMT starts empty so derive_num_pubkeys_from_smt
+    // returns 0.
+    let pk0_key = {
+        let mc = state.minting_account.lock().unwrap();
+        let pk0 = mc.generate_public_key(0);
+        bitcoin::hashes::sha256::Hash::hash(&pk0.serialize()).to_byte_array()
+    };
+    {
+        let node_guard = state.account_node.lock().unwrap();
+        let state_arc = node_guard.state().clone();
+        let state_guard = state_arc.lock().unwrap();
+        assert!(
+            state_guard.smt.get(&pk0_key).is_none(),
+            "fresh test state must not contain pk_0 in its SMT"
+        );
+        assert_eq!(
+            crate::state::derive_num_pubkeys_from_smt(
+                &state.minting_account.lock().unwrap().private_key,
+                &state_guard.smt
+            ),
+            0,
+            "fresh test state must derive num_pubkeys == 0"
+        );
+    }
+
+    let recipient_bytes = [10u8; 32];
+    let recipient = "0x".to_string() + &hex::encode(recipient_bytes);
+    let body = serde_json::json!({
+        "account_address": recipient,
+        "amount": 1u64,
+    });
+    let req = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, resp_body) = send_request_with_state(state.clone(), req).await;
+    assert_eq!(status, StatusCode::OK, "body: {}", resp_body);
+
+    // After the response returns, the SMT must already hold pk_0 —
+    // this is the load-bearing Phase E behaviour. A second mint in the
+    // same scanner window would now derive num_pubkeys = 1 and
+    // proceed against the correct root.
+    let state_arc = {
+        let node_guard = state.account_node.lock().unwrap();
+        node_guard.state().clone()
+    };
+    {
+        let state_guard = state_arc.lock().unwrap();
+        assert!(
+            state_guard.smt.get(&pk0_key).is_some(),
+            "Phase E regression: mint_handler must advance SMT before returning 200"
+        );
+        assert_eq!(
+            crate::state::derive_num_pubkeys_from_smt(
+                &state.minting_account.lock().unwrap().private_key,
+                &state_guard.smt
+            ),
+            1,
+            "Phase E: SMT must reflect the new mint so the next mint sees num_pubkeys = 1"
+        );
+        // MMR advanced by exactly one leaf.
+        assert_eq!(state_guard.mmr.leaf_count(), 1);
+        // The new MMR leaf's prev_mmr_root must be a key in root_indices —
+        // this is the lookup the second mint's prover needs.
+        assert!(
+            state_guard
+                .root_indices
+                .contains_key(&state_guard.prev_mmr_root),
+            "root_indices must hold the entry for the freshly written prev_mmr_root"
+        );
+    }
+
+    // And the pending_inscriptions row reached `complete` in the same
+    // request, so a scanner observation of the same commit will
+    // short-circuit via `should_skip_scanner_state_update`.
+    let (pending_status,): (String,) =
+        sqlx::query_as("SELECT status FROM pending_inscriptions ORDER BY id DESC LIMIT 1")
+            .fetch_one(&*pool)
+            .await
+            .expect("a pending row must exist for the minted commitment");
+    assert_eq!(
+        pending_status,
+        crate::db::PENDING_STATUS_COMPLETE,
+        "Phase E: mint_handler must mark pending_inscriptions complete after state.update"
+    );
+    let (commit_txid_bytes,): (Vec<u8>,) =
+        sqlx::query_as("SELECT commit_txid FROM pending_inscriptions ORDER BY id DESC LIMIT 1")
+            .fetch_one(&*pool)
+            .await
+            .expect("commit_txid column must populate");
+    assert!(crate::scanner::should_skip_scanner_state_update(
+        crate::db::pending_inscription_status_by_commit_txid(&pool, &commit_txid_bytes)
+            .await
+            .unwrap()
+            .as_deref()
+    ));
+}
