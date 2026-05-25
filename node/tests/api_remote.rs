@@ -105,11 +105,26 @@ fn url(path: &str) -> String {
 /// the local `cargo test` invocation into the workflow). Outside CI
 /// the macro is still a skip — the suite is also runnable against a
 /// feature-trimmed PRD deploy, where an absent route is expected.
+///
+/// Escape hatch: setting `ZKCOINS_E2E_ALLOW_FEATURE_TRIMMED_SERVER`
+/// (any value, even empty) downgrades the CI panic back to a silent
+/// skip. The dev-api / prd-api Docker images intentionally ship the
+/// MVP-only feature set (`Dockerfile` `ARG FEATURES=`), so when the
+/// suite runs `--all-features` against a feature-trimmed *server*
+/// the gated `address_list` / `lnurl` tests must skip cleanly instead
+/// of panicking the CI canary. The env var documents this as an
+/// opt-in: workflows that point the suite at a trimmed server set it,
+/// workflows that point it at a fully-featured server leave it unset
+/// so the canary stays armed.
 macro_rules! feature_skip {
     ($feature:expr, $test:expr) => {{
-        if std::env::var("CI").is_ok() {
+        let allow_trimmed_server =
+            std::env::var("ZKCOINS_E2E_ALLOW_FEATURE_TRIMMED_SERVER").is_ok();
+        if std::env::var("CI").is_ok() && !allow_trimmed_server {
             panic!(
-                "feature `{}` disabled but running in CI — all-features build is required",
+                "feature `{}` disabled but running in CI — all-features build is required \
+                 (set ZKCOINS_E2E_ALLOW_FEATURE_TRIMMED_SERVER=1 if the target server is \
+                 intentionally feature-trimmed, e.g. the MVP-only DEV image)",
                 $feature
             );
         }
