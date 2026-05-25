@@ -2,7 +2,7 @@
 
 > **STATUS — SNAPSHOT OF PRE-MERGE STATE.** This file documents the
 > migration session state as of the PR
-> [#17](https://github.com/zk-coins/server/pull/17) merge on
+> [#17](https://github.com/zk-coins/node/pull/17) merge on
 > 2026-05-18. Current work is on `develop`. The per-stage commit map
 > (below) and the lesson index remain useful as a historical pickup
 > reference; the "What's deferred to post-MVP" and "Next session"
@@ -14,7 +14,7 @@ left off.
 ## Pre-merge branch state (historical)
 
 `feat/plonky2-migration` → merged into `develop` via PR
-[#17](https://github.com/zk-coins/server/pull/17) on 2026-05-18
+[#17](https://github.com/zk-coins/node/pull/17) on 2026-05-18
 21:50 UTC. All 6 CI checks were green at merge time (Lint & Build,
 Tests, Analyze rust, Analyze actions, CodeQL, Coverage MVP scope).
 
@@ -23,7 +23,7 @@ Tests, Analyze rust, Analyze actions, CodeQL, Coverage MVP scope).
 - Steps 1–4: ✅ done
 - Step 5 (monolithic circuit, all stages through 5d-next-5): ✅
   done. Stage 5d-next-5 source-side verification via aggregator
-  pattern landed via PR [#23](https://github.com/zk-coins/server/pull/23)
+  pattern landed via PR [#23](https://github.com/zk-coins/node/pull/23)
   — Phase 1 (aggregator skeleton, `cc9c4b6` from PR #22) + Phase 2a
   (outer `verify_proof(aggregator)` + `connect_hashes` vk binding +
   `ConstantGate::new(2)` shape lock) + Phase 2b (per-slot SMT
@@ -38,7 +38,7 @@ Tests, Analyze rust, Analyze actions, CodeQL, Coverage MVP scope).
   to nightly. `program/` + `script/` deleted (recoverable via
   `git checkout v0.last-sp1 -- ...`). shared + server fully
   migrated to Plonky2-era modules with the HashDigest type-shift
-  handled at all boundaries. `account_server::send_coins` wired to
+  handled at all boundaries. `account_node::send_coins` wired to
   the Plonky2 `Prover` wrapper (`c71c9fc`); the **in-circuit
   source-side validation** via `prove_*_and_sources` is wired
   through (Step 7 follow-up, addresses #25), with the off-circuit
@@ -46,7 +46,7 @@ Tests, Analyze rust, Analyze actions, CodeQL, Coverage MVP scope).
   the minute-scale prove. Dockerfile re-introduced (`dac0179`). 138
   server tests pass with `--all-features` (32 baseline + 10 inline
   error-path in `d6a3cb9` + 64 ported SP1-era fixtures re-enabled
-  via `account_server_tests.rs` + `server_tests.rs` + 13
+  via `account_node_tests.rs` + `router_tests.rs` + 13
   feature-gated + 1 new Stage 5d-next-5 Phase 2b negative + 17
   `map_send_coins_error` unit tests landed in PR #31 + 1 new
   handler-level 404 test landed in PR #31). All surface verified
@@ -57,7 +57,7 @@ Tests, Analyze rust, Analyze actions, CodeQL, Coverage MVP scope).
 
 ## Smoke test verified
 
-`cargo run --release -p server` boots cleanly:
+`cargo run --release -p node` boots cleanly:
 - `Prover::new()` builds the cyclic state-transition circuit
 - REST server binds `0.0.0.0:4242`
 - `GET /health` → `ok`
@@ -80,13 +80,13 @@ Closed follow-ups (all landed in PR #31):
    `send_coins` error string to its `(StatusCode, body)` pair.
    See PR #31 commit `feat(api): replace 200+success:false ...`.
 2. ✅ done — the workflow's `--ignore-filename-regex` already
-   drops `account_server.rs` + `server.rs` (Issue #28's snapshot
+   drops `account_node.rs` + `router.rs` (Issue #28's snapshot
    of the exclusion list was stale at the file level). Local
-   `cargo llvm-cov --release -p server --fail-under-lines 100
+   `cargo llvm-cov --release -p node --fail-under-lines 100
    --fail-under-functions 100` returns exit 0 with the current
    exclusion list: 100% functions (96/96), 99.44% lines
    (1067/1073), 97.98% regions. The 6 uncovered lines are all
-   `?` error-propagation sites in `account_server.rs::send_coins`
+   `?` error-propagation sites in `account_node.rs::send_coins`
    (323, 358, 400, 412, 415, 478) — the gate accepts the
    exit-0 status as authoritative; no tactical `#[coverage(off)]`
    annotations added (every uncovered line is a legitimately
@@ -135,7 +135,7 @@ SPEC §8 predicate including source-side verification of in-coins**
 ## What's deferred to post-MVP
 
 Nothing in the state-transition circuit itself is deferred — Stage
-5d-next-5 landed (PR [#23](https://github.com/zk-coins/server/pull/23))
+5d-next-5 landed (PR [#23](https://github.com/zk-coins/node/pull/23))
 and all three previously-off-circuit SPEC §13 source-side negatives
 are now covered in-circuit (`stage_5d_next_5_phase_3_*` tests).
 
@@ -159,7 +159,7 @@ At Stage 5d-next-5 / Phase 2b production parameters
   ~42 min on M3. Single-threaded ~80–120 min on `ubuntu-latest`.
 - `server` crate: 120 tests with `--all-features` (32 baseline + 10
   inline error-path + 64 ported SP1-era fixtures + 13 feature-gated
-  + 1 Stage 5d-next-5 Phase 2b negative). `cargo test -p server
+  + 1 Stage 5d-next-5 Phase 2b negative). `cargo test -p node
   --release --all-features -- --test-threads=1` wall ~36 min on M3.
 
 A serial workspace sweep at `--test-threads=1` is several hours.
@@ -167,7 +167,7 @@ Default multi-thread is bounded by RAM (~2 GB per test).
 
 `cargo llvm-cov --fail-under-lines 100 -- --test-threads=1` is the
 coverage gate. The CI workflow currently excludes
-`account_server.rs` + `server.rs` from the gate while the in-circuit
+`account_node.rs` + `router.rs` from the gate while the in-circuit
 `send_coins` refactor was in progress; with the refactor landed
 (this branch), the exclusions can be dropped — see "Files most
 likely to be touched next" above.
@@ -191,8 +191,8 @@ likely to be touched next" above.
 | 5d-next-3 combined | `d292855`, `8fab78a` | Init / Update with both loops active |
 | 5e | `7db3c29`, …, `50a1bd9` | 10-of-11 SPEC §13 negatives (pre-5d-next-5) |
 | docs / cleanup | `508ec9c`, `a502b8f`, `05c17f8`, `50a1bd9` | ROADMAP + SPEC + panic-test refactor |
-| 5d-next-5 Phase 1 | `cc6e60e`-era from PR [#22](https://github.com/zk-coins/server/pull/22) (`cc9c4b6`) | Aggregator skeleton + per-slot `conditionally_verify_proof` |
-| 5d-next-5 Phase 2a | PR [#23](https://github.com/zk-coins/server/pull/23) (`b5be37a`) | Outer `verify_proof(aggregator)` + `connect_hashes` vk binding + `ConstantGate::new(2)` shape lock |
+| 5d-next-5 Phase 1 | `cc6e60e`-era from PR [#22](https://github.com/zk-coins/node/pull/22) (`cc9c4b6`) | Aggregator skeleton + per-slot `conditionally_verify_proof` |
+| 5d-next-5 Phase 2a | PR [#23](https://github.com/zk-coins/node/pull/23) (`b5be37a`) | Outer `verify_proof(aggregator)` + `connect_hashes` vk binding + `ConstantGate::new(2)` shape lock |
 | 5d-next-5 Phase 2b | PR #23 (`f9fa75a`) | Per-slot SMT inclusion + SPEC §8 (c)(d)(e) chain + OCR coupling + active-bit binding |
 | 5d-next-5 Phase 3 | PR #23 (`f9fa75a` + `e09fe5f`) | 3 SPEC §13 source-side negatives + 4 positives; fixes the previously-3-of-11 §13 gap |
 | Step 7 follow-up | this branch (`7ff3f7b`, `cc6e60e`) | `send_coins` switched to in-circuit `prove_*_and_sources`; off-circuit shim retained as defense-in-depth fast-fail |
@@ -200,8 +200,8 @@ likely to be touched next" above.
 ## Files most likely to be touched next
 
 1. [`../.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) —
-   drop the temporary coverage exclusions for `account_server.rs` +
-   `server.rs`; optionally include the Stage 5d-next-5 cyclic tests
+   drop the temporary coverage exclusions for `account_node.rs` +
+   `router.rs`; optionally include the Stage 5d-next-5 cyclic tests
    by removing `--skip stage_5d --skip stage_5e` and bumping the
    `tests` job's `timeout-minutes` from 30 to ~120.
 2. Steps 8–9 in [`../ROADMAP.md`](../ROADMAP.md): App/wallet Schnorr
@@ -240,7 +240,7 @@ Kept for the wall-time reference points; the current branch is at
 **Current branch (Stage 5d-next-5 / Phase 2b landed; PR #31
 housekeeping merged).** Full `program-plonky2` lib sweep ~42 min
 wall on M3 with `--test-threads=2`, 115 cyclic-recursion tests
-green; full server sweep `cargo test -p server --release
+green; full server sweep `cargo test -p node --release
 --all-features -- --test-threads=1` ~36 min wall, 138 tests green
 (including the Phase 2b negative
 `test_send_coins_rejects_tampered_source_proof_inclusion` + the
@@ -259,13 +259,13 @@ Before adding new features:
    build after the cache warms.
 3. `cargo fmt --all --check` and `cargo clippy --workspace
    --all-targets --all-features -- -D warnings`.
-4. `cargo test -p server --release --all-features -- --test-threads=1`
+4. `cargo test -p node --release --all-features -- --test-threads=1`
    — 120 tests, ~36 min wall on M3.
 5. `cargo test -p zkcoins-program-plonky2 --release --lib --
    --test-threads=2` — 115 cyclic tests, ~42 min wall on M3.
 6. `cargo llvm-cov --fail-under-lines 100 --
    --test-threads=1` — coverage gate (after dropping the temporary
-   `account_server.rs` + `server.rs` exclusions from
+   `account_node.rs` + `router.rs` exclusions from
    `.github/workflows/ci.yaml`).
 
 If any test fails: bisect against the commit list in

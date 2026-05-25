@@ -13,7 +13,7 @@ carries its own toolchain pin.
 ## Toolchain
 
 Plonky2 1.1.0 requires nightly Rust because `plonky2_field` uses
-`#![feature(specialization)]`. After PR [#17](https://github.com/zk-coins/server/pull/17)
+`#![feature(specialization)]`. After PR [#17](https://github.com/zk-coins/node/pull/17)
 the entire workspace was unified to nightly via a single root
 `rust-toolchain` file; the standalone `program-plonky2/rust-toolchain.toml`
 was removed. This crate is now a regular workspace member
@@ -179,11 +179,11 @@ The established pattern (see `circuit/mmr.rs` and `circuit/smt.rs`):
 
 The root workspace's CI (`.github/workflows/ci.yaml`) clippies this
 crate's libs as part of `Lint & Build` (the only required check on
-`develop` per PR [#48](https://github.com/zk-coins/server/pull/48)).
+`develop` per PR [#48](https://github.com/zk-coins/node/pull/48)).
 The cyclic-recursion test sweep at production parameters (~22 cyclic
-tests × 3–15 min each) is NOT in CI — `Server + Shared Tests` runs
-`-p server -p shared` only. Decision on whether/how to gate the sweep
-in CI is tracked in [issue #50](https://github.com/zk-coins/server/issues/50);
+tests × 3–15 min each) is NOT in CI — `Node + Shared Tests` runs
+`-p node -p shared` only. Decision on whether/how to gate the sweep
+in CI is tracked in [issue #50](https://github.com/zk-coins/node/issues/50);
 until that lands, contributors run the sweep locally before opening /
 updating a PR that touches this crate (see
 [`../CONTRIBUTING.md`](../CONTRIBUTING.md) § "Pre-push checklist").
