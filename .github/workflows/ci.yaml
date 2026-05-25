@@ -37,12 +37,12 @@ on:
 
 concurrency:
   # Group by PR number so a new push to the same PR cancels the
-  # in-flight Heavy run on the outdated commit. M3 Ultra self-hosted
-  # runner capacity is scarce — letting an obsolete 60-90-min run
-  # finish wastes a runner slot the new commit needs. Grouping by
-  # SHA (the previous approach) put every commit in its own group,
-  # so `cancel-in-progress: true` never fired and back-to-back pushes
-  # queued sequentially.
+  # in-flight Heavy run on the outdated commit. The m3-ultra pool
+  # (6 runner agents on dfx01) is shared with every other open PR —
+  # letting an obsolete 60-90-min run finish wastes a slot another
+  # PR could use. Grouping by SHA (the previous approach) put every
+  # commit in its own group, so `cancel-in-progress: true` never
+  # fired and back-to-back pushes queued sequentially.
   # Falls back to `github.ref` for push/dispatch events (where there
   # is no `pull_request.number`), so e.g. a `workflow_dispatch` on
   # the same ref serializes too.
@@ -73,12 +73,13 @@ env:
 # cross-platform compile bitrot and lint regressions.
 #
 # `node-tests` + `coverage` are the authoritative test + coverage gate.
-# They run on a self-hosted M3 Ultra runner (label `m3-ultra`) — the
-# documented hardware target (CONTRIBUTING.md § "Working on the Plonky2
-# Migration"). On `ubuntu-latest` the full suite repeatedly hit the
-# 75-min timeout (issue #30); on the M3 Ultra it is ~60-90 min for a
-# Rust change. Moving the gate into CI rather than the developer's
-# laptop unblocks the developer on push (issue #40).
+# They run on the m3-ultra self-hosted runner pool (label `m3-ultra`,
+# 6 agents on dfx01) — the documented hardware target (CONTRIBUTING.md
+# § "Working on the Plonky2 Migration"). On `ubuntu-latest` the full
+# suite repeatedly hit the 75-min timeout (issue #30); on the M3 Ultra
+# it is ~60-90 min for a Rust change. Moving the gate into CI rather
+# than the developer's laptop unblocks the developer on push
+# (issue #40).
 #
 # Runner ops: see scripts/ci-runner/README.md.
 jobs:
@@ -152,7 +153,8 @@ jobs:
 
   node-tests:
     name: Node + Shared Tests (M3 Ultra)
-    # Heavy job (~60-90 min on the single self-hosted M3 Ultra). Gated
+    # Heavy job (~60-90 min on a self-hosted M3 Ultra runner — one of
+    # 6 agents on dfx01 sharing the host's 96 GB / 28 cores). Gated
     # behind the `ci:full` label so we don't burn runner time on every
     # speculative PR — apply the label when the PR is ready for the
     # authoritative test+coverage gate. The Release PR
