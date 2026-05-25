@@ -227,8 +227,8 @@ Condensed pointers into [`MIGRATION_RESEARCH.md`](./MIGRATION_RESEARCH.md) §7:
 
 ```bash
 git clone https://github.com/zk-coins/node.git
-cd server
-USERNAME_DOMAIN=test.zkcoins.local cargo run -p server
+cd node
+USERNAME_DOMAIN=test.zkcoins.local cargo run -p node
 # Server starts on http://0.0.0.0:4242
 ```
 
@@ -252,7 +252,7 @@ export DATABASE_URL=postgres://postgres:dev@localhost:5432/postgres
 
 # Apply the migrations against the running instance:
 cargo install sqlx-cli --no-default-features --features rustls,postgres
-cd server
+cd node
 sqlx migrate run
 ```
 
@@ -392,7 +392,7 @@ update
 | Module | snake_case | `account_node` |
 | Struct | PascalCase | `AccountState`, `CoinProof` |
 | Function | snake_case | `process_block`, `send_coins` |
-| Constant | SCREAMING_SNAKE | `ACCOUNT_SERVER_ADDR` |
+| Constant | SCREAMING_SNAKE | `ACCOUNT_NODE_ADDR` |
 
 ### Error Handling
 
@@ -529,7 +529,7 @@ docker run --rm -v zkcoins_server-data:/data alpine sh -c 'rm -rf /data/proofs'
 docker start zkcoins-node
 ```
 
-The server starts from genesis on next boot: `Loaded State from Postgres` (empty), `Loaded AccountServer from Postgres` (empty), `No saved block hash found, fetching latest from Esplora`. Past test wallets are abandoned on-chain (they're random) but the SMT is re-built from the chain tip onwards. This is **destructive** — never run it on PRD without a known-needed reason.
+The server starts from genesis on next boot: `Loaded State from Postgres` (empty), `Loaded AccountNode from Postgres` (empty), `No saved block hash found, fetching latest from Esplora`. Past test wallets are abandoned on-chain (they're random) but the SMT is re-built from the chain tip onwards. This is **destructive** — never run it on PRD without a known-needed reason.
 
 The E2E regen workflow on the app repo wipes this state before every run as part of the per-PR cadence in `app/e2e/README.md § 11.3`.
 
