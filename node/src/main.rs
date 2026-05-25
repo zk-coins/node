@@ -212,10 +212,26 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                             // is the documented monotonic-progress
                             // primitive.
                             scanner_progress_for_callback.fetch_add(1, Ordering::Relaxed);
+                            // Capture the freshly-inserted root_indices
+                            // entry (Phase C). `State::update`
+                            // guarantees `state.prev_mmr_root` is the
+                            // KEY of the entry it just wrote, so we
+                            // can recover the (smt_root, leaf_index)
+                            // tuple from the map without searching.
+                            let root_index_entry = state_guard
+                                .root_indices
+                                .get(&state_guard.prev_mmr_root)
+                                .copied()
+                                .map(|(smt_root, leaf_index)| {
+                                    (state_guard.prev_mmr_root, smt_root, leaf_index)
+                                });
                             match state_guard.serialize_for_persist() {
-                                Ok((smt_bytes, mmr_bytes)) => {
-                                    Some((new_root, smt_bytes, mmr_bytes))
-                                }
+                                Ok((smt_bytes, mmr_bytes)) => Some((
+                                    new_root,
+                                    smt_bytes,
+                                    mmr_bytes,
+                                    root_index_entry,
+                                )),
                                 Err(e) => {
                                     eprintln!(
                                         "Failed to serialize state after update: {} (skipping persist)",
@@ -241,7 +257,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                     }
                 }; // mutex dropped here, BEFORE the async tx below
 
-                if let Some((new_root, smt_bytes, mmr_bytes)) = snapshot {
+                if let Some((new_root, smt_bytes, mmr_bytes, root_index_entry)) = snapshot {
                     let block_hash_bytes = current_block_hash.to_byte_array();
 
                     // The callback runs INSIDE the async
@@ -256,11 +272,32 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                     // `block_in_place(|| Handle::current().block_on(…))`
                     // pattern, encapsulated in
                     // `persist_state_from_sync_context`.
+                    //
+                    // The freshly-inserted `mmr_root_index` row rides
+                    // along in the SAME transaction (Phase C). Folding
+                    // it in here closes the crash window the previous
+                    // two-call shape opened: a crash between the state
+                    // snapshot and the standalone root_index INSERT
+                    // resumed the scanner from a `latest_block` whose
+                    // MMR already contained the new leaf, so the
+                    // re-scanned commit advanced the MMR a second
+                    // time, the new `prev_mmr_root` diverged, and the
+                    // originally-missing row was never healed. With
+                    // both writes atomic, a crash before COMMIT leaves
+                    // the saved `latest_block` BEFORE this block; the
+                    // re-scan replays `state.update` against the same
+                    // unchanged MMR and writes the same row again
+                    // (ON CONFLICT DO NOTHING is a no-op when it
+                    // already landed).
+                    let root_index_ref = root_index_entry
+                        .as_ref()
+                        .map(|(p, s, i)| (p, s, *i as u64));
                     let persist_result = persist_state_from_sync_context(
                         &pool_for_callback,
                         &smt_bytes,
                         &mmr_bytes,
                         &block_hash_bytes,
+                        root_index_ref,
                     );
                     match persist_result {
                         Ok(()) => println!(

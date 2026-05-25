@@ -83,6 +83,16 @@ impl State {
     /// and the previous MMR root.
     ///
     /// Returns the new MMR root.
+    ///
+    /// After a successful call, the freshly-inserted `root_indices`
+    /// entry is uniquely identifiable as
+    /// `(self.prev_mmr_root, self.root_indices[&self.prev_mmr_root])`
+    /// — the function writes `self.prev_mmr_root` and inserts using the
+    /// same value as the map key, in that order, immediately before
+    /// `self.mmr.append`. Callers that need to persist this entry
+    /// (Phase C: `db::insert_root_index`) read it back from `self`
+    /// rather than threading a pool into this synchronous method, which
+    /// would force every test caller to grow a Postgres dependency.
     pub fn update(&mut self, commitments: &[Commitment]) -> Result<HashDigest, &'static str> {
         // 1. Insert all commitments into the SMT
         for commitment in commitments {
@@ -170,17 +180,27 @@ impl State {
         Ok((commitment, smt_proof, smt_root, mmr_proof))
     }
 
-    /// Load the SMT and MMR blobs from Postgres and rebuild a `State`.
+    /// Load the SMT and MMR blobs from Postgres and rebuild a `State`,
+    /// then rehydrate `root_indices` and `prev_mmr_root` from the
+    /// dedicated `mmr_root_index` table (migration `0004`).
     ///
-    /// When either blob is missing (fresh database, no prior bootstrap),
-    /// the corresponding tree is initialized empty. `root_indices` is
-    /// always rebuilt empty — it is a runtime memoization of
-    /// `(prev_mmr_root) -> (smt_root, leaf_index)` that is rebuilt
-    /// incrementally by `State::update` as new commitments arrive.
-    /// `prev_mmr_root` is similarly derived on the next `update()`
-    /// from `self.mmr.root_extended(MMR_PROOF_PATH_LEN)`, so a freshly
-    /// loaded state without it starts at `ZERO_HASH` exactly like the
-    /// previous file-based `load_from_files` fallback.
+    /// Phase C of the state-layer hardening series. Before this code
+    /// landed, `root_indices` was treated as a pure runtime memoization
+    /// and silently reset to empty on every restart — which broke any
+    /// account whose latest proof referenced a `commitment_history_root`
+    /// produced before the restart (`get_mmr_inclusion_proof` returned
+    /// `Err`, `/api/mint` surfaced 422 `Unable to get mmr inclusion
+    /// proof for the previous root`). The map is now persisted per
+    /// successful `update()` and rebuilt here.
+    ///
+    /// `prev_mmr_root` is restored from the highest-`leaf_index` entry
+    /// in the loaded map — that entry's KEY is precisely the value the
+    /// last successful `update()` wrote to `self.prev_mmr_root`
+    /// (`update` inserts using `prev_mmr_root` as the key and the
+    /// current `leaf_count` as the leaf_index, in that order, immediately
+    /// before `mmr.append`). On a fresh database the table is empty,
+    /// `root_indices` stays empty, and `prev_mmr_root` stays
+    /// `ZERO_HASH` exactly like `State::new`.
     pub async fn load_from_pg(pool: &PgPool) -> Result<Self, LoadStateError> {
         let mut state = Self::new();
         if let Some(data) = db::load_smt(pool).await? {
@@ -188,6 +208,34 @@ impl State {
         }
         if let Some(data) = db::load_mmr(pool).await? {
             state.mmr = bincode::deserialize(&data)?;
+        }
+        let entries = db::load_root_indices(pool).await?;
+        // The DB ORDER BY leaf_index means `entries` is monotonic; the
+        // last element is the one whose KEY is the most recently written
+        // `prev_mmr_root`. Drain it in order, capturing the last KEY as
+        // we go so we don't have to re-scan the assembled HashMap.
+        let mut last_key: Option<HashDigest> = None;
+        for (prev_root, smt_root, leaf_index) in entries {
+            // `leaf_index` came back as `u64` and was previously checked
+            // non-negative by `db::load_root_indices`. The production
+            // target is 64-bit (Linux x86_64 / aarch64), so the cast is
+            // provably infallible — `usize::try_from` would only fail on
+            // a 32-bit target, which we don't ship. `debug_assert!`
+            // guards the hypothetical 32-bit dev build without forcing
+            // an uncoverable error branch on the production target,
+            // which the Coverage Gate (100% lines+functions on
+            // `state.rs`) cannot exercise.
+            debug_assert!(
+                leaf_index <= usize::MAX as u64,
+                "mmr_root_index.leaf_index {} does not fit in usize on this target",
+                leaf_index
+            );
+            let leaf_usize = leaf_index as usize;
+            state.root_indices.insert(prev_root, (smt_root, leaf_usize));
+            last_key = Some(prev_root);
+        }
+        if let Some(prev) = last_key {
+            state.prev_mmr_root = prev;
         }
         Ok(state)
     }

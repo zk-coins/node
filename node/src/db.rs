@@ -22,6 +22,7 @@
 // first run.
 
 use sqlx::{postgres::PgPoolOptions, PgPool};
+use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes, HashDigest};
 
 /// Connect to `url` and run every migration in `./migrations` against
 /// the pool. Returns the live pool on success.
@@ -85,21 +86,65 @@ pub async fn load_latest_block(pool: &PgPool) -> Result<Option<[u8; 32]>, sqlx::
     }
 }
 
-/// Atomically write SMT, MMR, and `latest_block` in one transaction.
+/// Atomically write SMT, MMR, `latest_block`, and (optionally) the
+/// freshly-inserted `mmr_root_index` row in one transaction.
 ///
-/// The whole point of moving these three blobs into Postgres is the
+/// The whole point of moving these blobs into Postgres is the
 /// transactional guarantee — issue #11 documents the file-based
 /// failure mode where a crash between `smt.bin`, `mmr.bin`, and
 /// `latest_block.bin` leaves the three out of sync, and the next
 /// start-up either replays already-processed commitments (dup
 /// inserts into the SMT) or loses commitments outright. A single
-/// `BEGIN; UPSERT; UPSERT; UPSERT; COMMIT` removes that window.
+/// `BEGIN; UPSERT; UPSERT; UPSERT; INSERT; COMMIT` removes that window.
+///
+/// The Phase-C `mmr_root_index` write is part of the SAME transaction
+/// because a crash between the state snapshot and the root_index INSERT
+/// is catastrophic for replay healing: on restart the scanner resumes
+/// from the saved `latest_block` and re-scans the same commit tx →
+/// `state.update` runs again → SMT insert is idempotent but `mmr.append`
+/// is NOT → MMR diverges → `prev_mmr_root` becomes a NEW key → fresh
+/// `root_indices` entry written under the new key → the original
+/// missing entry is never healed. Folding the INSERT into the same tx
+/// means either both land or neither does; on a crash before COMMIT,
+/// the next start-up re-runs `state.update` against the SAME unchanged
+/// MMR and writes the SAME `(prev_mmr_root, smt_root, leaf_index)` —
+/// `ON CONFLICT (prev_mmr_root) DO NOTHING` makes that a no-op on the
+/// row that did land, or a fresh insert on the row that did not.
+///
+/// `root_index_entry` is `Option<…>` because the first call from a
+/// fresh database (no `State::update` has fired yet) has nothing to
+/// write — only the bootstrap path which seeds an empty SMT/MMR would
+/// hit that case in practice. Today every scanner-callback caller
+/// passes `Some(...)`.
 pub async fn persist_state_tx(
     pool: &PgPool,
     smt: &[u8],
     mmr: &[u8],
     latest_block: &[u8; 32],
+    root_index_entry: Option<(&HashDigest, &HashDigest, u64)>,
 ) -> Result<(), sqlx::Error> {
+    // Pre-encode the optional root_index columns OUTSIDE the tx so a
+    // bad `leaf_index` (e.g. > i64::MAX in some hypothetical future)
+    // surfaces before we open a Postgres connection. Today the value
+    // comes from `mmr.leaf_count()` so the conversion is infallible in
+    // practice; keep the defensive error for symmetry with the
+    // standalone `insert_root_index` helper.
+    let root_index_bytes = match root_index_entry {
+        None => None,
+        Some((prev_root, smt_root, leaf_index)) => {
+            let leaf_i64 = i64::try_from(leaf_index).map_err(|_| {
+                sqlx::Error::Encode(
+                    format!("leaf_index {} does not fit in i64 (BIGINT)", leaf_index).into(),
+                )
+            })?;
+            Some((
+                digest_to_bytes(prev_root),
+                digest_to_bytes(smt_root),
+                leaf_i64,
+            ))
+        }
+    };
+
     let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO smt_state (id, data, updated_at) \
@@ -128,6 +173,18 @@ pub async fn persist_state_tx(
     .bind(&latest_block[..])
     .execute(&mut *tx)
     .await?;
+    if let Some((prev_bytes, smt_bytes, leaf_i64)) = root_index_bytes {
+        sqlx::query(
+            "INSERT INTO mmr_root_index (prev_mmr_root, smt_root, leaf_index, created_at) \
+             VALUES ($1, $2, $3, NOW()) \
+             ON CONFLICT (prev_mmr_root) DO NOTHING",
+        )
+        .bind(&prev_bytes[..])
+        .bind(&smt_bytes[..])
+        .bind(leaf_i64)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await
 }
 
@@ -474,6 +531,105 @@ pub async fn load_pending_in_progress(
             },
         )
         .collect())
+}
+
+// ---- MMR root index persistence (Phase C) ---------------------------------
+
+/// Insert a single `(prev_mmr_root) -> (smt_root, leaf_index)` row.
+///
+/// Called from the scanner callback right after `State::update`
+/// successfully appended a new MMR leaf. `ON CONFLICT DO NOTHING` makes
+/// replays idempotent: an MMR append is monotonic, so the same
+/// `prev_mmr_root` key cannot legitimately resolve to two distinct
+/// `(smt_root, leaf_index)` tuples — the first writer's value is
+/// authoritative and a re-entrant retry (e.g. a scanner re-scan after a
+/// crash that already persisted this entry) is a no-op.
+///
+/// `leaf_index` is the in-memory `usize` from `mmr.leaf_count()`. We
+/// cast through `i64` because Postgres has no unsigned BIGINT — the
+/// load path rejects negative values, so this round-trip is safe up to
+/// `i64::MAX`, well above any plausible MMR depth.
+pub async fn insert_root_index(
+    pool: &PgPool,
+    prev_root: &HashDigest,
+    smt_root: &HashDigest,
+    leaf_index: u64,
+) -> Result<(), sqlx::Error> {
+    let prev_bytes = digest_to_bytes(prev_root);
+    let smt_bytes = digest_to_bytes(smt_root);
+    let leaf_i64 = i64::try_from(leaf_index).map_err(|_| {
+        sqlx::Error::Encode(
+            format!("leaf_index {} does not fit in i64 (BIGINT)", leaf_index).into(),
+        )
+    })?;
+    sqlx::query(
+        "INSERT INTO mmr_root_index (prev_mmr_root, smt_root, leaf_index, created_at) \
+         VALUES ($1, $2, $3, NOW()) \
+         ON CONFLICT (prev_mmr_root) DO NOTHING",
+    )
+    .bind(&prev_bytes[..])
+    .bind(&smt_bytes[..])
+    .bind(leaf_i64)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Load every `(prev_mmr_root, smt_root, leaf_index)` row from the
+/// `mmr_root_index` table, ordered by `leaf_index` so the caller can
+/// rebuild the in-memory map deterministically (and so the highest
+/// `leaf_index` entry — used to restore `State::prev_mmr_root` — is
+/// always the last element).
+///
+/// Returns an empty vector when the table has never been written
+/// (fresh database). Length / digest decoding mirrors the defensive
+/// branch in [`load_latest_block`]: 32 bytes for each digest, with a
+/// `sqlx::Error::Decode` surface on length mismatch rather than a
+/// panic deep in the bootstrap.
+pub async fn load_root_indices(
+    pool: &PgPool,
+) -> Result<Vec<(HashDigest, HashDigest, u64)>, sqlx::Error> {
+    let rows: Vec<(Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+        "SELECT prev_mmr_root, smt_root, leaf_index FROM mmr_root_index ORDER BY leaf_index",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (prev_bytes, smt_bytes, leaf_i64) in rows {
+        let prev_arr: [u8; 32] = prev_bytes.as_slice().try_into().map_err(|_| {
+            sqlx::Error::Decode(
+                format!(
+                    "mmr_root_index.prev_mmr_root has unexpected length {} (expected 32)",
+                    prev_bytes.len()
+                )
+                .into(),
+            )
+        })?;
+        let smt_arr: [u8; 32] = smt_bytes.as_slice().try_into().map_err(|_| {
+            sqlx::Error::Decode(
+                format!(
+                    "mmr_root_index.smt_root has unexpected length {} (expected 32)",
+                    smt_bytes.len()
+                )
+                .into(),
+            )
+        })?;
+        if leaf_i64 < 0 {
+            return Err(sqlx::Error::Decode(
+                format!(
+                    "mmr_root_index.leaf_index out of u64 range: {} (must be >= 0)",
+                    leaf_i64
+                )
+                .into(),
+            ));
+        }
+        out.push((
+            digest_from_bytes(&prev_arr),
+            digest_from_bytes(&smt_arr),
+            leaf_i64 as u64,
+        ));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

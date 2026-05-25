@@ -58,6 +58,9 @@ async fn connect_and_migrate_creates_all_tables() {
     let names: Vec<String> = rows.into_iter().map(|r| r.get::<String, _>(0)).collect();
     // _sqlx_migrations is created implicitly by sqlx::migrate!.
     // `minting_meta` lands via 0002_minting_meta.sql (PR-A3).
+    // `pending_inscriptions` lands via 0003_pending_inscriptions.sql
+    // (Phase B). `mmr_root_index` lands via 0004_mmr_root_index.sql
+    // (Phase C).
     assert_eq!(
         names,
         vec![
@@ -65,7 +68,9 @@ async fn connect_and_migrate_creates_all_tables() {
             "accounts".to_string(),
             "latest_block".to_string(),
             "minting_meta".to_string(),
+            "mmr_root_index".to_string(),
             "mmr_state".to_string(),
+            "pending_inscriptions".to_string(),
             "smt_state".to_string(),
             "usernames".to_string(),
         ]
@@ -99,7 +104,7 @@ async fn persist_state_tx_writes_smt_mmr_block_atomically() {
     let smt = vec![0xAAu8; 64];
     let mmr = vec![0xBBu8; 128];
     let block = [0xCCu8; 32];
-    persist_state_tx(&pool, &smt, &mmr, &block)
+    persist_state_tx(&pool, &smt, &mmr, &block, None)
         .await
         .expect("persist_state_tx failed");
 
@@ -114,20 +119,91 @@ async fn persist_state_tx_is_idempotent_on_conflict() {
     let smt1 = vec![1u8; 16];
     let mmr1 = vec![2u8; 16];
     let block1 = [3u8; 32];
-    persist_state_tx(&pool, &smt1, &mmr1, &block1)
+    persist_state_tx(&pool, &smt1, &mmr1, &block1, None)
         .await
         .unwrap();
 
     let smt2 = vec![4u8; 32];
     let mmr2 = vec![5u8; 32];
     let block2 = [6u8; 32];
-    persist_state_tx(&pool, &smt2, &mmr2, &block2)
+    persist_state_tx(&pool, &smt2, &mmr2, &block2, None)
         .await
         .unwrap();
 
     assert_eq!(load_smt(&pool).await.unwrap(), Some(smt2));
     assert_eq!(load_mmr(&pool).await.unwrap(), Some(mmr2));
     assert_eq!(load_latest_block(&pool).await.unwrap(), Some(block2));
+}
+
+#[tokio::test]
+async fn persist_state_tx_writes_root_index_in_same_transaction() {
+    // Phase-C atomicity guarantee: the `mmr_root_index` row rides
+    // along inside the same Postgres transaction as SMT/MMR/
+    // latest_block. Closing the crash window between the snapshot
+    // and the standalone INSERT is the whole point — see the
+    // doc-comment on `persist_state_tx` for the heal-on-restart
+    // story. This test asserts all four landed from one call.
+    let (pool, _container) = setup_pool().await;
+    let smt = vec![0xAAu8; 64];
+    let mmr = vec![0xBBu8; 128];
+    let block = [0xCCu8; 32];
+    let prev_root = zkcoins_program::hash::digest_from_bytes(&[0x10u8; 32]);
+    let smt_root = zkcoins_program::hash::digest_from_bytes(&[0x20u8; 32]);
+    persist_state_tx(&pool, &smt, &mmr, &block, Some((&prev_root, &smt_root, 7)))
+        .await
+        .expect("persist_state_tx failed");
+
+    assert_eq!(load_smt(&pool).await.unwrap(), Some(smt));
+    assert_eq!(load_mmr(&pool).await.unwrap(), Some(mmr));
+    assert_eq!(load_latest_block(&pool).await.unwrap(), Some(block));
+    let entries = load_root_indices(&pool).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0], (prev_root, smt_root, 7));
+}
+
+#[tokio::test]
+async fn persist_state_tx_root_index_on_conflict_does_nothing() {
+    // Re-scanning the same commit tx after a crash MUST be a no-op on
+    // the root_index row — `update()` is replayed against the same
+    // unchanged MMR and the (prev_mmr_root, smt_root, leaf_index)
+    // tuple is identical, so `ON CONFLICT (prev_mmr_root) DO NOTHING`
+    // keeps the original row authoritative. Belt-and-braces: the
+    // second call's `smt_root` differs to prove that the conflict
+    // branch genuinely takes the DO NOTHING path (otherwise the row
+    // would be silently mutated).
+    let (pool, _container) = setup_pool().await;
+    let smt = vec![1u8; 16];
+    let mmr = vec![2u8; 16];
+    let block = [3u8; 32];
+    let prev_root = zkcoins_program::hash::digest_from_bytes(&[0x10u8; 32]);
+    let original_smt_root = zkcoins_program::hash::digest_from_bytes(&[0x20u8; 32]);
+    let different_smt_root = zkcoins_program::hash::digest_from_bytes(&[0x99u8; 32]);
+
+    persist_state_tx(
+        &pool,
+        &smt,
+        &mmr,
+        &block,
+        Some((&prev_root, &original_smt_root, 0)),
+    )
+    .await
+    .unwrap();
+    persist_state_tx(
+        &pool,
+        &smt,
+        &mmr,
+        &block,
+        Some((&prev_root, &different_smt_root, 0)),
+    )
+    .await
+    .unwrap();
+
+    let entries = load_root_indices(&pool).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].1, original_smt_root,
+        "second call must DO NOTHING, original row stays authoritative"
+    );
 }
 
 #[tokio::test]
