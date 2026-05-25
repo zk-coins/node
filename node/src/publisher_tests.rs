@@ -466,9 +466,12 @@ async fn broadcast_inscription_txs_returns_both_txids_on_success() {
 
 #[tokio::test]
 async fn broadcast_inscription_txs_errors_when_track_tx_event_never_arrives() {
-    // Silent WS mock — the publisher must hit its 30-s safety-net
-    // and surface a hard error, NOT silently fall back to broadcasting
-    // the reveal (issue #84 design).
+    // Silent WS mock — exercises the "broadcast genuinely failed"
+    // path: the short WS timeout elapses, the publisher's REST
+    // fallback hits the wiremock default (no `GET /tx/{txid}` route
+    // mounted ⇒ 404 ⇒ esplora-client returns `Ok(None)`), and the
+    // publisher surfaces a hard `WsError::Timeout` instead of
+    // silently broadcasting the reveal (issue #84 design).
     let (server, mut config) = setup_mock_esplora().await;
     config.ws_url = Some(spawn_track_tx_ws("silent").await);
     // Override the production 30-s deadline so the test fails fast
