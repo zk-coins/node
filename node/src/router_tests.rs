@@ -4041,26 +4041,23 @@ async fn mint_broadcast_mock_server() -> wiremock::MockServer {
     mock_server
 }
 
-/// Drives the Err arm of the post-broadcast `db::commit_mint_tx` call
-/// at the tail of `mint_handler`. The broadcast goes through (wiremock
-/// answers the UTXO + tx POSTs), the handler walks past the early
-/// 503 broadcast-failure branch into the commit-tx phase. The pool is
-/// the lazy `dead_pool` that connect-errors on first use, so the
-/// transaction fails to begin and the handler returns
-/// `503 SERVICE_UNAVAILABLE` "Failed to persist mint commit
-/// transaction".
+/// Drives the Err arm of the pre-broadcast `pending_inscriptions`
+/// persist that PR #107 introduced. With the lazy `dead_pool` that
+/// connect-errors on first use, the publisher's
+/// `broadcast_inscription_txs_with_persistence` fails at the very
+/// first DB write (the `constructed`-row INSERT) BEFORE any tx is
+/// broadcast on chain. The publisher wraps the persistence error as
+/// `"persist pending inscription: …"` and the handler maps that to
+/// `503 SERVICE_UNAVAILABLE` "Failed to broadcast mint inscription
+/// on-chain".
 ///
-/// Phase D note: the in-memory minting `Account` and recipient `Account`
-/// HAVE mutated before the failed commit (the Phase-D shape applies
-/// `commit_mint` + `receive_coin` to the live in-memory state before
-/// the DB transaction begins, so the bytes the transaction tries to
-/// upsert come from the LIVE map). A commit failure therefore leaves
-/// memory ahead of DB; the next scanner sweep rehydrates the SMT from
-/// chain and the next mint observes the correct N via
-/// `derive_num_pubkeys_from_smt`. The 503 surface signals to the
-/// client that nothing durable landed.
+/// Contract: with a broken persistence layer, no on-chain commitment
+/// is published and `mint_handler` returns 503 cleanly. Coverage of
+/// the deeper post-broadcast `commit_mint_tx` Err branch is in
+/// `mint_commit_mint_tx_failure_returns_503` below (live pool +
+/// `accounts`-table trigger).
 #[tokio::test]
-async fn mint_commit_tx_failure_returns_503() {
+async fn mint_pending_inscriptions_persist_failure_returns_503() {
     let mock_server = mint_broadcast_mock_server().await;
     let ws_url = mint_broadcast_mock_ws().await;
 
@@ -4090,6 +4087,94 @@ async fn mint_commit_tx_failure_returns_503() {
         status,
         StatusCode::SERVICE_UNAVAILABLE,
         "body: {}",
+        resp_body
+    );
+    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(v["success"], false);
+    assert_eq!(v["error"], "Failed to broadcast mint inscription on-chain");
+}
+
+/// Drives the Err arm of the post-broadcast `db::commit_mint_tx` call
+/// at the tail of `mint_handler` (router.rs ~ "Failed to persist mint
+/// commit transaction"). Uses a live Postgres so the publisher's
+/// pre-broadcast `pending_inscriptions` INSERT, the broadcast itself,
+/// the in-memory `state.update`, and the atomic
+/// `persist_state_and_mark_complete_tx` all succeed; an `accounts`
+/// trigger then raises on the final `INSERT` so `commit_mint_tx`
+/// rolls back. Handler converts to 503.
+///
+/// Coverage: this is the only test exercising the `commit_mint_tx`
+/// Err branch in `mint_handler` post-Phase-E (the dead-pool path
+/// short-circuits earlier — see
+/// `mint_pending_inscriptions_persist_failure_returns_503`).
+#[tokio::test]
+async fn mint_commit_mint_tx_failure_returns_503() {
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container.get_host().await.unwrap();
+    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
+    // Trigger raises on every accounts INSERT, surfacing as
+    // `sqlx::Error::Database` from inside `commit_mint_tx`'s tx.
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION fail_accounts_insert() RETURNS trigger AS $$
+         BEGIN
+             RAISE EXCEPTION 'simulated commit_mint_tx failure';
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&*pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER block_accounts_insert BEFORE INSERT ON accounts \
+         FOR EACH ROW EXECUTE FUNCTION fail_accounts_insert()",
+    )
+    .execute(&*pool)
+    .await
+    .unwrap();
+
+    let mock_server = mint_broadcast_mock_server().await;
+    let ws_url = mint_broadcast_mock_ws().await;
+
+    let mut state = mint_test_state();
+    state.pool = Arc::clone(&pool);
+    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
+        url: mock_server.uri(),
+        is_mainnet: false,
+        network_name: "Mutinynet".to_string(),
+        ws_url: Some(ws_url),
+        track_tx_timeout: None,
+    });
+
+    let recipient_bytes = [12u8; 32];
+    let recipient = "0x".to_string() + &hex::encode(recipient_bytes);
+    let body = serde_json::json!({
+        "account_address": recipient,
+        "amount": 1u64,
+    });
+    let req = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, resp_body) = send_request_with_state(state, req).await;
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "commit_mint_tx failure must surface 503, body: {}",
         resp_body
     );
     let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
