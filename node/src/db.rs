@@ -5,12 +5,15 @@
 // `sqlx::PgPool` were defined there. PR-A2 wired the state-layer
 // (`load_smt`, `load_mmr`, `load_latest_block`, `persist_state_tx`)
 // into the bootstrap and scanner callback, fixing the cross-file
-// inconsistency window flagged as issue #11. PR-A3 (this commit)
-// wires the remaining `load_all_accounts` / `upsert_account` /
-// `load_all_usernames` / `claim_username` / `resolve_username` calls
-// into `AccountNode` and `UsernameStore`, and adds the
-// `load_minting_num_pubkeys` / `upsert_minting_num_pubkeys` pair that
-// replaces the legacy `minting_num_pubkeys.bin` sibling file.
+// inconsistency window flagged as issue #11. PR-A3 wired the
+// `load_all_accounts` / `upsert_account` / `load_all_usernames` /
+// `claim_username` / `resolve_username` calls into `AccountNode` and
+// `UsernameStore`. The Phase-D rework dropped the
+// `load_minting_num_pubkeys` / `upsert_minting_num_pubkeys` pair and
+// the optimistic counter-bump step inside `commit_mint_tx`: the
+// minting account's `num_pubkeys` is now derived from SMT membership
+// at runtime (see `state::derive_num_pubkeys_from_smt`). Migration
+// 0005 drops the `minting_meta` table outright.
 //
 // Choice of `sqlx::query` (runtime checked) over `sqlx::query!`
 // (compile-time checked): all SQL in this module is short, hand-
@@ -268,134 +271,26 @@ pub async fn resolve_username(pool: &PgPool, name: &str) -> Result<Option<Vec<u8
     Ok(row.map(|(addr,)| addr))
 }
 
-// ---- Minting metadata (PR-A3) ---------------------------------------------
+// ---- Minting commit transaction (Phase D) ---------------------------------
 
-/// Load the minting account's monotonic `num_pubkeys` counter from the
-/// `minting_meta` singleton row.
+/// Atomically upsert every account row mutated by a successful mint.
 ///
-/// Returns `Ok(None)` when the row has never been written (fresh
-/// database / no successful mint since bootstrap). Values outside the
-/// `0..=u32::MAX` range are rejected as a decode error — the in-
-/// memory counter is `u32` (BIP-32 child indices wrap at 2^31, so
-/// `u32` is already more head-room than the derivation path supports).
-pub async fn load_minting_num_pubkeys(pool: &PgPool) -> Result<Option<u32>, sqlx::Error> {
-    let row: Option<(i64,)> = sqlx::query_as("SELECT num_pubkeys FROM minting_meta WHERE id = 1")
-        .fetch_optional(pool)
-        .await?;
-    match row {
-        None => Ok(None),
-        Some((n,)) => {
-            // Defensive: BIGINT is signed and the column has no CHECK
-            // constraint, so a manual operator INSERT could plant a
-            // negative value or one above `u32::MAX`. Surface that as
-            // a decode error rather than panicking on the `as u32`
-            // cast.
-            if !(0..=i64::from(u32::MAX)).contains(&n) {
-                return Err(sqlx::Error::Decode(
-                    format!(
-                        "minting_meta.num_pubkeys out of u32 range: {} (must be 0..=u32::MAX)",
-                        n
-                    )
-                    .into(),
-                ));
-            }
-            Ok(Some(n as u32))
-        }
-    }
-}
-
-/// Upsert the minting account's monotonic `num_pubkeys` counter.
-/// Idempotent on conflict — the singleton row is keyed on `id = 1`.
-/// See `load_minting_num_pubkeys` for the matching read.
-pub async fn upsert_minting_num_pubkeys(pool: &PgPool, n: u32) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO minting_meta (id, num_pubkeys, updated_at) \
-         VALUES (1, $1, NOW()) \
-         ON CONFLICT (id) DO UPDATE \
-         SET num_pubkeys = EXCLUDED.num_pubkeys, updated_at = EXCLUDED.updated_at",
-    )
-    .bind(i64::from(n))
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Atomically commit a successful mint to Postgres.
+/// Phase D removed the optimistic `minting_meta.num_pubkeys` counter
+/// bump that used to sit at the head of this transaction: the
+/// minting-account `num_pubkeys` is now derived from SMT membership at
+/// runtime (`state::derive_num_pubkeys_from_smt`), so the only DB-side
+/// work left is the per-account UPSERT bundle. The signature still
+/// returns `Result<(), sqlx::Error>` to keep the call-site shape
+/// symmetric with the other helpers; the `bool` "race lost"
+/// discriminator on the old API is gone because the in-process
+/// concurrency gate has moved out of Postgres (see `mint_handler` for
+/// the new gate).
 ///
-/// One transaction performs three steps in order:
-///
-/// 1. **Optimistic counter bump.** The minting_meta row's
-///    `num_pubkeys` is moved from `expected_prev` to `new_count`. The
-///    statement is shaped so the UPDATE only fires when the stored
-///    value matches `expected_prev` (concurrent-mint guard, see
-///    zk-coins/node#89). When the row does not exist yet and
-///    `expected_prev = 0` the INSERT branch fires instead (fresh DB).
-///    Returns `Ok(false)` if neither branch affected a row — the
-///    caller MUST treat that as "another writer already committed
-///    `num_pubkeys = expected_prev + 1`; abort with 503 concurrent
-///    mint detected" and roll back any in-memory mutations.
-///
-/// 2. **UPSERT every affected account.** The `accounts` slice is
-///    treated as an unordered set; each `(address, bincode-encoded
-///    Account)` pair is written via the same `INSERT ... ON CONFLICT
-///    DO UPDATE` shape used by [`upsert_account`].
-///
-/// All three steps share the same transaction, so either everything
-/// commits or nothing does. The optimistic-lock branch in (1) is the
-/// load-bearing safety net: it prevents two concurrent broadcasters
-/// from both succeeding (the second's UPDATE matches 0 rows, the tx
-/// rolls back, the in-memory state stays clean).
-pub async fn commit_mint_tx(
-    pool: &PgPool,
-    expected_prev: u32,
-    new_count: u32,
-    accounts: &[(&[u8], &[u8])],
-) -> Result<bool, sqlx::Error> {
+/// All UPSERTs share one transaction so the bundle is atomic even on
+/// a partial DB failure — either every recipient + the mutated minting
+/// account land, or none do.
+pub async fn commit_mint_tx(pool: &PgPool, accounts: &[(&[u8], &[u8])]) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    // Two strict-mode branches keyed on `expected_prev`:
-    //   - `expected_prev == 0`: allow the fresh-DB INSERT (no row).
-    //     The ON CONFLICT branch also fires only when the stored
-    //     value is 0, so a stale operator INSERT that left the row
-    //     at a non-zero value can never be silently overwritten.
-    //   - `expected_prev > 0`: the row MUST already exist with stored
-    //     value `expected_prev`. Use a strict UPDATE with a WHERE
-    //     predicate; no INSERT fallback because the in-memory counter
-    //     advanced past a DB row that was never written, which is a
-    //     desync we must surface as Ok(false).
-    //
-    // When two mints race to bump the counter from N to N+1, only one
-    // wins the UPDATE; the other observes 0 rows affected and the
-    // caller aborts.
-    let result = if expected_prev == 0 {
-        sqlx::query(
-            "INSERT INTO minting_meta (id, num_pubkeys, updated_at) \
-             VALUES (1, $1, NOW()) \
-             ON CONFLICT (id) DO UPDATE \
-             SET num_pubkeys = EXCLUDED.num_pubkeys, updated_at = EXCLUDED.updated_at \
-             WHERE minting_meta.num_pubkeys = 0",
-        )
-        .bind(i64::from(new_count))
-        .execute(&mut *tx)
-        .await?
-    } else {
-        sqlx::query(
-            "UPDATE minting_meta SET num_pubkeys = $1, updated_at = NOW() \
-             WHERE id = 1 AND num_pubkeys = $2",
-        )
-        .bind(i64::from(new_count))
-        .bind(i64::from(expected_prev))
-        .execute(&mut *tx)
-        .await?
-    };
-    if result.rows_affected() == 0 {
-        // Roll back — neither the fresh-DB INSERT nor the UPDATE-with-
-        // expected branch matched. Another concurrent committer must
-        // have already moved the counter (or, if `expected_prev = 0`,
-        // a stale operator INSERT preloaded a non-zero row). Either
-        // way, our caller's snapshot is stale.
-        tx.rollback().await?;
-        return Ok(false);
-    }
     for (address, data) in accounts {
         sqlx::query(
             "INSERT INTO accounts (address, data, updated_at) \
@@ -409,7 +304,7 @@ pub async fn commit_mint_tx(
         .await?;
     }
     tx.commit().await?;
-    Ok(true)
+    Ok(())
 }
 
 // ---- Pending inscription persistence (Phase B) ----------------------------
