@@ -18,6 +18,9 @@ use std::str::FromStr;
 use esplora_client::{
     r#async::DefaultSleeper, AsyncClient as EsploraAsyncClient, Builder as EsploraBuilder,
 };
+use sqlx::PgPool;
+
+use crate::db;
 
 // Define a configuration struct for Esplora
 #[derive(Clone, Debug)]
@@ -543,10 +546,23 @@ pub async fn get_publisher_utxo(
     Ok(outpoints_with_sats)
 }
 
-/// Creates and broadcasts inscription transactions with the given commitment data
+/// Creates and broadcasts inscription transactions with the given commitment data.
+///
+/// **Persistence contract (Phase B).** When `pool` is `Some`, the
+/// constructed `(commit_tx, reveal_tx)` pair is persisted to the
+/// `pending_inscriptions` table BEFORE the first broadcast attempt
+/// and the row is walked through the `constructed → commit_broadcast
+/// → reveal_broadcast → complete` state machine as each broadcast
+/// lands. A crash anywhere in this sequence leaves a recoverable row
+/// for [`resume_pending_inscriptions`] to re-drive on the next boot.
+///
+/// When `pool` is `None` (out-of-band callers / unit tests that don't
+/// need persistence), the function behaves exactly like the
+/// pre-Phase-B version — no DB writes, no resume hooks.
 pub async fn create_and_broadcast_inscription(
     commitment_data: &[u8],
     config: &EsploraConfig,
+    pool: Option<&PgPool>,
 ) -> Result<Option<(Txid, Txid)>, Box<dyn std::error::Error + Send + Sync>> {
     // Generate publisher address
     let publisher_key = &*crate::PUBLISHER_KEY;
@@ -591,11 +607,63 @@ pub async fn create_and_broadcast_inscription(
     );
 
     // Print transaction IDs
-    println!("\nCommit TX ID: {}", commit_tx.compute_txid());
-    println!("Reveal TX ID: {}", reveal_tx.compute_txid());
+    let commit_txid = commit_tx.compute_txid();
+    let reveal_txid = reveal_tx.compute_txid();
+    println!("\nCommit TX ID: {}", commit_txid);
+    println!("Reveal TX ID: {}", reveal_txid);
+
+    // Persist the (commit, reveal) pair BEFORE attempting any
+    // broadcast. Crash-recovery (Phase B) hinges on the row being on
+    // disk at every state-machine boundary — if we crash between
+    // construct and commit-broadcast we want the resumer to find the
+    // row and re-broadcast both; if we crash between commit and
+    // reveal we want the resumer to find the row and re-broadcast
+    // just the reveal. Both behaviours require the row already
+    // exists by the time the first network call returns.
+    if let Some(pool) = pool {
+        let commit_tx_bytes = bitcoin::consensus::serialize(&commit_tx);
+        let reveal_tx_bytes = bitcoin::consensus::serialize(&reveal_tx);
+        let commit_output_value = commit_tx.output[0].value.to_sat() as i64;
+        match db::insert_pending_inscription(
+            pool,
+            commit_txid.as_byte_array(),
+            commitment_data,
+            &commit_tx_bytes,
+            &reveal_tx_bytes,
+            commit_output_value,
+        )
+        .await
+        {
+            Ok(true) => {
+                println!(
+                    "Persisted pending_inscriptions row (constructed) for commit={}",
+                    commit_txid
+                );
+            }
+            Ok(false) => {
+                // UNIQUE-conflict: the same commit_txid is already on
+                // disk (a previous attempt persisted, then crashed
+                // before completing). The resumer will pick it up on
+                // the next boot; in the meantime we still want to try
+                // broadcasting now in case the operator hasn't
+                // restarted yet.
+                println!(
+                    "pending_inscriptions row for commit={} already exists; proceeding with broadcast",
+                    commit_txid
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "Failed to persist pending_inscriptions row for {}: {}",
+                    commit_txid, e
+                );
+                return Err(format!("persist pending inscription: {}", e).into());
+            }
+        }
+    }
 
     // Broadcast the transactions
-    match broadcast_inscription_txs(config, &commit_tx, &reveal_tx).await {
+    match broadcast_inscription_txs_with_persistence(config, &commit_tx, &reveal_tx, pool).await {
         Ok((commit_txid, reveal_txid)) => {
             println!("Successfully broadcast transactions:");
             println!("Commit TXID: {}", commit_txid);
@@ -607,6 +675,311 @@ pub async fn create_and_broadcast_inscription(
             Err(e)
         }
     }
+}
+
+/// Esplora returns this substring inside an `HttpResponse { status:
+/// 400, message }` payload when the commit's input UTXO was already
+/// spent — typically because a previous attempt's commit broadcast
+/// landed even though our process crashed before recording the
+/// success. The resume path treats this as "commit already on chain;
+/// advance and proceed to reveal" instead of a hard failure.
+fn is_inputs_missingorspent_error(err: &dyn std::error::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("bad-txns-inputs-missingorspent")
+        || msg.contains("missing-inputs")
+        || msg.contains("txn-already-known")
+}
+
+/// Same as [`broadcast_inscription_txs`] but, when `pool` is
+/// `Some`, advances the matching `pending_inscriptions` row through
+/// `commit_broadcast → reveal_broadcast → complete` as each broadcast
+/// step succeeds.
+///
+/// Status updates are best-effort: a DB-write failure after a
+/// successful chain broadcast is logged but does NOT bubble back to
+/// the caller — the chain is the source of truth, the row is
+/// bookkeeping. If a status update fails, the next boot's resumer
+/// will simply re-broadcast the next step (Esplora replies
+/// `txn-already-known`) and advance the row then.
+///
+/// The body is a transcription of [`broadcast_inscription_txs`] with
+/// status-update hooks woven in at the three points where the chain
+/// confirms a step. Keeping the two functions separate (rather than
+/// having one take `Option<&PgPool>`) avoids changing the existing
+/// public surface and keeps the pure-broadcast code path readable.
+pub async fn broadcast_inscription_txs_with_persistence(
+    config: &EsploraConfig,
+    commit_tx: &Transaction,
+    reveal_tx: &Transaction,
+    pool: Option<&PgPool>,
+) -> Result<(Txid, Txid), Box<dyn std::error::Error + Send + Sync>> {
+    let builder = EsploraBuilder::new(&config.url);
+    let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(builder)?;
+
+    let commit_txid = commit_tx.compute_txid();
+    let commit_txid_bytes = *commit_txid.as_byte_array();
+    let ws_url = config.ws_url.clone().unwrap_or_else(|| {
+        std::env::var("ESPLORA_WS_URL").unwrap_or_else(|_| DEFAULT_ESPLORA_WS_URL.to_string())
+    });
+    let track_tx_timeout = config
+        .track_tx_timeout
+        .unwrap_or_else(|| std::time::Duration::from_secs(TRACK_TX_TIMEOUT_SECS));
+
+    println!(
+        "Subscribing to commit tx {} via WS ({}) before broadcast...",
+        commit_txid, ws_url
+    );
+    let stream = crate::scanner_ws::subscribe_track_tx(&ws_url, commit_txid).await?;
+
+    println!("Broadcasting commit transaction...");
+    client.broadcast(commit_tx).await?;
+    println!("Commit transaction broadcast successfully: {}", commit_txid);
+    advance_pending_status(
+        pool,
+        &commit_txid_bytes,
+        db::PENDING_STATUS_COMMIT_BROADCAST,
+    )
+    .await;
+
+    println!(
+        "Waiting for commit tx {} to appear in mempool via WS (deadline {:?})...",
+        commit_txid, track_tx_timeout
+    );
+    match stream.wait(track_tx_timeout).await {
+        Ok(()) => {}
+        Err(crate::scanner_ws::WsError::Timeout) => {
+            // Mutinynet's public WS endpoint regularly goes 30-90 s
+            // between frames; the REST fallback distinguishes "WS
+            // missed the frame" from a genuine broadcast failure.
+            // Same shape as `broadcast_inscription_txs` — see that
+            // function's docstring for the full rationale.
+            println!(
+                "WS timeout for {}; falling back to esplora-REST GET /tx/{}",
+                commit_txid, commit_txid
+            );
+            match client.get_tx(&commit_txid).await {
+                Ok(Some(_)) => {
+                    println!(
+                        "esplora-REST fallback confirmed commit tx {} is on-chain / in mempool",
+                        commit_txid
+                    );
+                }
+                Ok(None) => {
+                    println!(
+                        "esplora-REST fallback: commit tx {} not found (404); broadcast genuinely failed",
+                        commit_txid
+                    );
+                    return Err(Box::new(crate::scanner_ws::WsError::Timeout));
+                }
+                Err(e) => {
+                    println!(
+                        "esplora-REST fallback failed for {}: {}; propagating original WS timeout",
+                        commit_txid, e
+                    );
+                    return Err(Box::new(crate::scanner_ws::WsError::Timeout));
+                }
+            }
+        }
+        Err(other) => return Err(other.into()),
+    }
+
+    println!("Broadcasting reveal transaction...");
+    client.broadcast(reveal_tx).await?;
+    let reveal_txid = reveal_tx.compute_txid();
+    println!("Reveal transaction broadcast successfully: {}", reveal_txid);
+    advance_pending_status(
+        pool,
+        &commit_txid_bytes,
+        db::PENDING_STATUS_REVEAL_BROADCAST,
+    )
+    .await;
+    advance_pending_status(pool, &commit_txid_bytes, db::PENDING_STATUS_COMPLETE).await;
+
+    Ok((commit_txid, reveal_txid))
+}
+
+/// Helper: when `pool` is `Some`, set the row's status and log any
+/// error rather than propagating it. The chain has already accepted
+/// the step by the time this is called, so a DB-side failure is
+/// recoverable on the next boot via the resumer.
+async fn advance_pending_status(pool: Option<&PgPool>, commit_txid_bytes: &[u8], status: &str) {
+    let Some(pool) = pool else {
+        return;
+    };
+    if let Err(e) = db::update_pending_status(pool, commit_txid_bytes, status).await {
+        eprintln!(
+            "Failed to advance pending_inscriptions row {} to {}: {}",
+            hex::encode(commit_txid_bytes),
+            status,
+            e
+        );
+    }
+}
+
+/// Re-broadcast every pending inscription left in the
+/// `pending_inscriptions` table by a previous boot.
+///
+/// Strategy: load every row whose status is not `complete`, then
+/// dispatch by status:
+///
+/// * `constructed` — re-broadcast both commit and reveal. If the
+///   commit broadcast returns `bad-txns-inputs-missingorspent` the
+///   commit's input was already spent by a previous attempt that
+///   landed before we crashed; advance to `commit_broadcast` and
+///   continue to the reveal.
+/// * `commit_broadcast` — re-broadcast just the reveal. The commit
+///   is already on chain.
+/// * `reveal_broadcast` — re-broadcast the reveal anyway (idempotent;
+///   Esplora returns `txn-already-known`) and advance to `complete`.
+///
+/// **Non-fatal on errors.** A failure here MUST NOT crash the
+/// bootstrap — the publisher's CLI recovery tool (PR #106) remains
+/// the operator's escape hatch. Errors are logged loudly so they
+/// surface in the container's stdout / log aggregator.
+pub async fn resume_pending_inscriptions(
+    pool: &PgPool,
+    config: &EsploraConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let rows = db::load_pending_in_progress(pool).await?;
+    if rows.is_empty() {
+        println!("resume_pending_inscriptions: no pending rows");
+        return Ok(());
+    }
+    println!(
+        "resume_pending_inscriptions: resuming {} pending row(s)",
+        rows.len()
+    );
+
+    for row in rows {
+        if let Err(e) = resume_single_row(pool, config, &row).await {
+            eprintln!(
+                "resume_pending_inscriptions: row id={} commit_txid={} status={} failed: {}",
+                row.id,
+                hex::encode(&row.commit_txid),
+                row.status,
+                e
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Drives one [`db::PendingInscriptionRow`] to `complete`. Split out
+/// of [`resume_pending_inscriptions`] so a per-row failure short-
+/// circuits with `?` cleanly without abandoning the rest of the
+/// queue.
+async fn resume_single_row(
+    pool: &PgPool,
+    config: &EsploraConfig,
+    row: &db::PendingInscriptionRow,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let commit_tx: Transaction = bitcoin::consensus::deserialize(&row.commit_tx)
+        .map_err(|e| format!("deserialize commit_tx: {}", e))?;
+    let reveal_tx: Transaction = bitcoin::consensus::deserialize(&row.reveal_tx)
+        .map_err(|e| format!("deserialize reveal_tx: {}", e))?;
+
+    let builder = EsploraBuilder::new(&config.url);
+    let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(builder)?;
+
+    let commit_txid = commit_tx.compute_txid();
+
+    match row.status.as_str() {
+        db::PENDING_STATUS_CONSTRUCTED => {
+            println!(
+                "resume: row id={} status=constructed → re-broadcasting commit {}",
+                row.id, commit_txid
+            );
+            match client.broadcast(&commit_tx).await {
+                Ok(()) => {
+                    db::update_pending_status(
+                        pool,
+                        &row.commit_txid,
+                        db::PENDING_STATUS_COMMIT_BROADCAST,
+                    )
+                    .await?;
+                }
+                Err(e) if is_inputs_missingorspent_error(&e) => {
+                    // The commit already landed on a previous attempt.
+                    // Advance and fall through to the reveal step.
+                    println!(
+                        "resume: commit {} already on chain (bad-txns-inputs-missingorspent), advancing",
+                        commit_txid
+                    );
+                    db::update_pending_status(
+                        pool,
+                        &row.commit_txid,
+                        db::PENDING_STATUS_COMMIT_BROADCAST,
+                    )
+                    .await?;
+                }
+                Err(e) => return Err(e.into()),
+            }
+            broadcast_reveal_and_complete(pool, &client, &row.commit_txid, &reveal_tx).await?;
+        }
+        db::PENDING_STATUS_COMMIT_BROADCAST => {
+            println!(
+                "resume: row id={} status=commit_broadcast → broadcasting reveal for {}",
+                row.id, commit_txid
+            );
+            broadcast_reveal_and_complete(pool, &client, &row.commit_txid, &reveal_tx).await?;
+        }
+        db::PENDING_STATUS_REVEAL_BROADCAST => {
+            println!(
+                "resume: row id={} status=reveal_broadcast → re-broadcasting reveal for {} (idempotent)",
+                row.id, commit_txid
+            );
+            // Re-broadcast is idempotent: Esplora returns
+            // `txn-already-known` if the reveal landed on a previous
+            // attempt. Treat that as success.
+            match client.broadcast(&reveal_tx).await {
+                Ok(()) => {}
+                Err(e) if is_inputs_missingorspent_error(&e) => {
+                    println!(
+                        "resume: reveal for {} already on chain (txn-already-known); marking complete",
+                        commit_txid
+                    );
+                }
+                Err(e) => return Err(e.into()),
+            }
+            db::update_pending_status(pool, &row.commit_txid, db::PENDING_STATUS_COMPLETE).await?;
+        }
+        other => {
+            // Forward-compatible: an unknown status (e.g. a future
+            // `failed` value) is skipped instead of crashing the
+            // bootstrap.
+            println!(
+                "resume: row id={} commit_txid={} has unknown status {:?}; skipping",
+                row.id,
+                hex::encode(&row.commit_txid),
+                other
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Broadcast `reveal_tx` and mark the matching row `complete`. Used by
+/// both the `constructed` and `commit_broadcast` resume branches.
+async fn broadcast_reveal_and_complete(
+    pool: &PgPool,
+    client: &EsploraAsyncClient<DefaultSleeper>,
+    commit_txid_bytes: &[u8],
+    reveal_tx: &Transaction,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match client.broadcast(reveal_tx).await {
+        Ok(()) => {}
+        Err(e) if is_inputs_missingorspent_error(&e) => {
+            // Reveal already on chain — advance.
+            println!(
+                "resume: reveal {} already on chain (txn-already-known); marking complete",
+                reveal_tx.compute_txid()
+            );
+        }
+        Err(e) => return Err(e.into()),
+    }
+    db::update_pending_status(pool, commit_txid_bytes, db::PENDING_STATUS_REVEAL_BROADCAST).await?;
+    db::update_pending_status(pool, commit_txid_bytes, db::PENDING_STATUS_COMPLETE).await?;
+    Ok(())
 }
 
 #[cfg(test)]
