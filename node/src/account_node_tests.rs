@@ -139,10 +139,7 @@ fn test_wallet_operations() {
     let mut account_1_data = TestAccountData::new_generic(&[1u8; 32], Network::Signet);
     let mut account_2_data = TestAccountData::new_generic(&[2u8; 32], Network::Signet);
 
-    assert_eq!(
-        node.get_account_balance(&MINTING_ADDRESS).unwrap(),
-        10_000
-    );
+    assert_eq!(node.get_account_balance(&MINTING_ADDRESS).unwrap(), 10_000);
     assert!(node.get_account_balance(&account_1_data.address).is_err());
     assert!(node.get_account_balance(&account_2_data.address).is_err());
 
@@ -165,11 +162,9 @@ fn test_wallet_operations() {
         )
         .unwrap();
 
-    node
-        .receive_coin(coin_proofs.pop().unwrap()) // Order might matter if tied to invoice order
+    node.receive_coin(coin_proofs.pop().unwrap()) // Order might matter if tied to invoice order
         .expect("Unable to receive coin for account_1_invoice"); // Assuming account_1_invoice was last in vec or order doesn't strictly map here
-    node
-        .receive_coin(coin_proofs.pop().unwrap())
+    node.receive_coin(coin_proofs.pop().unwrap())
         .expect("Unable to receive coin for account_2_invoice");
 
     assert_eq!(
@@ -206,8 +201,7 @@ fn test_wallet_operations() {
         0
     ); // account_2's balance reduced after send
 
-    node
-        .receive_coin(coin_proofs_from_acc2.pop().unwrap())
+    node.receive_coin(coin_proofs_from_acc2.pop().unwrap())
         .expect("Unable to receive coin by account_1 from account_2");
     assert_eq!(
         node.get_account_balance(&account_1_data.address).unwrap(),
@@ -236,8 +230,7 @@ fn test_wallet_operations() {
         )
         .unwrap();
     println!("TIME ELAPSED FOR ONE RECURSIVE SEND: {:?}", duration);
-    node
-        .receive_coin(coin_proofs_from_acc1.pop().unwrap())
+    node.receive_coin(coin_proofs_from_acc1.pop().unwrap())
         .expect("Unable to receive coin by account_2 from account_1");
     assert_eq!(
         node.get_account_balance(&account_1_data.address).unwrap(),
@@ -270,10 +263,7 @@ fn test_create_minting_account() {
         *MINTING_ADDRESS,
         "Minting address is not stored in node correctly."
     );
-    assert_eq!(
-        node.get_account_balance(&MINTING_ADDRESS).unwrap(),
-        10_000
-    );
+    assert_eq!(node.get_account_balance(&MINTING_ADDRESS).unwrap(), 10_000);
 }
 
 #[test]
@@ -340,8 +330,7 @@ fn test_receive_duplicate_coin_rejected() {
     let duplicate = coin_proof.clone();
 
     // First receive should succeed
-    node
-        .receive_coin(coin_proof)
+    node.receive_coin(coin_proof)
         .expect("First receive should succeed");
 
     // Second receive of the same coin should be rejected
@@ -809,8 +798,7 @@ fn test_send_coins_rejects_tampered_source_proof_inclusion() {
         )
         .expect("state.update");
 
-    node
-        .receive_coin(coin_proofs.pop().expect("at least one coin"))
+    node.receive_coin(coin_proofs.pop().expect("at least one coin"))
         .expect("recipient receive_coin");
 
     // Tamper the queued `inclusion_proof.siblings[0]` directly on the
@@ -919,8 +907,7 @@ fn test_send_coins_rejects_too_many_coins_in_queue() {
         .expect("state.update");
 
     let cp = coin_proofs.pop().expect("at least one coin");
-    node
-        .receive_coin(cp.clone())
+    node.receive_coin(cp.clone())
         .expect("recipient receive_coin");
 
     // Force `coin_queue.len()` past the budget by cloning the single
@@ -983,8 +970,7 @@ fn test_send_coins_errors_when_state_lacks_commitment_for_in_coin() {
     // Intentionally SKIP `state_arc.update(...)` — state never sees
     // the minting account's commitment, so get_merkle_proofs cannot
     // look up the commitment proof on the recipient's send_coins call.
-    node
-        .receive_coin(coin_proofs.pop().expect("at least one coin"))
+    node.receive_coin(coin_proofs.pop().expect("at least one coin"))
         .expect("recipient receive_coin");
 
     let current_pk = generate_test_public_key(&recipient_data.xpriv, 0);
@@ -1040,8 +1026,7 @@ fn test_send_coins_errors_when_state_lacks_commitment_for_prev_account_proof() {
                 .collect::<Vec<_>>(),
         )
         .expect("state.update");
-    node
-        .receive_coin(coin_proofs.pop().expect("at least one coin"))
+    node.receive_coin(coin_proofs.pop().expect("at least one coin"))
         .expect("recipient receive_coin");
 
     // Forge an `account.proof = Some(...)` on the recipient by reusing
@@ -1187,8 +1172,7 @@ fn test_send_coins_rejects_source_commitment_missing_from_history_mmr() {
         )
         .expect("state.update");
 
-    node
-        .receive_coin(coin_proofs.pop().expect("at least one coin"))
+    node.receive_coin(coin_proofs.pop().expect("at least one coin"))
         .expect("recipient receive_coin");
 
     // Desync `state.prev_mmr_root` from the actual history-MMR
