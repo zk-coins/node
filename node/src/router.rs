@@ -102,6 +102,34 @@ pub(crate) struct AppState {
     /// `cfg(test)` so the field does not exist in release builds.
     #[cfg(test)]
     pub(crate) phase2_reached: Arc<tokio::sync::Notify>,
+    /// Test-only deterministic hold between `prepare_mint` (phase 2)
+    /// and the phase-3 re-derive. The handler acquires + immediately
+    /// drops this mutex AFTER `prepare_mint` returns and BEFORE the
+    /// re-derive reads SMT membership. Constructed unlocked so all
+    /// production-shaped tests proceed immediately (acquire is a
+    /// non-blocking no-op). The concurrent-mint race test grabs the
+    /// guard BEFORE spawning the request, holds it across the pk_N
+    /// injection, then drops it — a hard happens-before edge that
+    /// works for any number of sequential mints (unlike a `Notify`
+    /// where one consumed permit would block subsequent waiters).
+    /// Hidden behind `cfg(test)` so the field does not exist in
+    /// release builds.
+    #[cfg(test)]
+    pub(crate) phase3_release_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Test-only deterministic hold between the broadcast result and
+    /// the phase-3b state advance (`update_and_snapshot_for_persist`).
+    /// Mirrors `phase3_release_lock`: the handler acquires + immediately
+    /// drops this mutex AFTER `create_and_broadcast_inscription` returns
+    /// and BEFORE acquiring the state lock to apply the new commitment.
+    /// Constructed unlocked so production-shaped tests proceed
+    /// immediately. The in-process state.update Err test grabs the
+    /// guard before spawning the request, lets the handler run through
+    /// broadcast, injects the colliding SMT entry, then drops the
+    /// guard — at which point the handler's `state.update` observes
+    /// the collision and returns 503. Hidden behind `cfg(test)` so the
+    /// field does not exist in release builds.
+    #[cfg(test)]
+    pub(crate) state_advance_release_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 // Response types for our API
@@ -906,6 +934,16 @@ async fn mint_handler(
         }
     };
 
+    // Test-only deterministic hold between `prepare_mint` and the
+    // phase-3 re-derive. Pre-unlocked in all `test_state`
+    // constructors so production-shaped tests acquire + drop in one
+    // step. The concurrent-mint race test holds the guard from the
+    // outside across the pk_N injection, forcing the handler to
+    // block here until the injection is visible. Production builds
+    // compile this out entirely (the field does not exist).
+    #[cfg(test)]
+    drop(state.phase3_release_lock.lock().await);
+
     // Build the BIP-340 commitment over the prover's outputs. Sign with
     // the index-N private key — this is the same key the wallet would
     // sign with once `num_pubkeys` advances past N. We do NOT mutate
@@ -982,12 +1020,11 @@ async fn mint_handler(
         Some(&state.pool),
     )
     .await;
-    let commit_txid_bytes: Option<[u8; 32]> = match broadcast_outcome {
-        Ok(Some((commit_txid, _reveal_txid))) => {
+    let commit_txid_bytes: [u8; 32] = match broadcast_outcome {
+        Ok((commit_txid, _reveal_txid)) => {
             use bitcoin::hashes::Hash as _;
-            Some(commit_txid.to_byte_array())
+            commit_txid.to_byte_array()
         }
-        Ok(None) => None,
         Err(err) => {
             eprintln!("Error broadcasting mint inscription: {}", err);
             return handler_error_response(
@@ -1038,6 +1075,16 @@ async fn mint_handler(
     // `reveal_broadcast` and the in-memory state advance was NOT
     // persisted to disk (transaction atomicity); the scanner will
     // replay cleanly.
+    // Test-only deterministic hold between the broadcast result and
+    // the phase-3b state advance. Pre-unlocked in all `test_state`
+    // constructors so production-shaped tests acquire + drop in one
+    // step. The in-process state.update Err test holds the guard
+    // across a colliding SMT injection so the handler observes the
+    // collision when its `state.update` finally runs. Production
+    // builds compile this out entirely (the field does not exist).
+    #[cfg(test)]
+    drop(state.state_advance_release_lock.lock().await);
+
     let state_advance_outcome = {
         let state_arc_for_advance = {
             let account_node_guard = lock_or_recover(&state.account_node);
@@ -1070,56 +1117,43 @@ async fn mint_handler(
             );
         }
     };
-    if let Some(ctxid) = commit_txid_bytes {
-        let root_index_ref = root_index_entry.as_ref().map(|(p, s, i)| (p, s, *i as u64));
-        match db::persist_state_and_mark_complete_tx(
-            &state.pool,
-            &smt_bytes,
-            &mmr_bytes,
-            root_index_ref,
-            &ctxid,
-        )
-        .await
-        {
-            Ok(()) => {
-                println!(
-                    "mint_handler: state.update persisted + row marked complete. New MMR root: {}",
-                    hex::encode(zkcoins_program::hash::digest_to_bytes(&new_root))
-                );
-            }
-            Err(e) => {
-                // The atomic tx rolled back: SMT/MMR/root_index AND
-                // the row advance all stayed at their pre-call values
-                // on disk. The in-memory SMT/MMR HAVE already been
-                // mutated (that happened above before the await), so
-                // they are now ahead of disk by exactly one leaf.
-                // On restart, `State::load_from_pg` returns the
-                // pre-update on-disk state and the scanner-replay path
-                // walks the block, observes the row at
-                // `reveal_broadcast`, and integrates the inscription
-                // itself — a clean heal. Return 503 so the caller
-                // knows the durable state did not advance.
-                eprintln!(
-                    "mint_handler: atomic persist + mark-complete failed: {} (scanner-replay will heal)",
-                    e
-                );
-                return handler_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "mint broadcast landed on chain but durable state advance failed; scanner will reconcile",
-                );
-            }
+    let root_index_ref = root_index_entry.as_ref().map(|(p, s, i)| (p, s, *i as u64));
+    match db::persist_state_and_mark_complete_tx(
+        &state.pool,
+        &smt_bytes,
+        &mmr_bytes,
+        root_index_ref,
+        &commit_txid_bytes,
+    )
+    .await
+    {
+        Ok(()) => {
+            println!(
+                "mint_handler: state.update persisted + row marked complete. New MMR root: {}",
+                hex::encode(zkcoins_program::hash::digest_to_bytes(&new_root))
+            );
         }
-    } else {
-        // No commit_txid: the broadcast path returned Ok(None) (the
-        // test-only `Some(&state.pool)` no-pool branch should not
-        // surface here in production; defensive fallback). The
-        // in-memory state is already advanced; no row to mark complete.
-        // Persist SMT/MMR/root_index alone via a degenerate empty
-        // commit_txid is not meaningful, so just log and continue —
-        // production builds always have a commit_txid on success.
-        eprintln!(
-            "mint_handler: state.update advanced in-memory but no commit_txid available; persist skipped"
-        );
+        Err(e) => {
+            // The atomic tx rolled back: SMT/MMR/root_index AND
+            // the row advance all stayed at their pre-call values
+            // on disk. The in-memory SMT/MMR HAVE already been
+            // mutated (that happened above before the await), so
+            // they are now ahead of disk by exactly one leaf.
+            // On restart, `State::load_from_pg` returns the
+            // pre-update on-disk state and the scanner-replay path
+            // walks the block, observes the row at
+            // `reveal_broadcast`, and integrates the inscription
+            // itself — a clean heal. Return 503 so the caller
+            // knows the durable state did not advance.
+            eprintln!(
+                "mint_handler: atomic persist + mark-complete failed: {} (scanner-replay will heal)",
+                e
+            );
+            return handler_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "mint broadcast landed on chain but durable state advance failed; scanner will reconcile",
+            );
+        }
     }
 
     // ---- 4. COMMIT phase (broadcast OK) ---------------------------------

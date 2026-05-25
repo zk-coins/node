@@ -66,6 +66,8 @@ fn test_state() -> AppState {
             track_tx_timeout: None,
         }),
         phase2_reached: Arc::new(tokio::sync::Notify::new()),
+        phase3_release_lock: Arc::new(tokio::sync::Mutex::new(())),
+        state_advance_release_lock: Arc::new(tokio::sync::Mutex::new(())),
     }
 }
 
@@ -2239,6 +2241,8 @@ async fn send_with_insufficient_funds_returns_422_with_error_string() {
             track_tx_timeout: None,
         }),
         phase2_reached: Arc::new(tokio::sync::Notify::new()),
+        phase3_release_lock: Arc::new(tokio::sync::Mutex::new(())),
+        state_advance_release_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     let secret_bytes = include_bytes!("../minting_secret.bin");
@@ -3533,6 +3537,8 @@ fn mint_test_state() -> AppState {
             track_tx_timeout: None,
         }),
         phase2_reached: Arc::new(tokio::sync::Notify::new()),
+        phase3_release_lock: Arc::new(tokio::sync::Mutex::new(())),
+        state_advance_release_lock: Arc::new(tokio::sync::Mutex::new(())),
     }
 }
 
@@ -3966,30 +3972,36 @@ async fn mint_broadcast_mock_ws() -> String {
                 Ok(s) => s,
                 Err(_) => return,
             };
-            let mut ws = match tokio_tungstenite::accept_async(stream).await {
-                Ok(w) => w,
-                Err(_) => continue,
-            };
-            let first = match ws.next().await {
-                Some(Ok(WsMessage::Text(t))) => t,
-                _ => continue,
-            };
-            let value: serde_json::Value = match serde_json::from_str(&first) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if value.get("action") == Some(&serde_json::json!("track-tx")) {
-                if let Some(txid_str) = value.get("data").and_then(|v| v.as_str()) {
-                    // Documented mempool.space `txPosition` shape;
-                    // see `scanner_ws::frame_signals_tx_seen`.
-                    let frame = format!(
-                        r#"{{"txPosition":{{"txid":"{}","position":{{"block":1,"vsize":120}}}}}}"#,
-                        txid_str
-                    );
-                    let _ = ws.send(WsMessage::Text(frame)).await;
+            // Spawn per-connection so the accept loop continues
+            // immediately and tests issuing multiple sequential mints
+            // (each with its own WS connect) are not serialised behind
+            // the previous connection's 60s keepalive sleep.
+            tokio::spawn(async move {
+                let mut ws = match tokio_tungstenite::accept_async(stream).await {
+                    Ok(w) => w,
+                    Err(_) => return,
+                };
+                let first = match ws.next().await {
+                    Some(Ok(WsMessage::Text(t))) => t,
+                    _ => return,
+                };
+                let value: serde_json::Value = match serde_json::from_str(&first) {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                if value.get("action") == Some(&serde_json::json!("track-tx")) {
+                    if let Some(txid_str) = value.get("data").and_then(|v| v.as_str()) {
+                        // Documented mempool.space `txPosition` shape;
+                        // see `scanner_ws::frame_signals_tx_seen`.
+                        let frame = format!(
+                            r#"{{"txPosition":{{"txid":"{}","position":{{"block":1,"vsize":120}}}}}}"#,
+                            txid_str
+                        );
+                        let _ = ws.send(WsMessage::Text(frame)).await;
+                    }
                 }
-            }
-            let _ = tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let _ = tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            });
         }
     });
     url
@@ -4041,26 +4053,23 @@ async fn mint_broadcast_mock_server() -> wiremock::MockServer {
     mock_server
 }
 
-/// Drives the Err arm of the post-broadcast `db::commit_mint_tx` call
-/// at the tail of `mint_handler`. The broadcast goes through (wiremock
-/// answers the UTXO + tx POSTs), the handler walks past the early
-/// 503 broadcast-failure branch into the commit-tx phase. The pool is
-/// the lazy `dead_pool` that connect-errors on first use, so the
-/// transaction fails to begin and the handler returns
-/// `503 SERVICE_UNAVAILABLE` "Failed to persist mint commit
-/// transaction".
+/// Drives the Err arm of the pre-broadcast `pending_inscriptions`
+/// persist that PR #107 introduced. With the lazy `dead_pool` that
+/// connect-errors on first use, the publisher's
+/// `broadcast_inscription_txs_with_persistence` fails at the very
+/// first DB write (the `constructed`-row INSERT) BEFORE any tx is
+/// broadcast on chain. The publisher wraps the persistence error as
+/// `"persist pending inscription: …"` and the handler maps that to
+/// `503 SERVICE_UNAVAILABLE` "Failed to broadcast mint inscription
+/// on-chain".
 ///
-/// Phase D note: the in-memory minting `Account` and recipient `Account`
-/// HAVE mutated before the failed commit (the Phase-D shape applies
-/// `commit_mint` + `receive_coin` to the live in-memory state before
-/// the DB transaction begins, so the bytes the transaction tries to
-/// upsert come from the LIVE map). A commit failure therefore leaves
-/// memory ahead of DB; the next scanner sweep rehydrates the SMT from
-/// chain and the next mint observes the correct N via
-/// `derive_num_pubkeys_from_smt`. The 503 surface signals to the
-/// client that nothing durable landed.
+/// Contract: with a broken persistence layer, no on-chain commitment
+/// is published and `mint_handler` returns 503 cleanly. Coverage of
+/// the deeper post-broadcast `commit_mint_tx` Err branch is in
+/// `mint_commit_mint_tx_failure_returns_503` below (live pool +
+/// `accounts`-table trigger).
 #[tokio::test]
-async fn mint_commit_tx_failure_returns_503() {
+async fn mint_pending_inscriptions_persist_failure_returns_503() {
     let mock_server = mint_broadcast_mock_server().await;
     let ws_url = mint_broadcast_mock_ws().await;
 
@@ -4090,6 +4099,94 @@ async fn mint_commit_tx_failure_returns_503() {
         status,
         StatusCode::SERVICE_UNAVAILABLE,
         "body: {}",
+        resp_body
+    );
+    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(v["success"], false);
+    assert_eq!(v["error"], "Failed to broadcast mint inscription on-chain");
+}
+
+/// Drives the Err arm of the post-broadcast `db::commit_mint_tx` call
+/// at the tail of `mint_handler` (router.rs ~ "Failed to persist mint
+/// commit transaction"). Uses a live Postgres so the publisher's
+/// pre-broadcast `pending_inscriptions` INSERT, the broadcast itself,
+/// the in-memory `state.update`, and the atomic
+/// `persist_state_and_mark_complete_tx` all succeed; an `accounts`
+/// trigger then raises on the final `INSERT` so `commit_mint_tx`
+/// rolls back. Handler converts to 503.
+///
+/// Coverage: this is the only test exercising the `commit_mint_tx`
+/// Err branch in `mint_handler` post-Phase-E (the dead-pool path
+/// short-circuits earlier — see
+/// `mint_pending_inscriptions_persist_failure_returns_503`).
+#[tokio::test]
+async fn mint_commit_mint_tx_failure_returns_503() {
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container.get_host().await.unwrap();
+    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
+    // Trigger raises on every accounts INSERT, surfacing as
+    // `sqlx::Error::Database` from inside `commit_mint_tx`'s tx.
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION fail_accounts_insert() RETURNS trigger AS $$
+         BEGIN
+             RAISE EXCEPTION 'simulated commit_mint_tx failure';
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&*pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER block_accounts_insert BEFORE INSERT ON accounts \
+         FOR EACH ROW EXECUTE FUNCTION fail_accounts_insert()",
+    )
+    .execute(&*pool)
+    .await
+    .unwrap();
+
+    let mock_server = mint_broadcast_mock_server().await;
+    let ws_url = mint_broadcast_mock_ws().await;
+
+    let mut state = mint_test_state();
+    state.pool = Arc::clone(&pool);
+    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
+        url: mock_server.uri(),
+        is_mainnet: false,
+        network_name: "Mutinynet".to_string(),
+        ws_url: Some(ws_url),
+        track_tx_timeout: None,
+    });
+
+    let recipient_bytes = [12u8; 32];
+    let recipient = "0x".to_string() + &hex::encode(recipient_bytes);
+    let body = serde_json::json!({
+        "account_address": recipient,
+        "amount": 1u64,
+    });
+    let req = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, resp_body) = send_request_with_state(state, req).await;
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "commit_mint_tx failure must surface 503, body: {}",
         resp_body
     );
     let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
@@ -4408,6 +4505,15 @@ async fn mint_handler_concurrent_mint_during_proof_returns_503() {
     use bitcoin::hashes::Hash;
     let state = mint_test_state();
 
+    // Acquire `phase3_release_lock` BEFORE spawning the request. The
+    // handler's `lock().await` between `prepare_mint` and the phase-3
+    // re-derive will BLOCK until this test drops the guard after
+    // injecting `pk_0`. Using a Mutex (vs a Notify with one-permit
+    // semantics) makes this primitive reusable for any number of
+    // sequential mints — production-shaped tests acquire + drop in
+    // one step against the unlocked Mutex.
+    let phase3_guard = state.phase3_release_lock.clone().lock_owned().await;
+
     // Pre-subscribe to the phase-2 notify BEFORE spawning the request
     // so a fast handler that acquires `account_node` and fires
     // `notify_one()` immediately cannot lose the signal. `Notified` is
@@ -4449,10 +4555,10 @@ async fn mint_handler_concurrent_mint_during_proof_returns_503() {
         );
 
     // Insert pk_0's key into the SMT so the phase-3 re-derive returns
-    // 1 instead of the captured `expected_num_pubkeys = 0`. Phase 3
-    // acquires the state lock after the prover finishes; the insert
-    // here lands while phase 2 is running its blocking proof work on
-    // the worker thread.
+    // 1 instead of the captured `expected_num_pubkeys = 0`. The
+    // handler is currently blocked on `state.phase3_release` (drained
+    // above) so phase 3 cannot run before this insert lands, even on
+    // a sub-microsecond prover.
     {
         let pk0 = {
             let mc = state.minting_account.lock().unwrap();
@@ -4468,6 +4574,11 @@ async fn mint_handler_concurrent_mint_during_proof_returns_503() {
             .insert(key, zkcoins_program::hash::digest_from_bytes(&[2u8; 32]))
             .expect("inject pk_0 into SMT");
     }
+
+    // Release the handler from the phase3_release hold. It now runs
+    // the phase-3 re-derive against the just-mutated SMT, observes
+    // the bumped count, and returns 503 "Concurrent mint detected".
+    drop(phase3_guard);
 
     let (status, resp_body) =
         tokio::time::timeout(std::time::Duration::from_secs(60), request_task)
@@ -4805,6 +4916,205 @@ async fn mint_handler_atomic_tx_rollback_leaves_state_and_row_consistent() {
         .execute(&*pool)
         .await
         .unwrap();
+}
+
+/// Phase E in-process state.update Err coverage: if the SMT already
+/// contains the mint's signing pubkey under a DIFFERENT value when
+/// `update_and_snapshot_for_persist` runs (a concurrent-mint race that
+/// slipped both phase-2 gates, or a genuine bug), the handler must
+/// return 503 with the documented "in-process state advance failed"
+/// reason. The broadcast already landed on chain at this point, so the
+/// publisher has advanced the row to `reveal_broadcast`; the scanner-
+/// replay path picks the inscription up from chain on its next sweep.
+///
+/// Mechanism: hold `state_advance_release_lock` BEFORE spawning the
+/// request so the handler blocks AFTER the broadcast and BEFORE
+/// acquiring the state lock for `update_and_snapshot_for_persist`. Mid-
+/// hold, inject `pk_0`'s key into the SMT with a bogus value. Drop the
+/// guard — the handler resumes, the SMT `insert` returns
+/// `"Key already exists in the tree with different value"`, and the
+/// match arm at the top of phase 3b surfaces 503.
+///
+/// Asserts:
+///   - response is 503 with the expected error message
+///   - the pending_inscriptions row stays at `reveal_broadcast`
+///   - the on-disk SMT/MMR/root_index DID NOT advance (no atomic
+///     persist tx ran for this mint)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mint_handler_in_process_state_advance_collision_returns_503() {
+    use bitcoin::hashes::Hash;
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container.get_host().await.unwrap();
+    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
+    let mock_server = mint_broadcast_mock_server().await;
+    let ws_url = mint_broadcast_mock_ws().await;
+
+    let mut state = mint_test_state();
+    state.pool = Arc::clone(&pool);
+    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
+        url: mock_server.uri(),
+        is_mainnet: false,
+        network_name: "Mutinynet".to_string(),
+        ws_url: Some(ws_url),
+        track_tx_timeout: None,
+    });
+
+    // Hold the state-advance release lock so the handler will block
+    // after broadcast and before `update_and_snapshot_for_persist`.
+    let advance_guard = state.state_advance_release_lock.clone().lock_owned().await;
+
+    let recipient = "0x".to_string() + &hex::encode([12u8; 32]);
+    let body = serde_json::json!({
+        "account_address": recipient,
+        "amount": 1u64,
+    });
+    let req = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+
+    let state_for_request = state.clone();
+    let request_task =
+        tokio::spawn(async move { send_request_with_state(state_for_request, req).await });
+
+    // Wait until the publisher has advanced the row to
+    // `reveal_broadcast` — that is the observable signal that the
+    // broadcast has landed and the handler is now blocked on the
+    // state_advance_release_lock. Polling avoids races with the
+    // publisher's WS handshake; a hard timeout guards against a
+    // regression that would otherwise hang for the full CI budget.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let commit_txid_bytes: Vec<u8> = loop {
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "publisher did not advance any pending row to `reveal_broadcast` within 60s; \
+                 regression in mint_handler broadcast phase"
+            );
+        }
+        let row: Option<(Vec<u8>, String)> = sqlx::query_as(
+            "SELECT commit_txid, status FROM pending_inscriptions ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_optional(&*pool)
+        .await
+        .unwrap();
+        if let Some((ctxid, status)) = row {
+            if status == crate::db::PENDING_STATUS_REVEAL_BROADCAST {
+                break ctxid;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+
+    // Inject pk_0's key into the SMT with a value that will NOT match
+    // what `update_and_snapshot_for_persist` is about to write. The
+    // handler is currently blocked on the state_advance_release_lock
+    // (drained above) so its SMT mutation cannot run before this
+    // injection lands.
+    {
+        let pk0 = {
+            let mc = state.minting_account.lock().unwrap();
+            mc.generate_public_key(0)
+        };
+        let key: [u8; 32] = bitcoin::hashes::sha256::Hash::hash(&pk0.serialize()).to_byte_array();
+        let node_guard = state.account_node.lock().unwrap();
+        let state_arc = node_guard.state().clone();
+        drop(node_guard);
+        let mut state_guard = state_arc.lock().unwrap();
+        // A digest that does NOT match the legitimate
+        // `commitment.get_account_state_hash()` the handler will derive.
+        state_guard
+            .smt
+            .insert(key, zkcoins_program::hash::digest_from_bytes(&[0xAAu8; 32]))
+            .expect("inject pk_0 -> bogus value into SMT");
+    }
+
+    // Release the handler. It now runs `update_and_snapshot_for_persist`,
+    // the SMT insert at pk_0 errors with "Key already exists in the
+    // tree with different value", and the handler returns 503.
+    drop(advance_guard);
+
+    let (status, resp_body) =
+        tokio::time::timeout(std::time::Duration::from_secs(60), request_task)
+            .await
+            .expect("mint request must complete within 60s")
+            .expect("request task panicked");
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "in-process state.update collision must surface 503, body: {}",
+        resp_body
+    );
+    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(v["success"], false);
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("in-process state advance failed"),
+        "response error must explain the in-process collision failure mode, got: {}",
+        v["error"]
+    );
+
+    // The pending row stays at `reveal_broadcast`: the publisher set it
+    // there before the broadcast and the handler bailed before the
+    // atomic persist + mark-complete tx could run.
+    let (pending_status,): (String,) =
+        sqlx::query_as("SELECT status FROM pending_inscriptions WHERE commit_txid = $1")
+            .bind(&commit_txid_bytes)
+            .fetch_one(&*pool)
+            .await
+            .expect("the broadcasted commitment's row must exist");
+    assert_eq!(
+        pending_status,
+        crate::db::PENDING_STATUS_REVEAL_BROADCAST,
+        "in-process collision: pending row must stay at reveal_broadcast for scanner-replay to pick up"
+    );
+
+    // On-disk SMT/MMR/root_index did NOT advance — the handler bailed
+    // before invoking the atomic persist + mark-complete transaction.
+    assert_eq!(
+        crate::db::load_smt(&pool).await.unwrap(),
+        None,
+        "in-process collision must leave smt_state untouched"
+    );
+    assert_eq!(
+        crate::db::load_mmr(&pool).await.unwrap(),
+        None,
+        "in-process collision must leave mmr_state untouched"
+    );
+    assert!(
+        crate::db::load_root_indices(&pool)
+            .await
+            .unwrap()
+            .is_empty(),
+        "in-process collision must leave mmr_root_index untouched"
+    );
+
+    // Scanner-replay path stays armed (row not at `complete`).
+    assert!(
+        !crate::scanner::should_skip_scanner_state_update(
+            crate::db::pending_inscription_status_by_commit_txid(&pool, &commit_txid_bytes)
+                .await
+                .unwrap()
+                .as_deref()
+        ),
+        "scanner must NOT skip its state.update for an inscription whose in-process advance failed"
+    );
 }
 
 /// Phase E concurrent-mint coverage: two `/api/mint` requests with
