@@ -187,6 +187,15 @@ jobs:
       # local disk and survives between jobs — the speedup is biggest
       # for PR pushes that re-touch the same dependency set.
       RUSTC_WRAPPER: sccache
+      # Bump cache cap above sccache's 10-GiB default. The cache is
+      # user-level (~/Library/Caches/Mozilla.sccache) and shared by every
+      # m3-ultra runner on the host; with 3+ parallel runners the 10-GiB
+      # default thrashed — writes from one runner evicted hits another
+      # runner had not consumed yet. 50 GiB fits the current working set
+      # with room to grow; the host has >600 GiB free disk. The server
+      # only reads SCCACHE_CACHE_SIZE at start, so the install step below
+      # restarts it when the running cap differs from this value.
+      SCCACHE_CACHE_SIZE: "50G"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -207,10 +216,18 @@ jobs:
       # where they already exist is a no-op. Start sccache's server
       # explicitly so the first compile step has a warm cache daemon
       # and print stats up-front for visibility in the run log.
+      #
+      # If a server is already running with a different cap than the
+      # requested SCCACHE_CACHE_SIZE (e.g. carried over from a previous
+      # workflow version), stop it so the next --start-server picks up
+      # the new env value. The on-disk cache files survive the restart.
       - name: Ensure sccache + cargo-nextest are installed
         run: |
           command -v sccache >/dev/null || brew install sccache
           command -v cargo-nextest >/dev/null || brew install cargo-nextest
+          if ! sccache --show-stats 2>/dev/null | grep -qE "Max cache size +50 GiB"; then
+            sccache --stop-server >/dev/null 2>&1 || true
+          fi
           sccache --start-server >/dev/null 2>&1 || true
           sccache --show-stats
 
@@ -265,6 +282,8 @@ jobs:
       # Same sccache wrapper as `node-tests`; reuses the same on-disk
       # cache populated by the previous job in the same workflow run.
       RUSTC_WRAPPER: sccache
+      # See `node-tests` env block above for the 50-GiB rationale.
+      SCCACHE_CACHE_SIZE: "50G"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -273,11 +292,15 @@ jobs:
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       # Same install gate as `node-tests`. Idempotent: no-op on a
-      # warm runner where both tools already exist.
+      # warm runner where both tools already exist. See `node-tests`
+      # for why we conditionally restart the sccache server.
       - name: Ensure sccache + cargo-nextest are installed
         run: |
           command -v sccache >/dev/null || brew install sccache
           command -v cargo-nextest >/dev/null || brew install cargo-nextest
+          if ! sccache --show-stats 2>/dev/null | grep -qE "Max cache size +50 GiB"; then
+            sccache --stop-server >/dev/null 2>&1 || true
+          fi
           sccache --start-server >/dev/null 2>&1 || true
           sccache --show-stats
 
