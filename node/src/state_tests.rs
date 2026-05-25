@@ -1,8 +1,5 @@
 use super::*;
-use crate::db::{
-    connect_and_migrate, insert_root_index, load_root_indices, persist_state_tx,
-    upsert_root_indices,
-};
+use crate::db::{connect_and_migrate, insert_root_index, load_root_indices, persist_state_tx};
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
 use sqlx::PgPool;
@@ -649,46 +646,6 @@ async fn test_get_mmr_inclusion_proof_after_restart_succeeds() {
             "restored proof must verify against the loaded MMR root (entry {})",
             i
         );
-    }
-}
-
-#[tokio::test]
-async fn test_upsert_root_indices_batch_path_idempotent() {
-    // Exercise the batch helper (used by future snapshot-serialization
-    // tooling). Two invocations of the same batch must be idempotent
-    // thanks to ON CONFLICT DO NOTHING, and the empty-slice early-return
-    // must also be a no-op. Coverage gate (Phase C) requires every
-    // branch of the helper to be hit.
-    let (pool, _container) = setup_pool().await;
-
-    // Empty batch — early return.
-    upsert_root_indices(&pool, &[]).await.expect("empty batch");
-    assert!(load_root_indices(&pool).await.unwrap().is_empty());
-
-    // Non-empty batch — write three rows, then write the same three
-    // rows again. Second pass must not duplicate, must not error.
-    let entries: Vec<(HashDigest, HashDigest, u64)> = (0..3)
-        .map(|i| {
-            (
-                digest_from_bytes(&[i as u8; 32]),
-                digest_from_bytes(&[(i + 100) as u8; 32]),
-                i as u64,
-            )
-        })
-        .collect();
-    upsert_root_indices(&pool, &entries)
-        .await
-        .expect("first upsert");
-    upsert_root_indices(&pool, &entries)
-        .await
-        .expect("second upsert (idempotent)");
-    let loaded = load_root_indices(&pool).await.expect("load");
-    assert_eq!(loaded.len(), 3);
-    // ORDER BY leaf_index — should match insertion order here.
-    for (i, (prev, smt, idx)) in loaded.iter().enumerate() {
-        assert_eq!(*prev, entries[i].0);
-        assert_eq!(*smt, entries[i].1);
-        assert_eq!(*idx, entries[i].2);
     }
 }
 

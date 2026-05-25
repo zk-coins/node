@@ -575,45 +575,6 @@ pub async fn insert_root_index(
     Ok(())
 }
 
-/// Bulk-insert path for callers that already hold a batch of entries —
-/// e.g. a future snapshot-serialization tool that rebuilds the table
-/// from a full `State` dump. Uses the same `ON CONFLICT DO NOTHING`
-/// shape as [`insert_root_index`], so an interrupted batch can be
-/// safely re-run.
-///
-/// All rows are inserted in a single transaction; either every fresh
-/// `prev_mmr_root` lands or none do. Existing rows are left untouched
-/// by the conflict clause.
-pub async fn upsert_root_indices(
-    pool: &PgPool,
-    entries: &[(HashDigest, HashDigest, u64)],
-) -> Result<(), sqlx::Error> {
-    if entries.is_empty() {
-        return Ok(());
-    }
-    let mut tx = pool.begin().await?;
-    for (prev_root, smt_root, leaf_index) in entries {
-        let prev_bytes = digest_to_bytes(prev_root);
-        let smt_bytes = digest_to_bytes(smt_root);
-        let leaf_i64 = i64::try_from(*leaf_index).map_err(|_| {
-            sqlx::Error::Encode(
-                format!("leaf_index {} does not fit in i64 (BIGINT)", leaf_index).into(),
-            )
-        })?;
-        sqlx::query(
-            "INSERT INTO mmr_root_index (prev_mmr_root, smt_root, leaf_index, created_at) \
-             VALUES ($1, $2, $3, NOW()) \
-             ON CONFLICT (prev_mmr_root) DO NOTHING",
-        )
-        .bind(&prev_bytes[..])
-        .bind(&smt_bytes[..])
-        .bind(leaf_i64)
-        .execute(&mut *tx)
-        .await?;
-    }
-    tx.commit().await
-}
-
 /// Load every `(prev_mmr_root, smt_root, leaf_index)` row from the
 /// `mmr_root_index` table, ordered by `leaf_index` so the caller can
 /// rebuild the in-memory map deterministically (and so the highest
