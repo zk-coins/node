@@ -21,9 +21,13 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// Default publisher key used in `main.rs`. Tests use it to produce
-/// deterministic Taproot addresses and signatures.
-const TEST_PUBLISHER_KEY: &str = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+/// Test publisher key used to produce deterministic Taproot addresses
+/// and signatures. The production `PUBLISHER_KEY` is now a required env
+/// var with no default (see `lib.rs`); this constant is a local
+/// test-only placeholder passed directly into `inscription_txs` and
+/// never reaches the global `crate::PUBLISHER_KEY` resolution. Matches
+/// the CI test value in `.github/workflows/ci.yaml`.
+const TEST_PUBLISHER_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 
 fn test_publisher_address(network: Network) -> Address {
     let secp = Secp256k1::new();

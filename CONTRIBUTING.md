@@ -474,15 +474,40 @@ for the historical pickup record.
 
 ## Environment Variables
 
+The node reads its configuration exclusively from environment variables;
+no `.env` file is loaded by the process. The table below covers every
+variable the server actually reads (`node/src/lib.rs`, `runtime.rs`,
+`scanner_ws.rs`, `publisher.rs`). Required variables panic the bootstrap
+on startup if unset — there is no silent fallback.
+
 | Variable | Default | Description |
 |---|---|---|
-| `ESPLORA_URL` | `https://mutinynet.com/api` | Esplora REST API endpoint (electrs or public) |
-| `ESPLORA_WS_URL` | `wss://mutinynet.com/api/v1/ws` | Esplora WebSocket endpoint consumed by `scanner_ws` (issue #84). DEV/PRD override only when the upstream WS path changes |
-| `IS_MAINNET` | `false` | `true` for Bitcoin Mainnet, `false` for Mutinynet/Signet |
-| `NETWORK_NAME` | `Mutinynet` / `Mainnet` | Human-readable name returned by `/api/info` |
-| `USERNAME_DOMAIN` | _(required, no default)_ | External hostname returned by `/api/info`; server panics on startup if unset (see PR [#36](https://github.com/zk-coins/node/pull/36) for the regression that introduced the global panic hook) |
-| `PUBLISHER_KEY` | test key | 32-byte hex private key for inscription publishing. **Required on mainnet** |
-| `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
+| `DATABASE_URL` | _(required, no default)_ | Postgres connection string for the state-layer (e.g. `postgresql://zkcoins:<pw>@postgres:5432/zkcoins`). Server panics on startup if unset. |
+| `PUBLISHER_KEY` | _(required, no default)_ | 32-byte hex private key for Taproot inscription publishing. **Required on every network — DEV, signet, and mainnet.** No fallback default exists: the previous `1234…` placeholder was a publicly-known test key that drainer bots swept within minutes of any on-chain top-up (4 historical drains confirmed). Server panics on startup if unset. Generate locally via `openssl rand -hex 32`. In any deployed environment, source it from your secret manager — **never commit a real key**. |
+| `USERNAME_DOMAIN` | _(required, no default)_ | External hostname returned by `/api/info`; server panics on startup if unset (see PR [#36](https://github.com/zk-coins/node/pull/36) for the regression that introduced the global panic hook). |
+| `POSTGRES_PASSWORD` | _(required, no default for the DB container)_ | Read by the Postgres container, not by the node process itself; the node's `DATABASE_URL` already embeds the password. Listed here because it is part of the local-dev bootstrap (see `Local Development with Postgres` below). |
+| `ESPLORA_URL` | `https://mutinynet.com/api` | Esplora REST API endpoint (electrs or public). |
+| `ESPLORA_WS_URL` | `wss://mutinynet.com/api/v1/ws` | Esplora WebSocket endpoint consumed by `scanner_ws` (issue #84). DEV/PRD override only when the upstream WS path changes. |
+| `IS_MAINNET` | `false` | `true` for Bitcoin Mainnet, `false` for Mutinynet/Signet. |
+| `NETWORK_NAME` | `Mutinynet` / `Mainnet` | Human-readable name returned by `/api/info`. |
+| `PROOFS_DIR` | `./proofs` | Directory for per-proof bincode files (see `Persistent State` below). |
+| `SCANNER_INITIAL_SETTLE_TIMEOUT_MS` | (runtime-defined) | Override for the scanner's initial-settle deadline; see `runtime.rs`. |
+| `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`). |
+
+### Minimal local-dev env
+
+```bash
+export DATABASE_URL="postgresql://postgres:dev@localhost:5432/postgres"
+export PUBLISHER_KEY="$(openssl rand -hex 32)"
+export USERNAME_DOMAIN="test.zkcoins.local"
+# Optional — defaults are fine for Mutinynet:
+# export ESPLORA_URL="https://mutinynet.com/api"
+# export IS_MAINNET="false"
+cargo run -p node
+```
+
+For any deployed environment, the real values live in your secret manager
+of choice and are passed into the node container as env vars at startup.
 
 ## Docker
 
