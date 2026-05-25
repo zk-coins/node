@@ -54,7 +54,7 @@ concurrency:
   # the Heavy run for them would be a footgun. Trade-off: removing
   # `ci:full` mid-run does NOT auto-stop a Heavy run that is already
   # executing; cancel it manually with `gh run cancel` if you really
-  # need to free the runner.
+  # need to free an agent.
   group: >-
     ${{
       (github.event.action == 'labeled' || github.event.action == 'unlabeled')
@@ -177,12 +177,12 @@ jobs:
       # check non-empty + shape).
       USERNAME_DOMAIN: test.zkcoins.local
       # `db_tests` use the `testcontainers` crate, which talks to the local
-      # Docker daemon. The M3 Ultra runner on dfx01 runs Colima (not
-      # Docker Desktop), whose socket lives under the runner user's home
-      # directory. `testcontainers` defaults to `/var/run/docker.sock`,
-      # which does not exist on Colima, so we point it at the real socket
-      # — same value the `docker info` step picks up implicitly via the
-      # default `docker` context.
+      # Docker daemon. dfx01 runs Colima (not Docker Desktop), whose
+      # socket lives under the runner user's home directory.
+      # `testcontainers` defaults to `/var/run/docker.sock`, which does
+      # not exist on Colima, so we point it at the real socket — same
+      # value the `docker info` step picks up implicitly via the default
+      # `docker` context.
       DOCKER_HOST: unix:///Users/dfx01/.colima/default/docker.sock
       # `sccache` wraps `rustc` and caches compiled crates across CI
       # runs. The M3 Ultra runner agents are self-hosted, so the cache
@@ -191,11 +191,11 @@ jobs:
       RUSTC_WRAPPER: sccache
       # Bump cache cap above sccache's 10-GiB default. The cache is
       # user-level (~/Library/Caches/Mozilla.sccache) and shared by every
-      # m3-ultra runner on the host; with 3+ parallel runners the 10-GiB
-      # default thrashed — writes from one runner evicted hits another
-      # runner had not consumed yet. 50 GiB fits the current working set
-      # with room to grow; the host has >600 GiB free disk. The server
-      # only reads SCCACHE_CACHE_SIZE at start, so the install step below
+      # m3-ultra agent on the host; with 3+ parallel agents the 10-GiB
+      # default thrashed — writes from one agent evicted hits another
+      # had not consumed yet. 50 GiB fits the current working set with
+      # room to grow; the host has >600 GiB free disk. The server only
+      # reads SCCACHE_CACHE_SIZE at start, so the install step below
       # restarts it when the running cap differs from this value.
       SCCACHE_CACHE_SIZE: "50G"
     steps:
@@ -242,7 +242,7 @@ jobs:
         run: docker info > /dev/null
 
       # `cargo nextest` replaces `cargo test`: process-per-test isolation
-      # plus smart scheduling (slow tests start first). `--test-threads=1`
+      # plus smart scheduling (slow tests start first). `--test-threads 1`
       # is preserved — the repo invariant is that tests run serially to
       # avoid testcontainers port races and shared-state pollution.
       # `api_remote` is the live-DEV-server verification integration test
@@ -274,12 +274,12 @@ jobs:
       ESPLORA_URL: http://127.0.0.1:1/api
       USERNAME_DOMAIN: test.zkcoins.local
       # `db_tests` use the `testcontainers` crate, which talks to the local
-      # Docker daemon. The M3 Ultra runner on dfx01 runs Colima (not
-      # Docker Desktop), whose socket lives under the runner user's home
-      # directory. `testcontainers` defaults to `/var/run/docker.sock`,
-      # which does not exist on Colima, so we point it at the real socket
-      # — same value the `docker info` step picks up implicitly via the
-      # default `docker` context.
+      # Docker daemon. dfx01 runs Colima (not Docker Desktop), whose
+      # socket lives under the runner user's home directory.
+      # `testcontainers` defaults to `/var/run/docker.sock`, which does
+      # not exist on Colima, so we point it at the real socket — same
+      # value the `docker info` step picks up implicitly via the default
+      # `docker` context.
       DOCKER_HOST: unix:///Users/dfx01/.colima/default/docker.sock
       # Same sccache wrapper as `node-tests`; reuses the same on-disk
       # cache populated by the previous job in the same workflow run.

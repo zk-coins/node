@@ -326,16 +326,18 @@ ssh "$RUNNER_HOST" 'for d in ~/actions-runner-*; do rm -rf "$d/_work/node/node/t
 Each PR exercises 2 Heavy jobs (`node-tests` + `coverage`), so the
 6-agent pool saturates at 3 concurrent PRs (3 PRs × 2 jobs = 6
 agents). The snapshot below was captured on 2026-05-25 with 3 Heavy
-jobs running concurrently (the pre-expansion 3-runner topology), and
-the saturated-forecast column linearly projects to 6:
+jobs running concurrently (the pre-expansion 3-runner topology); the
+saturated-forecast column projects linearly to 6 jobs, except App
+memory which clamps at the host's 96 GB ceiling as inactive cache
+pages get reclaimed under pressure:
 
-| Metric                                | 3 jobs running (snapshot 2026-05-25) | 6 jobs running (saturated, forecast) |
-|---------------------------------------|--------------------------------------|--------------------------------------|
-| `cargo` test process RSS              | ~14 GB total                         | ~29 GB total                         |
-| App memory (RSS + reclaimable cache)  | ~85 GB peak                          | ~95 GB peak                          |
-| Swap used                             | 0 MB                                 | 0 MB expected                        |
-| CPU cores in use                      | 3 of 28                              | 6 of 28                              |
-| sccache cache (host-wide, shared)     | 50 GiB cap, ~3 GiB live              | 50 GiB cap                           |
+| Metric                                       | 3 jobs running (snapshot 2026-05-25) | 6 jobs running (saturated, forecast) |
+|----------------------------------------------|--------------------------------------|--------------------------------------|
+| `cargo` test process RSS                     | ~14 GB total                         | ~29 GB total                         |
+| App memory (RSS + reclaimable cache)         | ~85 GB peak                          | ~95 GB peak (cache-bound)            |
+| Swap used                                    | 0 MB                                 | 0 MB expected                        |
+| Active test processes (`--test-threads 1`)   | 3                                    | 6 (saturated)                        |
+| sccache cache (host-wide, shared)            | 50 GiB cap, ~3 GiB live              | 50 GiB cap                           |
 
 Tests run with `--test-threads 1`, so each agent has one in-flight
 test process at a time. A 4th PR carrying `ci:full` queues until an
@@ -354,7 +356,7 @@ pressure becomes an issue.
 
 ## Tracking
 
-The runner is a launchd service on the runner host, not a Docker
-container, so it does not fit the `status-server.py`
-container-tracking convention. Track it via the GitHub UI runner page
-instead.
+Each agent is a launchd service on the host, not a Docker container,
+so the pool does not fit the `status-server.py` container-tracking
+convention. Track agents via the GitHub UI runner page instead, or
+`gh api repos/zk-coins/node/actions/runners`.
