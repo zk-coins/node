@@ -43,14 +43,14 @@ ingestion brings that down to the WS round-trip.
 
 Where it applies:
 
-- `server/src/scanner.rs` — pure inscription parsing, no polling.
-- `server/src/scanner_runtime.rs` — block-walk loop, drains the WS-fed channel.
-- `server/src/scanner_ws.rs` — WS subscriber + reconnect-with-backoff.
-- `server/src/scanner_ws_parse.rs` — pure WS frame parsers.
-- `server/src/publisher.rs` — `track-tx` wait between commit and reveal.
+- `node/src/scanner.rs` — pure inscription parsing, no polling.
+- `node/src/scanner_runtime.rs` — block-walk loop, drains the WS-fed channel.
+- `node/src/scanner_ws.rs` — WS subscriber + reconnect-with-backoff.
+- `node/src/scanner_ws_parse.rs` — pure WS frame parsers.
+- `node/src/publisher.rs` — `track-tx` wait between commit and reveal.
 
 Where it does NOT apply: integration tests
-(`server/tests/api_remote.rs`), health-readiness probes, and any
+(`node/tests/api_remote.rs`), health-readiness probes, and any
 self-host operator code outside the four files above.
 
 CI enforces this with a `grep` step inside the `Lint & Build` job in
@@ -58,11 +58,11 @@ CI enforces this with a `grep` step inside the `Lint & Build` job in
 
 ```bash
 grep -rEn 'tokio::time::(sleep|sleep_until|interval)|std::thread::sleep' \
-  server/src/scanner.rs \
-  server/src/scanner_runtime.rs \
-  server/src/scanner_ws.rs \
-  server/src/scanner_ws_parse.rs \
-  server/src/publisher.rs \
+  node/src/scanner.rs \
+  node/src/scanner_runtime.rs \
+  node/src/scanner_ws.rs \
+  node/src/scanner_ws_parse.rs \
+  node/src/publisher.rs \
   | grep -v 'scanner-polling-ok:'
 ```
 
@@ -259,10 +259,10 @@ sqlx migrate run
 Run the `db_tests` (Docker required, runs `postgres:17` per test):
 
 ```bash
-cargo test -p server db -- --test-threads=1
+cargo test -p node db -- --test-threads=1
 ```
 
-The schema lives in `server/migrations/0001_initial.sql`. After
+The schema lives in `node/migrations/0001_initial.sql`. After
 changing it, drop the local database (`docker rm -f zkcoins-pg`) and
 re-run `sqlx migrate run` against a fresh instance — there is no
 `down` migration in the MVP, the migration set is forward-only.
@@ -499,7 +499,7 @@ Docker builds use nightly Rust auto-installed via the workspace `rust-toolchain`
 
 ## Persistent State
 
-After the PR-A1/PR-A2/PR-A3 Postgres migration series, all persistent server state lives in a Postgres 17 database (`DATABASE_URL` env var). The only on-disk state remaining is the per-proof file store. The state-layer schema (`server/migrations/*.sql`) is applied idempotently on every boot by `db::connect_and_migrate`.
+After the PR-A1/PR-A2/PR-A3 Postgres migration series, all persistent server state lives in a Postgres 17 database (`DATABASE_URL` env var). The only on-disk state remaining is the per-proof file store. The state-layer schema (`node/migrations/*.sql`) is applied idempotently on every boot by `db::connect_and_migrate`.
 
 | Location                                | Format                                                     | Purpose                                                                                                                                                                                                                                                                          |
 | --------------------------------------- | ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -547,7 +547,7 @@ See [docs.zkcoins.app/infrastructure/backend](https://docs.zkcoins.app/infrastru
 | Workflow | Trigger | Action |
 |---|---|---|
 | `ci.yaml` (Lint & Build) | Ready PR → develop, push to develop | `cargo fmt --check`, clippy (MVP + all-features + program lib), build (MVP + all-features) on `ubuntu-latest`. |
-| `ci.yaml` (Server + Shared Tests) | Ready PR → develop with `ci:full` label, push to develop | `cargo test -p server -p shared --release --all-features` on a self-hosted M3 Ultra runner (issue #40). |
+| `ci.yaml` (Server + Shared Tests) | Ready PR → develop with `ci:full` label, push to develop | `cargo test -p node -p shared --release --all-features` on a self-hosted M3 Ultra runner (issue #40). |
 | `ci.yaml` (Coverage Gate) | Ready PR → develop with `ci:full` label, push to develop | `cargo llvm-cov` with the 100% line + function gate, MVP scope, on the same self-hosted runner. |
 | `deploy-dev.yaml` | Push to develop | Docker build (ARM64) → push `zkcoins/node:beta` → deploy to DEV |
 | `deploy-prd.yaml` | Push to main | Docker build (ARM64) → push `zkcoins/node:latest` → deploy to PRD |

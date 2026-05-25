@@ -69,19 +69,19 @@ API endpoints, background services, their activation status, and the tests that 
 
 | Function                             | Trigger                               | Status                   | Triage  | Tests                         |
 | ------------------------------------ | ------------------------------------- | ------------------------ | ------- | ----------------------------- |
-| Health check                         | `GET /health`                         | always                   | mvp     | 100% (server)                  |
-| Network info                         | `GET /api/info`                       | env¹                     | mvp     | 100% (server)                  |
-| Get balance                          | `GET /api/balance?address=<hex>`      | always                   | mvp     | 100% (server)                  |
-| List all addresses                   | `GET /api/address`                    | feature (`address-list`) | gate    | 100% (server)                  |
+| Health check                         | `GET /health`                         | always                   | mvp     | 100% (router)                  |
+| Network info                         | `GET /api/info`                       | env¹                     | mvp     | 100% (router)                  |
+| Get balance                          | `GET /api/balance?address=<hex>`      | always                   | mvp     | 100% (router)                  |
+| List all addresses                   | `GET /api/address`                    | feature (`address-list`) | gate    | 100% (router)                  |
 | Mint coins (single-phase)            | `POST /api/mint`                      | always²                  | mvp     | 100% (account_node)                 |
-| Send — phase 1 (generate proof)      | `POST /api/send`                      | env²                     | mvp     | 100% (server)                  |
-| Send — phase 2 (commit + broadcast)  | `POST /api/commit`                    | env³                     | mvp     | 100% (server) · 0% (publisher) |
+| Send — phase 1 (generate proof)      | `POST /api/send`                      | env²                     | mvp     | 100% (router)                  |
+| Send — phase 2 (commit + broadcast)  | `POST /api/commit`                    | env³                     | mvp     | 100% (router) · 0% (publisher) |
 | Receive coin                         | `POST /api/receive`                   | always                   | mvp     | 100% (account_node)                 |
-| Download coin proof                  | `GET /api/proof/:id`                  | always                   | mvp     | 100% (server)                  |
+| Download coin proof                  | `GET /api/proof/:id`                  | always                   | mvp     | 100% (router)                  |
 | Claim username                       | `POST /api/username/claim`            | always                   | mvp     | 100% (username)                |
 | Resolve username                     | `GET /api/username/resolve/:username` | always                   | mvp     | 100% (username)                |
-| LNURL-Pay metadata                   | `GET /.well-known/lnurlp/:username`   | feature (`lnurl`)        | gate    | 100% (server)                  |
-| LNURL-Pay callback                   | `GET /lnurl/pay/:username`            | feature (`lnurl`)        | gate    | 100% (server)                  |
+| LNURL-Pay metadata                   | `GET /.well-known/lnurlp/:username`   | feature (`lnurl`)        | gate    | 100% (router)                  |
+| LNURL-Pay callback                   | `GET /lnurl/pay/:username`            | feature (`lnurl`)        | gate    | 100% (router)                  |
 | Bitcoin block scanner (background)   | WS subscription in `scanner_ws.rs`    | env⁴                     | mvp     | 100% (scanner) · — (main, excluded) |
 | State persistence (SMT/MMR write)    | Scanner callback on commitment match  | always                   | mvp     | 100% (state)                   |
 | Taproot inscription broadcast        | Called by `/api/commit`               | env³                     | mvp     | 0% (publisher)                |
@@ -103,7 +103,7 @@ All non-MVP routes are gated by Cargo features so the disabled handler functions
 | `address-list` | `GET /api/address`                                                                                                                                    |
 | `lnurl`        | `GET /.well-known/lnurlp/:u`, `GET /lnurl/pay/:u`                                                                                                     |
 
-Build the MVP-only binary (DEV + PRD ship this): `cargo build --release -p server`. Build with every feature enabled (CI clippy + tests + self-host opt-in): `cargo build --release -p server --all-features`. The Docker `FEATURES` build arg accepts a comma-separated list and is forwarded to `cargo build --features`; both `deploy-dev.yaml` and `deploy-prd.yaml` leave it empty.
+Build the MVP-only binary (DEV + PRD ship this): `cargo build --release -p server`. Build with every feature enabled (CI clippy + tests + self-host opt-in): `cargo build --release -p node --all-features`. The Docker `FEATURES` build arg accepts a comma-separated list and is forwarded to `cargo build --features`; both `deploy-dev.yaml` and `deploy-prd.yaml` leave it empty.
 
 ### Triage gaps
 
@@ -231,15 +231,15 @@ Runtime config above shapes _behaviour_ of compiled-in routes. _Which_ routes ar
 
 Spawned from `main.rs::main`:
 
-1. **REST server** (`tokio::spawn` of `start_rest_server`) — Axum app bound to `0.0.0.0:4242`
+1. **REST server** (`tokio::spawn` of `start_rest_node`) — Axum app bound to `0.0.0.0:4242`
 2. **Block scanner** (driven directly in main, not spawned) — `scan_for_inscriptions` consumes new tips from the WS-fed `mpsc<BlockHash>` channel produced by `scanner_ws::run_scanner_ws` (spawned as a tokio task at startup) and writes state on each verified commitment. No fixed-interval polling — see [issue #84](https://github.com/zk-coins/node/issues/84)
 
 ### Tests
 
 | Stack            | Command                                       | What it covers                                                                                             |
 | ---------------- | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `cargo test`     | `cargo test -p server`                        | MVP code paths — what the DEV + PRD binary actually contains                                               |
-| `cargo test`     | `cargo test -p server --all-features`         | Including the gated `address-list` and `lnurl` routes                                                      |
+| `cargo test`     | `cargo test -p node`                        | MVP code paths — what the DEV + PRD binary actually contains                                               |
+| `cargo test`     | `cargo test -p node --all-features`         | Including the gated `address-list` and `lnurl` routes                                                      |
 | `cargo-llvm-cov` | `cargo llvm-cov -p server`                    | Coverage gate enforced by CI: 100% lines + functions on the activated MVP surface                          |
 
 Per-module coverage (CI-gated):

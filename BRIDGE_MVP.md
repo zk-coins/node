@@ -439,8 +439,8 @@ burn records, and pending payouts.
 
 | File | Change |
 | ---- | ------ |
-| `server/src/state.rs` | Add 3 new fields, persist/load, expose query methods |
-| `server/src/state_tests.rs` | Tests for new state operations |
+| `node/src/state.rs` | Add 3 new fields, persist/load, expose query methods |
+| `node/src/state_tests.rs` | Tests for new state operations |
 
 ### 6.3 New fields
 
@@ -478,7 +478,7 @@ enum PayoutStatus {
 
 ### 6.4 Persistence
 
-Follow the existing pattern in `server/src/state.rs`: bincode-serialised
+Follow the existing pattern in `node/src/state.rs`: bincode-serialised
 binary files alongside `smt.bin` / `mmr.bin`. Names:
 
 - `peg_in_consumed_smt.bin`
@@ -722,9 +722,9 @@ Extend `zk-coins/node` HTTP API with peg-in and peg-out endpoints.
 
 | File | Change |
 | ---- | ------ |
-| `server/src/bridge.rs` | **new** — bridge module |
-| `server/src/server.rs` | Add bridge endpoints to router |
-| `server/src/runtime.rs` | Wire bridge state into runtime |
+| `node/src/bridge.rs` | **new** — bridge module |
+| `node/src/server.rs` | Add bridge endpoints to router |
+| `node/src/runtime.rs` | Wire bridge state into runtime |
 
 ### 9.3 Endpoints
 

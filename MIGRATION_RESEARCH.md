@@ -157,7 +157,7 @@ For a Plonky2 MVP shipping in weeks-not-months:
 ### From our existing SP1 code (`program/src/`)
 - The current `SparseMerkleTree` / `MerkleMountainRange` algorithms (modulo hash swap to Poseidon and lex-ordering for AccM if we go that route).
 - The `AccountState`, `Coin`, `Invoice` data shapes (modulo D1, D2 fixes).
-- The Account → coin_queue → send flow in `server/src/account_node.rs` — this is host-side glue, no circuit changes here except wiring to the new Plonky2 prover.
+- The Account → coin_queue → send flow in `node/src/account_node.rs` — this is host-side glue, no circuit changes here except wiring to the new Plonky2 prover.
 - The 12 tests in `program/src/merkle/sparse_merkle_tree.rs::tests` — survive as-is once `hash_concat` is Poseidon-backed.
 
 ### Newly required work (no upstream donor)
@@ -1272,7 +1272,7 @@ processing blocks. No restart, no monitor, no visible failure in
 well-known constant (`hash_bytes(b"zkcoins:minting-address:placeholder:v1")`
 in `program-plonky2/src/types.rs`). The SP1-era `ClientAccount::new`
 in `server` still derived `address` from the privkey's first child
-pubkey; the `assert_eq!` in `start_rest_server` between the two could
+pubkey; the `assert_eq!` in `start_rest_node` between the two could
 never hold again. **And** a panic inside a `tokio::spawn`-ed task by
 default only kills the task — the process happily continued in zombie
 state for 8 h with the listener dead and the scanner alive.
@@ -1280,7 +1280,7 @@ state for 8 h with the listener dead and the scanner alive.
 **Fix (PR [#36](https://github.com/zk-coins/node/pull/36)):**
 
 1. **Explicit `MINTING_ADDRESS` override** applied in
-   `runtime.rs::start_rest_server`: after constructing the
+   `runtime.rs::start_rest_node`: after constructing the
    minting `ClientAccount` from `minting_secret.bin`, the code
    overwrites `minting_client.address = *MINTING_ADDRESS` so the
    on-chain identity matches the well-known constant that the Plonky2
@@ -1290,8 +1290,8 @@ state for 8 h with the listener dead and the scanner alive.
    runs the default reporter and then `exit(1)`. Any future tokio
    worker panic now crash-loops the container via `restart:
    unless-stopped` instead of becoming a silent zombie.
-3. **Integration smoke test** (`start_rest_server_binds_and_serves_health`)
-   that spawns `start_rest_server` against an ephemeral port and probes
+3. **Integration smoke test** (`start_rest_node_binds_and_serves_health`)
+   that spawns `start_rest_node` against an ephemeral port and probes
    `/health` over real TCP. `runtime.rs` was excluded from the
    coverage scope, so the bootstrap path that exploded had no test at
    all. ~22 s warm; runs in the standard test sweep.

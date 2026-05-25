@@ -307,7 +307,7 @@ The `BurnProof` branch handles the peg-out side:
 - The burned coin's identifier is added to a `burned_coins_smt` so
   it cannot be double-burned
 
-### 4.2 New state structures (`server/src/state.rs`)
+### 4.2 New state structures (`node/src/state.rs`)
 
 Three additions to the global state:
 

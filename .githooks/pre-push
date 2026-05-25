@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pre-push gate for zk-coins/server.
+# Pre-push gate for zk-coins/node.
 #
 # Activation (one-time per clone):
 #   git config core.hooksPath .githooks
@@ -25,11 +25,11 @@ set -euo pipefail
 echo "[pre-push] cargo fmt --all --check"
 cargo fmt --all --check
 
-echo "[pre-push] cargo clippy -p server -p shared (MVP feature set)"
-cargo clippy -p server -p shared -- -D warnings
+echo "[pre-push] cargo clippy -p node -p shared (MVP feature set)"
+cargo clippy -p node -p shared -- -D warnings
 
-echo "[pre-push] cargo clippy -p server --all-features (self-host opt-in build)"
-cargo clippy -p server --all-features -- -D warnings
+echo "[pre-push] cargo clippy -p node --all-features (self-host opt-in build)"
+cargo clippy -p node --all-features -- -D warnings
 
 echo "[pre-push] cargo clippy -p zkcoins-program-plonky2 -p zkcoins-prover-plonky2 --lib"
 cargo clippy -p zkcoins-program-plonky2 -p zkcoins-prover-plonky2 --lib -- -D warnings
