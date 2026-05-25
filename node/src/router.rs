@@ -103,16 +103,19 @@ pub(crate) struct AppState {
     #[cfg(test)]
     pub(crate) phase2_reached: Arc<tokio::sync::Notify>,
     /// Test-only deterministic hold between `prepare_mint` (phase 2)
-    /// and the phase-3 re-derive. The handler `.notified().await`s
-    /// this AFTER `prepare_mint` returns and BEFORE the re-derive
-    /// reads SMT membership, so the concurrent-mint race test can
-    /// inject `pk_N` between the two without losing the race to a
-    /// fast prover. The notify is pre-armed (`notify_one()` called in
-    /// `test_state` constructors) so production-shaped tests that
-    /// don't care about the hold proceed immediately. Hidden behind
-    /// `cfg(test)` so the field does not exist in release builds.
+    /// and the phase-3 re-derive. The handler acquires + immediately
+    /// drops this mutex AFTER `prepare_mint` returns and BEFORE the
+    /// re-derive reads SMT membership. Constructed unlocked so all
+    /// production-shaped tests proceed immediately (acquire is a
+    /// non-blocking no-op). The concurrent-mint race test grabs the
+    /// guard BEFORE spawning the request, holds it across the pk_N
+    /// injection, then drops it — a hard happens-before edge that
+    /// works for any number of sequential mints (unlike a `Notify`
+    /// where one consumed permit would block subsequent waiters).
+    /// Hidden behind `cfg(test)` so the field does not exist in
+    /// release builds.
     #[cfg(test)]
-    pub(crate) phase3_release: Arc<tokio::sync::Notify>,
+    pub(crate) phase3_release_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 // Response types for our API
@@ -918,13 +921,14 @@ async fn mint_handler(
     };
 
     // Test-only deterministic hold between `prepare_mint` and the
-    // phase-3 re-derive. Pre-armed in `test_state` constructors so the
-    // production-shaped tests proceed immediately. The
-    // concurrent-mint race test re-arms it AFTER injecting the SMT
-    // entry to guarantee phase 3 observes the injection. Production
-    // builds compile this out entirely (the field does not exist).
+    // phase-3 re-derive. Pre-unlocked in all `test_state`
+    // constructors so production-shaped tests acquire + drop in one
+    // step. The concurrent-mint race test holds the guard from the
+    // outside across the pk_N injection, forcing the handler to
+    // block here until the injection is visible. Production builds
+    // compile this out entirely (the field does not exist).
     #[cfg(test)]
-    state.phase3_release.notified().await;
+    drop(state.phase3_release_lock.lock().await);
 
     // Build the BIP-340 commitment over the prover's outputs. Sign with
     // the index-N private key — this is the same key the wallet would

@@ -102,13 +102,7 @@ pub async fn start_rest_node(
         #[cfg(test)]
         phase2_reached: Arc::new(tokio::sync::Notify::new()),
         #[cfg(test)]
-        phase3_release: {
-            // Pre-arm so the handler's cfg(test) hold-point is a
-            // no-op for runtime tests that don't exercise the race.
-            let n = Arc::new(tokio::sync::Notify::new());
-            n.notify_one();
-            n
-        },
+        phase3_release_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     // Bootstrap the minting account if it isn't already in the DB.
