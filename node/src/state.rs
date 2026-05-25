@@ -318,6 +318,56 @@ impl State {
         Ok(state)
     }
 
+    /// Apply `commitments` via [`State::update`] and capture the
+    /// snapshot tuple required to feed `db::persist_state_tx` on the
+    /// async side without holding the state lock across the await.
+    ///
+    /// Returns `(new_mmr_root, smt_bytes, mmr_bytes, root_index_entry)`:
+    /// * `new_mmr_root` is the value [`State::update`] returns (the
+    ///   root of the MMR after the new leaf was appended).
+    /// * `smt_bytes` / `mmr_bytes` are the bincode blobs that go into
+    ///   the `smt_state` / `mmr_state` singleton rows.
+    /// * `root_index_entry` is the freshly-inserted
+    ///   `(prev_mmr_root, smt_root, leaf_index)` triple — recovered
+    ///   from the live `root_indices` map under the same lock so the
+    ///   caller does not need to repeat [`State::update`]'s internal
+    ///   bookkeeping. `None` only on a serialize-side bincode error
+    ///   propagated from [`Self::serialize_for_persist`].
+    ///
+    /// This helper exists so the scanner-callback (`main.rs`) and the
+    /// new Phase-E synchronous in-process integration in
+    /// [`crate::router::mint_handler`] share a single source of truth
+    /// for "what bytes must I hand to `persist_state_tx` after a
+    /// successful update?". Both callers acquire the state lock, run
+    /// this method, drop the lock, then await `persist_state_tx` with
+    /// the returned tuple — keeping the `std::sync::Mutex` off the
+    /// `.await` while still letting `update` and `serialize_for_persist`
+    /// observe a consistent snapshot.
+    #[allow(clippy::type_complexity)]
+    pub fn update_and_snapshot_for_persist(
+        &mut self,
+        commitments: &[Commitment],
+    ) -> Result<
+        (
+            HashDigest,
+            Vec<u8>,
+            Vec<u8>,
+            Option<(HashDigest, HashDigest, usize)>,
+        ),
+        &'static str,
+    > {
+        let new_root = self.update(commitments)?;
+        let root_index_entry = self
+            .root_indices
+            .get(&self.prev_mmr_root)
+            .copied()
+            .map(|(smt_root, leaf_index)| (self.prev_mmr_root, smt_root, leaf_index));
+        let (smt_bytes, mmr_bytes) = self
+            .serialize_for_persist()
+            .map_err(|_| "state serialize_for_persist failed (bincode)")?;
+        Ok((new_root, smt_bytes, mmr_bytes, root_index_entry))
+    }
+
     /// Serialize the SMT and MMR to bincode blobs for `persist_state_tx`.
     ///
     /// Returned tuple is `(smt_bytes, mmr_bytes)`. The caller is
