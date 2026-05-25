@@ -4634,3 +4634,331 @@ async fn mint_handler_advances_state_synchronously_with_broadcast() {
             .as_deref()
     ));
 }
+
+/// Phase E BLOCKER fix: if the atomic
+/// `persist_state_and_mark_complete_tx` rolls back mid-transaction, the
+/// `pending_inscriptions` row MUST stay at its prior status (here:
+/// `reveal_broadcast`) and the on-disk SMT/MMR/root_index must NOT
+/// advance. The scanner-replay path is then free to integrate the
+/// inscription from chain on the next sweep without doubling up the MMR
+/// leaf (which is exactly the BLOCKER class the atomic tx eliminated).
+///
+/// Mechanism: install a `BEFORE UPDATE` trigger on
+/// `pending_inscriptions` that raises an exception when the new
+/// `status` value is `complete`. The trigger fires INSIDE the atomic
+/// tx — the BEGIN/UPSERT(smt)/UPSERT(mmr)/INSERT(mmr_root_index) steps
+/// all run successfully, then the final UPDATE...SET status='complete'
+/// raises and the COMMIT envelope rolls everything back. The handler
+/// surfaces 503 and the on-disk state is byte-for-byte identical to
+/// the pre-call snapshot.
+///
+/// (The in-memory SMT/MMR mutation already happened before the await
+/// — that is a known property of the new shape; the contract is that
+/// on tx Err, durable state is unchanged and the handler signals 503
+/// so the caller knows not to trust the in-memory state across a
+/// restart.)
+#[tokio::test]
+async fn mint_handler_atomic_tx_rollback_leaves_state_and_row_consistent() {
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container.get_host().await.unwrap();
+    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
+    // Install the trigger that fails the in-tx mark-complete UPDATE.
+    // PL/pgSQL: any UPDATE that sets `status = 'complete'` raises
+    // before the row mutates, surfacing a `sqlx::Error::Database` from
+    // inside the atomic envelope.
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION fail_complete() RETURNS trigger AS $$
+         BEGIN
+             IF NEW.status = 'complete' THEN
+                 RAISE EXCEPTION 'simulated mark-complete failure';
+             END IF;
+             RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&*pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER block_complete BEFORE UPDATE ON pending_inscriptions \
+         FOR EACH ROW EXECUTE FUNCTION fail_complete()",
+    )
+    .execute(&*pool)
+    .await
+    .unwrap();
+
+    let mock_server = mint_broadcast_mock_server().await;
+    let ws_url = mint_broadcast_mock_ws().await;
+
+    let mut state = mint_test_state();
+    state.pool = Arc::clone(&pool);
+    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
+        url: mock_server.uri(),
+        is_mainnet: false,
+        network_name: "Mutinynet".to_string(),
+        ws_url: Some(ws_url),
+        track_tx_timeout: None,
+    });
+
+    let recipient_bytes = [11u8; 32];
+    let recipient = "0x".to_string() + &hex::encode(recipient_bytes);
+    let body = serde_json::json!({
+        "account_address": recipient,
+        "amount": 1u64,
+    });
+    let req = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, resp_body) = send_request_with_state(state.clone(), req).await;
+
+    // The trigger fires inside the atomic tx, the tx rolls back, the
+    // handler converts to 503.
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "atomic tx rollback must surface 503, body: {}",
+        resp_body
+    );
+    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
+    assert_eq!(v["success"], false);
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("durable state advance failed"),
+        "response error must explain the failure mode, got: {}",
+        v["error"]
+    );
+
+    // On-disk SMT/MMR/root_index did NOT advance — the atomic
+    // envelope rolled them back together with the failed UPDATE.
+    assert_eq!(
+        crate::db::load_smt(&pool).await.unwrap(),
+        None,
+        "atomic-tx rollback must leave smt_state untouched"
+    );
+    assert_eq!(
+        crate::db::load_mmr(&pool).await.unwrap(),
+        None,
+        "atomic-tx rollback must leave mmr_state untouched"
+    );
+    assert!(
+        crate::db::load_root_indices(&pool)
+            .await
+            .unwrap()
+            .is_empty(),
+        "atomic-tx rollback must leave mmr_root_index untouched"
+    );
+
+    // The pending row stays at `reveal_broadcast` (the publisher set
+    // it there before the broadcast, and the mark-complete UPDATE was
+    // exactly the call that the trigger blocked). Scanner-replay on
+    // next boot observes the row, falls through
+    // `should_skip_scanner_state_update`, integrates the inscription
+    // itself, and runs state.update against the (still-clean) on-disk
+    // SMT — yielding leaf_count == 1, not 2.
+    let (pending_status,): (String,) =
+        sqlx::query_as("SELECT status FROM pending_inscriptions ORDER BY id DESC LIMIT 1")
+            .fetch_one(&*pool)
+            .await
+            .expect("a pending row must exist for the broadcasted commitment");
+    assert_eq!(
+        pending_status,
+        crate::db::PENDING_STATUS_REVEAL_BROADCAST,
+        "atomic-tx rollback: pending row must stay at reveal_broadcast for scanner-replay to pick up"
+    );
+    let (commit_txid_bytes,): (Vec<u8>,) =
+        sqlx::query_as("SELECT commit_txid FROM pending_inscriptions ORDER BY id DESC LIMIT 1")
+            .fetch_one(&*pool)
+            .await
+            .unwrap();
+    assert!(
+        !crate::scanner::should_skip_scanner_state_update(
+            crate::db::pending_inscription_status_by_commit_txid(&pool, &commit_txid_bytes)
+                .await
+                .unwrap()
+                .as_deref()
+        ),
+        "scanner must NOT skip its state.update for an inscription whose mark-complete failed"
+    );
+
+    // Drop the trigger so any follow-up scanner-replay (out of scope
+    // for this test) would succeed; we assert the contract above and
+    // leave the verification of the heal-on-replay path to the e2e
+    // tests covered by `mint_handler_advances_state_synchronously_with_broadcast`.
+    sqlx::query("DROP TRIGGER block_complete ON pending_inscriptions")
+        .execute(&*pool)
+        .await
+        .unwrap();
+}
+
+/// Phase E concurrent-mint coverage: two `/api/mint` requests with
+/// DIFFERENT recipients (different commitments → different SMT keys)
+/// must both succeed end-to-end. Both walk past the phase-2 re-derive
+/// gate (they observe DIFFERENT `expected_num_pubkeys` because the
+/// first mint's state advance lands before the second's gate runs —
+/// or, if interleaved, the gate's re-derive observes the freshly
+/// inserted pubkey and the second's `num_pubkeys` is already bumped).
+/// Both serialize on the state lock for the in-process state.update,
+/// and the atomic persist + mark-complete commits both rows.
+///
+/// Asserts:
+///   - both responses are 200
+///   - both pending_inscriptions rows reach `complete`
+///   - MMR `leaf_count == 2`
+///   - mmr_root_index has exactly 2 entries
+///   - no SMT key-collision error path was hit (no `Key already exists`
+///     log; tested indirectly by both 200 responses — the new 503 path
+///     for in-process state.update Err would surface here if a
+///     collision occurred).
+///
+/// Note: this test serializes the two requests deliberately (await
+/// the first 200 before sending the second) so we can deterministically
+/// assert end-state. The earlier `mint_handler_concurrent_mint_during_proof_returns_503`
+/// covers the truly-concurrent case (same `expected_num_pubkeys`); the
+/// genuine concurrent-different-recipients race relies on the in-process
+/// re-derive gate to either let both through (sequentially) or 503 one
+/// of them. The end-state invariant — MMR leaf_count == 2 for two
+/// successful mints — is the load-bearing piece this test pins.
+#[tokio::test]
+async fn mint_handler_two_sequential_mints_with_different_recipients_advance_cleanly() {
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container.get_host().await.unwrap();
+    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
+    let mock_server = mint_broadcast_mock_server().await;
+    let ws_url = mint_broadcast_mock_ws().await;
+
+    let mut state = mint_test_state();
+    state.pool = Arc::clone(&pool);
+    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
+        url: mock_server.uri(),
+        is_mainnet: false,
+        network_name: "Mutinynet".to_string(),
+        ws_url: Some(ws_url),
+        track_tx_timeout: None,
+    });
+
+    // First mint: recipient A.
+    let recipient_a = "0x".to_string() + &hex::encode([0xAAu8; 32]);
+    let req_a = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "account_address": recipient_a, "amount": 1u64 }).to_string(),
+        ))
+        .unwrap();
+    let (status_a, body_a) = send_request_with_state(state.clone(), req_a).await;
+    assert_eq!(status_a, StatusCode::OK, "first mint body: {}", body_a);
+
+    // After the first mint returns, the SMT must hold pk_0 and
+    // derive_num_pubkeys_from_smt must observe 1. This is the
+    // invariant the synchronous state.update advance gives the next
+    // mint.
+    {
+        let state_arc = {
+            let node_guard = state.account_node.lock().unwrap();
+            node_guard.state().clone()
+        };
+        let state_guard = state_arc.lock().unwrap();
+        assert_eq!(state_guard.mmr.leaf_count(), 1, "after mint A");
+        assert_eq!(
+            crate::state::derive_num_pubkeys_from_smt(
+                &state.minting_account.lock().unwrap().private_key,
+                &state_guard.smt
+            ),
+            1,
+            "after mint A, num_pubkeys must derive to 1 so mint B uses pk_1"
+        );
+    }
+
+    // Second mint: recipient B (different commitment → different SMT
+    // key). Must walk through cleanly; no `Key already exists` path.
+    let recipient_b = "0x".to_string() + &hex::encode([0xBBu8; 32]);
+    let req_b = Request::post("/api/mint")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "account_address": recipient_b, "amount": 2u64 }).to_string(),
+        ))
+        .unwrap();
+    let (status_b, body_b) = send_request_with_state(state.clone(), req_b).await;
+    assert_eq!(status_b, StatusCode::OK, "second mint body: {}", body_b);
+
+    // Final invariants:
+    //   - in-memory MMR holds exactly 2 leaves
+    //   - in-memory derive_num_pubkeys_from_smt == 2
+    //   - 2 root_indices entries
+    {
+        let state_arc = {
+            let node_guard = state.account_node.lock().unwrap();
+            node_guard.state().clone()
+        };
+        let state_guard = state_arc.lock().unwrap();
+        assert_eq!(
+            state_guard.mmr.leaf_count(),
+            2,
+            "two successful mints → leaf_count == 2 (regression: a duplicate append would give 3 or 4)"
+        );
+        assert_eq!(
+            crate::state::derive_num_pubkeys_from_smt(
+                &state.minting_account.lock().unwrap().private_key,
+                &state_guard.smt
+            ),
+            2,
+            "two successful mints → derive_num_pubkeys_from_smt == 2"
+        );
+        assert_eq!(
+            state_guard.root_indices.len(),
+            2,
+            "two successful mints → 2 root_indices entries"
+        );
+    }
+
+    // Both pending_inscriptions rows reached `complete`.
+    let complete_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pending_inscriptions WHERE status = 'complete'")
+            .fetch_one(&*pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        complete_count, 2,
+        "both pending rows must reach `complete` after their respective atomic txs"
+    );
+
+    // On-disk MMR root_index table mirrors the in-memory state: 2
+    // rows, one per mint. The atomic tx wrote both
+    // SMT/MMR/root_index/status-complete bundles together.
+    let on_disk_root_indices = crate::db::load_root_indices(&pool).await.unwrap();
+    assert_eq!(
+        on_disk_root_indices.len(),
+        2,
+        "on-disk mmr_root_index must have 2 entries after two successful atomic txs"
+    );
+}
