@@ -1,7 +1,10 @@
 use super::*;
 use crate::db::{connect_and_migrate, insert_root_index, load_root_indices, persist_state_tx};
+use bitcoin::bip32::{ChildNumber, Xpub};
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
+use bitcoin::Network;
+use shared::SECP256K1;
 use sqlx::PgPool;
 use std::str::FromStr;
 use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
@@ -748,4 +751,90 @@ async fn test_insert_root_index_is_idempotent_on_conflict() {
         .expect("second insert (idempotent)");
     let loaded = load_root_indices(&pool).await.unwrap();
     assert_eq!(loaded.len(), 1);
+}
+
+// ---- derive_num_pubkeys_from_smt (Phase D) --------------------------------
+
+/// Derive the BIP-32 child pubkey at `index` from `xpriv` using the same
+/// derivation path the production [`derive_num_pubkeys_from_smt`] walks.
+/// Test-only helper so each membership setup builds the exact same key
+/// bytes the production code will subsequently look up.
+fn derive_pk(xpriv: &Xpriv, index: u32) -> bitcoin::secp256k1::PublicKey {
+    Xpub::from_priv(&SECP256K1, xpriv)
+        .derive_pub(&SECP256K1, &[ChildNumber::Normal { index }])
+        .expect("derive_pub")
+        .public_key
+}
+
+/// SMT key for a pubkey, matching [`State::update`]'s
+/// `sha256(public_key.serialize())` convention.
+fn smt_key_for_pk(pk: &bitcoin::secp256k1::PublicKey) -> [u8; 32] {
+    bitcoin::hashes::sha256::Hash::hash(&pk.serialize()).to_byte_array()
+}
+
+/// Empty SMT → no minting pubkey has been issued yet.
+#[test]
+fn derive_num_pubkeys_from_smt_empty_returns_zero() {
+    let xpriv = Xpriv::new_master(Network::Signet, &[7u8; 32]).expect("xpriv");
+    let smt = SparseMerkleTree::new();
+    assert_eq!(derive_num_pubkeys_from_smt(&xpriv, &smt), 0);
+}
+
+/// SMT contains `pk_0, pk_1, …, pk_{N-1}` → derive returns N.
+///
+/// Covers the "found at index N" branch of the algorithm: every loop
+/// iteration up to `n = N - 1` finds the key in the SMT and `continue`s,
+/// the `n = N` iteration misses and returns. Drives a small N (3) so the
+/// test stays fast — the branch under test is invariant in N.
+#[test]
+fn derive_num_pubkeys_from_smt_returns_first_missing_index() {
+    let xpriv = Xpriv::new_master(Network::Signet, &[11u8; 32]).expect("xpriv");
+    let mut smt = SparseMerkleTree::new();
+    // Stuff in pk_0, pk_1, pk_2. Value bytes are arbitrary — the
+    // derive function only checks key presence, not leaf value.
+    for n in 0..3u32 {
+        let pk = derive_pk(&xpriv, n);
+        let key = smt_key_for_pk(&pk);
+        let dummy_value = digest_from_bytes(&[(n + 1) as u8; 32]);
+        smt.insert(key, dummy_value).expect("smt insert");
+    }
+    assert_eq!(derive_num_pubkeys_from_smt(&xpriv, &smt), 3);
+}
+
+/// Two distinct minting wallets writing into the same SMT don't
+/// contaminate each other's derived counts: each `xpriv` walks its own
+/// branch and stops at its own first miss.
+#[test]
+fn derive_num_pubkeys_from_smt_is_xpriv_scoped() {
+    let xpriv_a = Xpriv::new_master(Network::Signet, &[1u8; 32]).expect("xpriv a");
+    let xpriv_b = Xpriv::new_master(Network::Signet, &[2u8; 32]).expect("xpriv b");
+    let mut smt = SparseMerkleTree::new();
+    // Insert pk_0 from xpriv_a only.
+    let pk_a0 = derive_pk(&xpriv_a, 0);
+    smt.insert(smt_key_for_pk(&pk_a0), digest_from_bytes(&[9u8; 32]))
+        .expect("smt insert");
+    assert_eq!(derive_num_pubkeys_from_smt(&xpriv_a, &smt), 1);
+    assert_eq!(derive_num_pubkeys_from_smt(&xpriv_b, &smt), 0);
+}
+
+/// Loop-bound panic: every index up to and including `bound` is in the
+/// SMT → the next iteration hits `n >= bound` and panics. Exercises the
+/// safety-net branch of the algorithm; uses the
+/// `derive_num_pubkeys_from_smt_with_bound` inner with a tiny bound so
+/// the SMT setup is fast (a million real BIP-32 derivations would take
+/// minutes).
+#[test]
+#[should_panic(expected = "loop bound is a safety net")]
+fn derive_num_pubkeys_from_smt_panics_on_loop_bound_exceeded() {
+    let xpriv = Xpriv::new_master(Network::Signet, &[33u8; 32]).expect("xpriv");
+    let mut smt = SparseMerkleTree::new();
+    // Fill the SMT with pk_0..=pk_BOUND so the loop never finds a miss.
+    const BOUND: u32 = 3;
+    for n in 0..=BOUND + 1 {
+        let pk = derive_pk(&xpriv, n);
+        let key = smt_key_for_pk(&pk);
+        smt.insert(key, digest_from_bytes(&[(n as u8).wrapping_add(1); 32]))
+            .expect("smt insert");
+    }
+    let _ = derive_num_pubkeys_from_smt_with_bound(&xpriv, &smt, BOUND);
 }
