@@ -300,14 +300,12 @@ async fn test_get_commitment_proof_with_mmr() {
     // Update state with this commitment
     let mmr_root = state.update(std::slice::from_ref(&commitment)).unwrap();
 
-    // Get the complete proof (SMT + MMR)
-    let proof_result = state.get_commitment_proof(&commitment.public_key);
-    assert!(
-        proof_result.is_ok(),
-        "Should return a valid proof for existing commitment"
-    );
-
-    let (commitment_msg, smt_proof, smt_root, mmr_proof) = proof_result.unwrap();
+    // Get the complete proof (SMT + MMR). `.expect` itself asserts
+    // the Ok arm — a redundant `assert!(.is_ok())` before unwrap would
+    // double-emit on the same failure mode.
+    let (commitment_msg, smt_proof, smt_root, mmr_proof) = state
+        .get_commitment_proof(&commitment.public_key)
+        .expect("Should return a valid proof for existing commitment");
 
     // Verify the message
     assert_eq!(

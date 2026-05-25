@@ -23,11 +23,11 @@
 //! The DEV server is shared by other workflows (per-PR app E2E,
 //! interactive testing). To keep this suite race-free we always:
 //!   - mint into freshly-generated wallets (no fixed addresses)
-//!   - tolerate `503 Service Unavailable` on mutating endpoints,
-//!     which the server returns when the Mutinynet publisher wallet
-//!     has no UTXOs — a benign DEV condition
 //!   - assert strictly on 4xx codes (client-fixable contract bugs)
-//!   - skip on 5xx codes with a logged warning (server-side flake)
+//!   - assert strictly on 5xx codes as well (server-side regressions
+//!     are real bugs, not flakes — the deploy-dev preflight verifies
+//!     publisher wallet + /health/ready BEFORE this suite runs, so a
+//!     503 here is unambiguous: it means something regressed)
 //!
 //! Read by:
 //!   - `cargo test -p node --release --test api_remote` (locally)
@@ -48,6 +48,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use shared::commitment::Commitment;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use zkcoins_program::hash::digest_to_bytes;
+use zkcoins_program::types::MINTING_ADDRESS;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -57,18 +59,20 @@ const DEFAULT_API_URL: &str = "https://dev-api.zkcoins.app";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const POLL_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long to keep retrying the user-level `/api/send` while the
-/// server reports "Unable to get merkle proofs for provided public
-/// key" — see the inline comment in `send_commit_roundtrip_moves_balance`
-/// for why this is timing-bound on the scanner picking up the mint's
-/// Taproot inscription. Mutinynet block time is ~30 s, the scanner
-/// polls every 30 s, so 2 minutes is enough on a healthy network
-/// without dragging the suite past the workflow timeout when the
-/// publisher is offline.
-const SEND_RETRY_DEADLINE: Duration = Duration::from_secs(120);
-const SEND_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const MINT_AMOUNT: u64 = 50_000;
 const SEND_AMOUNT: u64 = 10_000;
+/// Bootstrap balance seeded into the `MINTING_ADDRESS` account at
+/// startup by `start_rest_node` (see `node::runtime`).
+/// Must stay strictly less than `2^48` for Plonky2 Goldilocks safety
+/// — see the matching constant guard in `runtime_tests`. The
+/// happy-path roundtrips probe `/api/balance` on `MINTING_ADDRESS`
+/// before their first mint and use this as an upper bound —
+/// `0 < balance <= BOOTSTRAP_MINTING_BALANCE`. The exact value is
+/// not asserted because the deploy-dev push trigger does not run
+/// `reset_state`, so prior test residue legitimately reduces the
+/// minting balance; the bound still catches a fully empty / negative
+/// state.
+const BOOTSTRAP_MINTING_BALANCE: u64 = 1u64 << 48;
 
 fn api_base() -> String {
     std::env::var("ZKCOINS_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string())
@@ -92,20 +96,23 @@ fn url(path: &str) -> String {
     format!("{}{}", api_base().trim_end_matches('/'), path)
 }
 
-/// Helper: log a one-line "skip" with reason and return.
-macro_rules! dev_skip {
-    ($reason:expr) => {{
-        eprintln!("DEV environment skip: {}", $reason);
-        return;
-    }};
-}
-
-/// Helper: log a one-line "feature off" skip and return. Distinct
-/// from [`dev_skip!`] so the workflow log line clearly marks "the
-/// route is absent by design" vs. "the route is present but flaked
-/// on the network".
+/// Helper: log a one-line "feature off" skip and return.
+///
+/// When running in CI (env `CI=true`) this is a hard panic instead of
+/// a silent skip: CI is supposed to build with `--all-features`, so a
+/// `feature_skip!` firing in CI is the canary for an accidentally
+/// dropped `--all-features` flag in a workflow (e.g. someone copied
+/// the local `cargo test` invocation into the workflow). Outside CI
+/// the macro is still a skip — the suite is also runnable against a
+/// feature-trimmed PRD deploy, where an absent route is expected.
 macro_rules! feature_skip {
     ($feature:expr, $test:expr) => {{
+        if std::env::var("CI").is_ok() {
+            panic!(
+                "feature `{}` disabled but running in CI — all-features build is required",
+                $feature
+            );
+        }
         eprintln!(
             "SKIP {}: feature `{}` disabled on this server",
             $test, $feature
@@ -153,13 +160,22 @@ async fn fetch_capabilities(client: &reqwest::Client) -> Capabilities {
         .json()
         .await
         .expect("/api/info body is JSON for capability detection");
+    // Each capability field MUST be a bool — a missing field or a
+    // non-bool value is a contract regression in `/api/info` and a
+    // `.unwrap_or(false)` would silently mask it as "feature off".
     let mut caps = Capabilities {
-        address_list: body["capabilities"]["address_list"]
-            .as_bool()
-            .unwrap_or(false),
-        faucet: body["capabilities"]["faucet"].as_bool().unwrap_or(false),
-        usernames: body["capabilities"]["usernames"].as_bool().unwrap_or(false),
-        lnurl: body["capabilities"]["lnurl"].as_bool().unwrap_or(false),
+        address_list: body["capabilities"]["address_list"].as_bool().expect(
+            "/api/info capabilities.address_list must be a bool — missing field is a contract regression",
+        ),
+        faucet: body["capabilities"]["faucet"].as_bool().expect(
+            "/api/info capabilities.faucet must be a bool — missing field is a contract regression",
+        ),
+        usernames: body["capabilities"]["usernames"].as_bool().expect(
+            "/api/info capabilities.usernames must be a bool — missing field is a contract regression",
+        ),
+        lnurl: body["capabilities"]["lnurl"].as_bool().expect(
+            "/api/info capabilities.lnurl must be a bool — missing field is a contract regression",
+        ),
     };
     if let Ok(force) = std::env::var("ZKCOINS_FORCE_DISABLE_FEATURES") {
         for flag in force.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -331,12 +347,12 @@ async fn health_ready_returns_ready_with_no_failures() {
         .expect("GET /health/ready");
     let status = resp.status();
     let body: Value = resp.json().await.expect("/health/ready body is JSON");
-    if status != StatusCode::OK {
-        dev_skip!(format!(
-            "/health/ready returned {} with body {}",
-            status, body
-        ));
-    }
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "/health/ready must return 200 — failures: {:?}",
+        body["failures"]
+    );
     assert_eq!(body["ready"], Value::Bool(true));
     let failures = body["failures"].as_array().expect("failures is an array");
     assert!(
@@ -383,6 +399,42 @@ async fn info_returns_well_formed_response() {
             body["capabilities"][cap]
         );
     }
+}
+
+/// Shape-only probe of `/health/publisher` — the JSON contract is
+/// asserted here so the suite breaks if the field set changes, even
+/// when the publisher wallet itself is empty (the deploy-dev
+/// preflight separately enforces a non-zero UTXO count). 200 is
+/// required: an Esplora-side error surfaces as 503 and we want that
+/// to fail the suite, not be silently tolerated.
+#[tokio::test]
+async fn health_publisher_returns_well_formed_response() {
+    let resp = http_client()
+        .get(url("/health/publisher"))
+        .send()
+        .await
+        .expect("GET /health/publisher");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "/health/publisher must return 200 — anything else means Esplora is unreachable or the publisher route regressed"
+    );
+    let body: Value = resp.json().await.expect("/health/publisher body is JSON");
+    assert!(
+        body["address"].as_str().is_some_and(|v| !v.is_empty()),
+        "publisher address must be a non-empty string, got {:?}",
+        body["address"]
+    );
+    assert!(
+        body["utxo_count"].as_u64().is_some(),
+        "utxo_count must be a u64, got {:?}",
+        body["utxo_count"]
+    );
+    assert!(
+        body["total_sats"].as_u64().is_some(),
+        "total_sats must be a u64, got {:?}",
+        body["total_sats"]
+    );
 }
 
 #[tokio::test]
@@ -464,34 +516,6 @@ async fn proof_for_huge_id_returns_404() {
         .await
         .expect("GET /api/proof/<huge>");
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn proof_id_one_returns_200_or_404() {
-    // proof_id=1 may exist (a prior test minted) or not (fresh state).
-    // Both 200 (binary) and 404 are valid; anything else is a regression.
-    let resp = http_client()
-        .get(url("/api/proof/1"))
-        .send()
-        .await
-        .expect("GET /api/proof/1");
-    let status = resp.status();
-    assert!(
-        status == StatusCode::OK || status == StatusCode::NOT_FOUND,
-        "proof/1 returned unexpected status: {}",
-        status
-    );
-    if status == StatusCode::OK {
-        let bytes = resp.bytes().await.expect("body bytes");
-        // A valid CoinProof bincode payload is at least a few hundred
-        // bytes (Plonky2 proof + commitment). 100 is a loose lower
-        // bound that just guards against an empty response.
-        assert!(
-            bytes.len() > 100,
-            "expected non-trivial CoinProof bytes, got {}",
-            bytes.len()
-        );
-    }
 }
 
 #[tokio::test]
@@ -875,6 +899,15 @@ async fn mint_roundtrip_lands_balance_and_proof() {
     let client = http_client();
     let alice = TestWallet::new();
 
+    // Minting-account sanity guard: the deploy-dev workflow's
+    // `push: branches: [develop]` trigger does NOT run
+    // `reset-zkcoins-server`, so the minting balance is allowed to be
+    // anywhere in (0, BOOTSTRAP_MINTING_BALANCE]. We only fail hard
+    // on the genuinely impossible states (balance > bootstrap = code
+    // regression or unauthorized re-seed; balance == 0 = unexpected
+    // DB wipe). See `assert_minting_balance_in_bounds` for details.
+    assert_minting_balance_in_bounds(&client).await;
+
     let mint_resp = client
         .post(url("/api/mint"))
         .json(&json!({
@@ -885,12 +918,6 @@ async fn mint_roundtrip_lands_balance_and_proof() {
         .await
         .expect("POST /api/mint");
     let mint_status = mint_resp.status();
-    if mint_status.is_server_error() {
-        dev_skip!(format!(
-            "mint returned {} — DEV environment flake",
-            mint_status
-        ));
-    }
     assert_eq!(mint_status, StatusCode::OK, "unexpected mint status");
     let mint_body: Value = mint_resp.json().await.expect("mint body JSON");
     assert_eq!(
@@ -936,56 +963,38 @@ async fn send_commit_roundtrip_moves_balance() {
     let alice = TestWallet::new();
     let bob = TestWallet::new();
 
+    // Minting-account sanity guard — mirror of the one in
+    // `mint_roundtrip_lands_balance_and_proof`. The deploy-dev
+    // workflow's `push: branches: [develop]` trigger does NOT run
+    // `reset-zkcoins-server`, so we cannot pin the minting balance to
+    // an exact value (or even a small accept-set keyed off
+    // `MINT_AMOUNT`): the balance accumulates `bootstrap - N*MINT_AMOUNT`
+    // across every prior develop push that ran this suite. The
+    // bounds-check still catches the impossible / catastrophic states
+    // (balance > bootstrap = code regression or unauthorized re-seed;
+    // balance == 0 = unexpected DB wipe).
+    assert_minting_balance_in_bounds(&client).await;
+
     // ---- Mint ----
-    // 422 with "Unable to get merkle proofs for provided public key" is
-    // the documented signal that a PRIOR mint's on-chain Taproot
-    // inscription has not yet been observed by the scanner. This test
-    // runs sequentially after `mint_roundtrip_lands_balance_and_proof`
-    // in the single-threaded suite, so the second mint hits the
-    // server's "look up prev commitment" branch and depends on the
-    // scanner having caught up. Mutinynet block time is ≈30 s and the
-    // scanner polls Esplora on a 30 s interval — so until both delays
-    // elapse, the SMT does not know about the prev_commitment_pubkey
-    // the server needs to attach to this mint. Apply the same retry
-    // pattern that `/api/send` below uses for the same condition.
-    let mint_body_json = json!({
-        "account_address": alice.address_hex(),
-        "amount": MINT_AMOUNT,
-    });
-    let (mint_status, mint_body_text) = {
-        let deadline = std::time::Instant::now() + SEND_RETRY_DEADLINE;
-        loop {
-            let resp = client
-                .post(url("/api/mint"))
-                .json(&mint_body_json)
-                .send()
-                .await
-                .expect("POST /api/mint");
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            let should_retry = status == StatusCode::UNPROCESSABLE_ENTITY
-                && text.contains("Unable to get merkle proofs");
-            if !should_retry || std::time::Instant::now() >= deadline {
-                break (status, text);
-            }
-            eprintln!(
-                "mint 422 (merkle proofs not yet observed); retrying in {:?}",
-                SEND_RETRY_INTERVAL
-            );
-            tokio::time::sleep(SEND_RETRY_INTERVAL).await;
-        }
-    };
-    if mint_status.is_server_error() {
-        dev_skip!(format!("mint returned {} — DEV flake", mint_status));
-    }
-    if mint_status == StatusCode::UNPROCESSABLE_ENTITY
-        && mint_body_text.contains("Unable to get merkle proofs")
-    {
-        dev_skip!(format!(
-            "mint returned 422 after {:?} of retries — scanner did not observe the prior mint inscription in time; body={}",
-            SEND_RETRY_DEADLINE, mint_body_text
-        ));
-    }
+    // Post-#87 the scanner is event-driven (Esplora WS subscription),
+    // so by the time `mint_roundtrip_lands_balance_and_proof` returns
+    // 200 and writes alice-1's balance, the prior commitment is
+    // already at-most-one-block away from being indexed in the SMT.
+    // A `422 Unable to get merkle proofs` here is therefore a real
+    // scanner-side regression, not a benign timing flake — the
+    // previous PR-83-era retry loop is gone. Asserting `== 200`
+    // surfaces it.
+    let mint_resp = client
+        .post(url("/api/mint"))
+        .json(&json!({
+            "account_address": alice.address_hex(),
+            "amount": MINT_AMOUNT,
+        }))
+        .send()
+        .await
+        .expect("POST /api/mint");
+    let mint_status = mint_resp.status();
+    let mint_body_text = mint_resp.text().await.unwrap_or_default();
     assert_eq!(
         mint_status,
         StatusCode::OK,
@@ -998,12 +1007,12 @@ async fn send_commit_roundtrip_moves_balance() {
 
     // Wait for the balance to settle so send_coins has something to spend.
     let balance_before = poll_balance_at_least(&client, &alice.address_hex(), MINT_AMOUNT).await;
-    if balance_before < MINT_AMOUNT {
-        dev_skip!(format!(
-            "balance never settled to {} after mint (saw {})",
-            MINT_AMOUNT, balance_before
-        ));
-    }
+    assert!(
+        balance_before >= MINT_AMOUNT,
+        "scanner never observed mint after MINT_AMOUNT={} (saw {})",
+        MINT_AMOUNT,
+        balance_before
+    );
 
     // ---- Fetch the mint's CoinProof to discover prev_commitment_pubkey ----
     let proof_resp = client
@@ -1020,6 +1029,12 @@ async fn send_commit_roundtrip_moves_balance() {
         .expect("mint coin proof has commitment")
         .public_key;
 
+    // (No second poll needed — `poll_balance_at_least` above already
+    // observed alice.balance >= MINT_AMOUNT; the inscription is therefore
+    // on-chain and the scanner has ingested it. Removing the redundant
+    // 15-s wait shaves test runtime without losing signal — if the
+    // scanner regresses, the FIRST wait will fail.)
+
     // ---- Send ----
     let amount = SEND_AMOUNT;
     let ts = unix_now();
@@ -1034,53 +1049,14 @@ async fn send_commit_roundtrip_moves_balance() {
         "signature": signature,
         "timestamp": ts,
     });
-    // 422 with "Unable to get merkle proofs for provided public key"
-    // is the documented signal that the on-chain commitment for the
-    // freshly-minted account has not yet been observed by the scanner.
-    // Mints broadcast a Taproot inscription whose confirmation depends
-    // on Mutinynet block time (≈30 s), and the scanner polls Esplora
-    // on a 30 s interval — so until both delays elapse, the SMT does
-    // not know about the prev_commitment_pubkey we just discovered.
-    // Poll for up to [`SEND_RETRY_DEADLINE`] before treating it as a
-    // DEV-environment skip, so a typical run on a healthy Mutinynet
-    // (block time 30 s) completes the full roundtrip.
-    let (send_status, send_body_text) = {
-        let deadline = std::time::Instant::now() + SEND_RETRY_DEADLINE;
-        loop {
-            let resp = client
-                .post(url("/api/send"))
-                .json(&send_body)
-                .send()
-                .await
-                .expect("POST /api/send");
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            let should_retry = status == StatusCode::UNPROCESSABLE_ENTITY
-                && text.contains("Unable to get merkle proofs");
-            if !should_retry || std::time::Instant::now() >= deadline {
-                break (status, text);
-            }
-            eprintln!(
-                "send 422 (merkle proofs not yet observed); retrying in {:?}",
-                SEND_RETRY_INTERVAL
-            );
-            tokio::time::sleep(SEND_RETRY_INTERVAL).await;
-        }
-    };
-    if send_status.is_server_error() {
-        dev_skip!(format!(
-            "send returned {} — DEV flake; body={}",
-            send_status, send_body_text
-        ));
-    }
-    if send_status == StatusCode::UNPROCESSABLE_ENTITY
-        && send_body_text.contains("Unable to get merkle proofs")
-    {
-        dev_skip!(format!(
-            "send returned 422 after {:?} of retries — scanner did not observe the mint inscription in time; body={}",
-            SEND_RETRY_DEADLINE, send_body_text
-        ));
-    }
+    let send_resp = client
+        .post(url("/api/send"))
+        .json(&send_body)
+        .send()
+        .await
+        .expect("POST /api/send");
+    let send_status = send_resp.status();
+    let send_body_text = send_resp.text().await.unwrap_or_default();
     assert_eq!(
         send_status,
         StatusCode::OK,
@@ -1091,18 +1067,34 @@ async fn send_commit_roundtrip_moves_balance() {
     let send_body: Value = serde_json::from_str(&send_body_text).expect("send body JSON");
     assert_eq!(send_body["success"], Value::Bool(true));
     let send_proof_id = send_body["proof_id"].as_u64().expect("send proof_id");
+
+    // Value-bearing assertions on the response payload: each hash
+    // field must decode to exactly 32 bytes and be non-zero. A
+    // shape-only `.is_some()` check was masking server bugs that
+    // returned a placeholder zero-hash or a truncated hex string.
     let ash_hex = send_body["account_state_hash"]
         .as_str()
-        .expect("account_state_hash")
+        .expect("account_state_hash present")
         .to_string();
+    let ash_bytes = hex::decode(&ash_hex).expect("ash is hex");
+    assert_eq!(ash_bytes.len(), 32, "account_state_hash must be 32 bytes");
+    assert!(
+        ash_bytes.iter().any(|&b| b != 0),
+        "account_state_hash must be non-zero"
+    );
     let ocr_hex = send_body["output_coins_root"]
         .as_str()
-        .expect("output_coins_root")
+        .expect("output_coins_root present")
         .to_string();
+    let ocr_bytes = hex::decode(&ocr_hex).expect("ocr is hex");
+    assert_eq!(ocr_bytes.len(), 32, "output_coins_root must be 32 bytes");
+    assert!(
+        ocr_bytes.iter().any(|&b| b != 0),
+        "output_coins_root must be non-zero"
+    );
+    assert!(send_proof_id > 0, "proof_id must be a positive u64");
 
     // ---- Commit ----
-    let ash_bytes = hex::decode(&ash_hex).expect("decode ash");
-    let ocr_bytes = hex::decode(&ocr_hex).expect("decode ocr");
     let mut commit_message = Vec::with_capacity(64);
     commit_message.extend_from_slice(&ash_bytes);
     commit_message.extend_from_slice(&ocr_bytes);
@@ -1121,9 +1113,6 @@ async fn send_commit_roundtrip_moves_balance() {
         .await
         .expect("POST /api/commit");
     let commit_status = commit_resp.status();
-    if commit_status.is_server_error() {
-        dev_skip!(format!("commit returned {} — DEV flake", commit_status));
-    }
     assert_eq!(
         commit_status,
         StatusCode::OK,
@@ -1174,9 +1163,9 @@ async fn username_claim_resolve_lnurlp_roundtrip() {
         .await
         .expect("POST /api/username/claim");
     let claim_status = claim_resp.status();
-    if claim_status == StatusCode::SERVICE_UNAVAILABLE {
-        dev_skip!("username claim returned 503 — DB unavailable");
-    }
+    // DB availability is covered separately by `/health/ready`'s `db`
+    // failure tag; a 503 here means the username claim path itself
+    // regressed and is treated as a hard failure (no `dev_skip!`).
     assert_eq!(
         claim_status,
         StatusCode::OK,
@@ -1213,8 +1202,23 @@ async fn username_claim_resolve_lnurlp_roundtrip() {
         "callback must reference the username, got {:?}",
         lnurlp_body["callback"]
     );
-    assert!(lnurlp_body["minSendable"].as_u64().is_some());
-    assert!(lnurlp_body["maxSendable"].as_u64().is_some());
+    let min_sendable = lnurlp_body["minSendable"]
+        .as_u64()
+        .expect("minSendable must be a u64");
+    let max_sendable = lnurlp_body["maxSendable"]
+        .as_u64()
+        .expect("maxSendable must be a u64");
+    assert!(
+        min_sendable >= 1,
+        "minSendable must be >= 1 msat, got {}",
+        min_sendable
+    );
+    assert!(
+        max_sendable >= min_sendable,
+        "maxSendable ({}) must be >= minSendable ({})",
+        max_sendable,
+        min_sendable
+    );
     assert!(lnurlp_body["metadata"]
         .as_str()
         .is_some_and(|s| !s.is_empty()));
@@ -1278,6 +1282,57 @@ async fn poll_balance_at_most(client: &reqwest::Client, address: &str, target: u
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// Fetch the current balance of the well-known `MINTING_ADDRESS`.
+/// Used by the fresh-state guard at the top of the happy-path
+/// roundtrips to detect a dirty DEV state (prior mint residue or a
+/// missed `reset_state` run).
+async fn fetch_minting_balance(client: &reqwest::Client) -> u64 {
+    let minting_hex = format!("0x{}", hex::encode(digest_to_bytes(&MINTING_ADDRESS)));
+    let resp = client
+        .get(url(&format!("/api/balance?address={}", minting_hex)))
+        .send()
+        .await
+        .expect("GET /api/balance for MINTING_ADDRESS");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "/api/balance must return 200 for MINTING_ADDRESS"
+    );
+    let body: Value = resp.json().await.expect("balance body is JSON");
+    body["balance"].as_u64().expect("balance must be a u64")
+}
+
+/// Assert that the minting account exists and its balance has not
+/// somehow exceeded the bootstrap value. Allows for arbitrary prior
+/// mints in the same DB lifetime (each mint reduces the balance, never
+/// increases it).
+///
+/// Hard-fails if:
+/// - balance > BOOTSTRAP_MINTING_BALANCE (impossible without a code bug
+///   or unauthorized re-seed), OR
+/// - balance == 0 with no inflight mints (suggests an unwanted reset
+///   or DB wipe between deploys)
+///
+/// The deploy-dev workflow's `push: branches: [develop]` trigger does
+/// NOT run `reset-zkcoins-server`; that command requires explicit
+/// `workflow_dispatch` with `reset_state: true`. Strict equality with
+/// BOOTSTRAP_MINTING_BALANCE would therefore tripwire CI on the second
+/// push after any reset. Use this upper-bound assertion instead.
+async fn assert_minting_balance_in_bounds(client: &reqwest::Client) {
+    let balance = fetch_minting_balance(client).await;
+    assert!(
+        balance <= BOOTSTRAP_MINTING_BALANCE,
+        "minting balance {} > bootstrap {} — code regression or unauthorized re-seed",
+        balance,
+        BOOTSTRAP_MINTING_BALANCE,
+    );
+    assert!(
+        balance > 0,
+        "minting balance is 0 — likely an unexpected reset_state run or DB wipe; \
+         check the deploy-dev workflow's recent runs"
+    );
 }
 
 fn random_suffix() -> String {

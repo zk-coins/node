@@ -58,7 +58,7 @@ sqlx = { version = "0.8", default-features = false, features = [
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-# Used by `publisher_tests` for Esplora mocking and by `server_tests`
+# Used by `publisher_tests` for Esplora mocking and by `router_tests`
 # to mock the Esplora HTTP endpoint behind the `/health/ready`
 # readiness probe so the tests never hit the real
 # `https://mutinynet.com/api` from CI.
@@ -76,6 +76,12 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # run picks a fresh wallet and avoids collisions with concurrent
 # DEV-server consumers.
 rand = "0.8"
+# Auto-cleaning scratch directories for the ProofStore tests in
+# `router_tests`. Replaces the ad-hoc `std::env::temp_dir() + nanos
+# + remove_dir_all().ok()` shape — the `TempDir` Drop impl removes
+# the directory even when the test panics, so no test leaves a
+# leaked /tmp/zkcoins-* tree behind.
+tempfile = "3"
 
 [features]
 # All non-MVP features are off by default. When a feature is not enabled, the

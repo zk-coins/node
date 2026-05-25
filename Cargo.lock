@@ -1969,6 +1969,7 @@ dependencies = [
  "sha2",
  "shared",
  "sqlx",
+ "tempfile",
  "testcontainers",
  "testcontainers-modules",
  "tokio",
