@@ -119,9 +119,10 @@ async fn start_rest_node_binds_and_serves_health() {
 
     let (pool, _pg_container) = setup_pool().await;
 
-    let handle = tokio::spawn(async move {
-        start_rest_node(account_node, username_store, &addr, pool, None).await
-    });
+    let handle =
+        tokio::spawn(
+            async move { start_rest_node(account_node, username_store, &addr, pool).await },
+        );
 
     // Wait for the listener to come up. axum binds within ~hundreds of
     // ms on a warm cargo cache; cap the wait at 5 s so a regression
@@ -219,9 +220,10 @@ async fn bootstrap_initial_minting_account_balance_is_goldilocks_safe() {
 
     let (pool, _pg_container) = setup_pool().await;
 
-    let handle = tokio::spawn(async move {
-        start_rest_node(account_node, username_store, &addr, pool, None).await
-    });
+    let handle =
+        tokio::spawn(
+            async move { start_rest_node(account_node, username_store, &addr, pool).await },
+        );
 
     let minting_hex = hex::encode(digest_to_bytes(&MINTING_ADDRESS));
     let request = format!(
@@ -286,81 +288,10 @@ async fn bootstrap_initial_minting_account_balance_is_goldilocks_safe() {
     );
 }
 
-/// Startup invariant guard (zk-coins/node#89).
-///
-/// Seed a `minting_meta.num_pubkeys = 5` row into a fresh Postgres
-/// with NO SMT commitments. Bootstrap reads the counter, then the
-/// startup invariant check enumerates `pubkey_idx ∈ 0..5` and looks
-/// each up via `State::get_commitment_proof`. The first lookup fails
-/// (empty SMT → "MMR leaf count = 0"), the check returns Err with the
-/// CRITICAL log line, and `start_rest_node` propagates the error
-/// without ever binding the listener.
-///
-/// The assertion is text-shape on the CRITICAL message (verbatim,
-/// stable string) plus an absence-of-listener assertion via a probe
-/// TCP-connect to the port we requested — a successful connect would
-/// mean the bootstrap erroneously continued past the invariant check.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn startup_invariant_rejects_when_num_pubkeys_exceeds_smt() {
-    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind probe");
-    let port = probe.local_addr().expect("probe addr").port();
-    drop(probe);
-    let addr = format!("127.0.0.1:{}", port);
-
-    std::env::set_var("USERNAME_DOMAIN", "test.zkcoins.local");
-    std::env::set_var("ESPLORA_URL", "http://127.0.0.1:1/api");
-
-    let tmp = std::env::temp_dir().join(format!(
-        "zkcoins-invariant-test-{}-{}",
-        std::process::id(),
-        port
-    ));
-    std::fs::create_dir_all(&tmp).expect("create tempdir");
-    std::env::set_var("PROOFS_DIR", tmp.to_string_lossy().into_owned());
-
-    let (pool, _pg_container) = setup_pool().await;
-
-    // Seed the desynced row BEFORE building AccountNode + start_rest_node.
-    crate::db::upsert_minting_num_pubkeys(&pool, 5)
-        .await
-        .expect("seed stale minting_meta.num_pubkeys=5");
-
-    let state = Arc::new(Mutex::new(State::new()));
-    let account_node = AccountNode::new(Arc::clone(&state));
-    let username_store = UsernameStore::new();
-
-    // No scanner running in this test; pass `None` so the invariant
-    // check skips the settle wait and evaluates the SMT membership
-    // predicate immediately (the desync is permanent — no real
-    // scanner would unblock it).
-    let result = start_rest_node(account_node, username_store, &addr, pool, None).await;
-    std::fs::remove_dir_all(&tmp).ok();
-
-    let err = result.expect_err("start_rest_node must reject a desynced state");
-    let msg = format!("{:#}", err);
-    assert!(
-        msg.contains("CRITICAL: minting state desync at pubkey_idx=0"),
-        "expected the CRITICAL desync message, got: {}",
-        msg
-    );
-    assert!(
-        msg.contains("reset_state"),
-        "CRITICAL message must surface the recovery procedure (reset_state), got: {}",
-        msg
-    );
-
-    // Belt-and-braces: nobody bound the listener.
-    let bound = tokio::time::timeout(
-        Duration::from_millis(200),
-        tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)),
-    )
-    .await
-    .map(|res| res.is_ok())
-    .unwrap_or(false);
-    assert!(
-        !bound,
-        "listener must NOT have been bound when startup invariant failed"
-    );
-}
+// Phase D removed the startup `check_minting_state_invariant` check.
+// `num_pubkeys` is now derived from SMT membership at runtime
+// (`state::derive_num_pubkeys_from_smt`), which is the same source the
+// pre-Phase-D check measured the counter *against*. With the counter
+// and the SMT collapsed into one value the desync mode the check
+// guarded against can no longer arise, so the test that exercised the
+// `CRITICAL: minting state desync` Err arm is gone too.
