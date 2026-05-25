@@ -483,7 +483,7 @@ on startup if unset — there is no silent fallback.
 | Variable | Default | Description |
 |---|---|---|
 | `DATABASE_URL` | _(required, no default)_ | Postgres connection string for the state-layer (e.g. `postgresql://zkcoins:<pw>@postgres:5432/zkcoins`). Server panics on startup if unset. |
-| `PUBLISHER_KEY` | _(required, no default)_ | 32-byte hex private key for Taproot inscription publishing. **Required on every network — DEV, signet, and mainnet.** No fallback default exists: the previous `1234…` placeholder was a publicly-known test key that drainer bots swept within minutes of any on-chain top-up (4 historical drains confirmed). Server panics on startup if unset. Generate locally via `openssl rand -hex 32`. On `dfxdev` / `dfxprd` it's sourced from Vaultwarden — **never commit a real key**. |
+| `PUBLISHER_KEY` | _(required, no default)_ | 32-byte hex private key for Taproot inscription publishing. **Required on every network — DEV, signet, and mainnet.** No fallback default exists: the previous `1234…` placeholder was a publicly-known test key that drainer bots swept within minutes of any on-chain top-up (4 historical drains confirmed). Server panics on startup if unset. Generate locally via `openssl rand -hex 32`. In any deployed environment, source it from your secret manager — **never commit a real key**. |
 | `USERNAME_DOMAIN` | _(required, no default)_ | External hostname returned by `/api/info`; server panics on startup if unset (see PR [#36](https://github.com/zk-coins/node/pull/36) for the regression that introduced the global panic hook). |
 | `POSTGRES_PASSWORD` | _(required, no default for the DB container)_ | Read by the Postgres container, not by the node process itself; the node's `DATABASE_URL` already embeds the password. Listed here because it is part of the local-dev bootstrap (see `Local Development with Postgres` below). |
 | `ESPLORA_URL` | `https://mutinynet.com/api` | Esplora REST API endpoint (electrs or public). |
@@ -506,8 +506,8 @@ export USERNAME_DOMAIN="test.zkcoins.local"
 cargo run -p node
 ```
 
-For DEV / PRD deploys the real values live in Vaultwarden — see
-[`DFXServer/server`](https://github.com/DFXswiss/server) `vault-inventory.md`.
+For any deployed environment, the real values live in your secret manager
+of choice and are passed into the node container as env vars at startup.
 
 ## Docker
 

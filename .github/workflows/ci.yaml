@@ -188,13 +188,13 @@ jobs:
       # path matches the lazy_static-derived `PUBLISHER_ADDRESS`.
       PUBLISHER_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
       # `db_tests` use the `testcontainers` crate, which talks to the local
-      # Docker daemon. The M3 Ultra runner on dfx01 runs Colima (not
-      # Docker Desktop), whose socket lives under the runner user's home
+      # Docker daemon. The self-hosted runner runs Colima (not Docker
+      # Desktop), whose socket lives under the runner user's home
       # directory. `testcontainers` defaults to `/var/run/docker.sock`,
-      # which does not exist on Colima, so we point it at the real socket
-      # — same value the `docker info` step picks up implicitly via the
-      # default `docker` context.
-      DOCKER_HOST: unix:///Users/dfx01/.colima/default/docker.sock
+      # which does not exist on Colima, so the `Set DOCKER_HOST` step
+      # below points it at the real socket via `$HOME` — same value the
+      # `docker info` step picks up implicitly via the default `docker`
+      # context.
       # `sccache` wraps `rustc` and caches compiled crates across CI
       # runs. The M3 Ultra runner is self-hosted, so the cache lives on
       # local disk and survives between jobs — the speedup is biggest
@@ -223,6 +223,13 @@ jobs:
       # workspace rust-toolchain.
       - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Point `testcontainers` at the Colima socket under the runner
+      # user's home; see the `DOCKER_HOST` comment in the job env block
+      # above. Set in a step (not the static `env:` block) so the path
+      # resolves from `$HOME` at runtime instead of being hard-coded.
+      - name: Set DOCKER_HOST for Colima socket
+        run: echo "DOCKER_HOST=unix://$HOME/.colima/default/docker.sock" >> "$GITHUB_ENV"
 
       # `sccache` (compile cache) and `cargo-nextest` (test runner) are
       # installed once per runner via Homebrew. Re-running on a host
@@ -291,14 +298,9 @@ jobs:
       # block — the test mocks derive the wiremock'd publisher address
       # from this key.
       PUBLISHER_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
-      # `db_tests` use the `testcontainers` crate, which talks to the local
-      # Docker daemon. The M3 Ultra runner on dfx01 runs Colima (not
-      # Docker Desktop), whose socket lives under the runner user's home
-      # directory. `testcontainers` defaults to `/var/run/docker.sock`,
-      # which does not exist on Colima, so we point it at the real socket
-      # — same value the `docker info` step picks up implicitly via the
-      # default `docker` context.
-      DOCKER_HOST: unix:///Users/dfx01/.colima/default/docker.sock
+      # `db_tests` use the `testcontainers` crate; see `node-tests`
+      # above for the rationale. `DOCKER_HOST` is set in a step below
+      # so the Colima socket path resolves from `$HOME` at runtime.
       # Same sccache wrapper as `node-tests`; reuses the same on-disk
       # cache populated by the previous job in the same workflow run.
       RUSTC_WRAPPER: sccache
@@ -310,6 +312,11 @@ jobs:
 
       - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # See `node-tests` job above for the rationale; resolves the
+      # Colima socket path from `$HOME` at runtime.
+      - name: Set DOCKER_HOST for Colima socket
+        run: echo "DOCKER_HOST=unix://$HOME/.colima/default/docker.sock" >> "$GITHUB_ENV"
 
       # Same install gate as `node-tests`. Idempotent: no-op on a
       # warm runner where both tools already exist. See `node-tests`

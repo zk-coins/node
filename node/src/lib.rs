@@ -76,18 +76,14 @@ lazy_static! {
         domain
     };
 
-    /// Publisher Bitcoin private key (32-byte hex). REQUIRED env var
-    /// on every network (DEV / signet / mainnet). No fallback default
-    /// exists: the previous `1234567890abcdef…` placeholder was a
-    /// publicly-known test key that drainer bots swept within minutes
-    /// of any on-chain top-up. The matching public address +
-    /// derivation is exposed by `GET /health/publisher`.
+    /// Publisher Bitcoin private key (32-byte hex). REQUIRED env var.
+    /// No fallback default exists: the previous `1234567890abcdef…`
+    /// placeholder was a publicly-known test key that drainer bots
+    /// swept within minutes of any on-chain top-up. The matching
+    /// public address is exposed by `GET /health/publisher`.
     pub static ref PUBLISHER_KEY: String = std::env::var("PUBLISHER_KEY")
         .expect("PUBLISHER_KEY env var must be set — no default exists. \
-                 On dfxdev/dfxprd this is sourced from Vaultwarden \
-                 (item `zkcoins DEV - dfxdev` / `zkcoins PRD - dfxprd`, \
-                 see DFXServer/server vault-inventory.md). Local dev: \
-                 generate a random 32-byte hex via `openssl rand -hex 32`.");
+                 Generate a 32-byte hex secret via `openssl rand -hex 32`.");
 
     /// Taproot publisher address derived once at startup from
     /// `PUBLISHER_KEY` against the configured `NETWORK_CONFIG`. Folding
