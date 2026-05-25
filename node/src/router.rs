@@ -116,6 +116,20 @@ pub(crate) struct AppState {
     /// release builds.
     #[cfg(test)]
     pub(crate) phase3_release_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Test-only deterministic hold between the broadcast result and
+    /// the phase-3b state advance (`update_and_snapshot_for_persist`).
+    /// Mirrors `phase3_release_lock`: the handler acquires + immediately
+    /// drops this mutex AFTER `create_and_broadcast_inscription` returns
+    /// and BEFORE acquiring the state lock to apply the new commitment.
+    /// Constructed unlocked so production-shaped tests proceed
+    /// immediately. The in-process state.update Err test grabs the
+    /// guard before spawning the request, lets the handler run through
+    /// broadcast, injects the colliding SMT entry, then drops the
+    /// guard — at which point the handler's `state.update` observes
+    /// the collision and returns 503. Hidden behind `cfg(test)` so the
+    /// field does not exist in release builds.
+    #[cfg(test)]
+    pub(crate) state_advance_release_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 // Response types for our API
@@ -1061,6 +1075,16 @@ async fn mint_handler(
     // `reveal_broadcast` and the in-memory state advance was NOT
     // persisted to disk (transaction atomicity); the scanner will
     // replay cleanly.
+    // Test-only deterministic hold between the broadcast result and
+    // the phase-3b state advance. Pre-unlocked in all `test_state`
+    // constructors so production-shaped tests acquire + drop in one
+    // step. The in-process state.update Err test holds the guard
+    // across a colliding SMT injection so the handler observes the
+    // collision when its `state.update` finally runs. Production
+    // builds compile this out entirely (the field does not exist).
+    #[cfg(test)]
+    drop(state.state_advance_release_lock.lock().await);
+
     let state_advance_outcome = {
         let state_arc_for_advance = {
             let account_node_guard = lock_or_recover(&state.account_node);

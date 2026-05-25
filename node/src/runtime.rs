@@ -103,6 +103,8 @@ pub async fn start_rest_node(
         phase2_reached: Arc::new(tokio::sync::Notify::new()),
         #[cfg(test)]
         phase3_release_lock: Arc::new(tokio::sync::Mutex::new(())),
+        #[cfg(test)]
+        state_advance_release_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     // Bootstrap the minting account if it isn't already in the DB.
