@@ -365,7 +365,7 @@ impl AccountNode {
     /// state-transition (witness assembly, prove, post-prove account
     /// mutation) against an externally-owned `&mut Account` and returns
     /// the produced coin proofs. The caller is responsible for deciding
-    /// whether to commit the mutated account back into the server
+    /// whether to commit the mutated account back into the node
     /// (e.g. after on-chain broadcast succeeded — see
     /// [`Self::prepare_mint`] + [`Self::commit_mint`]).
     ///
@@ -895,57 +895,57 @@ mod inline_tests {
 
     #[test]
     fn get_minting_account_address_errors_when_not_imported() {
-        let mut server = fresh_node();
+        let mut node = fresh_node();
         assert_eq!(
-            server.get_minting_account_address().unwrap_err(),
+            node.get_minting_account_address().unwrap_err(),
             "Minting account not created"
         );
     }
 
     #[test]
     fn get_minting_account_address_returns_minting_address_when_present() {
-        let mut server = fresh_node();
-        server.import_account(*zkcoins_program::types::MINTING_ADDRESS, Account::new());
+        let mut node = fresh_node();
+        node.import_account(*zkcoins_program::types::MINTING_ADDRESS, Account::new());
         assert_eq!(
-            server.get_minting_account_address().unwrap(),
+            node.get_minting_account_address().unwrap(),
             *zkcoins_program::types::MINTING_ADDRESS
         );
     }
 
     #[test]
     fn get_account_balance_errors_for_unknown_address() {
-        let server = fresh_node();
+        let node = fresh_node();
         let unknown = zkcoins_program::hash::digest_from_bytes(&[7u8; 32]);
         assert_eq!(
-            server.get_account_balance(&unknown).unwrap_err(),
+            node.get_account_balance(&unknown).unwrap_err(),
             "No account with this address"
         );
     }
 
     #[test]
     fn get_account_balance_returns_zero_for_empty_account() {
-        let mut server = fresh_node();
+        let mut node = fresh_node();
         let address = zkcoins_program::hash::digest_from_bytes(&[1u8; 32]);
-        server.import_account(address, Account::new());
-        assert_eq!(server.get_account_balance(&address).unwrap(), 0);
+        node.import_account(address, Account::new());
+        assert_eq!(node.get_account_balance(&address).unwrap(), 0);
     }
 
     #[test]
     fn get_account_returns_some_for_known_address() {
-        let mut server = fresh_node();
+        let mut node = fresh_node();
         let address = zkcoins_program::hash::digest_from_bytes(&[1u8; 32]);
         let mut account = Account::new();
         account.balance = 42;
-        server.import_account(address, account);
-        let got = server.get_account(&address).expect("present");
+        node.import_account(address, account);
+        let got = node.get_account(&address).expect("present");
         assert_eq!(got.balance, 42);
     }
 
     #[test]
     fn get_account_returns_none_for_unknown_address() {
-        let server = fresh_node();
+        let node = fresh_node();
         let unknown = zkcoins_program::hash::digest_from_bytes(&[9u8; 32]);
-        assert!(server.get_account(&unknown).is_none());
+        assert!(node.get_account(&unknown).is_none());
     }
 
     #[test]
@@ -969,11 +969,11 @@ mod inline_tests {
 
     #[test]
     fn send_coins_errors_for_unknown_account() {
-        let mut server = fresh_node();
+        let mut node = fresh_node();
         let recipient = zkcoins_program::hash::digest_from_bytes(&[2u8; 32]);
         let account_address = zkcoins_program::hash::digest_from_bytes(&[3u8; 32]);
         let pk = dummy_secp_public_key();
-        let result = server.send_coins(
+        let result = node.send_coins(
             vec![Invoice::new(1, recipient)],
             account_address,
             pk,
@@ -985,12 +985,12 @@ mod inline_tests {
 
     #[test]
     fn send_coins_errors_on_insufficient_funds() {
-        let mut server = fresh_node();
+        let mut node = fresh_node();
         let account_address = zkcoins_program::hash::digest_from_bytes(&[4u8; 32]);
-        server.import_account(account_address, Account::new());
+        node.import_account(account_address, Account::new());
         let recipient = zkcoins_program::hash::digest_from_bytes(&[5u8; 32]);
         let pk = dummy_secp_public_key();
-        let result = server.send_coins(
+        let result = node.send_coins(
             vec![Invoice::new(100, recipient)],
             account_address,
             pk,
@@ -1002,9 +1002,9 @@ mod inline_tests {
 
     #[test]
     fn prepare_mint_errors_when_minting_account_absent() {
-        let server = fresh_node();
+        let node = fresh_node();
         let pk = dummy_secp_public_key();
-        let result = server.prepare_mint(vec![], pk, pk, None);
+        let result = node.prepare_mint(vec![], pk, pk, None);
         assert_eq!(result.unwrap_err(), "Minting account not created");
     }
 
@@ -1111,13 +1111,13 @@ mod inline_tests {
         .join();
         assert!(state.is_poisoned(), "state mutex must be poisoned");
 
-        let mut server = AccountNode::new(Arc::clone(&state));
+        let mut node = AccountNode::new(Arc::clone(&state));
         let recipient = zkcoins_program::hash::digest_from_bytes(&[2u8; 32]);
         let account_address = zkcoins_program::hash::digest_from_bytes(&[3u8; 32]);
         let pk = dummy_secp_public_key();
         // The send_coins call must traverse the poisoned-lock recovery
         // path before hitting the "Unknown account address" guard.
-        let result = server.send_coins(
+        let result = node.send_coins(
             vec![Invoice::new(1, recipient)],
             account_address,
             pk,

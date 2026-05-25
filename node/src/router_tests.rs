@@ -952,7 +952,7 @@ async fn claim_username_mixed_case_input_normalised_before_hashing() {
         .unwrap()
         .as_secs();
 
-    // Sign over the NORMALISED form — that is the contract the server
+    // Sign over the NORMALISED form — that is the contract the node
     // enforces by canonicalising before hashing.
     let mut hasher = Sha256::new();
     hasher.update(b"zkcoins:claim_username");
@@ -2966,8 +2966,8 @@ fn lock_or_recover_account_node_poisoned() {
     // Generic instantiation: cover the AccountNode-specific monomorphic
     // copy of lock_or_recover's poison-recovery closure.
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let server = Arc::new(Mutex::new(AccountNode::new(Arc::clone(&state_arc))));
-    let server_clone = Arc::clone(&server);
+    let node = Arc::new(Mutex::new(AccountNode::new(Arc::clone(&state_arc))));
+    let server_clone = Arc::clone(&node);
 
     let _ = std::thread::spawn(move || {
         let _guard = server_clone.lock().unwrap();
@@ -2975,8 +2975,8 @@ fn lock_or_recover_account_node_poisoned() {
     })
     .join();
 
-    assert!(server.is_poisoned());
-    let _guard = lock_or_recover(&server);
+    assert!(node.is_poisoned());
+    let _guard = lock_or_recover(&node);
 }
 
 #[test]
@@ -3542,12 +3542,12 @@ fn mint_test_state() -> AppState {
 fn mint_test_state_without_minting_account() -> AppState {
     let state = mint_test_state();
     {
-        let mut server = state.account_node.lock().unwrap();
+        let mut node = state.account_node.lock().unwrap();
         // Reset to a brand-new server with no accounts at all. The
         // `Arc<Mutex<State>>` inside `server` is replaced too, but the
         // shared `state_inner` is dropped on overwrite which is fine
         // — nothing else holds it after `mint_test_state` returns.
-        *server = AccountNode::new(Arc::new(Mutex::new(State::new())));
+        *node = AccountNode::new(Arc::new(Mutex::new(State::new())));
     }
     state
 }
@@ -3620,13 +3620,13 @@ async fn mint_insufficient_funds_returns_422() {
     // `send_coins_error_response`.
     let state = mint_test_state();
     {
-        let mut server = state.account_node.lock().unwrap();
+        let mut node = state.account_node.lock().unwrap();
         // Re-import the minting account with balance=0. The previous
         // import is overwritten by HashMap semantics inside
         // `import_account`.
         let mut empty = Account::new();
         empty.balance = 0;
-        server.import_account(*zkcoins_program::types::MINTING_ADDRESS, empty);
+        node.import_account(*zkcoins_program::types::MINTING_ADDRESS, empty);
     }
 
     let body = serde_json::json!({
@@ -4169,8 +4169,8 @@ async fn mint_receive_coin_failure_logs_and_returns_ok() {
         .insert(predicted_coin_id_bytes, predicted_coin_id)
         .expect("insert into fresh SMT must succeed");
     {
-        let mut server = state.account_node.lock().unwrap();
-        server.import_account(recipient, recipient_account);
+        let mut node = state.account_node.lock().unwrap();
+        node.import_account(recipient, recipient_account);
     }
 
     let recipient_hex = "0x".to_string() + &hex::encode(recipient_bytes);
