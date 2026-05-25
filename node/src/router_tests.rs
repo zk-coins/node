@@ -2429,9 +2429,9 @@ async fn commit_with_valid_signature_fails_broadcast_returns_503() {
     let mock_server = MockServer::start().await;
     let secp = secp::Secp256k1::new();
     let publisher_sk = SecretKey::from_slice(
-        &hex::decode("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef").unwrap(),
+        &hex::decode("0000000000000000000000000000000000000000000000000000000000000001").unwrap(),
     )
-    .expect("default publisher key parses");
+    .expect("CI test publisher key parses");
     let publisher_kp = Keypair::from_secret_key(&secp, &publisher_sk);
     let (publisher_xonly, _) = bitcoin::secp256k1::XOnlyPublicKey::from_keypair(&publisher_kp);
     let publisher_address =
@@ -3784,15 +3784,18 @@ async fn mint_happy_path_broadcasts_and_returns_proof_id() {
     );
 
     // 2. Spin up wiremock and answer the publisher's UTXO + broadcast
-    //    requests. The publisher key in unit tests is the default
-    //    `DEFAULT_PUBLISHER_KEY` from lib.rs (PUBLISHER_KEY env var
-    //    unset in CI) — derive the matching Taproot address so the
-    //    `/address/<addr>/utxo` mock matches.
+    //    requests. The publisher key under test is the CI test value
+    //    set via the `PUBLISHER_KEY` env var in `.github/workflows/ci.yaml`
+    //    (`0000…0001`, a syntactically valid 32-byte hex placeholder
+    //    distinct from the publicly burned `1234…` key removed in the
+    //    "require PUBLISHER_KEY on every network" hardening) — derive
+    //    the matching Taproot address so the `/address/<addr>/utxo`
+    //    mock matches.
     let mock_server = MockServer::start().await;
     let secp = Secp256k1::new();
     let sk =
-        SecretKey::from_str("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
-            .expect("default publisher key parses");
+        SecretKey::from_str("0000000000000000000000000000000000000000000000000000000000000001")
+            .expect("CI test publisher key parses");
     let key_pair = Keypair::from_secret_key(&secp, &sk);
     let (xonly, _) = XOnlyPublicKey::from_keypair(&key_pair);
     let publisher_address = bitcoin::Address::p2tr(&secp, xonly, None, Network::Signet);
@@ -3996,8 +3999,8 @@ async fn mint_broadcast_mock_server() -> wiremock::MockServer {
     let mock_server = MockServer::start().await;
     let secp = Secp256k1::new();
     let sk =
-        SecretKey::from_str("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
-            .expect("default publisher key parses");
+        SecretKey::from_str("0000000000000000000000000000000000000000000000000000000000000001")
+            .expect("CI test publisher key parses");
     let key_pair = Keypair::from_secret_key(&secp, &sk);
     let (xonly, _) = XOnlyPublicKey::from_keypair(&key_pair);
     let publisher_address = bitcoin::Address::p2tr(&secp, xonly, None, Network::Signet);

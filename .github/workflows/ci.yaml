@@ -174,6 +174,19 @@ jobs:
       # is irrelevant for the `info_returns_*` assertions (they only
       # check non-empty + shape).
       USERNAME_DOMAIN: test.zkcoins.local
+      # `PUBLISHER_KEY` is required on every network (no default — see
+      # `node/src/lib.rs`). The previous `1234567890abcdef…` fallback
+      # was a publicly-known test key that drainer bots swept within
+      # minutes of any on-chain top-up; the fallback was removed
+      # network-wide in the "require PUBLISHER_KEY on every network"
+      # hardening. The value below is a syntactically valid 32-byte
+      # hex placeholder (`0000…0001`) chosen so a future grep for the
+      # burned `1234…` key returns empty across the repo + CI config;
+      # it is NOT a secret and MUST NEVER be reused on any chain that
+      # holds value. The same value is hard-coded in the test mocks at
+      # `node/src/router_tests.rs` so the wiremock'd publisher address
+      # path matches the lazy_static-derived `PUBLISHER_ADDRESS`.
+      PUBLISHER_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
       # `db_tests` use the `testcontainers` crate, which talks to the local
       # Docker daemon. The M3 Ultra runner on dfx01 runs Colima (not
       # Docker Desktop), whose socket lives under the runner user's home
@@ -271,6 +284,13 @@ jobs:
     env:
       ESPLORA_URL: http://127.0.0.1:1/api
       USERNAME_DOMAIN: test.zkcoins.local
+      # `PUBLISHER_KEY` is required on every network (no default — see
+      # `node/src/lib.rs`); the value mirrors `node-tests` above and is
+      # a syntactically valid 32-byte hex placeholder, NOT a secret.
+      # MUST match `node/src/router_tests.rs` and the `node-tests` env
+      # block — the test mocks derive the wiremock'd publisher address
+      # from this key.
+      PUBLISHER_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
       # `db_tests` use the `testcontainers` crate, which talks to the local
       # Docker daemon. The M3 Ultra runner on dfx01 runs Colima (not
       # Docker Desktop), whose socket lives under the runner user's home
