@@ -1258,7 +1258,7 @@ needs `ConstantGate::new(2)` injection in pass 3 and
 
 ### 7.23 `MINTING_ADDRESS` panic in `tokio::spawn`-ed task swallows server bootstrap — **MEDIUM, codified**
 
-**Discovered:** first auto-deploy of `zkcoin/node:beta` on the DEV
+**Discovered:** first auto-deploy of `zkcoins/node:beta` on the DEV
 host post-PR [#17](https://github.com/zk-coins/node/pull/17). The
 container started, the REST server bound `0.0.0.0:4242`, but
 `https://dev-api.zkcoins.app/health` returned Cloudflare 502 for hours.

@@ -487,12 +487,12 @@ for the historical pickup record.
 ## Docker
 
 ```bash
-docker build -t zkcoin/node .
+docker build -t zkcoins/node .
 docker run -p 4242:4242 \
   --network bitcoin \
   -e ESPLORA_URL=http://electrs-mainnet:3000 \
   -e USERNAME_DOMAIN=zkcoins.app \
-  zkcoin/node
+  zkcoins/node
 ```
 
 Docker builds use nightly Rust auto-installed via the workspace `rust-toolchain` — no Succinct toolchain, no zkVM target.
@@ -549,8 +549,8 @@ See [docs.zkcoins.app/infrastructure/backend](https://docs.zkcoins.app/infrastru
 | `ci.yaml` (Lint & Build) | Ready PR → develop, push to develop | `cargo fmt --check`, clippy (MVP + all-features + program lib), build (MVP + all-features) on `ubuntu-latest`. |
 | `ci.yaml` (Server + Shared Tests) | Ready PR → develop with `ci:full` label, push to develop | `cargo test -p server -p shared --release --all-features` on a self-hosted M3 Ultra runner (issue #40). |
 | `ci.yaml` (Coverage Gate) | Ready PR → develop with `ci:full` label, push to develop | `cargo llvm-cov` with the 100% line + function gate, MVP scope, on the same self-hosted runner. |
-| `deploy-dev.yaml` | Push to develop | Docker build (ARM64) → push `zkcoin/node:beta` → deploy to DEV |
-| `deploy-prd.yaml` | Push to main | Docker build (ARM64) → push `zkcoin/node:latest` → deploy to PRD |
+| `deploy-dev.yaml` | Push to develop | Docker build (ARM64) → push `zkcoins/node:beta` → deploy to DEV |
+| `deploy-prd.yaml` | Push to main | Docker build (ARM64) → push `zkcoins/node:latest` → deploy to PRD |
 | `auto-release-pr.yaml` | Push to develop | Creates Release PR (develop → main) |
 
 **Draft PRs** skip every `ci.yaml` job — the workflow fires once the

@@ -6,8 +6,8 @@
 # step needed.
 #
 # Build:
-#   docker build -t zkcoin/node:latest .
-#   docker build -t zkcoin/node:beta .
+#   docker build -t zkcoins/node:latest .
+#   docker build -t zkcoins/node:beta .
 #
 # Both DEV (`:beta`) and PRD (`:latest`) ship the MVP-only binary
 # (no Cargo features beyond the always-on mint and username routes).
@@ -19,7 +19,7 @@
 #     -e ESPLORA_URL=http://electrs:3000 \
 #     -e PUBLISHER_KEY=<hex> \
 #     -v zkcoins-data:/data \
-#     zkcoin/node:latest
+#     zkcoins/node:latest
 
 FROM rust:bookworm AS builder
 WORKDIR /app

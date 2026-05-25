@@ -6,8 +6,8 @@ Rust/Axum backend for [zkcoins.app](https://zkcoins.app) — account management,
 
 | Environment | URL                                                | Image                  |
 | ----------- | -------------------------------------------------- | ---------------------- |
-| **PRD**     | [api.zkcoins.app](https://api.zkcoins.app)         | `zkcoin/node:latest` |
-| **DEV**     | [dev-api.zkcoins.app](https://dev-api.zkcoins.app) | `zkcoin/node:beta`   |
+| **PRD**     | [api.zkcoins.app](https://api.zkcoins.app)         | `zkcoins/node:latest` |
+| **DEV**     | [dev-api.zkcoins.app](https://dev-api.zkcoins.app) | `zkcoins/node:beta`   |
 
 ## Stack
 
@@ -40,7 +40,7 @@ The **on-chain footprint stays private** — Plonky2 ensures that the public out
 | Operator sees plaintext transaction data | ❌ Yes — DFX runs the hosted node | ✅ No |
 | Setup effort | ✅ None | ⚠️ Postgres + electrs + Bitcoin node |
 
-**If you need full transaction privacy, run your own server.** Every release is shipped as `zkcoin/node:latest` (see [Live](#live)), the build recipe is [`Dockerfile`](./Dockerfile), and runtime knobs are documented in [Configuration](#configuration). Point the [zkcoins.app](https://zkcoins.app) client at your self-hosted instance for end-to-end self-custody of transaction data.
+**If you need full transaction privacy, run your own server.** Every release is shipped as `zkcoins/node:latest` (see [Live](#live)), the build recipe is [`Dockerfile`](./Dockerfile), and runtime knobs are documented in [Configuration](#configuration). Point the [zkcoins.app](https://zkcoins.app) client at your self-hosted instance for end-to-end self-custody of transaction data.
 
 ## Contributing
 
@@ -300,21 +300,21 @@ The last SP1 zkVM / SHA256 state is preserved at tag `v0.last-sp1` for historica
 ## Docker
 
 ```bash
-docker build -t zkcoin/node .
+docker build -t zkcoins/node .
 docker run -p 4242:4242 \
   --network bitcoin \
   -e ESPLORA_URL=http://electrs-mainnet:3000 \
-  zkcoin/node
+  zkcoins/node
 ```
 
-Docker builds use nightly Rust auto-installed via `rust-toolchain` (no external toolchain needed). The Dockerfile lives at the repo root; `.github/workflows/deploy-dev.yaml` builds `zkcoin/node:beta` for `linux/arm64` and deploys to the DEV host on every push to `develop`.
+Docker builds use nightly Rust auto-installed via `rust-toolchain` (no external toolchain needed). The Dockerfile lives at the repo root; `.github/workflows/deploy-dev.yaml` builds `zkcoins/node:beta` for `linux/arm64` and deploys to the DEV host on every push to `develop`.
 
 ## CI/CD
 
 | Workflow               | Trigger      | Action                                               |
 | ---------------------- | ------------ | ---------------------------------------------------- |
-| `deploy-dev.yaml`      | Push develop | Docker (ARM64) → `zkcoin/node:beta` → DEV server   |
-| `deploy-prd.yaml`      | Push main    | Docker (ARM64) → `zkcoin/node:latest` → PRD server |
+| `deploy-dev.yaml`      | Push develop | Docker (ARM64) → `zkcoins/node:beta` → DEV server   |
+| `deploy-prd.yaml`      | Push main    | Docker (ARM64) → `zkcoins/node:latest` → PRD server |
 | `auto-release-pr.yaml` | Push develop | Creates Release PR (develop → main)                  |
 
 Build time: ~5 minutes (Rust compilation on ARM64).
