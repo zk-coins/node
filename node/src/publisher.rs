@@ -114,31 +114,16 @@ pub fn inscription_txs(
 
     let amount: u64 = outpoints_with_sats.iter().map(|(_, sats)| sats).sum();
 
-    // Build a taproot script committing to the data
-    let mut script_builder = script::Builder::new()
-        .push_slice(public_key.serialize())
-        .push_opcode(opcodes::all::OP_CHECKSIG)
-        .push_opcode(opcodes::OP_FALSE)
-        .push_opcode(opcodes::all::OP_IF);
-
-    // Add the commitment data in chunks
-    for chunk in commitment_data.chunks(MAX_CHUNK_SIZE) {
-        let buffer = PushBytesBuf::try_from(chunk.to_vec()).unwrap();
-        script_builder = script_builder.push_slice(buffer);
-    }
-
-    let reveal_script = script_builder
-        .push_opcode(opcodes::all::OP_ENDIF)
-        .into_script();
-
-    let taproot_spend_info = TaprootBuilder::new()
-        .add_leaf(0, reveal_script.clone())
-        .unwrap()
-        .finalize(&secp256k1, public_key)
-        .unwrap();
-
-    // The commit address commits to our data
-    let commit_address = Address::p2tr_tweaked(taproot_spend_info.output_key(), network);
+    // Build the script-path Taproot anchor that commits to the data.
+    // The same builder is used by `build_reveal_only`, ensuring the
+    // commit address (and therefore the reveal-spend script) matches
+    // exactly between the in-process happy path and out-of-band
+    // recovery callers.
+    let TaprootAnchor {
+        commit_address,
+        reveal_script,
+        taproot_spend_info,
+    } = build_taproot_anchor(commitment_data, public_key, network);
 
     // Create commit transaction
     let mut commit_tx = Transaction {
@@ -194,12 +179,149 @@ pub fn inscription_txs(
         witness.push(signature.as_ref());
     }
 
+    let commit_txid = commit_tx.compute_txid();
+    let commit_output_value = commit_tx.output[0].value.to_sat();
+
+    let reveal_tx = build_reveal_only_inner(
+        commit_txid,
+        commit_output_value,
+        publisher_address,
+        &key_pair,
+        &reveal_script,
+        &taproot_spend_info,
+        &secp256k1,
+    );
+
+    (commit_tx, reveal_tx)
+}
+
+/// Internal helper carrying the script-path anchor artefacts that both
+/// `inscription_txs` and the recovery CLI need to reconstruct.
+struct TaprootAnchor {
+    commit_address: Address,
+    reveal_script: ScriptBuf,
+    taproot_spend_info: bitcoin::taproot::TaprootSpendInfo,
+}
+
+/// Builds the script-path Taproot anchor (commit address + reveal
+/// script + spend info) from a commitment payload, the publisher's
+/// x-only pubkey, and the target network. Pure / deterministic — the
+/// same `(commitment_data, public_key, network)` triple always produces
+/// the same anchor.
+fn build_taproot_anchor(
+    commitment_data: &[u8],
+    public_key: XOnlyPublicKey,
+    network: Network,
+) -> TaprootAnchor {
+    let secp256k1 = Secp256k1::new();
+
+    // Build a taproot script committing to the data
+    let mut script_builder = script::Builder::new()
+        .push_slice(public_key.serialize())
+        .push_opcode(opcodes::all::OP_CHECKSIG)
+        .push_opcode(opcodes::OP_FALSE)
+        .push_opcode(opcodes::all::OP_IF);
+
+    // Add the commitment data in chunks
+    for chunk in commitment_data.chunks(MAX_CHUNK_SIZE) {
+        let buffer = PushBytesBuf::try_from(chunk.to_vec()).unwrap();
+        script_builder = script_builder.push_slice(buffer);
+    }
+
+    let reveal_script = script_builder
+        .push_opcode(opcodes::all::OP_ENDIF)
+        .into_script();
+
+    let taproot_spend_info = TaprootBuilder::new()
+        .add_leaf(0, reveal_script.clone())
+        .unwrap()
+        .finalize(&secp256k1, public_key)
+        .unwrap();
+
+    let commit_address = Address::p2tr_tweaked(taproot_spend_info.output_key(), network);
+
+    TaprootAnchor {
+        commit_address,
+        reveal_script,
+        taproot_spend_info,
+    }
+}
+
+/// Reveal-only constructor used by both the in-process publisher path
+/// (`inscription_txs`) and the out-of-band recovery CLI
+/// (`bin/recover_inscription.rs`).
+///
+/// Re-derives the script-path Taproot anchor from `commitment_data`
+/// and the publisher key, then assembles + nonce-mines the reveal
+/// transaction that spends the commit anchor's output[0] back to the
+/// publisher address. The caller supplies the already-broadcast
+/// `commit_txid` and the anchor output's value in sats — there is no
+/// commit broadcast or commit signing on this path.
+///
+/// Returns the mined reveal transaction together with the derived
+/// commit address so the caller can sanity-check it against the
+/// observed on-chain anchor.
+pub fn build_reveal_only(
+    commit_txid: Txid,
+    commit_output_value: u64,
+    commitment_data: &[u8],
+    publisher_key: &str,
+    publisher_address: &Address,
+    network: Network,
+) -> (Transaction, Address) {
+    let secp256k1 = Secp256k1::new();
+    let sk = SecretKey::from_str(publisher_key).unwrap();
+    let key_pair = secp256k1::Keypair::from_secret_key(&secp256k1, &sk);
+    let (public_key, _parity) = XOnlyPublicKey::from_keypair(&key_pair);
+
+    let TaprootAnchor {
+        commit_address,
+        reveal_script,
+        taproot_spend_info,
+    } = build_taproot_anchor(commitment_data, public_key, network);
+
+    let reveal_tx = build_reveal_only_inner(
+        commit_txid,
+        commit_output_value,
+        publisher_address,
+        &key_pair,
+        &reveal_script,
+        &taproot_spend_info,
+        &secp256k1,
+    );
+
+    (reveal_tx, commit_address)
+}
+
+/// Inner reveal-construction loop shared by `inscription_txs` and
+/// `build_reveal_only`. Takes the pre-derived anchor artefacts so we
+/// only re-derive once per call site, matching the legacy code path.
+#[allow(clippy::too_many_arguments)]
+fn build_reveal_only_inner(
+    commit_txid: Txid,
+    commit_output_value: u64,
+    publisher_address: &Address,
+    key_pair: &secp256k1::Keypair,
+    reveal_script: &ScriptBuf,
+    taproot_spend_info: &bitcoin::taproot::TaprootSpendInfo,
+    secp256k1: &Secp256k1<secp256k1::All>,
+) -> Transaction {
+    // The reveal spends the commit anchor; mirror the prevout `TxOut`
+    // used for signing so the legacy and recovery paths produce a
+    // byte-identical witness for the same inputs. The scriptPubKey is
+    // derived directly from the tweaked output key (network-agnostic —
+    // P2TR scriptPubKey is `OP_1 <32-byte-output-key>` on every chain).
+    let commit_prevout = TxOut {
+        value: Amount::from_sat(commit_output_value),
+        script_pubkey: ScriptBuf::new_p2tr_tweaked(taproot_spend_info.output_key()),
+    };
+
     // Create reveal transaction
     let mut reveal_tx = Transaction {
         version: Version(1),
         lock_time: LockTime::from_consensus(0),
         input: vec![TxIn {
-            previous_output: OutPoint::new(commit_tx.compute_txid(), 0),
+            previous_output: OutPoint::new(commit_txid, 0),
             script_sig: script::Builder::new().into_script(),
             witness: Witness::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
@@ -212,7 +334,7 @@ pub fn inscription_txs(
 
     let reveal_fee = min_fee(&reveal_tx, Some(REVEAL_TX_WITNESS_WEIGHT));
     reveal_tx.output.first_mut().unwrap().value =
-        Amount::from_sat(amount - reveal_fee - commit_fee);
+        Amount::from_sat(commit_output_value - reveal_fee);
 
     // Mine the reveal transaction to have a txid starting with our marker
     println!(
@@ -234,14 +356,14 @@ pub fn inscription_txs(
         let signature_hash = sighash_cache
             .taproot_script_spend_signature_hash(
                 0,
-                &Prevouts::All(&[&commit_tx.output[0]]),
-                TapLeafHash::from_script(&reveal_script, LeafVersion::TapScript),
+                &Prevouts::All(&[&commit_prevout]),
+                TapLeafHash::from_script(reveal_script, LeafVersion::TapScript),
                 TapSighashType::Default,
             )
             .unwrap();
 
         let message = secp256k1::Message::from_digest_slice(&signature_hash[..]).unwrap();
-        let signature = secp256k1.sign_schnorr(&message, &key_pair);
+        let signature = secp256k1.sign_schnorr(&message, key_pair);
 
         let witness = sighash_cache.witness_mut(0).unwrap();
         witness.clear();
@@ -267,7 +389,7 @@ pub fn inscription_txs(
         }
     }
 
-    (commit_tx, reveal_tx)
+    reveal_tx
 }
 
 /// Broadcasts the commit and reveal transactions to the Bitcoin
