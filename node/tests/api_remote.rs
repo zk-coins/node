@@ -30,7 +30,7 @@
 //!   - skip on 5xx codes with a logged warning (server-side flake)
 //!
 //! Read by:
-//!   - `cargo test -p server --release --test api_remote` (locally)
+//!   - `cargo test -p node --release --test api_remote` (locally)
 //!   - the `api-e2e` job in `deploy-dev.yaml` after `build-and-deploy`
 //!
 //! Configuration:
@@ -40,11 +40,11 @@
 use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
 use bitcoin::secp256k1::{self as secp, Keypair, Message, PublicKey, SecretKey};
 use bitcoin::Network;
+use node::account_node::CoinProof;
+use node::router::Capabilities;
 use rand::RngCore;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
-use server::account_server::CoinProof;
-use server::server::Capabilities;
 use sha2::{Digest, Sha256};
 use shared::commitment::Commitment;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -304,7 +304,7 @@ async fn root_returns_service_metadata() {
     let resp = http_client().get(url("/")).send().await.expect("GET /");
     assert_eq!(resp.status(), StatusCode::OK);
     let body: Value = resp.json().await.expect("root body is JSON");
-    assert_eq!(body["service"], "zkcoins-server");
+    assert_eq!(body["service"], "zkcoins-node");
     assert!(body["version"].as_str().is_some_and(|v| !v.is_empty()));
     assert!(body["network"].as_str().is_some_and(|v| !v.is_empty()));
     assert!(body["endpoints"]["info"].is_string());

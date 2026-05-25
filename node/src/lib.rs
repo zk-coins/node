@@ -1,4 +1,4 @@
-//! Library crate root for `server`.
+//! Library crate root for `node`.
 //!
 //! The server is primarily a binary (`main.rs`), but a few pieces of
 //! it must be reachable from out-of-tree integration tests
@@ -25,15 +25,15 @@
 // untouched.
 #![allow(clippy::new_without_default)]
 
-pub mod account_server;
+pub mod account_node;
 pub mod db;
 pub mod publisher;
+pub mod router;
+pub mod runtime;
 pub mod scanner;
 pub mod scanner_runtime;
 pub mod scanner_ws;
 pub mod scanner_ws_parse;
-pub mod server;
-pub mod server_runtime;
 pub mod state;
 pub mod username;
 

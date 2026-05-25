@@ -4,7 +4,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use crate::account_server::{Account, AccountServer};
+use crate::account_node::{Account, AccountNode};
 use crate::state::State;
 
 /// Build a `PgPool` that points at nowhere — every query against it
@@ -13,8 +13,8 @@ use crate::state::State;
 /// the error branch (which mirrors the legacy file-IO best-effort
 /// semantics: log + continue, never fail the response). The matching
 /// happy-path tests for the upsert lines run against a real
-/// Postgres 17 testcontainer in `db_tests.rs`, `account_server_tests.rs`,
-/// `username_tests.rs`, and `server_runtime_tests.rs`.
+/// Postgres 17 testcontainer in `db_tests.rs`, `account_node_tests.rs`,
+/// `username_tests.rs`, and `runtime_tests.rs`.
 fn dead_pool() -> Arc<sqlx::PgPool> {
     Arc::new(
         sqlx::postgres::PgPoolOptions::new()
@@ -26,18 +26,18 @@ fn dead_pool() -> Arc<sqlx::PgPool> {
 }
 
 /// Create a minimal AppState for testing.
-/// The AccountServer is constructed with a real (mock) prover so that the
+/// The AccountNode is constructed with a real (mock) prover so that the
 /// type system is satisfied, but we seed it with a minting account so that
 /// balance / address queries work without needing the minting_secret.bin
 /// flow.
 fn test_state() -> AppState {
     let state = Arc::new(Mutex::new(State::new()));
-    let mut account_server = AccountServer::new(Arc::clone(&state));
+    let mut account_node = AccountNode::new(Arc::clone(&state));
 
     // Seed a minting account with max balance (mirrors production setup)
     let mut minting_account = Account::new();
     minting_account.balance = 1_000_000;
-    account_server.import_account(*zkcoins_program::types::MINTING_ADDRESS, minting_account);
+    account_node.import_account(*zkcoins_program::types::MINTING_ADDRESS, minting_account);
 
     // Create a dummy minting ClientAccount from a deterministic key
     let minting_client = {
@@ -48,7 +48,7 @@ fn test_state() -> AppState {
     };
 
     AppState {
-        account_server: Arc::new(Mutex::new(account_server)),
+        account_node: Arc::new(Mutex::new(account_node)),
         proof_store: Arc::new(ProofStore::new("/tmp/zkcoins-test-proofs")),
         minting_account: Arc::new(Mutex::new(minting_client)),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
@@ -112,7 +112,7 @@ async fn root_returns_service_metadata() {
     // a pointer to /api/info — those two are enough to prove the handler
     // ran and serialized correctly.
     let json: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(json["service"], "zkcoins-server");
+    assert_eq!(json["service"], "zkcoins-node");
     assert_eq!(json["endpoints"]["info"], "GET  /api/info");
     assert!(json["version"].as_str().is_some_and(|v| !v.is_empty()));
     assert!(json["network"].as_str().is_some_and(|v| !v.is_empty()));
@@ -824,7 +824,7 @@ async fn claim_username_with_valid_signature() {
     // log-and-continue. So this happy-path test cannot use the lazy
     // `dead_pool`; it boots a real Postgres 17 container, mirroring
     // the per-test isolation pattern from `db_tests::setup_pool` /
-    // `username_tests::setup_pool` / `server_runtime_tests::setup_pool`.
+    // `username_tests::setup_pool` / `runtime_tests::setup_pool`.
     let pg_container = Postgres::default()
         .with_tag("17")
         .start()
@@ -871,11 +871,11 @@ async fn claim_username_with_valid_signature() {
     let keypair = Keypair::from_secret_key(&secp, &secret);
     let sig = secp.sign_schnorr(&msg, &keypair);
 
-    // Import the address into the account_server so resolve_identifier can find it
+    // Import the address into the account_node so resolve_identifier can find it
     let state = live_test_state(pool);
     {
-        let mut account_server = state.account_server.lock().unwrap();
-        account_server.import_account(
+        let mut account_node = state.account_node.lock().unwrap();
+        account_node.import_account(
             zkcoins_program::hash::digest_from_bytes(&address),
             Account::new(),
         );
@@ -965,8 +965,8 @@ async fn claim_username_mixed_case_input_normalised_before_hashing() {
 
     let state = live_test_state(pool);
     {
-        let mut account_server = state.account_server.lock().unwrap();
-        account_server.import_account(
+        let mut account_node = state.account_node.lock().unwrap();
+        account_node.import_account(
             zkcoins_program::hash::digest_from_bytes(&address),
             Account::new(),
         );
@@ -1032,8 +1032,8 @@ async fn claim_username_raw_case_signature_rejected() {
 
     let state = test_state();
     {
-        let mut account_server = state.account_server.lock().unwrap();
-        account_server.import_account(
+        let mut account_node = state.account_node.lock().unwrap();
+        account_node.import_account(
             zkcoins_program::hash::digest_from_bytes(&address),
             Account::new(),
         );
@@ -1093,8 +1093,8 @@ async fn claim_username_precheck_conflict_returns_409() {
 
     let state = test_state();
     {
-        let mut account_server = state.account_server.lock().unwrap();
-        account_server.import_account(
+        let mut account_node = state.account_node.lock().unwrap();
+        account_node.import_account(
             zkcoins_program::hash::digest_from_bytes(&address),
             Account::new(),
         );
@@ -2195,10 +2195,10 @@ async fn send_with_insufficient_funds_returns_422_with_error_string() {
 
     // Build a state where the minting account has been emptied.
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut account_server = AccountServer::new(Arc::clone(&state_arc));
+    let mut account_node = AccountNode::new(Arc::clone(&state_arc));
     let mut empty_minting = Account::new();
     empty_minting.balance = 0;
-    account_server.import_account(*zkcoins_program::types::MINTING_ADDRESS, empty_minting);
+    account_node.import_account(*zkcoins_program::types::MINTING_ADDRESS, empty_minting);
     let minting_client = {
         let secret = include_bytes!("../minting_secret.bin");
         let private_key = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Signet, secret)
@@ -2206,7 +2206,7 @@ async fn send_with_insufficient_funds_returns_422_with_error_string() {
         shared::ClientAccount::new(private_key)
     };
     let state = AppState {
-        account_server: Arc::new(Mutex::new(account_server)),
+        account_node: Arc::new(Mutex::new(account_node)),
         proof_store: Arc::new(ProofStore::new("/tmp/zkcoins-test-proofs-empty")),
         minting_account: Arc::new(Mutex::new(minting_client)),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
@@ -2515,7 +2515,7 @@ fn persist_proof_bytes_logs_error_when_write_fails() {
     // Pointing at a file inside a directory that does not exist guarantees
     // `File::create` inside `atomic_write` returns an `Err` on both Linux
     // and macOS. The function is best-effort: it logs and returns ().
-    // Exercising it covers the `if let Err(e) = ...` arm in server.rs
+    // Exercising it covers the `if let Err(e) = ...` arm in router.rs
     // that was reported uncovered on the Linux runner only.
     let bad = std::path::Path::new("/this/path/does/not/exist/zkcoins/0.bin");
     ProofStore::persist_proof_bytes(bad, b"payload", 42);
@@ -2749,7 +2749,7 @@ async fn send_with_wrong_signature_returns_401() {
 #[tokio::test]
 async fn receive_coin_duplicate_returns_success_false() {
     // After a valid receive, posting the same proof bytes again should
-    // exercise the Err arm of account_server.receive_coin (duplicate
+    // exercise the Err arm of account_node.receive_coin (duplicate
     // detection via coin_queue).
     let state = test_state();
 
@@ -2879,11 +2879,11 @@ async fn send_without_signature_skips_verification_and_proceeds() {
 }
 
 #[test]
-fn lock_or_recover_account_server_poisoned() {
-    // Generic instantiation: cover the AccountServer-specific monomorphic
+fn lock_or_recover_account_node_poisoned() {
+    // Generic instantiation: cover the AccountNode-specific monomorphic
     // copy of lock_or_recover's poison-recovery closure.
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let server = Arc::new(Mutex::new(AccountServer::new(Arc::clone(&state_arc))));
+    let server = Arc::new(Mutex::new(AccountNode::new(Arc::clone(&state_arc))));
     let server_clone = Arc::clone(&server);
 
     let _ = std::thread::spawn(move || {
@@ -2916,7 +2916,7 @@ fn lock_or_recover_username_store_poisoned() {
 // --- Item 1 (Issue #28) — HTTP error mapping for /api/send + /api/mint ---
 //
 // `map_send_coins_error` is the single source of truth for translating
-// `account_server::send_coins` failure strings into a `(StatusCode,
+// `account_node::send_coins` failure strings into a `(StatusCode,
 // body)` pair. These unit tests pin every documented error string to
 // its mapped pair so adding a new error string anywhere in `send_coins`
 // will silently fall through the `_ => INTERNAL_SERVER_ERROR` arm of
@@ -2925,7 +2925,7 @@ fn lock_or_recover_username_store_poisoned() {
 
 #[test]
 fn map_send_coins_error_unknown_account_address_is_404() {
-    let (status, body) = crate::server::map_send_coins_error("Unknown account address");
+    let (status, body) = crate::router::map_send_coins_error("Unknown account address");
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body, "Unknown account address");
 }
@@ -2933,14 +2933,14 @@ fn map_send_coins_error_unknown_account_address_is_404() {
 #[test]
 fn map_send_coins_error_prev_commitment_pubkey_required_is_400() {
     let (status, body) =
-        crate::server::map_send_coins_error("prev_commitment_pubkey required for account update");
+        crate::router::map_send_coins_error("prev_commitment_pubkey required for account update");
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body, "prev_commitment_pubkey required for account update");
 }
 
 #[test]
 fn map_send_coins_error_insufficient_funds_is_422() {
-    let (status, body) = crate::server::map_send_coins_error("Insufficient funds");
+    let (status, body) = crate::router::map_send_coins_error("Insufficient funds");
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body, "Insufficient funds");
 }
@@ -2948,20 +2948,20 @@ fn map_send_coins_error_insufficient_funds_is_422() {
 #[test]
 fn map_send_coins_error_unable_to_get_merkle_proofs_is_422() {
     // Reachable from send_coins via the prev_commitment_pubkey path
-    // (account_server::get_merkle_proofs:224). Caller supplied a
+    // (account_node::get_merkle_proofs:224). Caller supplied a
     // public_key that has no associated commitment proof in state.
     let (status, body) =
-        crate::server::map_send_coins_error("Unable to get merkle proofs for provided public key");
+        crate::router::map_send_coins_error("Unable to get merkle proofs for provided public key");
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body, "Unable to get merkle proofs for provided public key");
 }
 
 #[test]
 fn map_send_coins_error_unable_to_get_mmr_inclusion_proof_is_422() {
-    // Reachable from send_coins via get_merkle_proofs (account_server::236).
+    // Reachable from send_coins via get_merkle_proofs (account_node::236).
     // Caller's previous_proof references a history root the server's MMR
     // hasn't observed yet — stale snapshot, caller-fixable.
-    let (status, body) = crate::server::map_send_coins_error(
+    let (status, body) = crate::router::map_send_coins_error(
         "Unable to get mmr inclusion proof for the previous root",
     );
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -2973,11 +2973,11 @@ fn map_send_coins_error_unable_to_get_mmr_inclusion_proof_is_422() {
 
 #[test]
 fn map_send_coins_error_proof_public_inputs_too_short_is_500() {
-    // Reachable from send_coins via get_merkle_proofs (account_server::232).
+    // Reachable from send_coins via get_merkle_proofs (account_node::232).
     // The proof bytes stored against the account are too short to
     // decode N_PROOF_DATA_PUBLIC_INPUTS field elements — server-side
     // corruption or version mismatch, not caller-fixable.
-    let (status, body) = crate::server::map_send_coins_error("Proof public_inputs too short");
+    let (status, body) = crate::router::map_send_coins_error("Proof public_inputs too short");
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(body, "Proof public_inputs too short");
 }
@@ -2985,7 +2985,7 @@ fn map_send_coins_error_proof_public_inputs_too_short_is_500() {
 #[test]
 fn map_send_coins_error_phase_2b_shim_in_coin_not_in_source_ocr_is_422() {
     let (status, body) =
-        crate::server::map_send_coins_error("In-coin not present in source's output_coins_root");
+        crate::router::map_send_coins_error("In-coin not present in source's output_coins_root");
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body, "In-coin not present in source's output_coins_root");
 }
@@ -2993,21 +2993,21 @@ fn map_send_coins_error_phase_2b_shim_in_coin_not_in_source_ocr_is_422() {
 #[test]
 fn map_send_coins_error_phase_2b_shim_source_not_in_history_is_422() {
     let (status, body) =
-        crate::server::map_send_coins_error("Source commitment not present in history MMR");
+        crate::router::map_send_coins_error("Source commitment not present in history MMR");
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body, "Source commitment not present in history MMR");
 }
 
 #[test]
 fn map_send_coins_error_coin_missing_commitment_is_422() {
-    let (status, body) = crate::server::map_send_coins_error("Coin is missing commitment");
+    let (status, body) = crate::router::map_send_coins_error("Coin is missing commitment");
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body, "Coin is missing commitment");
 }
 
 #[test]
 fn map_send_coins_error_missing_inclusion_proof_is_422() {
-    let (status, body) = crate::server::map_send_coins_error("Should provide an inclusion proof");
+    let (status, body) = crate::router::map_send_coins_error("Should provide an inclusion proof");
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body, "Should provide an inclusion proof");
 }
@@ -3015,14 +3015,14 @@ fn map_send_coins_error_missing_inclusion_proof_is_422() {
 #[test]
 fn map_send_coins_error_coin_already_in_coin_history_is_422() {
     let (status, body) =
-        crate::server::map_send_coins_error("Coin should not exist in coin history tree");
+        crate::router::map_send_coins_error("Coin should not exist in coin history tree");
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body, "Coin should not exist in coin history tree");
 }
 
 #[test]
 fn map_send_coins_error_coin_already_in_output_smt_is_422() {
-    let (status, body) = crate::server::map_send_coins_error("Coin should not exist in tree yet");
+    let (status, body) = crate::router::map_send_coins_error("Coin should not exist in tree yet");
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body, "Coin should not exist in tree yet");
 }
@@ -3030,7 +3030,7 @@ fn map_send_coins_error_coin_already_in_output_smt_is_422() {
 #[test]
 fn map_send_coins_error_too_many_in_coins_is_422() {
     let (status, body) =
-        crate::server::map_send_coins_error("Too many in-coins for one transition");
+        crate::router::map_send_coins_error("Too many in-coins for one transition");
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body, "Too many in-coins for one transition");
 }
@@ -3038,7 +3038,7 @@ fn map_send_coins_error_too_many_in_coins_is_422() {
 #[test]
 fn map_send_coins_error_too_many_out_coins_is_422() {
     let (status, body) =
-        crate::server::map_send_coins_error("Too many out-coins for one transition");
+        crate::router::map_send_coins_error("Too many out-coins for one transition");
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body, "Too many out-coins for one transition");
 }
@@ -3048,7 +3048,7 @@ fn map_send_coins_error_prove_failed_initial_collapses_to_500_prove_failed() {
     // Per the threat-model note in map_send_coins_error, the prover-internal
     // error string is intentionally collapsed to a generic "prove failed"
     // body so 5xx responses don't leak prover state to callers.
-    let (status, body) = crate::server::map_send_coins_error(
+    let (status, body) = crate::router::map_send_coins_error(
         "prove_initial_with_in_and_out_coins_and_sources failed",
     );
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -3057,7 +3057,7 @@ fn map_send_coins_error_prove_failed_initial_collapses_to_500_prove_failed() {
 
 #[test]
 fn map_send_coins_error_prove_failed_account_update_collapses_to_500_prove_failed() {
-    let (status, body) = crate::server::map_send_coins_error(
+    let (status, body) = crate::router::map_send_coins_error(
         "prove_account_update_with_in_and_out_coins_and_sources failed",
     );
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -3071,7 +3071,7 @@ fn map_send_coins_error_unknown_string_is_500_internal_error() {
     // a generic "internal error" body so the wallet treats it as a
     // server problem and the operator finds the unmapped string in the
     // `eprintln!` log.
-    let (status, body) = crate::server::map_send_coins_error("a string we never added");
+    let (status, body) = crate::router::map_send_coins_error("a string we never added");
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(body, "internal error");
 }
@@ -3082,7 +3082,7 @@ async fn send_with_unknown_account_returns_404_with_error_string() {
     use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
 
     // test_state() only seeds the minting account. Any other 32-byte
-    // address is unknown to the account_server, so send_coins returns
+    // address is unknown to the account_node, so send_coins returns
     // "Unknown account address" which the handler maps to 404.
     let secret_bytes = include_bytes!("../minting_secret.bin");
     let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
@@ -3311,20 +3311,20 @@ async fn ready_returns_503_when_esplora_unreachable() {
 // test suite rather than moving to `tests/`.
 
 /// Build an `AppState` configured for mint tests: minting account
-/// seeded with `1u64 << 48` (Goldilocks-safe — see `server_runtime
-/// ::start_rest_server`'s bootstrap comment), real prover wired
-/// through the default `AccountServer`, dead Postgres pool by default
+/// seeded with `1u64 << 48` (Goldilocks-safe — see `runtime
+/// ::start_rest_node`'s bootstrap comment), real prover wired
+/// through the default `AccountNode`, dead Postgres pool by default
 /// (callers swap it for a live pool via the second return value).
 fn mint_test_state() -> AppState {
     let state_inner = Arc::new(Mutex::new(State::new()));
-    let mut account_server = AccountServer::new(Arc::clone(&state_inner));
+    let mut account_node = AccountNode::new(Arc::clone(&state_inner));
 
     // The Plonky2 state-transition circuit packs the running balance
     // as `balance_hi * 2^32 + balance_lo`; keeping the seed below 2^48
-    // matches the production bootstrap in `start_rest_server`.
+    // matches the production bootstrap in `start_rest_node`.
     let mut minting_account = Account::new();
     minting_account.balance = 1u64 << 48;
-    account_server.import_account(*zkcoins_program::types::MINTING_ADDRESS, minting_account);
+    account_node.import_account(*zkcoins_program::types::MINTING_ADDRESS, minting_account);
 
     // Mirror the production bootstrap: the wallet's address is forced
     // to the canonical `MINTING_ADDRESS` constant, regardless of what
@@ -3339,7 +3339,7 @@ fn mint_test_state() -> AppState {
     };
 
     AppState {
-        account_server: Arc::new(Mutex::new(account_server)),
+        account_node: Arc::new(Mutex::new(account_node)),
         proof_store: Arc::new(ProofStore::new("/tmp/zkcoins-mint-test-proofs")),
         minting_account: Arc::new(Mutex::new(minting_client)),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
@@ -3360,12 +3360,12 @@ fn mint_test_state() -> AppState {
 fn mint_test_state_without_minting_account() -> AppState {
     let state = mint_test_state();
     {
-        let mut server = state.account_server.lock().unwrap();
+        let mut server = state.account_node.lock().unwrap();
         // Reset to a brand-new server with no accounts at all. The
         // `Arc<Mutex<State>>` inside `server` is replaced too, but the
         // shared `state_inner` is dropped on overwrite which is fine
         // — nothing else holds it after `mint_test_state` returns.
-        *server = AccountServer::new(Arc::new(Mutex::new(State::new())));
+        *server = AccountNode::new(Arc::new(Mutex::new(State::new())));
     }
     state
 }
@@ -3438,7 +3438,7 @@ async fn mint_insufficient_funds_returns_422() {
     // `send_coins_error_response`.
     let state = mint_test_state();
     {
-        let mut server = state.account_server.lock().unwrap();
+        let mut server = state.account_node.lock().unwrap();
         // Re-import the minting account with balance=0. The previous
         // import is overwritten by HashMap semantics inside
         // `import_account`.
@@ -3468,7 +3468,7 @@ async fn mint_insufficient_funds_returns_422() {
 /// the inscription broadcast fails against the default unreachable
 /// `esplora_config` (127.0.0.1:1) and the handler returns 503.
 ///
-/// **zk-coins/server#89 regression guard.** The asserts below pin the
+/// **zk-coins/node#89 regression guard.** The asserts below pin the
 /// no-state-advance contract that the prepare-then-commit refactor
 /// introduced: after a broadcast failure the in-memory
 /// `minting_account.num_pubkeys` MUST still be 0, the minting
@@ -3490,7 +3490,7 @@ async fn mint_broadcast_failure_returns_503() {
     let minting_coin_queue_len_before: usize;
     let minting_proof_some_before: bool;
     {
-        let server_guard = state.account_server.lock().unwrap();
+        let server_guard = state.account_node.lock().unwrap();
         let acct = server_guard
             .get_account(&zkcoins_program::types::MINTING_ADDRESS)
             .expect("minting account seeded by mint_test_state");
@@ -3530,10 +3530,10 @@ async fn mint_broadcast_failure_returns_503() {
     let num_pubkeys_after = state.minting_account.lock().unwrap().num_pubkeys;
     assert_eq!(
         num_pubkeys_after, 0,
-        "in-memory minting_account.num_pubkeys must NOT advance on broadcast failure (zk-coins/server#89)"
+        "in-memory minting_account.num_pubkeys must NOT advance on broadcast failure (zk-coins/node#89)"
     );
     {
-        let server_guard = state.account_server.lock().unwrap();
+        let server_guard = state.account_node.lock().unwrap();
         let acct_after = server_guard
             .get_account(&zkcoins_program::types::MINTING_ADDRESS)
             .expect("minting account still present after failed mint");
@@ -3847,7 +3847,7 @@ async fn mint_broadcast_mock_server() -> wiremock::MockServer {
 /// transaction fails to begin and the handler returns
 /// `503 SERVICE_UNAVAILABLE` "Failed to persist mint commit
 /// transaction". The in-memory state was guarded by the same commit
-/// path, so per zk-coins/server#89 `num_pubkeys` MUST still be 0
+/// path, so per zk-coins/node#89 `num_pubkeys` MUST still be 0
 /// after the failed commit.
 #[tokio::test]
 async fn mint_commit_tx_failure_returns_503() {
@@ -3865,7 +3865,7 @@ async fn mint_commit_tx_failure_returns_503() {
         track_tx_timeout: None,
     });
     let minting_account = Arc::clone(&state.minting_account);
-    let account_server = Arc::clone(&state.account_server);
+    let account_node = Arc::clone(&state.account_node);
 
     let recipient = "0x".to_string() + &hex::encode([4u8; 32]);
     let body = serde_json::json!({
@@ -3891,7 +3891,7 @@ async fn mint_commit_tx_failure_returns_503() {
     // No in-memory advance — the commit fence held.
     assert_eq!(minting_account.lock().unwrap().num_pubkeys, 0);
     {
-        let server_guard = account_server.lock().unwrap();
+        let server_guard = account_node.lock().unwrap();
         let acct = server_guard
             .get_account(&zkcoins_program::types::MINTING_ADDRESS)
             .expect("minting account still present");
@@ -3902,7 +3902,7 @@ async fn mint_commit_tx_failure_returns_503() {
     }
 }
 
-/// Drives the Err arm of `AccountServer::receive_coin_into` inside
+/// Drives the Err arm of `AccountNode::receive_coin_into` inside
 /// the commit phase of `mint_handler`. Pre-populates the recipient
 /// account's `coin_history` SMT with the identifier that
 /// `prepare_mint` is about to produce, so `receive_coin_into` returns
@@ -3910,7 +3910,7 @@ async fn mint_commit_tx_failure_returns_503() {
 /// Identifier prediction mirrors `Account::create_coins` off-circuit
 /// (canonical AccountState layout + Poseidon hash + index 0).
 ///
-/// Per the prepare-then-commit refactor (zk-coins/server#89) the
+/// Per the prepare-then-commit refactor (zk-coins/node#89) the
 /// receive error is logged and the unchanged recipient clone still
 /// participates in `commit_mint_tx`. With a live Postgres the
 /// transaction commits, the handler returns 200 OK, and
@@ -3980,7 +3980,7 @@ async fn mint_receive_coin_failure_logs_and_returns_ok() {
         .insert(predicted_coin_id_bytes, predicted_coin_id)
         .expect("insert into fresh SMT must succeed");
     {
-        let mut server = state.account_server.lock().unwrap();
+        let mut server = state.account_node.lock().unwrap();
         server.import_account(recipient, recipient_account);
     }
 
@@ -4005,7 +4005,7 @@ async fn mint_receive_coin_failure_logs_and_returns_ok() {
     );
 }
 
-/// Retry-after-broadcast-failure (zk-coins/server#89).
+/// Retry-after-broadcast-failure (zk-coins/node#89).
 ///
 /// First mint runs against an unreachable Esplora (the default
 /// `mint_test_state` config points at 127.0.0.1:1) — the handler
@@ -4109,7 +4109,7 @@ async fn mint_retry_after_broadcast_failure_succeeds() {
     assert_eq!(state.minting_account.lock().unwrap().num_pubkeys, 1);
     let recipient_digest = zkcoins_program::hash::digest_from_bytes(&recipient_bytes);
     {
-        let server_guard = state.account_server.lock().unwrap();
+        let server_guard = state.account_node.lock().unwrap();
         assert!(
             server_guard.get_account(&recipient_digest).is_some(),
             "recipient account must be created on successful mint"
@@ -4117,14 +4117,14 @@ async fn mint_retry_after_broadcast_failure_succeeds() {
     }
 }
 
-/// Concurrent-mint serialization (zk-coins/server#89).
+/// Concurrent-mint serialization (zk-coins/node#89).
 ///
 /// Pins the optimistic-UPDATE loser branch of `commit_mint_tx`
 /// deterministically by pre-seeding a stale `minting_meta.num_pubkeys
 /// = 1` row while the in-memory `minting_account.num_pubkeys` is
 /// still 0. A truly-parallel two-mint race would land
 /// probabilistically (the proof phase serializes on the shared
-/// `Arc<Mutex<AccountServer>>`, the broadcast races against the DB
+/// `Arc<Mutex<AccountNode>>`, the broadcast races against the DB
 /// tx) and would be flaky in CI; the deterministic shape here
 /// exercises the same exit branch — `expected_prev = 0`, stored = 1,
 /// `INSERT ... ON CONFLICT DO UPDATE ... WHERE minting_meta.num_pubkeys
@@ -4219,7 +4219,7 @@ async fn concurrent_mints_only_one_commits() {
 }
 
 /// Drives the post-proof "concurrent mint detected during proof phase"
-/// branch of `mint_handler` (server.rs:854-858 / zk-coins/server#90)
+/// branch of `mint_handler` (router.rs:854-858 / zk-coins/node#90)
 /// against the pure helper.
 ///
 /// Pairs with `mint_handler_concurrent_mint_during_proof_returns_503`
@@ -4229,7 +4229,7 @@ async fn concurrent_mints_only_one_commits() {
 /// is covered, not just the helper.
 #[tokio::test]
 async fn concurrent_mint_during_proof_response_returns_503() {
-    let (status, Json(body)) = crate::server::concurrent_mint_during_proof_response(0, 1);
+    let (status, Json(body)) = crate::router::concurrent_mint_during_proof_response(0, 1);
     assert_eq!(
         status,
         StatusCode::SERVICE_UNAVAILABLE,
@@ -4242,16 +4242,16 @@ async fn concurrent_mint_during_proof_response_returns_503() {
 /// End-to-end race that drives the post-proof "concurrent mint
 /// detected during proof phase" branch of `mint_handler` through the
 /// HTTP layer so the `return concurrent_mint_during_proof_response(...)`
-/// call site (server.rs ~L891) is covered, not just the helper.
+/// call site (router.rs ~L891) is covered, not just the helper.
 ///
 /// Synchronisation strategy (deterministic, not time-based): the test
-/// pre-acquires the `state.account_server` mutex BEFORE issuing the
+/// pre-acquires the `state.account_node` mutex BEFORE issuing the
 /// `/api/mint` request. The handler completes phase 1 (lock
 /// `minting_account`, snapshot `expected_num_pubkeys = 0`, release)
-/// and then blocks at phase 2 trying to lock `account_server`. While
+/// and then blocks at phase 2 trying to lock `account_node`. While
 /// the handler is parked on that lock, the test acquires
 /// `state.minting_account` and bumps `num_pubkeys` to a non-matching
-/// value, then drops the `account_server` guard. The handler proceeds
+/// value, then drops the `account_node` guard. The handler proceeds
 /// through phase 2 (prover work), reaches phase 3, re-locks
 /// `minting_account`, observes the bumped counter, and returns 503
 /// before ever touching the broadcast / Esplora / Postgres paths —
@@ -4263,7 +4263,7 @@ async fn concurrent_mint_during_proof_response_returns_503() {
 /// executor and prevent the test thread from running the bump step.
 ///
 /// `clippy::await_holding_lock` is silenced because holding the
-/// `account_server` `MutexGuard` across the `sleep().await` IS the
+/// `account_node` `MutexGuard` across the `sleep().await` IS the
 /// synchronisation primitive — releasing it earlier would defeat the
 /// test by letting phase 2 finish before the bump.
 #[allow(clippy::await_holding_lock)]
@@ -4271,11 +4271,11 @@ async fn concurrent_mint_during_proof_response_returns_503() {
 async fn mint_handler_concurrent_mint_during_proof_returns_503() {
     let state = mint_test_state();
 
-    // Pre-acquire the account_server lock so phase 2 of mint_handler
+    // Pre-acquire the account_node lock so phase 2 of mint_handler
     // parks until we release it. Phase 1 only touches
     // `state.minting_account`, so the handler can still complete its
     // snapshot (capturing expected_num_pubkeys = 0) before parking.
-    let account_server_guard = state.account_server.lock().unwrap();
+    let account_node_guard = state.account_node.lock().unwrap();
 
     let recipient = "0x".to_string() + &hex::encode([7u8; 32]);
     let body = serde_json::json!({
@@ -4288,14 +4288,14 @@ async fn mint_handler_concurrent_mint_during_proof_returns_503() {
         .unwrap();
 
     // Drive the request on a worker so we can manipulate state from
-    // this task while the handler is parked on the account_server
+    // this task while the handler is parked on the account_node
     // mutex inside phase 2.
     let state_for_request = state.clone();
     let request_task =
         tokio::spawn(async move { send_request_with_state(state_for_request, req).await });
 
     // Give the handler a generous window to enter phase 2 and park on
-    // the account_server lock. Phase 1 is microseconds of work; 200ms
+    // the account_node lock. Phase 1 is microseconds of work; 200ms
     // is overkill but cheap. Note: we cannot rely on `lock().is_locked`
     // because std::sync::Mutex offers no such API — but holding the
     // guard here is enough, because phase 2 will block until we drop
@@ -4310,11 +4310,11 @@ async fn mint_handler_concurrent_mint_during_proof_returns_503() {
         minting.num_pubkeys = 1;
     }
 
-    // Release the account_server lock so phase 2 can proceed. The
+    // Release the account_node lock so phase 2 can proceed. The
     // handler now runs the prover, re-locks minting_account, observes
     // num_pubkeys = 1 != expected 0, and returns 503 via
     // `concurrent_mint_during_proof_response`.
-    drop(account_server_guard);
+    drop(account_node_guard);
 
     let (status, resp_body) = request_task.await.expect("request task panicked");
 
@@ -4330,7 +4330,7 @@ async fn mint_handler_concurrent_mint_during_proof_returns_503() {
 }
 
 /// Drives the Err arm of `upsert_mint_recipient_or_log`
-/// (server.rs:1025-1028 / zk-coins/server#90). The recipient upsert
+/// (router.rs:1025-1028 / zk-coins/node#90). The recipient upsert
 /// loop in `mint_handler` is best-effort log-and-continue: the
 /// minting_meta + minting-account bump already committed inside
 /// `commit_mint_tx`, so a recipient-row upsert failure only delays the
@@ -4349,5 +4349,5 @@ async fn upsert_mint_recipient_or_log_swallows_pool_dead_error() {
     let pool = dead_pool();
     let addr = [0u8; 32];
     let bytes = [0u8; 16];
-    crate::server::upsert_mint_recipient_or_log(&pool, &addr, &bytes).await;
+    crate::router::upsert_mint_recipient_or_log(&pool, &addr, &bytes).await;
 }

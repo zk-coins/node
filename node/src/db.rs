@@ -1,14 +1,14 @@
 // Postgres state-layer for the zkCoins server.
 //
 // Introduced in PR-A1 of the 3-PR Postgres migration series; the
-// schema (see `server/migrations/*.sql`) and the typed API around
+// schema (see `node/migrations/*.sql`) and the typed API around
 // `sqlx::PgPool` were defined there. PR-A2 wired the state-layer
 // (`load_smt`, `load_mmr`, `load_latest_block`, `persist_state_tx`)
 // into the bootstrap and scanner callback, fixing the cross-file
 // inconsistency window flagged as issue #11. PR-A3 (this commit)
 // wires the remaining `load_all_accounts` / `upsert_account` /
 // `load_all_usernames` / `claim_username` / `resolve_username` calls
-// into `AccountServer` and `UsernameStore`, and adds the
+// into `AccountNode` and `UsernameStore`, and adds the
 // `load_minting_num_pubkeys` / `upsert_minting_num_pubkeys` pair that
 // replaces the legacy `minting_num_pubkeys.bin` sibling file.
 //
@@ -135,7 +135,7 @@ pub async fn persist_state_tx(
 
 /// Load every `(address, data)` pair from the `accounts` table.
 ///
-/// Used at boot in PR-A3 to rebuild the in-memory `AccountServer`
+/// Used at boot in PR-A3 to rebuild the in-memory `AccountNode`
 /// map. Returns an empty vector if the table is empty.
 pub async fn load_all_accounts(pool: &PgPool) -> Result<Vec<(Vec<u8>, Vec<u8>)>, sqlx::Error> {
     let rows: Vec<(Vec<u8>, Vec<u8>)> =
@@ -147,7 +147,7 @@ pub async fn load_all_accounts(pool: &PgPool) -> Result<Vec<(Vec<u8>, Vec<u8>)>,
 
 /// Upsert a single account row. The bincode blob in `data` is
 /// considered authoritative — concurrent writers must serialize at
-/// the application layer (`Arc<Mutex<AccountServer>>` in main.rs).
+/// the application layer (`Arc<Mutex<AccountNode>>` in main.rs).
 pub async fn upsert_account(pool: &PgPool, address: &[u8], data: &[u8]) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO accounts (address, data, updated_at) \
@@ -271,7 +271,7 @@ pub async fn upsert_minting_num_pubkeys(pool: &PgPool, n: u32) -> Result<(), sql
 ///    `num_pubkeys` is moved from `expected_prev` to `new_count`. The
 ///    statement is shaped so the UPDATE only fires when the stored
 ///    value matches `expected_prev` (concurrent-mint guard, see
-///    zk-coins/server#89). When the row does not exist yet and
+///    zk-coins/node#89). When the row does not exist yet and
 ///    `expected_prev = 0` the INSERT branch fires instead (fresh DB).
 ///    Returns `Ok(false)` if neither branch affected a row — the
 ///    caller MUST treat that as "another writer already committed

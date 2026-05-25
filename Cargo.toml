@@ -2,7 +2,7 @@
 members = [
     "program-plonky2",
     "script-plonky2",
-    "server",
+    "node",
     "shared",
 ]
 resolver = "2"

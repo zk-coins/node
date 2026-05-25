@@ -1948,6 +1948,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "node"
+version = "1.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.7.9",
+ "bincode",
+ "bitcoin",
+ "bitcoin_hashes 0.16.0",
+ "bitcoincore-zmq",
+ "esplora-client",
+ "futures-util",
+ "hex",
+ "http-body-util",
+ "lazy_static",
+ "rand 0.8.6",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shared",
+ "sqlx",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tokio-tungstenite",
+ "tower",
+ "tower-http 0.5.2",
+ "wiremock",
+ "zkcoins-program-plonky2",
+ "zkcoins-prover-plonky2",
+]
+
+[[package]]
 name = "num"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3033,39 +3066,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "server"
-version = "1.1.0"
-dependencies = [
- "anyhow",
- "axum 0.7.9",
- "bincode",
- "bitcoin",
- "bitcoin_hashes 0.16.0",
- "bitcoincore-zmq",
- "esplora-client",
- "futures-util",
- "hex",
- "http-body-util",
- "lazy_static",
- "rand 0.8.6",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2",
- "shared",
- "sqlx",
- "testcontainers",
- "testcontainers-modules",
- "tokio",
- "tokio-tungstenite",
- "tower",
- "tower-http 0.5.2",
- "wiremock",
- "zkcoins-program-plonky2",
- "zkcoins-prover-plonky2",
 ]
 
 [[package]]

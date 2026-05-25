@@ -432,7 +432,7 @@ Estimated effort: **3–5 weeks**, risk **high** for two reasons:
 
 ### 6.1 Goal
 
-Extend `server::state::State` to track peg-in consumption,
+Extend `node::state::State` to track peg-in consumption,
 burn records, and pending payouts.
 
 ### 6.2 Files touched
@@ -518,11 +518,11 @@ A daemon that:
 
 ### 7.2 Where the code lives
 
-This is **not** in `zk-coins/server` directly — it's a separate
+This is **not** in `zk-coins/node` directly — it's a separate
 crate that the server binary depends on. Proposed:
 
 ```
-zk-coins/server/
+zk-coins/node/
     crates/
         bridge-signer/        ← new crate
             src/
@@ -633,7 +633,7 @@ In MVP, the same 3 nodes run both daemons.
 ### 8.2 Files touched
 
 ```
-zk-coins/server/
+zk-coins/node/
     crates/
         bridge-operator/      ← new crate
             src/
@@ -716,7 +716,7 @@ operator + watchtower implementations).
 
 ### 9.1 Goal
 
-Extend `zk-coins/server` HTTP API with peg-in and peg-out endpoints.
+Extend `zk-coins/node` HTTP API with peg-in and peg-out endpoints.
 
 ### 9.2 Files touched
 
@@ -724,7 +724,7 @@ Extend `zk-coins/server` HTTP API with peg-in and peg-out endpoints.
 | ---- | ------ |
 | `server/src/bridge.rs` | **new** — bridge module |
 | `server/src/server.rs` | Add bridge endpoints to router |
-| `server/src/server_runtime.rs` | Wire bridge state into runtime |
+| `server/src/runtime.rs` | Wire bridge state into runtime |
 
 ### 9.3 Endpoints
 
@@ -850,7 +850,7 @@ one fraud-proof challenge.
 
 - 3 Linux VMs, each running:
   - Bitcoin signet node (synced)
-  - `zk-coins/server` instance configured for bridge mode
+  - `zk-coins/node` instance configured for bridge mode
   - `bridge-signer`, `bridge-operator`, `bridge-watchtower` daemons
 - Shared regtest or signet Bitcoin network
 - A test client that drives peg-ins and peg-outs

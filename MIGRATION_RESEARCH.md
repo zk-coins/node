@@ -157,7 +157,7 @@ For a Plonky2 MVP shipping in weeks-not-months:
 ### From our existing SP1 code (`program/src/`)
 - The current `SparseMerkleTree` / `MerkleMountainRange` algorithms (modulo hash swap to Poseidon and lex-ordering for AccM if we go that route).
 - The `AccountState`, `Coin`, `Invoice` data shapes (modulo D1, D2 fixes).
-- The Account → coin_queue → send flow in `server/src/account_server.rs` — this is host-side glue, no circuit changes here except wiring to the new Plonky2 prover.
+- The Account → coin_queue → send flow in `server/src/account_node.rs` — this is host-side glue, no circuit changes here except wiring to the new Plonky2 prover.
 - The 12 tests in `program/src/merkle/sparse_merkle_tree.rs::tests` — survive as-is once `hash_concat` is Poseidon-backed.
 
 ### Newly required work (no upstream donor)
@@ -402,7 +402,7 @@ pgrep -f "target/debug/deps/zkcoins_program_plonky2"
 permission in this sandbox, so `cd ... && gh ...` fails with "Unable
 to read current working directory: Operation not permitted".
 
-**Mitigation:** always pass `--repo zk-coins/server` explicitly to gh
+**Mitigation:** always pass `--repo zk-coins/node` explicitly to gh
 commands run in background contexts. Captured in memory as
 `feedback_ci_monitor_after_push`.
 
@@ -1258,8 +1258,8 @@ needs `ConstantGate::new(2)` injection in pass 3 and
 
 ### 7.23 `MINTING_ADDRESS` panic in `tokio::spawn`-ed task swallows server bootstrap — **MEDIUM, codified**
 
-**Discovered:** first auto-deploy of `zkcoin/server:beta` on the DEV
-host post-PR [#17](https://github.com/zk-coins/server/pull/17). The
+**Discovered:** first auto-deploy of `zkcoin/node:beta` on the DEV
+host post-PR [#17](https://github.com/zk-coins/node/pull/17). The
 container started, the REST server bound `0.0.0.0:4242`, but
 `https://dev-api.zkcoins.app/health` returned Cloudflare 502 for hours.
 `docker compose ps` showed the container as `Up (unhealthy)` — the
@@ -1277,22 +1277,22 @@ never hold again. **And** a panic inside a `tokio::spawn`-ed task by
 default only kills the task — the process happily continued in zombie
 state for 8 h with the listener dead and the scanner alive.
 
-**Fix (PR [#36](https://github.com/zk-coins/server/pull/36)):**
+**Fix (PR [#36](https://github.com/zk-coins/node/pull/36)):**
 
 1. **Explicit `MINTING_ADDRESS` override** applied in
-   `server_runtime.rs::start_rest_server`: after constructing the
+   `runtime.rs::start_rest_server`: after constructing the
    minting `ClientAccount` from `minting_secret.bin`, the code
    overwrites `minting_client.address = *MINTING_ADDRESS` so the
    on-chain identity matches the well-known constant that the Plonky2
    circuit uses, replacing the failing `assert_eq!`. Matches the
-   pattern already used in `server_tests.rs::TestAccountData::new_minting_account`.
+   pattern already used in `router_tests.rs::TestAccountData::new_minting_account`.
 2. **Global panic hook** installed at the top of `main.rs::main` that
    runs the default reporter and then `exit(1)`. Any future tokio
    worker panic now crash-loops the container via `restart:
    unless-stopped` instead of becoming a silent zombie.
 3. **Integration smoke test** (`start_rest_server_binds_and_serves_health`)
    that spawns `start_rest_server` against an ephemeral port and probes
-   `/health` over real TCP. `server_runtime.rs` was excluded from the
+   `/health` over real TCP. `runtime.rs` was excluded from the
    coverage scope, so the bootstrap path that exploded had no test at
    all. ~22 s warm; runs in the standard test sweep.
 4. **deploy-dev post-curl-retry** in `.github/workflows/deploy-dev.yaml`:
@@ -1300,7 +1300,7 @@ state for 8 h with the listener dead and the scanner alive.
    the ssh deploy. A green "Build and deploy to DEV" with a broken
    upstream is no longer possible — the workflow fails, the auto-release
    PR loses its green check, and the regression surfaces immediately
-   instead of hours later. Mirrored to deploy-prd in PR [#51](https://github.com/zk-coins/server/pull/51).
+   instead of hours later. Mirrored to deploy-prd in PR [#51](https://github.com/zk-coins/node/pull/51).
 
 **Lesson:** in async server code, NEVER let a spawned task panic
 silently. Either install a global panic hook (the cheap fix taken

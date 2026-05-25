@@ -1,6 +1,6 @@
 # zkCoins Circuit Specification
 
-This document specifies the zkCoins state-transition circuit (currently implemented in Plonky2 + Poseidon in `program-plonky2/src/circuit/main.rs`) and the surrounding off-circuit responsibilities. It is **implementation-agnostic**: it does not mandate Plonky2, Poseidon, or any particular proof system. It is intended as a starting point for porting the circuit to other proof systems (e.g. Plonky3 with Poseidon2 / BabyBear) while preserving protocol semantics. Historical context: the original implementation used SP1 + SHA256 (recoverable at tag `v0.last-sp1`); PR [#17](https://github.com/zk-coins/server/pull/17) (merged 2026-05-18) migrated to Plonky2 + Poseidon-Goldilocks.
+This document specifies the zkCoins state-transition circuit (currently implemented in Plonky2 + Poseidon in `program-plonky2/src/circuit/main.rs`) and the surrounding off-circuit responsibilities. It is **implementation-agnostic**: it does not mandate Plonky2, Poseidon, or any particular proof system. It is intended as a starting point for porting the circuit to other proof systems (e.g. Plonky3 with Poseidon2 / BabyBear) while preserving protocol semantics. Historical context: the original implementation used SP1 + SHA256 (recoverable at tag `v0.last-sp1`); PR [#17](https://github.com/zk-coins/node/pull/17) (merged 2026-05-18) migrated to Plonky2 + Poseidon-Goldilocks.
 
 > **Scope note.** This spec describes the **zkCoins MVP variant** of the Shielded CSV protocol, not the paper as published. It deliberately departs from [eprint 2025/068](https://eprint.iacr.org/2025/068) in 11 concrete ways — see §15 "Divergences from Shielded CSV (paper)" below, and [`MIGRATION_RESEARCH.md`](./MIGRATION_RESEARCH.md) for full analysis against the upstream reference implementation at [`ShieldedCSV/ShieldedCSV`](https://github.com/ShieldedCSV/ShieldedCSV).
 >
@@ -14,7 +14,7 @@ The reference implementation lives in:
 - `program-plonky2/src/merkle/sparse_merkle_tree.rs` — Poseidon SMT
 - `program-plonky2/src/merkle/merkle_mountain_range.rs` — Poseidon MMR
 - `script-plonky2/src/lib.rs` — host-side Plonky2 prover wrapper
-- `server/src/account_server.rs` — input preparation (host)
+- `server/src/account_node.rs` — input preparation (host)
 - `server/src/state.rs` — global state (SMT + MMR)
 - `shared/src/commitment.rs` — Schnorr commitment used to bind a proof to an on-chain inscription
 
@@ -177,7 +177,7 @@ Commitment {
 
 The signed message is `H(account_state_hash || output_coins_root)` where both inputs are `HashDigest`s. If a Plonky2 port keeps SHA256 _here_ for compatibility with secp256k1 Schnorr, that is fine — but the `account_state_hash` and `output_coins_root` operands themselves are produced by `H` and so MUST match the chosen circuit hash. Mismatching the two will break the scanner ↔ circuit link.
 
-### 5.2 Global state (`server::state::State`)
+### 5.2 Global state (`node::state::State`)
 
 - `smt: SparseMerkleTree` — keyed by `H(serialize_compressed(commitment_pubkey))`, value = `H(account_state_hash || output_coins_root)` (`Commitment::get_account_state_hash()` — misleading name, it's actually the message digest).
 - `mmr: MerkleMountainRange` — leaves are `H(smt_root || prev_mmr_root)`.
@@ -335,7 +335,7 @@ fn main(inputs: ProgramInputs):
 
 ### Note on the minting account
 
-`MINTING_ADDRESS` is a `HashDigest` constant. In the Plonky2/Poseidon build it is a domain-separated placeholder baked into `program-plonky2/src/types.rs::MINTING_ADDRESS` and **overridden at runtime** in `server_runtime.rs::start_rest_server`: after constructing the minting `ClientAccount` from `minting_secret.bin`, the code sets `minting_client.address = *MINTING_ADDRESS` so the prover circuit and the server state share the same value. This runtime override was added in PR [#36](https://github.com/zk-coins/server/pull/36) to fix a panic-in-tokio-spawn regression (see [`MIGRATION_RESEARCH.md` §7.23](./MIGRATION_RESEARCH.md#723-minting_address-panic-in-tokiospawn-ed-task-swallows-server-bootstrap--medium-codified)). The closed test environment means we are not bound to the historical SP1 minting key.
+`MINTING_ADDRESS` is a `HashDigest` constant. In the Plonky2/Poseidon build it is a domain-separated placeholder baked into `program-plonky2/src/types.rs::MINTING_ADDRESS` and **overridden at runtime** in `runtime.rs::start_rest_server`: after constructing the minting `ClientAccount` from `minting_secret.bin`, the code sets `minting_client.address = *MINTING_ADDRESS` so the prover circuit and the server state share the same value. This runtime override was added in PR [#36](https://github.com/zk-coins/node/pull/36) to fix a panic-in-tokio-spawn regression (see [`MIGRATION_RESEARCH.md` §7.23](./MIGRATION_RESEARCH.md#723-minting_address-panic-in-tokiospawn-ed-task-swallows-server-bootstrap--medium-codified)). The closed test environment means we are not bound to the historical SP1 minting key.
 
 ---
 
@@ -370,7 +370,7 @@ For the **initial proof** there is no prior account proof to verify. The circuit
 
 ## 11. Off-Circuit Responsibilities
 
-### 11.1 Server (`server::account_server::send_coins`)
+### 11.1 Node (`node::account_node::send_coins`)
 
 1. Look up the sender's `Account` (its coin queue, prior account proof, and own coin_history SMT).
 2. For each queued `CoinProof`:
@@ -390,7 +390,7 @@ Given a fresh server response `(proof_id, account_state_hash, output_coins_root)
 1. Sign `H(account_state_hash || output_coins_root)` with the **current** commitment private key (BIP-32 derivation index = `num_pubkeys - 1` in the reference).
 2. POST `(proof_id, commitment)` to `/api/commit`. The server attaches this commitment to the proof, builds a Taproot commit+reveal tx pair whose commit-tx txid begins with `4242`, and broadcasts.
 
-### 11.3 Scanner (`server::scanner`)
+### 11.3 Scanner (`node::scanner`)
 
 1. Poll Esplora (or any Bitcoin tx source).
 2. Filter txs whose txid hex starts with `4242`.
@@ -409,7 +409,7 @@ This list captures the non-trivial decisions a port must make. None of them are 
 
 1. **Pick `H`.** Recommended: Poseidon over Goldilocks (`F = GF(2^64 - 2^32 + 1)`), width 12, full+partial rounds per the standard parameter set. `HashDigest` becomes 4 field elements (≡ 256-bit security with appropriate rate).
 
-2. **Re-derive `MINTING_ADDRESS`.** Plonky2 port has it as a domain-separated placeholder (`program-plonky2/src/types.rs::MINTING_ADDRESS`). At server runtime, `server_runtime.rs::start_rest_server` overrides it by setting `minting_client.address = *MINTING_ADDRESS` on the freshly-constructed `ClientAccount` so the prover circuit and runtime state agree on the value (see `MIGRATION_RESEARCH.md` §7.23). Closed test environment means no requirement to match the historical SP1 minting key.
+2. **Re-derive `MINTING_ADDRESS`.** Plonky2 port has it as a domain-separated placeholder (`program-plonky2/src/types.rs::MINTING_ADDRESS`). At server runtime, `runtime.rs::start_rest_server` overrides it by setting `minting_client.address = *MINTING_ADDRESS` on the freshly-constructed `ClientAccount` so the prover circuit and runtime state agree on the value (see `MIGRATION_RESEARCH.md` §7.23). Closed test environment means no requirement to match the historical SP1 minting key.
 
 3. **`AccountState` hashing.** Drop `bincode + SHA256`. Define a canonical field-element layout (e.g. `[owner_limbs(4), balance_lo, balance_hi, pubkey_x_limbs(4), pubkey_parity]`) and hash with Poseidon. Both circuit and host MUST agree.
 
@@ -434,7 +434,7 @@ This list captures the non-trivial decisions a port must make. None of them are 
 
 12. **No `panic!`, no `expect!`.** In Plonky2 every "fail the proof" path becomes a constraint. Replace `Result<_, &'static str>` host code with explicit asserts inside the circuit. Note in particular: `checked_add`/`checked_sub`/`balance == 0`/`recipient == owner`/`coin.identifier == expected_identifier`.
 
-13. **Don't trust the `verify_previous_root` shortcut in the host.** `account_server.rs::get_merkle_proofs` has a `let _ = proofs.verify_previous_root(...)` comment claiming it's redundant. That redundancy holds because the in-circuit predicate re-checks it — for `prev_account` via Stage 5c+'s `CommitmentMerkleProofs` gates, and for in-coin sources via Stage 5d-next-5 Phase 2b's per-slot SPEC §8 (c)(d)(e) chain.
+13. **Don't trust the `verify_previous_root` shortcut in the host.** `account_node.rs::get_merkle_proofs` has a `let _ = proofs.verify_previous_root(...)` comment claiming it's redundant. That redundancy holds because the in-circuit predicate re-checks it — for `prev_account` via Stage 5c+'s `CommitmentMerkleProofs` gates, and for in-coin sources via Stage 5d-next-5 Phase 2b's per-slot SPEC §8 (c)(d)(e) chain.
 
 ---
 

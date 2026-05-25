@@ -135,14 +135,14 @@ pub struct CoinTemplate {
 }
 ```
 
-`Account` (in `server/src/account_server.rs`) gains a per-asset
+`Account` (in `server/src/account_node.rs`) gains a per-asset
 balance map; the old `balance: u64` collapses to "balance of the
 default asset" only for the migration window (see §6.3 — there is
 no migration window because state is wiped at cutover, so the field
 is replaced outright).
 
 ```rust
-// server/src/account_server.rs
+// server/src/account_node.rs
 
 pub struct Account {
     pub proof:        Option<Proof>,
@@ -302,7 +302,7 @@ Both changes are breaking for the wallet signature shape; bump
 **Single-asset invariant.** In a single transition, all input coins
 and all output coins share the same `asset_id`. This is enforced
 twice — defense in depth, matching the pattern in
-`server/src/account_server.rs::send_coins` (off-circuit pre-check)
+`server/src/account_node.rs::send_coins` (off-circuit pre-check)
 and `program-plonky2/src/circuit/main.rs` (in-circuit constraint):
 
 - **Off-circuit (server pre-check):** before paying prove cost,
@@ -581,7 +581,7 @@ an empty `assets` table.
 
 PR-A1/A2/A3 already left DEV and PRD with empty Postgres state
 after the Plonky2 cutover (`SPEC.md` invariant 2; PR
-[#73](https://github.com/zk-coins/server/pull/73) finalised the
+[#73](https://github.com/zk-coins/node/pull/73) finalised the
 state-wipe pattern). Multi-asset reuses the same operational
 procedure; no new wipe tooling required.
 
@@ -766,7 +766,7 @@ pub struct Capabilities {
 ```
 
 The `faucet` flag stays for wallet-side back-compat (it has been
-`false` since PR [#73](https://github.com/zk-coins/server/pull/73)
+`false` since PR [#73](https://github.com/zk-coins/node/pull/73)
 on both DEV and PRD anyway) but is functionally subsumed by
 `multi_asset = true` once the upgrade lands.
 
@@ -1093,7 +1093,7 @@ cleanest design is a sentinel recipient address (`BURN_ADDRESS
 = HashDigest::ZERO` or a domain-separated constant) that the
 circuit treats as a coin sink with no corresponding
 `apply_coin`. Adds one branch in
-`account_server::receive_coin`. Defer until a real use case
+`account_node::receive_coin`. Defer until a real use case
 arrives.
 
 ### 12.13 Decimals semantics (clarification)
@@ -1182,7 +1182,7 @@ So nobody scope-creeps:
 - `program-plonky2/src/types.rs` — `Coin`, `CoinTemplate`,
   `AccountState`, `ProofData`, `calculate_coin_identifier`.
 - `shared/src/lib.rs` — `Invoice`, `ClientAccount::create_commitment`.
-- `server/src/account_server.rs` — `Account`, `send_coins`, the
+- `server/src/account_node.rs` — `Account`, `send_coins`, the
   off-circuit pre-check pattern that the new single-asset
   invariant follows.
 - `server/src/server.rs` — `verify_send_signature` (mint signature

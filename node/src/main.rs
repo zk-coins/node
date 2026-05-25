@@ -1,22 +1,22 @@
-//! Binary entrypoint for `server`.
+//! Binary entrypoint for `node`.
 //!
 //! Modules live in `lib.rs`; this file only wires the bootstrap
 //! (panic hook, Postgres pool, scanner task, REST listener) together.
 //! Splitting the modules out of the binary lets out-of-tree
-//! integration tests (`server/tests/api_remote.rs`) import the
+//! integration tests (`node/tests/api_remote.rs`) import the
 //! handler response types and the `CoinProof` struct without
 //! duplicating definitions or making the binary itself reachable
 //! from a `cargo test --test ...` target.
 
-use server::account_server;
-use server::db;
-use server::publisher::EsploraConfig;
-use server::scanner_runtime::scan_for_inscriptions;
-use server::scanner_ws::{run_scanner_ws, ScannerWsConfig};
-use server::server_runtime::start_rest_server;
-use server::state::State;
-use server::username;
-use server::{persist_state_from_sync_context, DATABASE_URL, NETWORK_CONFIG};
+use node::account_node;
+use node::db;
+use node::publisher::EsploraConfig;
+use node::runtime::start_rest_node;
+use node::scanner_runtime::scan_for_inscriptions;
+use node::scanner_ws::{run_scanner_ws, ScannerWsConfig};
+use node::state::State;
+use node::username;
+use node::{persist_state_from_sync_context, DATABASE_URL, NETWORK_CONFIG};
 use shared::commitment::Commitment;
 use std::error::Error as StdError;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 // `atomic_write` helper that supported them is removed — the only
 // remaining on-disk writes are the per-proof files under
 // `${PROOFS_DIR:-./proofs}/{id}.bin`, owned by `ProofStore` in
-// `server.rs`.
+// `router.rs`.
 const ACCOUNT_SERVER_ADDR: &str = "0.0.0.0:4242";
 
 use bitcoin::hashes::Hash;
@@ -79,14 +79,14 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     ));
     println!("Loaded State from Postgres");
 
-    // Reload AccountServer + UsernameStore from Postgres. The matching
+    // Reload AccountNode + UsernameStore from Postgres. The matching
     // file-based loaders from PR-A1/A2 are gone — these two calls are
     // the single source of truth after PR-A3. A DB error here aborts
     // the bootstrap (same reasoning as the State load above).
-    let account_server = account_server::AccountServer::load_from_pg(Arc::clone(&state), &pool)
+    let account_node = account_node::AccountNode::load_from_pg(Arc::clone(&state), &pool)
         .await
         .expect("load account server from Postgres");
-    println!("Loaded AccountServer from Postgres");
+    println!("Loaded AccountNode from Postgres");
     let username_store = username::UsernameStore::load_from_pg(&pool)
         .await
         .expect("load username store from Postgres");
@@ -95,13 +95,13 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // Shared scanner-progress counter. Incremented by the scanner
     // callback every time `state.update` succeeds (i.e. an inscription
     // landed in the SMT). Read by the startup invariant check in
-    // `start_rest_server` to wait for the scanner to ingest at least
+    // `start_rest_node` to wait for the scanner to ingest at least
     // one block before declaring a desync — see
-    // `check_minting_state_invariant` doc-comment + zk-coins/server#89
+    // `check_minting_state_invariant` doc-comment + zk-coins/node#89
     // round-2 MAJOR 2.
     let scanner_progress = Arc::new(AtomicU64::new(0));
 
-    // Spawn the account_server as a separate task. A bootstrap error
+    // Spawn the account_node as a separate task. A bootstrap error
     // here (Postgres unreachable, startup invariant violated, listener
     // bind failure) used to be `eprintln!`'d and dropped on the floor
     // by this `tokio::spawn` block — the scanner kept running, the
@@ -109,13 +109,13 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // because nothing was bound to the listener port. Aborting the
     // whole process on bootstrap failure means the orchestrator
     // crash-loops the container and alerting fires on the loop,
-    // matching the panic-hook behaviour above (zk-coins/server#89
+    // matching the panic-hook behaviour above (zk-coins/node#89
     // round-2 MAJOR 2).
     let pool_for_rest = Arc::clone(&pool);
     let scanner_progress_for_rest = Arc::clone(&scanner_progress);
     tokio::spawn(async move {
-        if let Err(e) = start_rest_server(
-            account_server,
+        if let Err(e) = start_rest_node(
+            account_node,
             username_store,
             ACCOUNT_SERVER_ADDR,
             pool_for_rest,
@@ -206,7 +206,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                     match state_guard.update(&[commitment]) {
                         Ok(new_root) => {
                             // Signal scanner progress to the startup
-                            // invariant check (zk-coins/server#89
+                            // invariant check (zk-coins/node#89
                             // round-2 MAJOR 2). The counter only needs
                             // to be > 0 to unblock the wait — fetch_add
                             // is the documented monotonic-progress

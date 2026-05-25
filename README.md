@@ -1,4 +1,4 @@
-# zkCoins Server
+# zkCoins Node
 
 Rust/Axum backend for [zkcoins.app](https://zkcoins.app) — account management, ZK proof generation, Bitcoin blockchain scanning, and nullifier publishing.
 
@@ -6,8 +6,8 @@ Rust/Axum backend for [zkcoins.app](https://zkcoins.app) — account management,
 
 | Environment | URL                                                | Image                  |
 | ----------- | -------------------------------------------------- | ---------------------- |
-| **PRD**     | [api.zkcoins.app](https://api.zkcoins.app)         | `zkcoin/server:latest` |
-| **DEV**     | [dev-api.zkcoins.app](https://dev-api.zkcoins.app) | `zkcoin/server:beta`   |
+| **PRD**     | [api.zkcoins.app](https://api.zkcoins.app)         | `zkcoin/node:latest` |
+| **DEV**     | [dev-api.zkcoins.app](https://dev-api.zkcoins.app) | `zkcoin/node:beta`   |
 
 ## Stack
 
@@ -24,7 +24,7 @@ Full rationale: [docs.zkcoins.app/tech-decisions](https://docs.zkcoins.app/tech-
 
 ## Trust Model
 
-Proof generation runs **inside this server process**. `AccountServer::send_coins` (`server/src/account_server.rs`) calls `self.prover.prove_account_update_with_in_and_out_coins_and_sources(...)` (and the `prove_initial_*` variant for first-time accounts) on every send / receive / mint. ZK proving requires the full private witness, so the server sees, in cleartext:
+Proof generation runs **inside this server process**. `AccountServer::send_coins` (`server/src/account_node.rs`) calls `self.prover.prove_account_update_with_in_and_out_coins_and_sources(...)` (and the `prove_initial_*` variant for first-time accounts) on every send / receive / mint. ZK proving requires the full private witness, so the server sees, in cleartext:
 
 - Sender, recipient, and amount of every coin movement
 - The complete in-coin / out-coin / source-aggregator slot layout per account
@@ -40,7 +40,7 @@ The **on-chain footprint stays private** — Plonky2 ensures that the public out
 | Operator sees plaintext transaction data | ❌ Yes — DFX runs the hosted node | ✅ No |
 | Setup effort | ✅ None | ⚠️ Postgres + electrs + Bitcoin node |
 
-**If you need full transaction privacy, run your own server.** Every release is shipped as `zkcoin/server:latest` (see [Live](#live)), the build recipe is [`Dockerfile`](./Dockerfile), and runtime knobs are documented in [Configuration](#configuration). Point the [zkcoins.app](https://zkcoins.app) client at your self-hosted instance for end-to-end self-custody of transaction data.
+**If you need full transaction privacy, run your own server.** Every release is shipped as `zkcoin/node:latest` (see [Live](#live)), the build recipe is [`Dockerfile`](./Dockerfile), and runtime knobs are documented in [Configuration](#configuration). Point the [zkcoins.app](https://zkcoins.app) client at your self-hosted instance for end-to-end self-custody of transaction data.
 
 ## Contributing
 
@@ -68,10 +68,10 @@ API endpoints, background services, their activation status, and the tests that 
 | Network info                         | `GET /api/info`                       | env¹                     | mvp     | 100% (server)                  |
 | Get balance                          | `GET /api/balance?address=<hex>`      | always                   | mvp     | 100% (server)                  |
 | List all addresses                   | `GET /api/address`                    | feature (`address-list`) | gate    | 100% (server)                  |
-| Mint coins (single-phase)            | `POST /api/mint`                      | always²                  | mvp     | 100% (account_server)                 |
+| Mint coins (single-phase)            | `POST /api/mint`                      | always²                  | mvp     | 100% (account_node)                 |
 | Send — phase 1 (generate proof)      | `POST /api/send`                      | env²                     | mvp     | 100% (server)                  |
 | Send — phase 2 (commit + broadcast)  | `POST /api/commit`                    | env³                     | mvp     | 100% (server) · 0% (publisher) |
-| Receive coin                         | `POST /api/receive`                   | always                   | mvp     | 100% (account_server)                 |
+| Receive coin                         | `POST /api/receive`                   | always                   | mvp     | 100% (account_node)                 |
 | Download coin proof                  | `GET /api/proof/:id`                  | always                   | mvp     | 100% (server)                  |
 | Claim username                       | `POST /api/username/claim`            | always                   | mvp     | 100% (username)                |
 | Resolve username                     | `GET /api/username/resolve/:username` | always                   | mvp     | 100% (username)                |
@@ -126,40 +126,40 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 
 #### Get balance
 
-- **Module:** `server.rs::get_balance_handler` → `account_server.rs::AccountServer::get_account_balance`
+- **Module:** `server.rs::get_balance_handler` → `account_node.rs::AccountServer::get_account_balance`
 - **Behaviour:** address parsed as hex pubkey, looks up the account. Returns `{ balance, username? }`. A well-formed address with no on-chain activity yields `200 OK` with `balance: 0` (canonical zero state, not 404). The minting address returns `u64::MAX`. Malformed input — invalid hex, wrong length, or a missing `address` query parameter — returns `422`
 - **Tests:** `server.rs::tests::balance_*` (6 tests covering happy path, unknown address with and without a claimed username, invalid hex, missing param, wrong length)
 
 #### List all addresses
 
-- **Module:** `server.rs::get_address_handler` → `account_server.rs::AccountServer::get_addresses`
+- **Module:** `server.rs::get_address_handler` → `account_node.rs::AccountServer::get_addresses`
 - **Behaviour:** returns all known addresses as hex strings. Intended for explorer/debug use, not user-facing
 - **Tests:** `server.rs::tests::address_returns_list`
 
 #### Mint coins (single-phase)
 
-- **Module:** `server.rs::mint_handler` → `account_server.rs::send_coins` with the server-held minting account
+- **Module:** `server.rs::mint_handler` → `account_node.rs::send_coins` with the server-held minting account
 - **Behaviour:** server signs commitment itself (no client roundtrip) using the minting key
 - **Proof generation:** `zkcoins_prover::Prover` (the Plonky2 wrapper in [`script-plonky2/`](./script-plonky2/)) — `prove_initial` for new accounts, `prove_account_update` for receivers
-- **Tests:** `account_server.rs::tests::test_create_minting_account`, `test_mint_single_invoice`, `test_mint_repro_live_setup`
+- **Tests:** `account_node.rs::tests::test_create_minting_account`, `test_mint_single_invoice`, `test_mint_repro_live_setup`
 
 #### Send — phase 1 (generate proof)
 
-- **Module:** `server.rs::send_coin_handler` → `verify_send_signature` (Schnorr over `SHA256(account_address || recipient || amount || timestamp)`, ±5 min skew) → `account_server.rs::send_coins`
+- **Module:** `server.rs::send_coin_handler` → `verify_send_signature` (Schnorr over `SHA256(account_address || recipient || amount || timestamp)`, ±5 min skew) → `account_node.rs::send_coins`
 - **Behaviour:** returns `{ proof_id, account_state_hash, output_coins_root }`. Proof is persisted under `data/proofs/<id>.bin` for later commit
 - **Tests:** request-layer tests in `server.rs::tests::send_*` and `send_signature_*` (12 tests covering parser, signature verification, replay). Proof generation itself is not exercised — the Plonky2 cyclic-recursion build is too slow for unit tests (~3–15 min per prove at production parameters); positive proofs are exercised in `program-plonky2/` directly
 
 #### Send — phase 2 (commit + broadcast)
 
 - **Module:** `server.rs::commit_handler` → `publisher.rs::create_and_broadcast_inscription`
-- **Behaviour:** verifies the client's Schnorr commitment, builds a Taproot commit+reveal tx pair, mines a txid prefix `4242` (max 400 000 attempts in `publisher.rs::inscription_txs`), broadcasts both txs, then calls `account_server.rs::receive_coin` to deliver the coin to the recipient
+- **Behaviour:** verifies the client's Schnorr commitment, builds a Taproot commit+reveal tx pair, mines a txid prefix `4242` (max 400 000 attempts in `publisher.rs::inscription_txs`), broadcasts both txs, then calls `account_node.rs::receive_coin` to deliver the coin to the recipient
 - **Tests:** `server.rs::tests::commit_missing_body_returns_error`, `commit_nonexistent_proof_id_returns_404`. **No happy-path broadcast test** — would require a live Bitcoin signet/regtest
 
 #### Receive coin
 
-- **Module:** `server.rs::receive_coin_handler` → `account_server.rs::receive_coin`
+- **Module:** `server.rs::receive_coin_handler` → `account_node.rs::receive_coin`
 - **Behaviour:** replay-protected via per-account `coin_history` SMT
-- **Tests:** `account_server.rs::tests::test_receive_duplicate_coin_rejected`, `test_receive_updates_balance`
+- **Tests:** `account_node.rs::tests::test_receive_duplicate_coin_rejected`, `test_receive_updates_balance`
 
 #### Download coin proof
 
@@ -188,7 +188,7 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 #### Bitcoin block scanner
 
 - **Module:** `scanner.rs::scan_for_inscriptions` / `InscriptionScanner::scan_from_block`. Loop spawned from `main.rs::main`. State saved between runs in `data/latest_block.bin`
-- **Behaviour:** subscribes to the Esplora WebSocket (`scanner_ws.rs`, `ESPLORA_WS_URL`) for new tip events; drains the resulting mpsc channel in `scanner_runtime.rs`, walking forward through `block_status.next_best`; filters txs by txid prefix `4242`; extracts Taproot inscription content via `extract_inscription_content`; deserialises as `Commitment`; calls callback in `main.rs` which verifies the signature and updates state. Polling was removed in [issue #84](https://github.com/zk-coins/server/issues/84); see [CONTRIBUTING.md § "No polling — events only"](./CONTRIBUTING.md#no-polling--events-only) for the CI lint that enforces this
+- **Behaviour:** subscribes to the Esplora WebSocket (`scanner_ws.rs`, `ESPLORA_WS_URL`) for new tip events; drains the resulting mpsc channel in `scanner_runtime.rs`, walking forward through `block_status.next_best`; filters txs by txid prefix `4242`; extracts Taproot inscription content via `extract_inscription_content`; deserialises as `Commitment`; calls callback in `main.rs` which verifies the signature and updates state. Polling was removed in [issue #84](https://github.com/zk-coins/node/issues/84); see [CONTRIBUTING.md § "No polling — events only"](./CONTRIBUTING.md#no-polling--events-only) for the CI lint that enforces this
 - **Tests:** `scanner.rs::tests::parse_valid_inscription_into_commitment`, `reject_invalid_inscription_data`, `verify_commitment_signature_after_deserialization`, `parse_multi_chunk_inscription`. **No integration test** with a real Bitcoin block
 
 #### State persistence (SMT/MMR write)
@@ -227,7 +227,7 @@ Runtime config above shapes _behaviour_ of compiled-in routes. _Which_ routes ar
 Spawned from `main.rs::main`:
 
 1. **REST server** (`tokio::spawn` of `start_rest_server`) — Axum app bound to `0.0.0.0:4242`
-2. **Block scanner** (driven directly in main, not spawned) — `scan_for_inscriptions` consumes new tips from the WS-fed `mpsc<BlockHash>` channel produced by `scanner_ws::run_scanner_ws` (spawned as a tokio task at startup) and writes state on each verified commitment. No fixed-interval polling — see [issue #84](https://github.com/zk-coins/server/issues/84)
+2. **Block scanner** (driven directly in main, not spawned) — `scan_for_inscriptions` consumes new tips from the WS-fed `mpsc<BlockHash>` channel produced by `scanner_ws::run_scanner_ws` (spawned as a tokio task at startup) and writes state on each verified commitment. No fixed-interval polling — see [issue #84](https://github.com/zk-coins/node/issues/84)
 
 ### Tests
 
@@ -241,9 +241,9 @@ Per-module coverage (CI-gated):
 
 | Module              | Line + function % | Notes                                                                              |
 | ------------------- | ----------------- | ---------------------------------------------------------------------------------- |
-| `account_server.rs` | 100%              | send-coins flow, account ledger, scanner integration                               |
+| `account_node.rs` | 100%              | send-coins flow, account ledger, scanner integration                               |
 | `scanner.rs`        | 100%              | Bitcoin block / inscription scanner                                                |
-| `server.rs`         | 100%              | REST handlers + request validation                                                 |
+| `router.rs`         | 100%              | REST handlers + request validation                                                 |
 | `state.rs`          | 100%              | Poseidon-based SMT + MMR                                                           |
 | `username.rs`       | 100%              | Username claim / resolve / LNURL                                                   |
 | `publisher.rs`      | excluded          | Bitcoin commit/reveal broadcasting — needs live signet/regtest node                |
@@ -279,7 +279,7 @@ server/                  # Axum REST API
 ├── src/
 │   ├── main.rs          # Entry point, chain scanner, bind 0.0.0.0:4242
 │   ├── server.rs        # REST endpoints + /health
-│   ├── account_server.rs  # Account logic, coin proofs, prover calls
+│   ├── account_node.rs  # Account logic, coin proofs, prover calls
 │   ├── state.rs         # Sparse Merkle Tree + Merkle Mountain Range
 │   ├── scanner.rs       # Bitcoin block scanner (event-driven via scanner_ws, prefix 4242)
 │   ├── scanner_ws.rs    # Esplora WebSocket subscriber (issue #84, replaces 30 s polling)
@@ -300,21 +300,21 @@ The last SP1 zkVM / SHA256 state is preserved at tag `v0.last-sp1` for historica
 ## Docker
 
 ```bash
-docker build -t zkcoin/server .
+docker build -t zkcoin/node .
 docker run -p 4242:4242 \
   --network bitcoin \
   -e ESPLORA_URL=http://electrs-mainnet:3000 \
-  zkcoin/server
+  zkcoin/node
 ```
 
-Docker builds use nightly Rust auto-installed via `rust-toolchain` (no external toolchain needed). The Dockerfile lives at the repo root; `.github/workflows/deploy-dev.yaml` builds `zkcoin/server:beta` for `linux/arm64` and deploys to the DEV host on every push to `develop`.
+Docker builds use nightly Rust auto-installed via `rust-toolchain` (no external toolchain needed). The Dockerfile lives at the repo root; `.github/workflows/deploy-dev.yaml` builds `zkcoin/node:beta` for `linux/arm64` and deploys to the DEV host on every push to `develop`.
 
 ## CI/CD
 
 | Workflow               | Trigger      | Action                                               |
 | ---------------------- | ------------ | ---------------------------------------------------- |
-| `deploy-dev.yaml`      | Push develop | Docker (ARM64) → `zkcoin/server:beta` → DEV server   |
-| `deploy-prd.yaml`      | Push main    | Docker (ARM64) → `zkcoin/server:latest` → PRD server |
+| `deploy-dev.yaml`      | Push develop | Docker (ARM64) → `zkcoin/node:beta` → DEV server   |
+| `deploy-prd.yaml`      | Push main    | Docker (ARM64) → `zkcoin/node:latest` → PRD server |
 | `auto-release-pr.yaml` | Push develop | Creates Release PR (develop → main)                  |
 
 Build time: ~5 minutes (Rust compilation on ARM64).
@@ -352,7 +352,7 @@ Current cyclic-recursion proof times at production parameters (`MAX_IN_COINS = M
 | [`BRIDGE_MVP.md`](./BRIDGE_MVP.md)                      | Engineering spec for the bridge MVP — 8 phases, file-by-file, 5–7 months effort estimate                       | Draft  |
 
 These documents describe the bridge and swap roadmap. They build on
-the Plonky2 migration that landed via PR [#17](https://github.com/zk-coins/server/pull/17)
+the Plonky2 migration that landed via PR [#17](https://github.com/zk-coins/node/pull/17)
 on 2026-05-18 and cross-reference `SPEC.md`, `MIGRATION_RESEARCH.md`,
 and `ROADMAP.md`.
 
