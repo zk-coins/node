@@ -901,7 +901,7 @@ async fn mint_roundtrip_lands_balance_and_proof() {
 
     // Minting-account sanity guard: the deploy-dev workflow's
     // `push: branches: [develop]` trigger does NOT run
-    // `reset-zkcoins-server`, so the minting balance is allowed to be
+    // `reset-zkcoins-node`, so the minting balance is allowed to be
     // anywhere in (0, BOOTSTRAP_MINTING_BALANCE]. We only fail hard
     // on the genuinely impossible states (balance > bootstrap = code
     // regression or unauthorized re-seed; balance == 0 = unexpected
@@ -966,7 +966,7 @@ async fn send_commit_roundtrip_moves_balance() {
     // Minting-account sanity guard — mirror of the one in
     // `mint_roundtrip_lands_balance_and_proof`. The deploy-dev
     // workflow's `push: branches: [develop]` trigger does NOT run
-    // `reset-zkcoins-server`, so we cannot pin the minting balance to
+    // `reset-zkcoins-node`, so we cannot pin the minting balance to
     // an exact value (or even a small accept-set keyed off
     // `MINT_AMOUNT`): the balance accumulates `bootstrap - N*MINT_AMOUNT`
     // across every prior develop push that ran this suite. The
@@ -1316,7 +1316,7 @@ async fn fetch_minting_balance(client: &reqwest::Client) -> u64 {
 ///   or DB wipe between deploys)
 ///
 /// The deploy-dev workflow's `push: branches: [develop]` trigger does
-/// NOT run `reset-zkcoins-server`; that command requires explicit
+/// NOT run `reset-zkcoins-node`; that command requires explicit
 /// `workflow_dispatch` with `reset_state: true`. Strict equality with
 /// BOOTSTRAP_MINTING_BALANCE would therefore tripwire CI on the second
 /// push after any reset. Use this upper-bound assertion instead.
