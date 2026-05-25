@@ -3966,30 +3966,36 @@ async fn mint_broadcast_mock_ws() -> String {
                 Ok(s) => s,
                 Err(_) => return,
             };
-            let mut ws = match tokio_tungstenite::accept_async(stream).await {
-                Ok(w) => w,
-                Err(_) => continue,
-            };
-            let first = match ws.next().await {
-                Some(Ok(WsMessage::Text(t))) => t,
-                _ => continue,
-            };
-            let value: serde_json::Value = match serde_json::from_str(&first) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if value.get("action") == Some(&serde_json::json!("track-tx")) {
-                if let Some(txid_str) = value.get("data").and_then(|v| v.as_str()) {
-                    // Documented mempool.space `txPosition` shape;
-                    // see `scanner_ws::frame_signals_tx_seen`.
-                    let frame = format!(
-                        r#"{{"txPosition":{{"txid":"{}","position":{{"block":1,"vsize":120}}}}}}"#,
-                        txid_str
-                    );
-                    let _ = ws.send(WsMessage::Text(frame)).await;
+            // Spawn per-connection so the accept loop continues
+            // immediately and tests issuing multiple sequential mints
+            // (each with its own WS connect) are not serialised behind
+            // the previous connection's 60s keepalive sleep.
+            tokio::spawn(async move {
+                let mut ws = match tokio_tungstenite::accept_async(stream).await {
+                    Ok(w) => w,
+                    Err(_) => return,
+                };
+                let first = match ws.next().await {
+                    Some(Ok(WsMessage::Text(t))) => t,
+                    _ => return,
+                };
+                let value: serde_json::Value = match serde_json::from_str(&first) {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                if value.get("action") == Some(&serde_json::json!("track-tx")) {
+                    if let Some(txid_str) = value.get("data").and_then(|v| v.as_str()) {
+                        // Documented mempool.space `txPosition` shape;
+                        // see `scanner_ws::frame_signals_tx_seen`.
+                        let frame = format!(
+                            r#"{{"txPosition":{{"txid":"{}","position":{{"block":1,"vsize":120}}}}}}"#,
+                            txid_str
+                        );
+                        let _ = ws.send(WsMessage::Text(frame)).await;
+                    }
                 }
-            }
-            let _ = tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let _ = tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            });
         }
     });
     url
