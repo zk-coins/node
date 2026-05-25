@@ -34,7 +34,10 @@ pub struct EsploraConfig {
     /// Override for the per-broadcast `track-tx` safety-net (issue
     /// #84). `None` uses the production default
     /// `TRACK_TX_TIMEOUT_SECS = 30`; tests pass a short Duration so
-    /// the silent-fallback assertion does not stall the suite.
+    /// the "broadcast genuinely failed" path (short WS timeout +
+    /// wiremock default 404 on `GET /tx/{txid}` ⇒ REST fallback returns
+    /// `None` ⇒ hard `WsError::Timeout`) does not stall the suite for
+    /// the full 30 s.
     ///
     /// Test-injection backdoor: production callers always leave this
     /// `None` and inherit the 30 s safety-net. Hidden from the
@@ -64,9 +67,15 @@ const MIN_INSCRIPTION_AMOUNT: u64 = 800;
 /// (issue #84). The publisher subscribes to the Esplora WS for the
 /// commit txid before broadcasting the reveal, and proceeds the
 /// moment the peer reports the commit as seen. If 30 s pass without
-/// any track-tx event, that is a hard error, NOT a silent fallback
-/// to "broadcast the reveal anyway" — a missing event in that window
-/// is a real upstream / network problem worth surfacing.
+/// any track-tx event, the publisher issues a SINGLE REST
+/// `GET /tx/{commit_txid}` fallback against the Esplora endpoint:
+/// a 200 means the tx is in mempool / a block (the WS just missed
+/// the frame, a regularly-observed Mutinynet failure mode) and the
+/// publisher proceeds with the reveal; a 404 or any other error
+/// propagates `WsError::Timeout`. The underlying rationale is
+/// unchanged: a missing event without REST corroboration is still
+/// a real upstream / network problem worth surfacing — never a
+/// silent fallback to "broadcast the reveal anyway".
 const TRACK_TX_TIMEOUT_SECS: u64 = 30;
 
 use crate::scanner_ws::DEFAULT_ESPLORA_WS_URL;
