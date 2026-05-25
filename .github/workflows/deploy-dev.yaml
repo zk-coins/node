@@ -87,7 +87,17 @@ jobs:
             DEPLOY_CMD="reset-zkcoins-node"
           fi
 
+          # ServerAlive* keep the session alive across long-running
+          # `docker compose recreate` steps where the remote command
+          # produces no stdout for >60s. Without keepalive the
+          # cloudflared tunnel (and the OpenSSH client) drop the
+          # session and exit 255 even though the host-side deploy
+          # script keeps running — observed on the PR #111 merge
+          # (run 26419696840). 30s interval × 8 retries = 4 min of
+          # network silence tolerated before the session is killed.
           ssh -i ~/.ssh/deploy_key \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=8 \
             -o ProxyCommand="cloudflared access ssh --hostname ${{ secrets.DEPLOY_DEV_HOST }}" \
             ${{ secrets.DEPLOY_DEV_USER }}@${{ secrets.DEPLOY_DEV_HOST }} \
             "$DEPLOY_CMD"
