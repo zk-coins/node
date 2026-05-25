@@ -999,11 +999,12 @@ async fn mint_handler(
 
     // ---- 3b. STATE_ADVANCE phase (Phase E, broadcast OK) ----------------
     // Apply the freshly-broadcast commitment to the in-memory SMT + MMR
-    // and persist the resulting snapshot in the SAME shape the scanner
-    // callback uses, then mark the `pending_inscriptions` row
-    // `complete`. The scanner's pre-state.update lookup uses that
-    // `complete` marker to skip its own redundant integration when it
-    // later observes the same commit on chain.
+    // and persist the resulting snapshot — together with the
+    // `pending_inscriptions.status = 'complete'` row advance — in ONE
+    // atomic Postgres transaction (`persist_state_and_mark_complete_tx`).
+    // The scanner's pre-state.update lookup uses that `complete` marker
+    // to skip its own redundant integration when it later observes the
+    // same commit on chain.
     //
     // Rationale (this is the regression Phase E fixes): the scanner
     // observed a mint's commit ~20-30 s after `/api/mint` returned 200.
@@ -1020,41 +1021,23 @@ async fn mint_handler(
     // Lock topology: the state lock is acquired AFTER the broadcast
     // completes (broadcasting is slow and would otherwise serialize
     // all `/api/mint` requests behind a single in-flight inscription).
-    // The two concurrent-mint races below are handled separately:
     //
-    //   (a) Two `/api/mint` handlers both reach STATE_ADVANCE with the
-    //       same `expected_num_pubkeys = N`. The phase-2 in-process
-    //       re-derive gate above already maps one of them to 503
-    //       before it reaches BROADCAST, so this branch normally sees
-    //       at most one update per N. Defence-in-depth: if both ever
-    //       did slip through the gate (e.g. across a binary upgrade
-    //       that changed the gate's behaviour), the second `state.update`
-    //       call would either be a no-op (same pubkey + same value, the
-    //       SMT insert is idempotent) or surface the SMT's
-    //       `"Key already exists in the tree with different value"`
-    //       error — both branches are logged and never abort the
-    //       caller's response.
-    //
-    //   (b) The scanner observes the commit between STATE_ADVANCE and
-    //       the post-state.update `complete` UPDATE. The scanner's
-    //       lookup sees `reveal_broadcast`, falls through, takes the
-    //       state lock (serialised with our STATE_ADVANCE by the same
-    //       Arc<Mutex<State>>), and runs its own state.update. If our
-    //       handler completed first, the scanner's update is the
-    //       idempotent no-op above; if the scanner ran first (because
-    //       our handler had to wait on the lock), our handler will
-    //       observe the SMT already-present and log the same tolerant
-    //       "Key already exists" error. Either way state is correct
-    //       and the row reaches `complete` on whichever path got
-    //       there second.
-    //
-    // Crash-recovery contract: a crash between broadcast Ok and the
-    // `complete` UPDATE leaves the row at `reveal_broadcast`. The
-    // scanner-replay path on next boot walks the block, sees the row
-    // is not `complete`, runs its own state.update, and marks the row
-    // complete. The publisher's resumer never advances to `complete`
-    // (Phase E moved that responsibility to the state-update step) so
-    // it cannot lie about the in-memory state having been updated.
+    // Crash-recovery contract (the BLOCKER this commit fixed): the
+    // previous two-step shape (persist SMT/MMR/root_index, then a
+    // standalone UPDATE to `complete`) opened a window where the
+    // SMT/MMR/root_index could land on disk while the row stayed at
+    // `reveal_broadcast`. On restart, `State::load_from_pg` rebuilt the
+    // in-memory state WITH the new leaf, the scanner re-scanned the
+    // block, observed `reveal_broadcast` → `should_skip_scanner_state_update`
+    // returned `false`, and `state.update` ran a second time — the SMT
+    // insert was an idempotent no-op (same key+value) but
+    // `mmr.append(leaf)` appended a DUPLICATE leaf, diverging the MMR
+    // root. The atomic single-tx persist + mark-complete below
+    // guarantees that on success, the scanner-skip predicate will
+    // correctly fire on replay. On tx failure, the row stays at
+    // `reveal_broadcast` and the in-memory state advance was NOT
+    // persisted to disk (transaction atomicity); the scanner will
+    // replay cleanly.
     let state_advance_outcome = {
         let state_arc_for_advance = {
             let account_node_guard = lock_or_recover(&state.account_node);
@@ -1063,80 +1046,80 @@ async fn mint_handler(
         let mut state_guard = lock_or_recover(&state_arc_for_advance);
         state_guard.update_and_snapshot_for_persist(std::slice::from_ref(&commitment))
     };
-    match state_advance_outcome {
-        Ok((new_root, smt_bytes, mmr_bytes, root_index_entry)) => {
-            // Mint_handler uses the `_without_block` variant: it knows
-            // the SMT + MMR + root_index trio but NOT the Bitcoin
-            // block hash for this inscription (it hasn't been mined
-            // yet). The scanner remains the sole writer of
-            // `latest_block`, which is its resume marker.
-            let root_index_ref = root_index_entry.as_ref().map(|(p, s, i)| (p, s, *i as u64));
-            match db::persist_state_without_block_tx(
-                &state.pool,
-                &smt_bytes,
-                &mmr_bytes,
-                root_index_ref,
-            )
-            .await
-            {
-                Ok(()) => {
-                    println!(
-                        "mint_handler: state.update persisted. New MMR root: {}",
-                        hex::encode(zkcoins_program::hash::digest_to_bytes(&new_root))
-                    );
-                    if let Some(ctxid) = commit_txid_bytes {
-                        if let Err(e) = db::update_pending_status(
-                            &state.pool,
-                            &ctxid,
-                            db::PENDING_STATUS_COMPLETE,
-                        )
-                        .await
-                        {
-                            // Best-effort: failure leaves the row at
-                            // `reveal_broadcast`. The scanner's
-                            // pre-state.update lookup will then NOT
-                            // short-circuit, but the in-memory SMT
-                            // already contains the entry so the
-                            // scanner's `state.update` will either
-                            // no-op (idempotent) or log the tolerant
-                            // "Key already exists" error. Logged here
-                            // for operator visibility.
-                            eprintln!(
-                                "Failed to mark pending_inscriptions {} complete after state.update: {}",
-                                hex::encode(ctxid),
-                                e
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    // The in-memory SMT/MMR mutated but the DB
-                    // snapshot didn't land. On restart, `State::load_from_pg`
-                    // returns the PRE-update state and the scanner-
-                    // replay path picks the commit up from chain and
-                    // re-runs state.update — same heal-on-restart
-                    // contract the scanner callback relies on.
-                    eprintln!(
-                        "Failed to persist mint state.update snapshot: {} (scanner-replay will heal)",
-                        e
-                    );
-                }
-            }
-        }
+    let (new_root, smt_bytes, mmr_bytes, root_index_entry) = match state_advance_outcome {
+        Ok(snapshot) => snapshot,
         Err(e) => {
-            // SMT/MMR could not be advanced in-process. This is rare
-            // (the SMT only errors on key collision with a different
-            // value, which is precisely the concurrent-mint race the
-            // doc-comment above covers) — log and continue. The
-            // scanner-replay path will heal on its next sweep. We do
-            // NOT surface 503 here: the broadcast already landed and
-            // the next mint's `derive_num_pubkeys_from_smt` will pick
-            // up the entry once the scanner integrates it.
+            // The in-process SMT/MMR could not be advanced — typically
+            // an SMT key-collision-with-different-value (a concurrent
+            // mint race that slipped the phase-2 re-derive gate, or a
+            // genuine bug). The broadcast already landed on chain, but
+            // the caller's mint was NOT integrated synchronously. The
+            // publisher already advanced the row to `reveal_broadcast`
+            // BEFORE the broadcast call; we keep it there so the
+            // scanner-replay path will pick the inscription up from
+            // chain and run state.update against the un-mutated SMT.
+            // Return 503 so the wallet knows the mint did NOT land
+            // synchronously and can poll for completion.
             eprintln!(
-                "mint_handler: in-process state.update failed: {} (deferring to scanner-replay path)",
+                "mint_handler: in-process state.update failed: {} (broadcast already landed; scanner-replay will reconcile)",
                 e
             );
+            return handler_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "mint broadcast landed on chain but in-process state advance failed; scanner will reconcile",
+            );
         }
+    };
+    if let Some(ctxid) = commit_txid_bytes {
+        let root_index_ref = root_index_entry.as_ref().map(|(p, s, i)| (p, s, *i as u64));
+        match db::persist_state_and_mark_complete_tx(
+            &state.pool,
+            &smt_bytes,
+            &mmr_bytes,
+            root_index_ref,
+            &ctxid,
+        )
+        .await
+        {
+            Ok(()) => {
+                println!(
+                    "mint_handler: state.update persisted + row marked complete. New MMR root: {}",
+                    hex::encode(zkcoins_program::hash::digest_to_bytes(&new_root))
+                );
+            }
+            Err(e) => {
+                // The atomic tx rolled back: SMT/MMR/root_index AND
+                // the row advance all stayed at their pre-call values
+                // on disk. The in-memory SMT/MMR HAVE already been
+                // mutated (that happened above before the await), so
+                // they are now ahead of disk by exactly one leaf.
+                // On restart, `State::load_from_pg` returns the
+                // pre-update on-disk state and the scanner-replay path
+                // walks the block, observes the row at
+                // `reveal_broadcast`, and integrates the inscription
+                // itself — a clean heal. Return 503 so the caller
+                // knows the durable state did not advance.
+                eprintln!(
+                    "mint_handler: atomic persist + mark-complete failed: {} (scanner-replay will heal)",
+                    e
+                );
+                return handler_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "mint broadcast landed on chain but durable state advance failed; scanner will reconcile",
+                );
+            }
+        }
+    } else {
+        // No commit_txid: the broadcast path returned Ok(None) (the
+        // test-only `Some(&state.pool)` no-pool branch should not
+        // surface here in production; defensive fallback). The
+        // in-memory state is already advanced; no row to mark complete.
+        // Persist SMT/MMR/root_index alone via a degenerate empty
+        // commit_txid is not meaningful, so just log and continue —
+        // production builds always have a commit_txid on success.
+        eprintln!(
+            "mint_handler: state.update advanced in-memory but no commit_txid available; persist skipped"
+        );
     }
 
     // ---- 4. COMMIT phase (broadcast OK) ---------------------------------

@@ -191,29 +191,56 @@ pub async fn persist_state_tx(
     tx.commit().await
 }
 
-/// Phase-E variant of [`persist_state_tx`] that writes the SMT, MMR,
-/// and `mmr_root_index` row WITHOUT touching the `latest_block` row.
+/// Phase-E atomic helper used by `mint_handler` after a successful
+/// broadcast: writes the SMT, MMR, `mmr_root_index` row AND advances
+/// the `pending_inscriptions` row to `complete` — all in one
+/// transaction. Leaves `latest_block` untouched (the scanner is the
+/// sole writer; the freshly broadcast inscription has not been mined
+/// yet, so the mint handler has no business overwriting the resume
+/// marker).
 ///
-/// `mint_handler` calls this after applying `state.update` synchronously
-/// to the in-memory SMT/MMR. The freshly broadcast inscription is not
-/// yet in a Bitcoin block, so the mint handler has no business
-/// overwriting the scanner's `latest_block` pointer — that pointer is
-/// the scanner's resume marker and the only writer that knows which
-/// block holds an inscription is the scanner itself. Splitting the
-/// write keeps the scanner's resume contract intact while still giving
-/// the mint flow the atomic SMT + MMR + root_index bundle that the
-/// "two mints in the same scanner window" race requires.
+/// ## Crash-recovery contract (the BLOCKER fix)
 ///
-/// Other than the missing `latest_block` UPSERT, the body is identical
-/// to `persist_state_tx`: same singleton-row UPSERTs, same
-/// `ON CONFLICT (prev_mmr_root) DO NOTHING` for the root-index row,
-/// same atomic BEGIN/COMMIT envelope so a partial-failure leaves the
-/// trio consistent.
-pub async fn persist_state_without_block_tx(
+/// The previous two-step shape (`persist_state_without_block_tx` then
+/// a standalone `update_pending_status(... COMPLETE)`) opened a crash
+/// window between the SMT/MMR/root_index COMMIT and the mark-complete
+/// UPDATE: on restart, `State::load_from_pg` rebuilt in-memory state
+/// WITH the new leaf, but the row was still `reveal_broadcast`. When
+/// the scanner later re-scanned the block, `should_skip_scanner_state_update`
+/// returned `false` and the callback fell through to `state.update` →
+/// `mmr.append` appended the same leaf a second time, diverging the
+/// MMR root.
+///
+/// Folding the row advance into the same transaction closes the
+/// window: either the SMT/MMR/root_index AND the `complete` row land
+/// together, or none of them do. Scanner re-scan after a successful
+/// commit observes `complete` and short-circuits cleanly; scanner re-scan
+/// after a rolled-back commit observes `reveal_broadcast` and integrates
+/// the inscription itself (the in-memory mutation was performed against
+/// the live `Arc<Mutex<State>>` but the COMMIT was atomic, so the
+/// caller's outer reaction to the Err propagation must be to NOT trust
+/// the in-memory snapshot — see `mint_handler`'s 503 path).
+///
+/// The UPDATE has a guard `status <> 'complete'` so a re-run on an
+/// already-complete row is a no-op and does not bump `updated_at`,
+/// keeping the audit trail tight.
+///
+/// ## Arguments
+///
+/// * `smt` / `mmr` — bincode blobs going into the singleton rows.
+/// * `root_index_entry` — `Some((prev_mmr_root, smt_root, leaf_index))`
+///   for the freshly-appended leaf. `None` is accepted for symmetry
+///   with `persist_state_tx` but `mint_handler` always passes `Some`
+///   because every successful `state.update` produces a new root entry.
+/// * `commit_txid` — raw 32-byte little-endian commit txid of the
+///   inscription, matching the `pending_inscriptions.commit_txid`
+///   column.
+pub async fn persist_state_and_mark_complete_tx(
     pool: &PgPool,
     smt: &[u8],
     mmr: &[u8],
     root_index_entry: Option<(&HashDigest, &HashDigest, u64)>,
+    commit_txid: &[u8],
 ) -> Result<(), sqlx::Error> {
     let root_index_bytes = match root_index_entry {
         None => None,
@@ -262,6 +289,15 @@ pub async fn persist_state_without_block_tx(
         .execute(&mut *tx)
         .await?;
     }
+    sqlx::query(
+        "UPDATE pending_inscriptions \
+         SET status = $1, updated_at = NOW() \
+         WHERE commit_txid = $2 AND status <> $1",
+    )
+    .bind(PENDING_STATUS_COMPLETE)
+    .bind(commit_txid)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await
 }
 
