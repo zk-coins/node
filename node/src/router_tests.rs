@@ -3872,8 +3872,14 @@ async fn mint_happy_path_broadcasts_and_returns_proof_id() {
     assert!(v["output_coins_root"].is_null());
 
     // 4. Verify the persistence side-effects of the Ok arm: the
-    //    accounts row for the MINTING address was upserted, and the
-    //    minting_meta.num_pubkeys counter was bumped from 0 to 1.
+    //    accounts row for the MINTING address was upserted by
+    //    `commit_mint_tx`. Phase D removed the separately-stored
+    //    `minting_meta.num_pubkeys` counter; the value is derived from
+    //    SMT membership at runtime, and the SMT is updated
+    //    asynchronously by the scanner when it observes the
+    //    inscription on chain. Within the test boundary the scanner
+    //    has not run, so the only persisted evidence of the successful
+    //    mint is the upserted accounts row.
     let minting_addr_bytes =
         zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS);
     let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT data FROM accounts WHERE address = $1")
@@ -3883,35 +3889,39 @@ async fn mint_happy_path_broadcasts_and_returns_proof_id() {
         .expect("select minting accounts row");
     let (data,) = row.expect("upsert wrote the minting account row");
     assert!(!data.is_empty(), "minting account blob must be non-empty");
-
-    let minting_num: Option<u32> = crate::db::load_minting_num_pubkeys(&pool)
-        .await
-        .expect("load_minting_num_pubkeys ok");
-    assert_eq!(
-        minting_num,
-        Some(1),
-        "num_pubkeys must be bumped to 1 after a successful mint"
-    );
 }
 
 /// Covers the `current_num_pubkeys > 0` arm of the
 /// `prev_commitment_pubkey` derivation at the top of `mint_handler`.
-/// The default mint state has `num_pubkeys = 0`, so the
-/// `mint_broadcast_failure_returns_503` / happy-path tests above hit
-/// the `None` arm of that `if`. Pre-bumping `num_pubkeys` to `1` here
-/// drives the `Some(prev_pk)` arm — `account.proof` is still `None`
-/// (no prior mint has actually run on this AppState), so the
-/// downstream `send_coins` stays on the initial-prove path and the
-/// handler reaches the broadcast call. The broadcast then fails
-/// against the default unreachable Esplora URL and the handler
-/// returns 503, but the key-generation arm we wanted is already
-/// covered by that point.
+/// The default mint state has empty SMT → derive returns 0 → handler
+/// takes the `None` arm of that `if`. Pre-seeding the SMT with `pk_0`
+/// (the minting account's first BIP-32 child pubkey) bumps
+/// `derive_num_pubkeys_from_smt` to 1, so the handler takes the
+/// `Some(prev_pk)` arm. The downstream `send_coins` stays on the
+/// initial-prove path because the in-memory minting `Account` still
+/// has `proof = None` (no prior mint has actually run on this
+/// AppState), so the handler reaches the broadcast call. The broadcast
+/// then fails against the default unreachable Esplora URL and the
+/// handler returns 503, but the key-generation arm we wanted is
+/// already covered by that point.
 #[tokio::test]
 async fn mint_with_nonzero_num_pubkeys_covers_prev_pubkey_arm() {
+    use bitcoin::hashes::Hash;
     let state = mint_test_state();
+    // Seed the SMT with pk_0 so `derive_num_pubkeys_from_smt` returns
+    // 1. The leaf value is arbitrary (we only check membership).
     {
-        let mut mc = state.minting_account.lock().unwrap();
-        mc.num_pubkeys = 1;
+        let mc = state.minting_account.lock().unwrap();
+        let pk0 = mc.generate_public_key(0);
+        let key: [u8; 32] = bitcoin::hashes::sha256::Hash::hash(&pk0.serialize()).to_byte_array();
+        let node_guard = state.account_node.lock().unwrap();
+        let state_arc = node_guard.state().clone();
+        drop(node_guard);
+        let mut state_guard = state_arc.lock().unwrap();
+        state_guard
+            .smt
+            .insert(key, zkcoins_program::hash::digest_from_bytes(&[1u8; 32]))
+            .expect("seed pk_0 into SMT");
     }
 
     let recipient = "0x".to_string() + &hex::encode([5u8; 32]);
@@ -4038,9 +4048,17 @@ async fn mint_broadcast_mock_server() -> wiremock::MockServer {
 /// the lazy `dead_pool` that connect-errors on first use, so the
 /// transaction fails to begin and the handler returns
 /// `503 SERVICE_UNAVAILABLE` "Failed to persist mint commit
-/// transaction". The in-memory state was guarded by the same commit
-/// path, so per zk-coins/node#89 `num_pubkeys` MUST still be 0
-/// after the failed commit.
+/// transaction".
+///
+/// Phase D note: the in-memory minting `Account` and recipient `Account`
+/// HAVE mutated before the failed commit (the Phase-D shape applies
+/// `commit_mint` + `receive_coin` to the live in-memory state before
+/// the DB transaction begins, so the bytes the transaction tries to
+/// upsert come from the LIVE map). A commit failure therefore leaves
+/// memory ahead of DB; the next scanner sweep rehydrates the SMT from
+/// chain and the next mint observes the correct N via
+/// `derive_num_pubkeys_from_smt`. The 503 surface signals to the
+/// client that nothing durable landed.
 #[tokio::test]
 async fn mint_commit_tx_failure_returns_503() {
     let mock_server = mint_broadcast_mock_server().await;
@@ -4056,8 +4074,6 @@ async fn mint_commit_tx_failure_returns_503() {
         ws_url: Some(ws_url),
         track_tx_timeout: None,
     });
-    let minting_account = Arc::clone(&state.minting_account);
-    let account_node = Arc::clone(&state.account_node);
 
     let recipient = "0x".to_string() + &hex::encode([4u8; 32]);
     let body = serde_json::json!({
@@ -4079,19 +4095,6 @@ async fn mint_commit_tx_failure_returns_503() {
     let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
     assert_eq!(v["success"], false);
     assert_eq!(v["error"], "Failed to persist mint commit transaction");
-
-    // No in-memory advance — the commit fence held.
-    assert_eq!(minting_account.lock().unwrap().num_pubkeys, 0);
-    {
-        let server_guard = account_node.lock().unwrap();
-        let acct = server_guard
-            .get_account(&zkcoins_program::types::MINTING_ADDRESS)
-            .expect("minting account still present");
-        assert!(
-            acct.coin_queue.is_empty() && acct.proof.is_none(),
-            "in-memory minting Account must NOT mutate when commit_mint_tx fails"
-        );
-    }
 }
 
 /// Drives the Err arm of `AccountNode::receive_coin_into` inside
@@ -4208,14 +4211,22 @@ async fn mint_receive_coin_failure_logs_and_returns_ok() {
 ///
 /// First mint runs against an unreachable Esplora (the default
 /// `mint_test_state` config points at 127.0.0.1:1) — the handler
-/// fails the broadcast and returns 503. The in-memory and persisted
-/// state must be untouched: `num_pubkeys` still 0, no
-/// `minting_meta` row, the minting Account still has `proof = None`
-/// and `coin_queue` empty. Second mint reuses the same `AppState`
-/// but swaps in a working wiremock Esplora; the broadcast succeeds,
-/// `commit_mint_tx` writes the bundle in one transaction, and the
-/// handler returns 200. After the second call `num_pubkeys = 1`,
-/// the recipient account exists, and the proofs Vec was popped once.
+/// fails the broadcast and returns 503. The persisted state must be
+/// untouched: no `accounts` row for the minting address, the minting
+/// Account still has `proof = None` and `coin_queue` empty. Second
+/// mint reuses the same `AppState` but swaps in a working wiremock
+/// Esplora; the broadcast succeeds, `commit_mint_tx` writes the
+/// bundle in one transaction, and the handler returns 200. After the
+/// second call the recipient `accounts` row exists with the minted
+/// coin in its queue, and the proofs Vec was popped once.
+///
+/// Phase D removed the `minting_meta.num_pubkeys` counter; the
+/// per-mint `derive_num_pubkeys_from_smt` walks the SMT directly so
+/// there is no persisted counter to assert here. The scanner has not
+/// run within the test boundary, so `derive_num_pubkeys_from_smt`
+/// would still return 0 after the second mint — that race window is
+/// the documented in-process gate (see `mint_handler` doc-comment),
+/// not a regression.
 ///
 /// **Idempotent-retry caveat (documented in `mint_handler`).** On a
 /// real broadcast failure where the first commit + reveal pair
@@ -4263,16 +4274,23 @@ async fn mint_retry_after_broadcast_failure_succeeds() {
     let (status1, _body1) = send_request_with_state(cloned_state_first, req).await;
     assert_eq!(status1, StatusCode::SERVICE_UNAVAILABLE);
 
-    // Confirm no DB row + no in-memory advance.
-    let minting_num_first: Option<u32> = crate::db::load_minting_num_pubkeys(&pool)
+    // Confirm no `accounts` row was written for the minting address —
+    // Phase D's `commit_mint_tx` only runs after the broadcast
+    // succeeds, so a 503 from the broadcast leg leaves the table
+    // empty. Phase D removed the separately-stored
+    // `minting_meta.num_pubkeys` counter, so there is no DB-side
+    // counter to inspect.
+    let minting_addr_bytes =
+        zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS);
+    let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT data FROM accounts WHERE address = $1")
+        .bind(&minting_addr_bytes[..])
+        .fetch_optional(&*pool)
         .await
-        .expect("load minting_meta after first mint");
+        .expect("select accounts row after failed mint");
     assert!(
-        minting_num_first.is_none() || minting_num_first == Some(0),
-        "minting_meta row must not show advance after broadcast failure, got {:?}",
-        minting_num_first
+        row.is_none(),
+        "no accounts row for minting address must be written when broadcast fails"
     );
-    assert_eq!(state.minting_account.lock().unwrap().num_pubkeys, 0);
 
     // ---- Second mint: working Esplora → 200 -----------------------------
     let mock_server = mint_broadcast_mock_server().await;
@@ -4296,16 +4314,20 @@ async fn mint_retry_after_broadcast_failure_succeeds() {
     let (status2, resp_body2) = send_request_with_state(cloned_state_second, req2).await;
     assert_eq!(status2, StatusCode::OK, "body: {}", resp_body2);
 
-    // Final state: counter at 1, recipient account exists.
-    let minting_num_after: Option<u32> = crate::db::load_minting_num_pubkeys(&pool)
-        .await
-        .expect("load minting_meta after second mint");
-    assert_eq!(
-        minting_num_after,
-        Some(1),
-        "num_pubkeys must be 1 after successful retry"
+    // Final state: minting accounts row was upserted (the retry
+    // landed in `commit_mint_tx`), recipient account exists with the
+    // minted coin in its queue. No `minting_meta.num_pubkeys`
+    // assertion — Phase D removed the counter.
+    let minting_row: Option<(Vec<u8>,)> =
+        sqlx::query_as("SELECT data FROM accounts WHERE address = $1")
+            .bind(&minting_addr_bytes[..])
+            .fetch_optional(&*pool)
+            .await
+            .expect("select minting accounts row after retry");
+    assert!(
+        minting_row.is_some(),
+        "minting accounts row must be written by the successful retry"
     );
-    assert_eq!(state.minting_account.lock().unwrap().num_pubkeys, 1);
     let recipient_digest = zkcoins_program::hash::digest_from_bytes(&recipient_bytes);
     {
         let node_guard = state.account_node.lock().unwrap();
@@ -4325,106 +4347,12 @@ async fn mint_retry_after_broadcast_failure_succeeds() {
     }
 }
 
-/// Concurrent-mint serialization (zk-coins/node#89).
-///
-/// Pins the optimistic-UPDATE loser branch of `commit_mint_tx`
-/// deterministically by pre-seeding a stale `minting_meta.num_pubkeys
-/// = 1` row while the in-memory `minting_account.num_pubkeys` is
-/// still 0. A truly-parallel two-mint race would land
-/// probabilistically (the proof phase serializes on the shared
-/// `Arc<Mutex<AccountNode>>`, the broadcast races against the DB
-/// tx) and would be flaky in CI; the deterministic shape here
-/// exercises the same exit branch — `expected_prev = 0`, stored = 1,
-/// `INSERT ... ON CONFLICT DO UPDATE ... WHERE minting_meta.num_pubkeys
-/// = 0` rejects on the WHERE predicate, `rows_affected == 0`, tx
-/// rolls back, handler returns `503 "Concurrent mint detected"`.
-///
-/// In production this is exactly what the loser observes when two
-/// requests both snapshotted `num_pubkeys = N` and the winner won the
-/// race to UPDATE the counter to N+1: the loser's `expected_prev = N`
-/// no longer matches the stored value, the WHERE clause filters out
-/// the UPDATE, and the loser surfaces 503 with no state advance.
-/// The optimistic lock guarantees that the in-memory `num_pubkeys`
-/// cannot diverge from the persisted counter even on the loser.
-#[tokio::test]
-async fn concurrent_mints_only_one_commits() {
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
-
-    let pg_container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = pg_container.get_host().await.unwrap();
-    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(
-        crate::db::connect_and_migrate(&url)
-            .await
-            .expect("connect_and_migrate failed"),
-    );
-
-    let mock_server = mint_broadcast_mock_server().await;
-    let ws_url = mint_broadcast_mock_ws().await;
-
-    let mut state = mint_test_state();
-    state.pool = Arc::clone(&pool);
-    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
-        url: mock_server.uri(),
-        is_mainnet: false,
-        network_name: "Mutinynet".to_string(),
-        ws_url: Some(ws_url),
-        track_tx_timeout: None,
-    });
-
-    // Force the optimistic UPDATE to race even when the in-memory
-    // proof phase has already serialized: pre-insert a stale
-    // `minting_meta` row with `num_pubkeys = 1` while the in-memory
-    // `minting_account.num_pubkeys` is still 0. The first concurrent
-    // mint will observe the in-memory `0`, derive pubkey index 0,
-    // broadcast successfully, then try
-    // `UPDATE minting_meta SET num_pubkeys = 1 WHERE num_pubkeys = 0`
-    // — but the row is already at 1, so `rows_affected == 0` and the
-    // commit_mint_tx returns Ok(false). The handler maps that to 503
-    // "Concurrent mint detected". This pins the race-loser branch
-    // deterministically (a real concurrent-mint race would land
-    // probabilistically, which is not portable to CI).
-    crate::db::upsert_minting_num_pubkeys(&pool, 1)
-        .await
-        .expect("seed stale minting_meta row");
-
-    let recipient = "0x".to_string() + &hex::encode([3u8; 32]);
-    let body = serde_json::json!({
-        "account_address": recipient,
-        "amount": 1u64,
-    });
-    let req = Request::post("/api/mint")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, resp_body) = send_request_with_state(state, req).await;
-
-    assert_eq!(
-        status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "concurrent_mint must surface 503, got body: {}",
-        resp_body
-    );
-    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
-    assert_eq!(v["success"], false);
-    assert_eq!(v["error"], "Concurrent mint detected");
-
-    // The stale row survives untouched.
-    let minting_num: Option<u32> = crate::db::load_minting_num_pubkeys(&pool)
-        .await
-        .expect("load minting_meta after concurrent-mint");
-    assert_eq!(
-        minting_num,
-        Some(1),
-        "loser must not bump the counter; stale row stays at 1"
-    );
-}
+// Phase D removed the optimistic `commit_mint_tx` UPDATE branch that
+// the pre-Phase-D `concurrent_mints_only_one_commits` test pinned.
+// The new concurrency gate is the phase-2 re-derive of
+// `derive_num_pubkeys_from_smt` against the live SMT — covered by
+// `mint_handler_concurrent_mint_during_proof_returns_503` below, which
+// drives the same 503 exit through `mint_handler` end-to-end.
 
 /// Drives the post-proof "concurrent mint detected during proof phase"
 /// branch of `mint_handler` (router.rs:854-858 / zk-coins/node#90)
@@ -4452,30 +4380,32 @@ async fn concurrent_mint_during_proof_response_returns_503() {
 /// HTTP layer so the `return concurrent_mint_during_proof_response(...)`
 /// call site (router.rs) is covered, not just the helper.
 ///
+/// Phase D shape: the in-process gate is a re-derive of
+/// `derive_num_pubkeys_from_smt` between the phase-1 SNAPSHOT and the
+/// phase-3 commit-signing leg. Triggering the gate deterministically
+/// means inserting `pk_0`'s key into the SMT between the two derives
+/// (simulating a scanner ingestion of a concurrent mint's inscription
+/// while we were proving).
+///
 /// Synchronisation strategy (deterministic, NOT time-based): the
 /// handler signals it has acquired the `state.account_node` guard
 /// at the top of phase 2 via the test-only
 /// `state.phase2_reached: Arc<tokio::sync::Notify>` field; the test
-/// `.notified().await`s on it, then acquires `state.minting_account`
-/// and bumps `num_pubkeys` to a non-matching value. The handler
-/// proceeds through phase 2 (prover work), reaches phase 3, re-locks
-/// `minting_account`, observes the bumped counter, and returns 503
-/// before ever touching the broadcast / Esplora / Postgres paths —
-/// so the bare `mint_test_state()` (dead pool, unreachable Esplora)
-/// is sufficient.
-///
-/// Previously this test used a 200 ms `tokio::time::sleep`, which
-/// was both racy (a slow CI scheduler could let phase 2 enter and
-/// finish before the bump landed) and opaque (a failure mode looked
-/// like "test occasionally returns 200 instead of 503"). The Notify
-/// barrier is a hard happens-before edge: the bump cannot run until
-/// the handler has reached phase 2.
+/// `.notified().await`s on it, then inserts the minting account's
+/// `pk_0` into the SMT. The handler proceeds through phase 2 (prover
+/// work), reaches phase 3, re-derives `num_pubkeys` from the SMT,
+/// observes the bumped count (1 vs the captured expected 0), and
+/// returns 503 before ever touching the broadcast / Esplora /
+/// Postgres paths — so the bare `mint_test_state()` (dead pool,
+/// unreachable Esplora) is sufficient.
 ///
 /// Requires the multi-thread runtime: phase 2's `prepare_mint` is
 /// blocking CPU work that would otherwise stall the single-threaded
-/// executor and prevent the test thread from running the bump step.
+/// executor and prevent the test thread from running the SMT
+/// insertion step.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mint_handler_concurrent_mint_during_proof_returns_503() {
+    use bitcoin::hashes::Hash;
     let state = mint_test_state();
 
     // Pre-subscribe to the phase-2 notify BEFORE spawning the request
@@ -4504,10 +4434,10 @@ async fn mint_handler_concurrent_mint_during_proof_returns_503() {
         tokio::spawn(async move { send_request_with_state(state_for_request, req).await });
 
     // Wait until the handler signals it has acquired the
-    // `account_node` guard at the top of phase 2. Phase 1
-    // (`minting_account` snapshot of `num_pubkeys = 0`) has finished
-    // by this point because it runs BEFORE phase 2 in `mint_handler`.
-    // This is a hard happens-before edge: the bump below cannot run
+    // `account_node` guard at the top of phase 2. Phase 1 (the SMT
+    // walk + minting_account pubkey derivation) has finished by this
+    // point because it runs BEFORE phase 2 in `mint_handler`. This is
+    // a hard happens-before edge: the SMT insert below cannot run
     // until the handler is observably past the phase-1 snapshot.
     // Defensive timeouts: if a regression skips notify_one(), the test
     // would otherwise hang for the full 120-min CI job budget. 30 s is
@@ -4518,14 +4448,25 @@ async fn mint_handler_concurrent_mint_during_proof_returns_503() {
             "phase2_reached notify must fire within 30s — regression in mint_handler phase 2 entry",
         );
 
-    // Now bump num_pubkeys on the minting_account. Phase 1 already
-    // captured expected_num_pubkeys = 0, so any non-zero value here
-    // trips the phase-3 inequality check. Phase 3 acquires the
-    // `minting_account` lock after the prover finishes; we hold the
-    // bump-mutating guard only briefly.
+    // Insert pk_0's key into the SMT so the phase-3 re-derive returns
+    // 1 instead of the captured `expected_num_pubkeys = 0`. Phase 3
+    // acquires the state lock after the prover finishes; the insert
+    // here lands while phase 2 is running its blocking proof work on
+    // the worker thread.
     {
-        let mut minting = state.minting_account.lock().unwrap();
-        minting.num_pubkeys = 1;
+        let pk0 = {
+            let mc = state.minting_account.lock().unwrap();
+            mc.generate_public_key(0)
+        };
+        let key: [u8; 32] = bitcoin::hashes::sha256::Hash::hash(&pk0.serialize()).to_byte_array();
+        let node_guard = state.account_node.lock().unwrap();
+        let state_arc = node_guard.state().clone();
+        drop(node_guard);
+        let mut state_guard = state_arc.lock().unwrap();
+        state_guard
+            .smt
+            .insert(key, zkcoins_program::hash::digest_from_bytes(&[2u8; 32]))
+            .expect("inject pk_0 into SMT");
     }
 
     let (status, resp_body) =
@@ -4545,25 +4486,9 @@ async fn mint_handler_concurrent_mint_during_proof_returns_503() {
     assert_eq!(v["error"], "Concurrent mint detected");
 }
 
-/// Drives the Err arm of `upsert_mint_recipient_or_log`
-/// (router.rs:1025-1028 / zk-coins/node#90). The recipient upsert
-/// loop in `mint_handler` is best-effort log-and-continue: the
-/// minting_meta + minting-account bump already committed inside
-/// `commit_mint_tx`, so a recipient-row upsert failure only delays the
-/// row until the next receive on the same address. The Err branch is
-/// otherwise only reachable on a pool-dead failure timed exactly
-/// between `commit_mint_tx` returning Ok and the loop iterating —
-/// which is intractable to orchestrate against a single shared
-/// `PgPool`. Factoring the upsert-or-log into a helper lets us pin
-/// the branch with a deterministic `dead_pool` call (the same pattern
-/// the rest of the suite uses for the parallel send/receive
-/// best-effort upserts).
-#[tokio::test]
-async fn upsert_mint_recipient_or_log_swallows_pool_dead_error() {
-    // dead_pool's lazy connect fails fast on first use; the helper
-    // logs the error and returns without panicking.
-    let pool = dead_pool();
-    let addr = [0u8; 32];
-    let bytes = [0u8; 16];
-    crate::router::upsert_mint_recipient_or_log(&pool, &addr, &bytes).await;
-}
+// Phase D folded the recipient upsert into the same `commit_mint_tx`
+// transaction as the minting account upsert (one bundle, one Postgres
+// transaction). The pre-Phase-D `upsert_mint_recipient_or_log` helper
+// was a standalone best-effort step after the commit and is gone, so
+// the dead-pool branch test that pinned it is gone too — failure of
+// `commit_mint_tx` itself is covered by `mint_commit_tx_failure_returns_503`.
