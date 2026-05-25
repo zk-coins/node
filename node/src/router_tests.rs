@@ -4506,7 +4506,14 @@ async fn mint_handler_concurrent_mint_during_proof_returns_503() {
     // by this point because it runs BEFORE phase 2 in `mint_handler`.
     // This is a hard happens-before edge: the bump below cannot run
     // until the handler is observably past the phase-1 snapshot.
-    notified.as_mut().await;
+    // Defensive timeouts: if a regression skips notify_one(), the test
+    // would otherwise hang for the full 120-min CI job budget. 30 s is
+    // >>> prepare_mint typical runtime (~200ms in the test build).
+    tokio::time::timeout(std::time::Duration::from_secs(30), notified.as_mut())
+        .await
+        .expect(
+            "phase2_reached notify must fire within 30s — regression in mint_handler phase 2 entry",
+        );
 
     // Now bump num_pubkeys on the minting_account. Phase 1 already
     // captured expected_num_pubkeys = 0, so any non-zero value here
@@ -4518,7 +4525,11 @@ async fn mint_handler_concurrent_mint_during_proof_returns_503() {
         minting.num_pubkeys = 1;
     }
 
-    let (status, resp_body) = request_task.await.expect("request task panicked");
+    let (status, resp_body) =
+        tokio::time::timeout(std::time::Duration::from_secs(60), request_task)
+            .await
+            .expect("mint request must complete within 60s")
+            .expect("request task panicked");
 
     assert_eq!(
         status,
