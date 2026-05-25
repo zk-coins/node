@@ -19,7 +19,6 @@ use node::username;
 use node::{persist_state_from_sync_context, DATABASE_URL, NETWORK_CONFIG};
 use shared::commitment::Commitment;
 use std::error::Error as StdError;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -92,34 +91,22 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         .expect("load username store from Postgres");
     println!("Loaded UsernameStore from Postgres");
 
-    // Shared scanner-progress counter. Incremented by the scanner
-    // callback every time `state.update` succeeds (i.e. an inscription
-    // landed in the SMT). Read by the startup invariant check in
-    // `start_rest_node` to wait for the scanner to ingest at least
-    // one block before declaring a desync — see
-    // `check_minting_state_invariant` doc-comment + zk-coins/node#89
-    // round-2 MAJOR 2.
-    let scanner_progress = Arc::new(AtomicU64::new(0));
-
     // Spawn the account_node as a separate task. A bootstrap error
-    // here (Postgres unreachable, startup invariant violated, listener
-    // bind failure) used to be `eprintln!`'d and dropped on the floor
-    // by this `tokio::spawn` block — the scanner kept running, the
-    // container stayed `Up`, and Cloudflare served 502s for hours
-    // because nothing was bound to the listener port. Aborting the
-    // whole process on bootstrap failure means the orchestrator
-    // crash-loops the container and alerting fires on the loop,
-    // matching the panic-hook behaviour above (zk-coins/node#89
-    // round-2 MAJOR 2).
+    // here (Postgres unreachable, listener bind failure) used to be
+    // `eprintln!`'d and dropped on the floor by this `tokio::spawn`
+    // block — the scanner kept running, the container stayed `Up`,
+    // and Cloudflare served 502s for hours because nothing was bound
+    // to the listener port. Aborting the whole process on bootstrap
+    // failure means the orchestrator crash-loops the container and
+    // alerting fires on the loop, matching the panic-hook behaviour
+    // above (zk-coins/node#89 round-2 MAJOR 2).
     let pool_for_rest = Arc::clone(&pool);
-    let scanner_progress_for_rest = Arc::clone(&scanner_progress);
     tokio::spawn(async move {
         if let Err(e) = start_rest_node(
             account_node,
             username_store,
             ACCOUNT_NODE_ADDR,
             pool_for_rest,
-            Some(scanner_progress_for_rest),
         )
         .await
         {
@@ -153,7 +140,6 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // Clones for the scanner callback closure.
     let pool_for_callback = Arc::clone(&pool);
     let state_for_callback = Arc::clone(&state);
-    let scanner_progress_for_callback = Arc::clone(&scanner_progress);
 
     // Event-driven chain ingestion (issue #84). The previous
     // implementation polled `get_tip_hash` every 30 s, gating
@@ -205,13 +191,6 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                     let mut state_guard = state_for_callback.lock().unwrap();
                     match state_guard.update(&[commitment]) {
                         Ok(new_root) => {
-                            // Signal scanner progress to the startup
-                            // invariant check (zk-coins/node#89
-                            // round-2 MAJOR 2). The counter only needs
-                            // to be > 0 to unblock the wait — fetch_add
-                            // is the documented monotonic-progress
-                            // primitive.
-                            scanner_progress_for_callback.fetch_add(1, Ordering::Relaxed);
                             // Capture the freshly-inserted root_indices
                             // entry (Phase C). `State::update`
                             // guarantees `state.prev_mmr_root` is the

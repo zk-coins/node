@@ -11,9 +11,7 @@
 //! is measured normally.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
 use axum::Json;
@@ -34,34 +32,11 @@ use crate::account_node::AccountNode;
 use crate::router::{create_router, AppState, ProofStore};
 use crate::username::UsernameStore;
 
-/// Default cap on how long the startup invariant check waits for the
-/// scanner to ingest at least one block before evaluating the SMT
-/// membership predicate. See [`check_minting_state_invariant`] for the
-/// trade-off this knob bounds. Overridable via the
-/// `SCANNER_INITIAL_SETTLE_TIMEOUT_MS` env var (set to `0` in unit tests
-/// that drive the invariant check without a running scanner).
-const SCANNER_INITIAL_SETTLE_TIMEOUT_MS_DEFAULT: u64 = 90_000;
-
-/// Poll cadence for the scanner-progress wait inside
-/// [`check_minting_state_invariant`]. Small enough that a settled
-/// scanner unblocks the bootstrap within ~50 ms, large enough to keep
-/// the busy-wait cost negligible.
-const SCANNER_PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-fn scanner_initial_settle_timeout() -> Duration {
-    let ms = std::env::var("SCANNER_INITIAL_SETTLE_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(SCANNER_INITIAL_SETTLE_TIMEOUT_MS_DEFAULT);
-    Duration::from_millis(ms)
-}
-
 pub async fn start_rest_node(
     account_node: AccountNode,
     username_store: UsernameStore,
     addr: &str,
     pool: Arc<PgPool>,
-    scanner_progress: Option<Arc<AtomicU64>>,
 ) -> anyhow::Result<()> {
     let socket_addr = addr
         .parse::<SocketAddr>()
@@ -87,34 +62,18 @@ pub async fn start_rest_node(
             *zkcoins_program::types::MINTING_ADDRESS
         );
         let mut minting_client = ClientAccount::new(private_key);
-        // ClientAccount::new starts with num_pubkeys=0, but each successful
-        // mint increments it. The counter MUST survive process restarts;
-        // otherwise we lose alignment with the server-side
-        // minting_account.proof (which IS persisted), the next mint sends
-        // the wrong prev_commitment_pubkey, and send_coins fails with
-        // "prev_commitment_pubkey required for account update".
+        // Phase D: `num_pubkeys` is no longer carried in the shared
+        // ClientAccount as boot state. Each `/api/mint` derives the
+        // count fresh from the SMT via
+        // `state::derive_num_pubkeys_from_smt`, which is the canonical
+        // source of truth (the SMT is loaded from Postgres at boot and
+        // mutated by the scanner on every inscription). The in-memory
+        // field stays at 0 here; mint_handler reads N off the SMT
+        // before deriving pubkeys and signs with a transient clone at
+        // `num_pubkeys = N + 1` exactly as before.
         //
-        // PR-A3 moved the counter from the `minting_num_pubkeys.bin`
-        // sibling file into the `minting_meta` Postgres table. A read
-        // failure here is non-fatal — we log it and start from 0,
-        // exactly like the legacy file-missing fallback used to do.
-        match db::load_minting_num_pubkeys(&pool).await {
-            Ok(Some(n)) => {
-                println!("Loaded minting num_pubkeys={} from Postgres", n);
-                minting_client.num_pubkeys = n;
-            }
-            Ok(None) => {
-                println!("No minting_meta row found, starting num_pubkeys=0");
-            }
-            Err(e) => {
-                eprintln!(
-                    "Failed to load minting num_pubkeys from Postgres ({}); starting at 0",
-                    e
-                );
-            }
-        }
         // Plonky2 migration (D11 in MIGRATION_RESEARCH.md): MINTING_ADDRESS
-        // is now a well-known constant derived from `hash_bytes(b"zkcoins:
+        // is a well-known constant derived from `hash_bytes(b"zkcoins:
         // minting-address:placeholder:v1")`, NOT from minting_secret.bin.
         // ClientAccount::new derives `address` from the privkey's first
         // child pubkey for ordinary wallets; for the minting wallet that
@@ -193,28 +152,14 @@ pub async fn start_rest_node(
         }
     }
 
-    // Startup invariant check (zk-coins/node#89): every persisted
-    // minting-account pubkey index in `0..num_pubkeys` MUST have a
-    // commitment in the SMT. A mismatch means the legacy
-    // write-ahead-of-broadcast mint flow advanced the counter past a
-    // failed inscription — every subsequent `/api/mint` and `/api/send`
-    // for the minting account would 422 on the missing merkle proof.
-    // The fix lives in `mint_handler` itself; this check is the second
-    // line of defence — it refuses to start the listener until the
-    // operator runs the `reset_state` workflow to restore the
-    // invariant.
-    //
-    // NO break-glass flag. Strict by default. Operator override is a
-    // code patch, not an env var.
-    {
-        let starting_num_pubkeys = {
-            let guard = lock_or_recover(&state.minting_account);
-            guard.num_pubkeys
-        };
-        check_minting_state_invariant(&state, starting_num_pubkeys, scanner_progress.as_deref())
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
-    }
+    // Phase D removed the startup `check_minting_state_invariant`:
+    // `num_pubkeys` is now derived from SMT membership at runtime
+    // (`state::derive_num_pubkeys_from_smt`), so the predicate the
+    // check measured ("every pubkey_idx ∈ 0..num_pubkeys has a
+    // commitment in the SMT") is a tautology by construction. The
+    // pre-Phase-D check existed only because the counter and the SMT
+    // could disagree — collapsing them into one removes the disagree
+    // mode and the check that measured it.
 
     // Phase B: re-broadcast any pending inscriptions left over from
     // a previous boot. A crash between commit-broadcast and
@@ -227,8 +172,6 @@ pub async fn start_rest_node(
     // Failures here are LOGGED and SWALLOWED — the operator's escape
     // hatch is the PR #106 CLI recovery tool, and a transient
     // Esplora outage on boot must not crash-loop the container.
-    // Mirrors the log-and-continue shape at runtime.rs:109 for the
-    // minting_meta load.
     if let Err(e) = resume_pending_inscriptions(&pool, &NETWORK_CONFIG).await {
         eprintln!(
             "Failed to resume pending inscriptions on bootstrap (continuing anyway): {}",
@@ -242,112 +185,6 @@ pub async fn start_rest_node(
     let listener = TcpListener::bind(socket_addr).await?;
     axum::serve(listener, app).await?;
 
-    Ok(())
-}
-
-/// Verify every persisted minting-account pubkey index `0..num_pubkeys`
-/// is anchored by a commitment in the SMT.
-///
-/// Returns `Ok(())` on a fresh state (`num_pubkeys == 0`) or after every
-/// index has been verified. Returns `Err(CRITICAL log message)` on the
-/// first miss — the caller propagates the error up so the bootstrap
-/// fails with a non-zero exit code, matching the project's no-degraded-
-/// mode startup policy.
-///
-/// **Scanner-settle wait (zk-coins/node#89 round-2 MAJOR 2).** Before
-/// declaring a desync the function waits up to
-/// [`scanner_initial_settle_timeout`] (default 90 s, overridable via
-/// `SCANNER_INITIAL_SETTLE_TIMEOUT_MS`) for the scanner to ingest at
-/// least one block. The signal is the `scanner_progress` `AtomicU64`
-/// fed by `main.rs`'s scanner callback (incremented on every
-/// `state.update` call). Without this wait, a fresh-state restart whose
-/// scanner has not yet caught the latest mint inscription would
-/// false-positive — the minting_meta counter is already at `N` from the
-/// pre-restart `commit_mint_tx`, but the SMT has not yet seen the
-/// inscription for pubkey index `N-1`. The trade-off: a real desync now
-/// takes up to 90 s to surface, but transient restart desyncs no longer
-/// crash-loop the container indefinitely waiting for an operator to
-/// notice. If the timeout expires the invariant check still runs — a
-/// genuine desync where the scanner is healthy but the inscription was
-/// never persisted will fail loudly, just 90 s later than before.
-///
-/// When `scanner_progress` is `None` (unit tests, fresh-state
-/// `num_pubkeys = 0` bootstraps) the wait is skipped.
-///
-/// **No break-glass flag.** Strict by default. If an operator needs
-/// to start the server with a known state desync (e.g. to inspect the
-/// damage), they must patch this function out. The lack of an env
-/// override is intentional — the previous `DEV_SKIP_BROADCAST_FAILURE`
-/// pattern is exactly the kind of silent-soft-fail that this check
-/// is here to prevent (see zk-coins/node#89).
-pub(crate) async fn check_minting_state_invariant(
-    state: &AppState,
-    num_pubkeys: u32,
-    scanner_progress: Option<&AtomicU64>,
-) -> Result<(), String> {
-    if num_pubkeys == 0 {
-        println!("Startup invariant: minting num_pubkeys=0, no SMT membership to verify");
-        return Ok(());
-    }
-
-    // Wait for the scanner to ingest at least one inscription before
-    // declaring a desync. See doc-comment above for the trade-off.
-    if let Some(progress) = scanner_progress {
-        let timeout = scanner_initial_settle_timeout();
-        if timeout.is_zero() {
-            println!(
-                "Startup invariant: scanner-settle wait skipped (SCANNER_INITIAL_SETTLE_TIMEOUT_MS=0)"
-            );
-        } else {
-            let deadline = Instant::now() + timeout;
-            let mut settled = false;
-            loop {
-                if progress.load(Ordering::Relaxed) > 0 {
-                    println!("Startup invariant: scanner reported progress within settle window");
-                    settled = true;
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    break;
-                }
-                tokio::time::sleep(SCANNER_PROGRESS_POLL_INTERVAL).await;
-            }
-            if !settled {
-                println!(
-                    "Startup invariant: scanner settle timeout ({} ms) elapsed without progress, \
-                     evaluating SMT membership against current state",
-                    timeout.as_millis()
-                );
-            }
-        }
-    }
-
-    let minting_pubkeys: Vec<bitcoin::secp256k1::PublicKey> = {
-        let guard = lock_or_recover(&state.minting_account);
-        (0..num_pubkeys)
-            .map(|i| guard.generate_public_key(i))
-            .collect()
-    };
-    let account_node_guard = lock_or_recover(&state.account_node);
-    let state_arc = account_node_guard.state().clone();
-    drop(account_node_guard);
-    let state_guard = lock_or_recover(&state_arc);
-    for (i, pk) in minting_pubkeys.iter().enumerate() {
-        if state_guard.get_commitment_proof(pk).is_err() {
-            let msg = format!(
-                "CRITICAL: minting state desync at pubkey_idx={}: commitment not in SMT. \
-                 Operator action: dispatch reset_state workflow or repair manually. \
-                 See zk-coins/node#89.",
-                i
-            );
-            eprintln!("{}", msg);
-            return Err(msg);
-        }
-    }
-    println!(
-        "Startup invariant: all {} minting pubkeys have commitments in SMT",
-        num_pubkeys
-    );
     Ok(())
 }
 

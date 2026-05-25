@@ -57,17 +57,16 @@ async fn connect_and_migrate_creates_all_tables() {
     .expect("introspection query failed");
     let names: Vec<String> = rows.into_iter().map(|r| r.get::<String, _>(0)).collect();
     // _sqlx_migrations is created implicitly by sqlx::migrate!.
-    // `minting_meta` lands via 0002_minting_meta.sql (PR-A3).
     // `pending_inscriptions` lands via 0003_pending_inscriptions.sql
     // (Phase B). `mmr_root_index` lands via 0004_mmr_root_index.sql
-    // (Phase C).
+    // (Phase C). `minting_meta` is created by 0002 then dropped by
+    // 0005 (Phase D), so it is absent from the final schema.
     assert_eq!(
         names,
         vec![
             "_sqlx_migrations".to_string(),
             "accounts".to_string(),
             "latest_block".to_string(),
-            "minting_meta".to_string(),
             "mmr_root_index".to_string(),
             "mmr_state".to_string(),
             "pending_inscriptions".to_string(),
@@ -317,72 +316,6 @@ async fn resolve_username_returns_none_for_unknown() {
 }
 
 #[tokio::test]
-async fn load_minting_num_pubkeys_returns_none_initially() {
-    let (pool, _container) = setup_pool().await;
-    assert!(load_minting_num_pubkeys(&pool).await.unwrap().is_none());
-}
-
-#[tokio::test]
-async fn upsert_minting_num_pubkeys_inserts_then_updates() {
-    let (pool, _container) = setup_pool().await;
-    upsert_minting_num_pubkeys(&pool, 7).await.unwrap();
-    assert_eq!(load_minting_num_pubkeys(&pool).await.unwrap(), Some(7));
-
-    upsert_minting_num_pubkeys(&pool, 42).await.unwrap();
-    assert_eq!(load_minting_num_pubkeys(&pool).await.unwrap(), Some(42));
-}
-
-#[tokio::test]
-async fn upsert_minting_num_pubkeys_round_trips_full_u32_range() {
-    let (pool, _container) = setup_pool().await;
-    upsert_minting_num_pubkeys(&pool, u32::MAX).await.unwrap();
-    assert_eq!(
-        load_minting_num_pubkeys(&pool).await.unwrap(),
-        Some(u32::MAX)
-    );
-}
-
-#[tokio::test]
-async fn load_minting_num_pubkeys_rejects_negative_value() {
-    // Plant a negative BIGINT directly via SQL and assert the loader
-    // surfaces the out-of-range value as an sqlx::Error::Decode rather
-    // than silently casting through `as u32`.
-    let (pool, _container) = setup_pool().await;
-    sqlx::query("INSERT INTO minting_meta (id, num_pubkeys) VALUES (1, $1)")
-        .bind(-1_i64)
-        .execute(&pool)
-        .await
-        .unwrap();
-    let err = load_minting_num_pubkeys(&pool)
-        .await
-        .expect_err("expected decode error");
-    assert!(
-        matches!(err, sqlx::Error::Decode(_)),
-        "unexpected: {:?}",
-        err
-    );
-}
-
-#[tokio::test]
-async fn load_minting_num_pubkeys_rejects_value_above_u32_max() {
-    // Same as above, but for the upper-bound branch.
-    let (pool, _container) = setup_pool().await;
-    sqlx::query("INSERT INTO minting_meta (id, num_pubkeys) VALUES (1, $1)")
-        .bind(i64::from(u32::MAX) + 1)
-        .execute(&pool)
-        .await
-        .unwrap();
-    let err = load_minting_num_pubkeys(&pool)
-        .await
-        .expect_err("expected decode error");
-    assert!(
-        matches!(err, sqlx::Error::Decode(_)),
-        "unexpected: {:?}",
-        err
-    );
-}
-
-#[tokio::test]
 async fn connect_and_migrate_propagates_connect_failure() {
     // Bogus port → connect() fails fast (no Postgres listening) and
     // the error propagates via `?`. Exercises the otherwise-unreached
@@ -397,78 +330,70 @@ async fn connect_and_migrate_propagates_connect_failure() {
     );
 }
 
-/// Drives the `expected_prev > 0` UPDATE branch of `commit_mint_tx`.
-/// The fresh-DB INSERT branch (`expected_prev == 0`) is covered by the
-/// happy-path mint tests in `router_tests.rs`; the UPDATE branch only
-/// fires on the second-and-later mint where a `minting_meta` row
-/// already exists with a non-zero counter. Pre-seeds the row with
-/// `num_pubkeys = 1`, calls `commit_mint_tx(expected_prev=1,
-/// new_count=2, ...)`, asserts `Ok(true)` and that the row advanced
-/// to 2.
+/// Happy-path: `commit_mint_tx` upserts every account in the bundle in
+/// a single transaction. Phase D collapsed the optimistic counter bump
+/// out of this helper (the minting account's `num_pubkeys` is now
+/// derived from SMT membership at runtime), so the only assertion left
+/// is "every row in the input slice round-trips through `accounts`".
+/// Multi-row exercises the loop body that the old single-account
+/// fixture never visited.
 #[tokio::test]
-async fn commit_mint_tx_updates_existing_row_when_expected_prev_matches() {
+async fn commit_mint_tx_upserts_every_account_atomically() {
     let (pool, _container) = setup_pool().await;
-    upsert_minting_num_pubkeys(&pool, 1)
+    let addr_a = [0xAAu8; 32];
+    let data_a = vec![0xA1u8; 8];
+    let addr_b = [0xBBu8; 32];
+    let data_b = vec![0xB1u8; 12];
+    let accounts: Vec<(&[u8], &[u8])> = vec![(&addr_a[..], &data_a), (&addr_b[..], &data_b)];
+    commit_mint_tx(&pool, &accounts)
         .await
-        .expect("seed minting_meta row at num_pubkeys=1");
+        .expect("commit_mint_tx must succeed");
 
-    let addr = [0xAAu8; 32];
-    let data = [0xBBu8; 16];
-    let accounts: Vec<(&[u8], &[u8])> = vec![(&addr[..], &data[..])];
-    let ok = commit_mint_tx(&pool, 1, 2, &accounts)
-        .await
-        .expect("commit_mint_tx UPDATE branch must succeed");
-    assert!(ok, "commit_mint_tx must return Ok(true) on UPDATE success");
-
-    assert_eq!(
-        load_minting_num_pubkeys(&pool).await.unwrap(),
-        Some(2),
-        "minting_meta.num_pubkeys must advance to 2 after UPDATE"
-    );
+    let rows = load_all_accounts(&pool).await.unwrap();
+    let mut got: Vec<(Vec<u8>, Vec<u8>)> = rows.into_iter().collect();
+    got.sort();
+    let mut want = vec![
+        (addr_a.to_vec(), data_a.clone()),
+        (addr_b.to_vec(), data_b.clone()),
+    ];
+    want.sort();
+    assert_eq!(got, want, "all accounts in the bundle must round-trip");
 }
 
-/// Companion to the UPDATE-happy-path test: drives the
-/// `expected_prev > 0` branch with a stale `expected_prev` that no
-/// longer matches the stored value, so the WHERE predicate filters
-/// the UPDATE out and `rows_affected == 0`. The transaction rolls
-/// back, the function returns `Ok(false)`, and neither the
-/// `minting_meta` row nor the `accounts` row is touched.
+/// Second call with the same address overwrites the prior payload via
+/// the `ON CONFLICT (address) DO UPDATE` branch. Exercises the
+/// idempotent-replay shape the post-Phase-D mint flow relies on (a
+/// concurrent receive between the snapshot and the commit will retry
+/// with the latest serialized Account on the next mint).
 #[tokio::test]
-async fn commit_mint_tx_returns_false_when_update_branch_loses_race() {
+async fn commit_mint_tx_is_idempotent_on_conflict() {
     let (pool, _container) = setup_pool().await;
-    upsert_minting_num_pubkeys(&pool, 5)
-        .await
-        .expect("seed minting_meta row at num_pubkeys=5");
-
     let addr = [0xCCu8; 32];
-    let data = [0xDDu8; 16];
-    let accounts: Vec<(&[u8], &[u8])> = vec![(&addr[..], &data[..])];
-    // expected_prev = 3 but the stored value is 5 → WHERE predicate
-    // filters the UPDATE out.
-    let ok = commit_mint_tx(&pool, 3, 4, &accounts)
-        .await
-        .expect("commit_mint_tx must surface the loser as Ok(false)");
-    assert!(
-        !ok,
-        "commit_mint_tx must return Ok(false) when UPDATE matches 0 rows"
-    );
+    let first = vec![0x01u8; 16];
+    let second = vec![0x02u8; 24];
 
-    assert_eq!(
-        load_minting_num_pubkeys(&pool).await.unwrap(),
-        Some(5),
-        "minting_meta.num_pubkeys must NOT change when UPDATE loses"
-    );
-    // The accounts upsert is inside the same transaction, so it must
-    // have rolled back too.
-    let row_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts WHERE address = $1")
-        .bind(&addr[..])
-        .fetch_one(&pool)
+    commit_mint_tx(&pool, &[(&addr[..], &first)])
         .await
-        .unwrap();
-    assert_eq!(
-        row_count, 0,
-        "accounts row must be rolled back when UPDATE loses"
-    );
+        .expect("first commit");
+    commit_mint_tx(&pool, &[(&addr[..], &second)])
+        .await
+        .expect("second commit");
+
+    let rows = load_all_accounts(&pool).await.unwrap();
+    assert_eq!(rows, vec![(addr.to_vec(), second.clone())]);
+}
+
+/// Empty input slice → empty transaction, no UPSERTs, no error. Pins
+/// the no-op shape so a future refactor that turns the empty case into
+/// a panic or error surfaces here rather than at a live caller.
+#[tokio::test]
+async fn commit_mint_tx_with_empty_accounts_is_noop() {
+    let (pool, _container) = setup_pool().await;
+    commit_mint_tx(&pool, &[])
+        .await
+        .expect("empty commit must succeed");
+    let rows = load_all_accounts(&pool).await.unwrap();
+    assert!(rows.is_empty());
 }
 
 #[tokio::test]

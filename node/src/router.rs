@@ -78,8 +78,9 @@ pub(crate) struct AppState {
     pub(crate) proof_store: Arc<ProofStore>,
     pub(crate) minting_account: Arc<Mutex<ClientAccount>>,
     pub(crate) username_store: Arc<Mutex<UsernameStore>>,
-    /// Postgres pool for per-account upserts (accounts table) and the
-    /// minting account's `minting_meta.num_pubkeys` counter. Cloned
+    /// Postgres pool for per-account upserts (accounts table); the
+    /// minting account's `num_pubkeys` is derived from SMT membership
+    /// at runtime (Phase D), no separately-stored counter. Cloned
     /// cheaply via `Arc`; the underlying connections are pooled.
     pub(crate) pool: Arc<PgPool>,
     /// Esplora endpoint configuration consumed by the `/health/ready`
@@ -372,12 +373,12 @@ pub(crate) fn handler_error_response(
 }
 
 /// Build the 503 response returned by `mint_handler` when the
-/// post-proof re-acquisition of the `minting_account` guard reveals
-/// that another concurrent mint already bumped `num_pubkeys`. Extracted
-/// from `mint_handler` so the (otherwise hard-to-race) branch can be
-/// covered by a deterministic unit test in `router_tests.rs` without
-/// having to orchestrate a real concurrent-mint race against the live
-/// prover.
+/// post-proof re-derivation of `num_pubkeys` (from SMT membership)
+/// reveals that another mint already landed on-chain since the SNAPSHOT
+/// phase. Extracted from `mint_handler` so the (otherwise hard-to-race)
+/// branch can be covered by a deterministic unit test in
+/// `router_tests.rs` without having to orchestrate a real concurrent-
+/// mint race against the live prover.
 pub(crate) fn concurrent_mint_during_proof_response(
     expected_num_pubkeys: u32,
     observed_num_pubkeys: u32,
@@ -387,25 +388,6 @@ pub(crate) fn concurrent_mint_during_proof_response(
         expected_num_pubkeys, observed_num_pubkeys
     );
     handler_error_response(StatusCode::SERVICE_UNAVAILABLE, "Concurrent mint detected")
-}
-
-/// Best-effort persist a recipient `Account` snapshot after the
-/// `commit_mint_tx` minting-meta + minting-account bump committed.
-/// Mirrors the per-account upsert-then-log shape used at every other
-/// post-commit recipient persistence site (`receive`, `send`). The
-/// minting_meta + minting-account row already committed inside
-/// `commit_mint_tx`, so a failure here only means the in-memory
-/// recipient leads the DB until the next successful upsert to the
-/// same address — not a state-divergence hazard. Extracted from
-/// `mint_handler` so the otherwise pool-dead-only Err arm can be
-/// covered by a deterministic unit test.
-pub(crate) async fn upsert_mint_recipient_or_log(pool: &PgPool, addr: &[u8], bytes: &[u8]) {
-    if let Err(e) = db::upsert_account(pool, addr, bytes).await {
-        eprintln!(
-            "Failed to upsert recipient account after mint commit: {}",
-            e
-        );
-    }
 }
 
 #[derive(Deserialize)]
@@ -772,31 +754,50 @@ async fn send_coin_handler(
 ///
 /// **Four phases, load-bearing ordering** (zk-coins/node#89):
 ///
-/// 1. **SNAPSHOT.** Briefly take the `minting_account` (ClientAccount)
-///    guard, read `N = num_pubkeys`, derive the three pubkeys the
-///    prover witness needs (`pk_N`, `pk_{N+1}`, optional `pk_{N-1}`).
-///    Release the guard. No mutation.
+/// 1. **SNAPSHOT.** Take the account_node guard briefly to clone the
+///    `Arc<Mutex<State>>`, then derive `N = derive_num_pubkeys_from_smt
+///    (xpriv, &smt)` under the state lock — N is the first BIP-32
+///    child index whose `sha256(pk_n.serialize())` is absent from the
+///    SMT. Generate the three pubkeys the prover witness needs
+///    (`pk_N`, `pk_{N+1}`, optional `pk_{N-1}`). No mutation.
 /// 2. **PROOF.** Briefly take the `account_node` guard, call
 ///    [`AccountNode::prepare_mint`] (clone-based, pure). Release
 ///    the guard. Build the signed `Commitment` over the prover's
 ///    output_coins_root + account_state_hash using a transient
 ///    ClientAccount clone with `num_pubkeys = N + 1` (so
 ///    `current_private_key` derives at index N) — the shared
-///    ClientAccount is NOT mutated yet.
+///    ClientAccount is NOT mutated yet. Re-derive N from the SMT
+///    immediately before signing and abort with 503 if it has
+///    advanced — the scanner may have ingested a concurrent mint's
+///    inscription while we were proving, which would invalidate the
+///    pubkeys baked into the prover witness.
 /// 3. **BROADCAST.** Inscribe the serialized `Commitment` onto Bitcoin.
-///    On any error → 503 SERVICE_UNAVAILABLE. The DB row is untouched,
-///    the in-memory minting Account is untouched, the recipient
-///    accounts are untouched. The next mint retries from `N` cleanly.
-/// 4. **COMMIT.** Apply receives to cloned recipients, hand the full
-///    set of mutated accounts plus an optimistic `UPDATE minting_meta
-///    SET num_pubkeys = N+1 WHERE id = 1 AND num_pubkeys = N` to a
-///    single sqlx transaction (see [`db::commit_mint_tx`]). On
-///    `rows_affected == 0` → 503 "concurrent mint detected" (another
-///    broadcaster won the race; our broadcast inscription is now a
-///    redundant on-chain blob — operationally cheap, see invariant
-///    below). On commit OK → swap the mutated accounts into the
-///    in-memory map, bump the in-memory ClientAccount's `num_pubkeys`,
-///    persist the MintProof. Return 200.
+///    On any error → 503 SERVICE_UNAVAILABLE. No DB write, no in-
+///    memory mutation, no recipient update. The next mint retries
+///    from `N` cleanly.
+/// 4. **COMMIT.** Apply receives to the LIVE recipients under the
+///    account_node lock (additive `receive_coin`, never overwriting),
+///    then UPSERT the mutated minting account and every touched
+///    recipient via [`db::commit_mint_tx`]. No counter step — N is
+///    re-derived from SMT membership at the next mint.
+///
+/// **Concurrency gate (Phase D).** The pre-Phase-D shape carried an
+/// optimistic `UPDATE minting_meta SET num_pubkeys = N+1 WHERE
+/// num_pubkeys = N` inside `commit_mint_tx` that serialised concurrent
+/// mints at the DB layer: the loser observed `rows_affected == 0` and
+/// the handler mapped that to a 503. Phase D dropped the counter
+/// outright (it lived only in `minting_meta`, which migration 0005
+/// drops), so the in-process gate is the phase-2 re-derivation
+/// described above. The on-chain gate is the scanner's `state.update`:
+/// `SparseMerkleTree::insert` errors on a duplicate key with a
+/// different value, so a true double-mint at pubkey index N (two
+/// handlers that both broadcast before either inscription was
+/// scanned) surfaces as a "Key already exists in the tree with
+/// different value" error inside the scanner callback — the second
+/// inscription is logged and dropped, the first remains
+/// authoritative. The on-chain blobs are operationally cheap (the
+/// publisher pays the fee, not the user). Clients that see a 503
+/// retry; the next mint observes the new N and proceeds.
 ///
 /// **Retry semantics.** Because the inscription is deterministically
 /// derived from `(commitment, publisher_key)`, a 503 from broadcast
@@ -806,9 +807,9 @@ async fn send_coin_handler(
 /// caller observes a second 503 here even though the chain has the
 /// commitment. The scanner-on-next-boot reconciliation path closes
 /// this window: the inscription is ingested into the SMT on the next
-/// scanner sweep, the startup invariant check in `runtime`
-/// then accepts the state, and the wallet's retry semantics drive
-/// progress. Document-only — no in-handler retry.
+/// scanner sweep, the next mint's `derive_num_pubkeys_from_smt` walks
+/// past it cleanly, and the wallet's retry semantics drive progress.
+/// Document-only — no in-handler retry.
 async fn mint_handler(
     State(state): State<AppState>,
     Json(request): Json<MintRequest>,
@@ -836,9 +837,24 @@ async fn mint_handler(
     let account_address = digest_from_bytes(&account_address_bytes);
 
     // ---- 1. SNAPSHOT phase (no mutation) ---------------------------------
+    // Derive `N = num_pubkeys` from SMT membership: the SMT is loaded
+    // from Postgres at boot and mutated by the scanner on every
+    // inscription, so it is authoritative. We avoid holding the
+    // `account_node` guard across the SMT walk by cloning the inner
+    // `Arc<Mutex<State>>` first.
+    let state_arc = {
+        let account_node_guard = lock_or_recover(&state.account_node);
+        account_node_guard.state().clone()
+    };
     let (expected_num_pubkeys, minting_pubkey, next_minting_pubkey, prev_commitment_pubkey) = {
         let minting_account_guard = lock_or_recover(&state.minting_account);
-        let n = minting_account_guard.num_pubkeys;
+        let n = {
+            let state_guard = lock_or_recover(&state_arc);
+            crate::state::derive_num_pubkeys_from_smt(
+                &minting_account_guard.private_key,
+                &state_guard.smt,
+            )
+        };
         let prev_pk = if n > 0 {
             Some(minting_account_guard.generate_public_key(n - 1))
         } else {
@@ -893,20 +909,30 @@ async fn mint_handler(
     // Build the BIP-340 commitment over the prover's outputs. Sign with
     // the index-N private key — this is the same key the wallet would
     // sign with once `num_pubkeys` advances past N. We do NOT mutate
-    // the shared ClientAccount's `num_pubkeys` yet; build a transient
-    // clone where `num_pubkeys = N + 1` so its `current_private_key()`
+    // the shared ClientAccount's `num_pubkeys`; build a transient clone
+    // where `num_pubkeys = N + 1` so its `current_private_key()`
     // derives at index N.
+    //
+    // Re-derive N from SMT membership immediately before signing — if
+    // the scanner ingested a concurrent mint's inscription while we
+    // were proving, the pubkeys baked into the witness are stale and
+    // every downstream consumer will reject the resulting commitment.
+    // Abort with 503; the wallet retries and the next attempt observes
+    // the new N. This is the in-process leg of the Phase-D concurrency
+    // gate documented on `mint_handler`'s doc-comment.
     let commitment = {
         let minting_account_guard = lock_or_recover(&state.minting_account);
-        // Defensive: another concurrent mint may have already bumped
-        // num_pubkeys while we were proving. Reject early — the
-        // pubkeys we derived in phase 1 (and the prover witness we
-        // built in phase 2) no longer match what's at the head of
-        // the chain. Mirrors the optimistic UPDATE on the DB side.
-        if minting_account_guard.num_pubkeys != expected_num_pubkeys {
+        let current_num_pubkeys = {
+            let state_guard = lock_or_recover(&state_arc);
+            crate::state::derive_num_pubkeys_from_smt(
+                &minting_account_guard.private_key,
+                &state_guard.smt,
+            )
+        };
+        if current_num_pubkeys != expected_num_pubkeys {
             return concurrent_mint_during_proof_response(
                 expected_num_pubkeys,
-                minting_account_guard.num_pubkeys,
+                current_num_pubkeys,
             );
         }
         let pis: [zkcoins_program::F; zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] =
@@ -949,8 +975,7 @@ async fn mint_handler(
     // regardless of how many transient broadcast attempts landed on
     // chain. The handler still observes an Err here on a genuine
     // broadcast failure and returns 503; reconciliation happens on the
-    // next scanner sweep and the startup invariant check accepts the
-    // state. No in-handler retry.
+    // next scanner sweep. No in-handler retry.
     if let Err(err) =
         create_and_broadcast_inscription(&commitment_data, &state.esplora_config, Some(&state.pool))
             .await
@@ -963,115 +988,73 @@ async fn mint_handler(
     }
 
     // ---- 4. COMMIT phase (broadcast OK) ---------------------------------
-    // The DB transaction writes ONLY the minting_meta counter bump and
-    // the minting account row. Recipient receives are applied to the
-    // LIVE in-memory recipient under the post-tx lock (additive, not
-    // overwriting), then persisted per-recipient via the same
-    // `db::upsert_account` shape that `broadcast_commit_and_deliver`
-    // uses for the send flow.
+    // Apply receives to the LIVE in-memory recipient under the
+    // account_node lock (additive `receive_coin`, never overwriting),
+    // then UPSERT every touched account (minting + recipients) in a
+    // single sqlx transaction via [`db::commit_mint_tx`].
     //
     // Rationale (zk-coins/node#89 round-2 MAJOR 1): a previous shape
-    // of this block snapshot-cloned each recipient under the lock,
-    // mutated the clone, then `import_account`'d the clone back after
-    // the tx commit. Between the snapshot read and the post-tx
-    // overwrite the lock was released across the `await` on
-    // `commit_mint_tx`. A concurrent `/api/send` flow that landed in
-    // `broadcast_commit_and_deliver` could mutate the live recipient in
-    // that window — and the post-tx `import_account` would clobber it
-    // with our stale clone, losing the concurrent update both in memory
-    // and (eventually) in the DB. The minting account itself does NOT
-    // have this hazard: there is exactly one writer per `num_pubkeys`
-    // (the optimistic UPDATE serializes them), so the snapshot-then-
-    // swap pattern on `mutated_minting` is sound.
+    // snapshot-cloned each recipient under the lock, mutated the
+    // clone, then `import_account`'d the clone back after the tx
+    // commit. Between the snapshot read and the post-tx overwrite the
+    // lock was released across the `await` on `commit_mint_tx`. A
+    // concurrent `/api/send` flow that landed in
+    // `broadcast_commit_and_deliver` could mutate the live recipient
+    // in that window — and the post-tx `import_account` would clobber
+    // it with our stale clone, losing the concurrent update both in
+    // memory and (eventually) in the DB. The fix is to take the
+    // account_node guard, do the `receive_coin` mutations, snapshot
+    // the LIVE account state inside the same critical section, then
+    // hand the bundle (already-fresh bytes) to the async DB upsert.
     let minting_addr_bytes =
         zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS);
     let minting_snapshot_bytes = AccountNode::serialize_account(&prepared.mutated_minting);
-    let commit_rows: Vec<(&[u8], &[u8])> =
-        vec![(&minting_addr_bytes[..], &minting_snapshot_bytes[..])];
-    let new_num_pubkeys = expected_num_pubkeys + 1;
-    let commit_result = db::commit_mint_tx(
-        &state.pool,
-        expected_num_pubkeys,
-        new_num_pubkeys,
-        &commit_rows,
-    )
-    .await;
-    let recipient_snapshots: Vec<(zkcoins_program::hash::HashDigest, Vec<u8>)> = match commit_result
-    {
-        Ok(true) => {
-            // Atomic swap of the mutated minting account into the
-            // in-memory map. The optimistic UPDATE on the DB side acted
-            // as the serialization point — we are now the only writer
-            // that observed `num_pubkeys == expected_num_pubkeys` and
-            // won the bump to `new_num_pubkeys`. Recipient receives are
-            // applied to the LIVE recipient (additive); a concurrent
-            // mutation of the same recipient by another handler is
-            // preserved because we never overwrite — `receive_coin`
-            // appends to the recipient's `coin_queue`.
-            let snapshots: Vec<(zkcoins_program::hash::HashDigest, Vec<u8>)> = {
-                let mut account_node_guard = lock_or_recover(&state.account_node);
-                account_node_guard.commit_mint(prepared.mutated_minting);
-                let mut snaps = Vec::with_capacity(prepared.coin_proofs.len());
-                for coin_proof in &prepared.coin_proofs {
-                    let recipient = coin_proof.coin.recipient;
-                    if let Err(e) = account_node_guard.receive_coin(coin_proof.clone()) {
-                        // Best-effort: a duplicate / replay error here
-                        // means the recipient already has this coin
-                        // (e.g. scanner-replay after restart). Log and
-                        // still snapshot whatever the live recipient
-                        // looks like so the DB row stays current.
-                        eprintln!("Failed to receive minted coin into live recipient: {}", e);
-                    }
-                    if let Some(acct) = account_node_guard.get_account(&recipient) {
-                        snaps.push((recipient, AccountNode::serialize_account(acct)));
-                    }
-                }
-                snaps
-            };
-            {
-                let mut minting_account_guard = lock_or_recover(&state.minting_account);
-                minting_account_guard.num_pubkeys = new_num_pubkeys;
+
+    let recipient_snapshots: Vec<(zkcoins_program::hash::HashDigest, Vec<u8>)> = {
+        let mut account_node_guard = lock_or_recover(&state.account_node);
+        account_node_guard.commit_mint(prepared.mutated_minting);
+        let mut snaps = Vec::with_capacity(prepared.coin_proofs.len());
+        for coin_proof in &prepared.coin_proofs {
+            let recipient = coin_proof.coin.recipient;
+            if let Err(e) = account_node_guard.receive_coin(coin_proof.clone()) {
+                // Best-effort: a duplicate / replay error here means
+                // the recipient already has this coin (e.g. scanner-
+                // replay after restart). Log and still snapshot
+                // whatever the live recipient looks like so the DB
+                // row stays current.
+                eprintln!("Failed to receive minted coin into live recipient: {}", e);
             }
-            snapshots
+            if let Some(acct) = account_node_guard.get_account(&recipient) {
+                snaps.push((recipient, AccountNode::serialize_account(acct)));
+            }
         }
-        Ok(false) => {
-            eprintln!(
-                "Concurrent mint detected: minting_meta.num_pubkeys != {} at commit time",
-                expected_num_pubkeys
-            );
-            return handler_error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Concurrent mint detected",
-            );
-        }
-        Err(e) => {
-            eprintln!("Failed to commit mint transaction to Postgres: {}", e);
-            // The on-chain commitment landed but the DB tx failed.
-            // Return 503 so the client knows nothing is durable on
-            // our side; the scanner-replay path on next boot will
-            // reconcile the in-memory SMT with the on-chain
-            // commitment.
-            return handler_error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Failed to persist mint commit transaction",
-            );
-        }
+        snaps
     };
 
-    // Persist the LIVE recipient snapshots taken after the in-memory
-    // `receive_coin`. Each upsert is independent (no transactional
-    // bundling with the minting row): the minting_meta + minting
-    // account bump already committed inside `commit_mint_tx`, and a
-    // recipient upsert that fails here is logged. The next scanner
-    // sweep can NOT re-derive the recipient `coin_queue` from chain
-    // state (the queue is a server-only artifact populated by
-    // `receive_coin`), so a missed upsert means the in-memory
-    // recipient leads the DB until the next successful receive on the
-    // same recipient overwrites the row. Mirrors the
-    // `broadcast_commit_and_deliver` recipient-persistence shape.
-    for (addr, bytes) in &recipient_snapshots {
-        let addr_bytes = zkcoins_program::hash::digest_to_bytes(addr);
-        upsert_mint_recipient_or_log(&state.pool, &addr_bytes, bytes).await;
+    // Build the per-account UPSERT bundle. `commit_mint_tx` writes
+    // every entry in one transaction so a partial-failure leaves the
+    // accounts table consistent.
+    let mut commit_rows: Vec<(&[u8], &[u8])> = Vec::with_capacity(1 + recipient_snapshots.len());
+    commit_rows.push((&minting_addr_bytes[..], &minting_snapshot_bytes[..]));
+    let recipient_addr_bytes: Vec<[u8; 32]> = recipient_snapshots
+        .iter()
+        .map(|(addr, _)| zkcoins_program::hash::digest_to_bytes(addr))
+        .collect();
+    for ((_, bytes), addr_bytes) in recipient_snapshots.iter().zip(recipient_addr_bytes.iter()) {
+        commit_rows.push((&addr_bytes[..], &bytes[..]));
+    }
+    if let Err(e) = db::commit_mint_tx(&state.pool, &commit_rows).await {
+        eprintln!("Failed to commit mint transaction to Postgres: {}", e);
+        // The on-chain commitment landed and the in-memory state is
+        // already updated, but the DB persistence failed. Return 503
+        // so the client knows nothing is durable on our side; the
+        // scanner-replay path on next boot will rehydrate the SMT
+        // from chain and the next mint observes the correct N via
+        // `derive_num_pubkeys_from_smt`.
+        return handler_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Failed to persist mint commit transaction",
+        );
     }
 
     let mut coin_proofs = prepared.coin_proofs;

@@ -1,7 +1,9 @@
+use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::PublicKey;
 use serde::{Deserialize, Serialize};
 use shared::commitment::Commitment;
+use shared::SECP256K1;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use zkcoins_program::circuit::main::MMR_PROOF_PATH_LEN;
@@ -10,6 +12,82 @@ use zkcoins_program::merkle::merkle_mountain_range::{MMRProof, MerkleMountainRan
 use zkcoins_program::merkle::sparse_merkle_tree::{InclusionProof, SparseMerkleTree};
 
 use crate::db;
+
+/// Defensive upper bound on the [`derive_num_pubkeys_from_smt`] loop.
+///
+/// The MVP faucet bumps `num_pubkeys` once per `/api/mint`, a feature-
+/// gated low-frequency endpoint. One million successful mints is several
+/// orders of magnitude above the deployment envelope (closed test
+/// environment, hand-driven mints), so a loop that exceeds the bound is
+/// a structural bug — either the SMT was corrupted to contain millions
+/// of synthetic minting pubkeys, or the caller passed an Xpriv that
+/// shadows another wallet's branch. Panic rather than return a poisoned
+/// `u32`: the safe response to a state we cannot reason about is to
+/// stop, not to keep minting.
+const DERIVE_NUM_PUBKEYS_LOOP_BOUND: u32 = 1_000_000;
+
+/// Derive the minting account's `num_pubkeys` from SMT membership.
+///
+/// The faucet generates a fresh BIP-32 child pubkey for each mint
+/// (`pk_n = generate_public_key(xpriv, n)`) and the scanner inserts
+/// `key = sha256(pk_n.serialize())` into the SMT once the on-chain
+/// inscription lands. The count of successful mints is therefore the
+/// length of the prefix `pk_0, pk_1, …` whose keys are all present in
+/// the SMT — equivalently, the smallest `n` whose key is absent.
+///
+/// Walks `n = 0, 1, 2, …`, deriving each pubkey and checking SMT
+/// membership via [`SparseMerkleTree::get`] (the cheapest membership
+/// primitive — O(1) `HashMap::get` on the leaf table, no proof
+/// reconstruction). Returns the first miss.
+///
+/// Replaces the pre-Phase-D `minting_meta.num_pubkeys` counter as the
+/// single source of truth: the SMT is already authoritative for "which
+/// minting commitments landed on-chain" (the scanner is the only writer
+/// and `state.update`'s `smt.insert` is idempotent on same key + same
+/// value), so collapsing the counter into it removes the desync class
+/// documented in zk-coins/node#89 by construction. The startup
+/// invariant check that compared the two values is now a tautology and
+/// has been removed.
+///
+/// **Loop bound.** Capped at [`DERIVE_NUM_PUBKEYS_LOOP_BOUND`]; an
+/// overrun panics. See the constant's docs for the rationale.
+pub fn derive_num_pubkeys_from_smt(xpriv: &Xpriv, smt: &SparseMerkleTree) -> u32 {
+    derive_num_pubkeys_from_smt_with_bound(xpriv, smt, DERIVE_NUM_PUBKEYS_LOOP_BOUND)
+}
+
+/// Bound-parametrised inner of [`derive_num_pubkeys_from_smt`].
+///
+/// Exposed at `pub(crate)` so the test suite can exercise the loop-
+/// bound panic branch with a tiny bound (millions of real BIP-32
+/// derivations + Poseidon SMT inserts is several minutes of wall time;
+/// the bound branch is the same regardless of the constant). Production
+/// callers MUST use the wrapper above with [`DERIVE_NUM_PUBKEYS_LOOP_BOUND`].
+pub(crate) fn derive_num_pubkeys_from_smt_with_bound(
+    xpriv: &Xpriv,
+    smt: &SparseMerkleTree,
+    bound: u32,
+) -> u32 {
+    let xpub = Xpub::from_priv(&SECP256K1, xpriv);
+    let mut n: u32 = 0;
+    loop {
+        let pk: PublicKey = xpub
+            .derive_pub(&SECP256K1, &[ChildNumber::Normal { index: n }])
+            .expect("BIP-32 unhardened derivation cannot fail for u32 indices")
+            .public_key;
+        let key: [u8; 32] = bitcoin::hashes::sha256::Hash::hash(&pk.serialize()).to_byte_array();
+        if smt.get(&key).is_none() {
+            return n;
+        }
+        if n >= bound {
+            panic!(
+                "derive_num_pubkeys_from_smt: SMT contains more than {} consecutive minting pubkeys; \
+                 the loop bound is a safety net for a state we cannot reason about",
+                bound
+            );
+        }
+        n += 1;
+    }
+}
 
 /// State stores both a Sparse Merkle Tree (for individual commitments)
 /// and a Merkle Mountain Range (for accumulating SMT roots).
