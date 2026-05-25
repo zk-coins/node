@@ -547,7 +547,7 @@ See [docs.zkcoins.app/infrastructure/backend](https://docs.zkcoins.app/infrastru
 | Workflow | Trigger | Action |
 |---|---|---|
 | `ci.yaml` (Lint & Build) | Ready PR → develop, push to develop | `cargo fmt --check`, clippy (MVP + all-features + program lib), build (MVP + all-features) on `ubuntu-latest`. |
-| `ci.yaml` (Node + Shared Tests) | Ready PR → develop with `ci:full` label, push to develop | `cargo nextest run -p node -p shared --release --all-features --test-threads=1` on the self-hosted M3 Ultra runner pool (issue #40). |
+| `ci.yaml` (Node + Shared Tests) | Ready PR → develop with `ci:full` label, push to develop | `cargo nextest run -p node -p shared --release --all-features --test-threads 1 -E 'not binary(api_remote)'` on the self-hosted M3 Ultra runner pool (issue #40). |
 | `ci.yaml` (Coverage Gate) | Ready PR → develop with `ci:full` label, push to develop | `cargo llvm-cov nextest` with the 100% line + function gate, MVP scope, on the same runner pool. |
 | `deploy-dev.yaml` | Push to develop | Docker build (ARM64) → push `zkcoins/node:beta` → deploy to DEV |
 | `deploy-prd.yaml` | Push to main | Docker build (ARM64) → push `zkcoins/node:latest` → deploy to PRD |

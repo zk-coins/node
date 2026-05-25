@@ -10,7 +10,7 @@ pre-push) and issue #30 for the previous design.
 
 A single Mac Studio M3 Ultra with 96 GB unified RAM hosts the pool
 (CONTRIBUTING.md § "Working on the Plonky2 Migration", invariant 3).
-**Six runner agents** share the host. The same host was previously
+**6 runner agents** share the host. The same host was previously
 used as the `ZKCOINS_PREPUSH_REMOTE` target.
 
 The pool size was tuned against measured resource usage — see
@@ -323,22 +323,23 @@ ssh "$RUNNER_HOST" 'for d in ~/actions-runner-*; do rm -rf "$d/_work/node/node/t
 
 ### Disk + RAM headroom
 
-The 6-agent pool shares the host. Measured against 3 parallel Heavy
-jobs (each PR exercises `node-tests` + `coverage`, so 3 PRs × 2 = 6
-agents busy):
+Each PR exercises 2 Heavy jobs (`node-tests` + `coverage`), so the
+6-agent pool saturates at 3 concurrent PRs (3 PRs × 2 jobs = 6
+agents). The snapshot below was captured on 2026-05-25 with 3 Heavy
+jobs running concurrently (the pre-expansion 3-runner topology), and
+the saturated-forecast column linearly projects to 6:
 
-| Metric                                | 3 parallel jobs (measured 2026-05-25) | 6 parallel jobs (forecast) |
-|---------------------------------------|---------------------------------------|----------------------------|
-| `cargo` test process RSS              | ~14 GB total                          | ~29 GB total               |
-| App memory (RSS + reclaimable cache)  | ~85 GB peak                           | ~95 GB peak                |
-| Swap used                             | 0 MB                                  | 0 MB expected              |
-| CPU cores in use                      | 3 of 28                               | 6 of 28                    |
-| sccache cache (host-wide, shared)     | 50 GiB cap, ~3 GiB live               | 50 GiB cap                 |
+| Metric                                | 3 jobs running (snapshot 2026-05-25) | 6 jobs running (saturated, forecast) |
+|---------------------------------------|--------------------------------------|--------------------------------------|
+| `cargo` test process RSS              | ~14 GB total                         | ~29 GB total                         |
+| App memory (RSS + reclaimable cache)  | ~85 GB peak                          | ~95 GB peak                          |
+| Swap used                             | 0 MB                                 | 0 MB expected                        |
+| CPU cores in use                      | 3 of 28                              | 6 of 28                              |
+| sccache cache (host-wide, shared)     | 50 GiB cap, ~3 GiB live              | 50 GiB cap                           |
 
-Tests run with `--test-threads=1`, so each agent has one in-flight
-test process at a time. The pool supports up to 3 PRs running the
-full Heavy gate in parallel. Beyond that, GitHub queues new Heavy
-jobs.
+Tests run with `--test-threads 1`, so each agent has one in-flight
+test process at a time. A 4th PR carrying `ci:full` queues until an
+agent frees up.
 
 The `sccache` cache is host-wide, shared by every agent
 (`~/Library/Caches/Mozilla.sccache`). `ci.yaml` sets

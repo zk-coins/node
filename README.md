@@ -256,7 +256,7 @@ Per-module coverage (CI-gated):
 | `*_runtime.rs`      | excluded          | Background-loop wrappers; covered indirectly via integration tests against handlers |
 | `scanner_ws.rs`     | excluded          | WS subscriber + reconnect loop; pure helpers (`parse_ws_frame`, `frame_signals_tx_seen`) are unit-tested, the I/O loop is covered indirectly via the publisher's `track-tx` round-trip |
 
-`publisher.rs`, `main.rs`, the `*_runtime.rs` wrappers, and `scanner_ws.rs` are excluded by design — they require a live Bitcoin node, a funded publisher key, a bound TCP socket, or an upstream WebSocket peer, none of which fit in a unit test. The exclusion list is encoded in the CI gate's `--ignore-filename-regex`; everything else is held at 100% lines + 100% functions. CI runs the MVP build, the all-features build, `cargo nextest run -p node -p shared --release --all-features --test-threads=1` on the self-hosted M3 Ultra runner pool, and the `Coverage Gate (100% lines + functions)` job.
+`publisher.rs`, `main.rs`, the `*_runtime.rs` wrappers, and `scanner_ws.rs` are excluded by design — they require a live Bitcoin node, a funded publisher key, a bound TCP socket, or an upstream WebSocket peer, none of which fit in a unit test. The exclusion list is encoded in the CI gate's `--ignore-filename-regex`; everything else is held at 100% lines + 100% functions. CI runs the MVP build, the all-features build, `cargo nextest run -p node -p shared --release --all-features --test-threads 1 -E 'not binary(api_remote)'` on the self-hosted M3 Ultra runner pool, and the `Coverage Gate (100% lines + functions)` job.
 
 ## Running
 

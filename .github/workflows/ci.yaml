@@ -185,9 +185,9 @@ jobs:
       # default `docker` context.
       DOCKER_HOST: unix:///Users/dfx01/.colima/default/docker.sock
       # `sccache` wraps `rustc` and caches compiled crates across CI
-      # runs. The M3 Ultra runner is self-hosted, so the cache lives on
-      # local disk and survives between jobs — the speedup is biggest
-      # for PR pushes that re-touch the same dependency set.
+      # runs. The M3 Ultra runner agents are self-hosted, so the cache
+      # lives on local disk and survives between jobs — the speedup is
+      # biggest for PR pushes that re-touch the same dependency set.
       RUSTC_WRAPPER: sccache
       # Bump cache cap above sccache's 10-GiB default. The cache is
       # user-level (~/Library/Caches/Mozilla.sccache) and shared by every
