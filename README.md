@@ -1,13 +1,18 @@
 # zkCoins Node
 
+[![Docker Image Version](https://img.shields.io/docker/v/zkcoins/node/latest?logo=docker&label=zkcoins%2Fnode&color=2496ED)](https://hub.docker.com/r/zkcoins/node)
+[![Docker Pulls](https://img.shields.io/docker/pulls/zkcoins/node?logo=docker&color=2496ED)](https://hub.docker.com/r/zkcoins/node)
+
 Rust/Axum backend for [zkcoins.app](https://zkcoins.app) — account management, ZK proof generation, Bitcoin blockchain scanning, and nullifier publishing.
+
+Container images: **[hub.docker.com/r/zkcoins/node](https://hub.docker.com/r/zkcoins/node)**
 
 ## Live
 
-| Environment | URL                                                | Image                  |
-| ----------- | -------------------------------------------------- | ---------------------- |
-| **PRD**     | [api.zkcoins.app](https://api.zkcoins.app)         | `zkcoins/node:latest` |
-| **DEV**     | [dev-api.zkcoins.app](https://dev-api.zkcoins.app) | `zkcoins/node:beta`   |
+| Environment | URL                                                | Image                                                                                |
+| ----------- | -------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| **PRD**     | [api.zkcoins.app](https://api.zkcoins.app)         | [`zkcoins/node:latest`](https://hub.docker.com/r/zkcoins/node/tags?name=latest)      |
+| **DEV**     | [dev-api.zkcoins.app](https://dev-api.zkcoins.app) | [`zkcoins/node:beta`](https://hub.docker.com/r/zkcoins/node/tags?name=beta)          |
 
 ## Stack
 
