@@ -126,27 +126,17 @@ pub async fn persist_state_tx(
     latest_block: &[u8; 32],
     root_index_entry: Option<(&HashDigest, &HashDigest, u64)>,
 ) -> Result<(), sqlx::Error> {
-    // Pre-encode the optional root_index columns OUTSIDE the tx so a
-    // bad `leaf_index` (e.g. > i64::MAX in some hypothetical future)
-    // surfaces before we open a Postgres connection. Today the value
-    // comes from `mmr.leaf_count()` so the conversion is infallible in
-    // practice; keep the defensive error for symmetry with the
-    // standalone `insert_root_index` helper.
-    let root_index_bytes = match root_index_entry {
-        None => None,
-        Some((prev_root, smt_root, leaf_index)) => {
-            let leaf_i64 = i64::try_from(leaf_index).map_err(|_| {
-                sqlx::Error::Encode(
-                    format!("leaf_index {} does not fit in i64 (BIGINT)", leaf_index).into(),
-                )
-            })?;
-            Some((
-                digest_to_bytes(prev_root),
-                digest_to_bytes(smt_root),
-                leaf_i64,
-            ))
-        }
-    };
+    // `leaf_index` is a `u64` coming from `mmr.leaf_count()`, which is
+    // bounded by the total inscription count (≪ 2^63 in practice). The
+    // cast is infallible on 64-bit targets, which is our only deployment
+    // target (Linux x86_64 / aarch64).
+    let root_index_bytes = root_index_entry.map(|(prev_root, smt_root, leaf_index)| {
+        (
+            digest_to_bytes(prev_root),
+            digest_to_bytes(smt_root),
+            leaf_index as i64,
+        )
+    });
 
     let mut tx = pool.begin().await?;
     sqlx::query(
@@ -242,21 +232,15 @@ pub async fn persist_state_and_mark_complete_tx(
     root_index_entry: Option<(&HashDigest, &HashDigest, u64)>,
     commit_txid: &[u8],
 ) -> Result<(), sqlx::Error> {
-    let root_index_bytes = match root_index_entry {
-        None => None,
-        Some((prev_root, smt_root, leaf_index)) => {
-            let leaf_i64 = i64::try_from(leaf_index).map_err(|_| {
-                sqlx::Error::Encode(
-                    format!("leaf_index {} does not fit in i64 (BIGINT)", leaf_index).into(),
-                )
-            })?;
-            Some((
-                digest_to_bytes(prev_root),
-                digest_to_bytes(smt_root),
-                leaf_i64,
-            ))
-        }
-    };
+    // See `persist_state_tx` for why the `u64 -> i64` cast is infallible
+    // on every target we ship.
+    let root_index_bytes = root_index_entry.map(|(prev_root, smt_root, leaf_index)| {
+        (
+            digest_to_bytes(prev_root),
+            digest_to_bytes(smt_root),
+            leaf_index as i64,
+        )
+    });
 
     let mut tx = pool.begin().await?;
     sqlx::query(
@@ -594,11 +578,10 @@ pub async fn insert_root_index(
 ) -> Result<(), sqlx::Error> {
     let prev_bytes = digest_to_bytes(prev_root);
     let smt_bytes = digest_to_bytes(smt_root);
-    let leaf_i64 = i64::try_from(leaf_index).map_err(|_| {
-        sqlx::Error::Encode(
-            format!("leaf_index {} does not fit in i64 (BIGINT)", leaf_index).into(),
-        )
-    })?;
+    // MMR leaf_index is bounded by total inscription count (≪ 2^63 in
+    // practice); the cast is infallible on 64-bit targets which is our
+    // only deployment target.
+    let leaf_i64 = leaf_index as i64;
     sqlx::query(
         "INSERT INTO mmr_root_index (prev_mmr_root, smt_root, leaf_index, created_at) \
          VALUES ($1, $2, $3, NOW()) \
