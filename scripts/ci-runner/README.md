@@ -1,16 +1,21 @@
-# Self-hosted GitHub Actions runner for `zk-coins/node`
+# Self-hosted GitHub Actions runners for `zk-coins/node`
 
-Operator-facing documentation for the self-hosted runner that executes
-the `Server + Shared Tests (M3 Ultra)` and `Coverage Gate (100% lines
-+ functions)` jobs in `.github/workflows/ci.yaml`. See issue #40 for
-the rationale (test + coverage gate in CI rather than pre-push) and
-issue #30 for the previous design.
+Operator-facing documentation for the self-hosted runner pool that
+executes the `Node + Shared Tests (M3 Ultra)` and `Coverage Gate
+(100% lines + functions)` jobs in `.github/workflows/ci.yaml`. See
+issue #40 for the rationale (test + coverage gate in CI rather than
+pre-push) and issue #30 for the previous design.
 
 ## Hardware target
 
-A single Mac Studio M3 Ultra with 96 GB unified RAM (CONTRIBUTING.md §
-"Working on the Plonky2 Migration", invariant 3). The same host that
-was previously used as the `ZKCOINS_PREPUSH_REMOTE` target.
+A single Mac Studio M3 Ultra with 96 GB unified RAM hosts the pool
+(CONTRIBUTING.md § "Working on the Plonky2 Migration", invariant 3).
+**6 runner agents** share the host. The same host was previously
+used as the `ZKCOINS_PREPUSH_REMOTE` target.
+
+The pool size was tuned against measured resource usage — see
+[**Disk + RAM headroom**](#disk--ram-headroom) below for the budget
+table and the rationale for the 6-agent cap.
 
 > **Operator convention.** All shell commands below assume an SSH
 > alias `$RUNNER_HOST` resolves to the runner host on your local
@@ -115,11 +120,77 @@ workflows from outside collaborators"** → *Require approval for all
 outside collaborators*. This is the one setting not currently exposed
 by the REST API — flip it in the UI.
 
+## Scaling out: adding more runner agents on the same host
+
+The host runs multiple runner agents under the same user account, one
+per directory + launchd plist. Pool today: **6 agents** named `dfx01`,
+`dfx01-2`, …, `dfx01-6`, all carrying the same labels. Adding another
+follows the one-time setup with a different `--name` and a unique
+directory.
+
+```bash
+# Pick the next free index. Current pool tops out at 6.
+NEW_IDX=7
+NEW_NAME="dfx01-${NEW_IDX}"
+NEW_DIR="actions-runner-zk-coins-node-${NEW_IDX}"   # recommended naming
+                                                    # for fresh installs
+
+TOKEN=$(gh api -X POST repos/zk-coins/node/actions/runners/registration-token | jq -r .token)
+
+ssh "$RUNNER_HOST" "bash -lc '
+  set -euo pipefail
+  mkdir -p ~/${NEW_DIR} && cd ~/${NEW_DIR}
+
+  if [ ! -f config.sh ]; then
+    RUNNER_VERSION=\$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | sed s/^v//)
+    TARBALL=actions-runner-osx-arm64-\${RUNNER_VERSION}.tar.gz
+    # Reuse a cached tarball if a prior add-runner run left one in /tmp.
+    [ -f /tmp/\${TARBALL} ] || curl -fsSL -o /tmp/\${TARBALL} \
+      \"https://github.com/actions/runner/releases/download/v\${RUNNER_VERSION}/\${TARBALL}\"
+    tar xzf /tmp/\${TARBALL}
+  fi
+
+  ./config.sh --unattended \
+    --url https://github.com/zk-coins/node \
+    --token ${TOKEN} \
+    --name \"${NEW_NAME}\" \
+    --labels self-hosted,macOS,ARM64,m3-ultra,zkcoins-prover \
+    --work _work \
+    --replace
+  ./svc.sh install
+  ./svc.sh start
+'"
+```
+
+Before adding agents, re-measure against the [**Disk + RAM
+headroom**](#disk--ram-headroom) budget below. Adding agents beyond
+what the host can sustain causes swap pressure and slows every
+concurrent job.
+
+The registration token is good for ~1 hour and can register multiple
+runners back-to-back. Looping a `for` over multiple `--name` values
+with `set -o pipefail` will SIGPIPE-abort if you also pipe `svc.sh
+status` through `head` — drop the pipe or wrap with `set +e`.
+
+> **Naming drift (2026-05-25):** the live agents `dfx01`, `dfx01-2`,
+> `dfx01-3` predate the `zk-coins/server` → `zk-coins/node` rename
+> and live under `~/actions-runner-zkcoins-server` /
+> `~/actions-runner-zk-coins-server-{2,3}`. `dfx01-4`/`-5`/`-6` were
+> added after the rename but still in `~/actions-runner-zk-coins-server-{4,5,6}`
+> for naming consistency with their siblings. New runners should use
+> `actions-runner-zk-coins-node-N`; clean-up of legacy paths happens
+> bundled with a re-register cycle. The substantive runner identity
+> (name + labels) is what GitHub routes against, not the directory
+> name, so jobs work regardless.
+
 ## Migrating to a dedicated runner user
 
 When the operational pressure allows, swap the host user under which
-the runner runs from the admin account to a fresh `gh-runner` account
-with no console login and no other repo access. Procedure:
+the agents run from the admin account to a fresh `gh-runner` account
+with no console login and no other repo access. With the 6-agent pool
+this means migrating each agent in turn; the pool can stay online
+during the migration (each agent goes offline only briefly while it
+moves users). Procedure:
 
 ```bash
 # 1. Create the user (requires sudo).
@@ -137,101 +208,155 @@ sudo -iu gh-runner bash -lc '
   bash <(curl -fsSL https://raw.githubusercontent.com/zk-coins/node/develop/scripts/ci-runner/bootstrap-prerequisites.sh)
 '
 
-# 3. Stop and uninstall the old runner under the admin user.
-ssh "$RUNNER_HOST" 'cd ~/actions-runner-zkcoins-node && ./svc.sh stop && ./svc.sh uninstall && ./config.sh remove --token PASTE_REMOVAL_TOKEN'
+# 3. For each agent in the pool: stop + uninstall it under the admin
+# user, then re-register it as gh-runner using the "Scaling out"
+# snippet above (substitute the existing agent name, e.g. dfx01-2).
+ssh "$RUNNER_HOST" "cd ~/${RUNNER_DIR} && ./svc.sh stop && ./svc.sh uninstall && ./config.sh remove --token PASTE_REMOVAL_TOKEN"
 
-# 4. Repeat the "Register" + "Install + start" steps above as gh-runner.
+# 4. Repeat the "Register" + "Install + start" steps above as
+#    gh-runner, once per agent.
 ```
 
-## Verifying the runner is online
+## Verifying the pool is online
 
 From any machine with `gh` configured:
 
 ```bash
-gh api repos/zk-coins/node/actions/runners | jq '.runners[] | {name, status, busy, labels: [.labels[].name]}'
+gh api repos/zk-coins/node/actions/runners \
+  | jq '.runners | sort_by(.name) | map({name, status, busy, labels: [.labels[].name]})'
 ```
 
-A healthy runner reports `"status": "online"` and includes the
-`m3-ultra` label.
+Healthy pool: 6 entries, every one reports `"status": "online"` and
+carries the labels `self-hosted, macOS, ARM64, m3-ultra,
+zkcoins-prover`.
 
 ## Activating the CI jobs (historical — done)
 
 This section describes the rollout sequence used when the workflow
-landed before the runner existed. It is kept as a reference for
-future runner additions; the current jobs are already active.
+landed before the first runner existed. It is kept as a reference
+for future runner additions; the current jobs are already active.
 
-The `server-tests` and `coverage` jobs in `.github/workflows/ci.yaml`
-were originally gated behind `if: false` so the workflow YAML could
-land before the runner came online. After the runner was verified,
-both gates were removed (PR #43). Branch protection on `develop`
-already requires:
+The `node-tests` (originally `server-tests`) and `coverage` jobs in
+`.github/workflows/ci.yaml` were originally gated behind `if: false`
+so the workflow YAML could land before the runner came online. After
+the first runner was verified, both gates were removed (PR #43).
 
-- `Server + Shared Tests (M3 Ultra)`
+Branch protection on `main` requires the full Heavy gate:
+
+- `Lint & Build`
+- `Node + Shared Tests (M3 Ultra)`
 - `Coverage Gate (100% lines + functions)`
+- `Build and deploy to DEV`
 
-(The pre-Plonky2 `Tests` and `Coverage (MVP scope)` required checks
-were removed from branch protection in the same operation; they are
-not referenced in the current workflow.)
+`develop` requires only `Lint & Build` — the Heavy gate is enforced
+at the Release-PR boundary (`develop → main`) via the auto-applied
+`ci:full` label on the Release PR (see `auto-release-pr.yaml`). The
+required-check name on `main` was renamed `Server + Shared Tests`
+→ `Node + Shared Tests` together with the workflow job rename.
 
 ## Operations
+
+All snippets below operate on a single agent. Set `RUNNER_DIR` to the
+agent's directory before running them — the pool has different
+directory names per agent (see [**Scaling out**](#scaling-out-adding-more-runner-agents-on-the-same-host)
+for the naming-drift note):
+
+```bash
+# Examples:
+RUNNER_DIR=actions-runner-zkcoins-server         # dfx01     (legacy)
+RUNNER_DIR=actions-runner-zk-coins-server-2      # dfx01-2   (legacy)
+RUNNER_DIR=actions-runner-zk-coins-server-6      # dfx01-6   (post-rename)
+```
+
+To act on every agent in the pool, loop:
+
+```bash
+ssh "$RUNNER_HOST" 'ls -d ~/actions-runner-* | xargs -I{} bash -lc "echo === {}; cd {} && ./svc.sh status | head -2"'
+```
 
 ### Updating the runner binary
 
 GitHub deprecates old runner versions about every 6 months. The
 launchd service auto-updates the runner binary unless `config.sh
---disableupdate` was used. Check the version:
+--disableupdate` was used. Check the version of one agent:
 
 ```bash
-ssh "$RUNNER_HOST" 'jq -r .version < ~/actions-runner-zkcoins-node/.runner'
+ssh "$RUNNER_HOST" "jq -r .version < ~/${RUNNER_DIR}/.runner"
 ```
 
-### Restarting / stopping the runner
+### Restarting / stopping a single agent
 
 ```bash
-ssh "$RUNNER_HOST" 'cd ~/actions-runner-zkcoins-node && ./svc.sh stop'
-ssh "$RUNNER_HOST" 'cd ~/actions-runner-zkcoins-node && ./svc.sh start'
-ssh "$RUNNER_HOST" 'cd ~/actions-runner-zkcoins-node && ./svc.sh status'
+ssh "$RUNNER_HOST" "cd ~/${RUNNER_DIR} && ./svc.sh stop"
+ssh "$RUNNER_HOST" "cd ~/${RUNNER_DIR} && ./svc.sh start"
+ssh "$RUNNER_HOST" "cd ~/${RUNNER_DIR} && ./svc.sh status"
 ```
 
-### Removing the runner
+### Removing an agent
 
 ```bash
 # Generate a *removal* token (different from the registration token):
 REMOVAL_TOKEN=$(gh api -X POST repos/zk-coins/node/actions/runners/remove-token | jq -r .token)
-ssh "$RUNNER_HOST" "cd ~/actions-runner-zkcoins-node && ./svc.sh stop && ./svc.sh uninstall && ./config.sh remove --token ${REMOVAL_TOKEN}"
+ssh "$RUNNER_HOST" "cd ~/${RUNNER_DIR} && ./svc.sh stop && ./svc.sh uninstall && ./config.sh remove --token ${REMOVAL_TOKEN}"
 ```
 
 ### Workspace cache
 
-The runner re-uses `~/actions-runner-zkcoins-node/_work/node/node/`
-across jobs, so cargo's incremental build cache persists. This is the
-documented "shared `target/` directory across jobs" trade-off in issue
-#40: fast incremental builds, but stale state can occasionally poison
-a green-to-red flip. If you see unexplained CI failures that disappear
-on rerun, nuke the cache:
+Each agent re-uses its own `~/${RUNNER_DIR}/_work/node/node/` across
+jobs, so cargo's incremental build cache persists per agent. This is
+the documented "shared `target/` directory across jobs" trade-off in
+issue #40: fast incremental builds, but stale state can occasionally
+poison a green-to-red flip. If a single agent reproduces an
+unexplained failure that disappears on rerun, nuke just that agent's
+cache:
 
 ```bash
-ssh "$RUNNER_HOST" 'rm -rf ~/actions-runner-zkcoins-node/_work/node/node/target'
+ssh "$RUNNER_HOST" "rm -rf ~/${RUNNER_DIR}/_work/node/node/target"
+```
+
+To clear all agents (rare — use only when a workspace-wide invariant
+is suspected):
+
+```bash
+ssh "$RUNNER_HOST" 'for d in ~/actions-runner-*; do rm -rf "$d/_work/node/node/target"; done'
 ```
 
 ### Disk + RAM headroom
 
-The Plonky2 prover wants peak ~50 GB RAM per test thread. The jobs
-run with `--test-threads=1` so two parallel jobs (server-tests +
-coverage) on the same host would race for RAM. Avoid running two
-concurrent zkCoins workflow runs on this runner — workflow-level
-`concurrency: cancel-in-progress: true` in `ci.yaml` already takes
-care of this for the same PR. For different PRs running in parallel,
-add a single self-hosted runner only (one concurrent job per repo)
-and let GitHub queue the rest.
+Each PR exercises 2 Heavy jobs (`node-tests` + `coverage`), so the
+6-agent pool saturates at 3 concurrent PRs (3 PRs × 2 jobs = 6
+agents). The snapshot below was captured on 2026-05-25 with 3 Heavy
+jobs running concurrently (the pre-expansion 3-runner topology); the
+saturated-forecast column projects linearly to 6 jobs, except App
+memory which clamps at the host's 96 GB ceiling as inactive cache
+pages get reclaimed under pressure:
 
-Cargo's `target/` grows fast — budget ~30-50 GB. Run `cargo clean`
-periodically (or wipe the workspace as above) if disk pressure
-becomes an issue.
+| Metric                                       | 3 jobs running (snapshot 2026-05-25) | 6 jobs running (saturated, forecast) |
+|----------------------------------------------|--------------------------------------|--------------------------------------|
+| `cargo` test process RSS                     | ~14 GB total                         | ~29 GB total                         |
+| App memory (RSS + reclaimable cache)         | ~85 GB peak                          | ~95 GB peak (cache-bound)            |
+| Swap used                                    | 0 MB                                 | 0 MB expected                        |
+| Active test processes (`--test-threads 1`)   | 3                                    | 6 (saturated)                        |
+| sccache cache (host-wide, shared)            | 50 GiB cap, ~3 GiB live              | 50 GiB cap                           |
+
+Tests run with `--test-threads 1`, so each agent has one in-flight
+test process at a time. A 4th PR carrying `ci:full` queues until an
+agent frees up.
+
+The `sccache` cache is host-wide, shared by every agent
+(`~/Library/Caches/Mozilla.sccache`). `ci.yaml` sets
+`SCCACHE_CACHE_SIZE=50G` and restarts the sccache server when the
+running cap differs — this avoids the eviction thrashing the 10-GiB
+default caused with 3+ concurrent agents.
+
+Per-agent `target/` directories grow fast (~30-50 GB each). With 6
+agents × 50 GB that is ~300 GB of cache on a 1 TB host. Run
+`cargo clean` per agent (or wipe the workspace as above) if disk
+pressure becomes an issue.
 
 ## Tracking
 
-The runner is a launchd service on the runner host, not a Docker
-container, so it does not fit the `status-server.py`
-container-tracking convention. Track it via the GitHub UI runner page
-instead.
+Each agent is a launchd service on the host, not a Docker container,
+so the pool does not fit the `status-server.py` container-tracking
+convention. Track agents via the GitHub UI runner page instead, or
+`gh api repos/zk-coins/node/actions/runners`.
