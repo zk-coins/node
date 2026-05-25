@@ -66,9 +66,12 @@ const SEND_AMOUNT: u64 = 10_000;
 /// Must stay strictly less than `2^48` for Plonky2 Goldilocks safety
 /// — see the matching constant guard in `runtime_tests`. The
 /// happy-path roundtrips probe `/api/balance` on `MINTING_ADDRESS`
-/// before their first mint and assert this exact value, so a dirty
-/// DEV state (prior test residue, missed `reset_state` run) trips a
-/// hard failure instead of being silently treated as "balance dipped".
+/// before their first mint and use this as an upper bound —
+/// `0 < balance <= BOOTSTRAP_MINTING_BALANCE`. The exact value is
+/// not asserted because the deploy-dev push trigger does not run
+/// `reset_state`, so prior test residue legitimately reduces the
+/// minting balance; the bound still catches a fully empty / negative
+/// state.
 const BOOTSTRAP_MINTING_BALANCE: u64 = 1u64 << 48;
 
 fn api_base() -> String {

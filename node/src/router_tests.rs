@@ -3372,6 +3372,104 @@ async fn ready_returns_503_when_esplora_unreachable() {
 }
 
 // =======================================================================
+// GET /health/publisher — operational preflight
+// =======================================================================
+//
+// The publisher health probe surfaces (address, utxo_count, total_sats)
+// for the deploy-dev preflight. Two reachable arms after the lazy_static
+// `PUBLISHER_ADDRESS` refactor: Ok (Esplora responded) and Err (Esplora-
+// side error). The `SecretKey::from_str` panic-arm is no longer in the
+// request path — `PUBLISHER_KEY` is validated once at startup.
+
+#[tokio::test]
+async fn health_publisher_returns_200_with_utxo_count_and_total_sats_when_esplora_responds() {
+    // Mock Esplora returning a known UTXO set so the handler's Ok arm
+    // is exercised: GET /address/{publisher_addr}/utxo returns a JSON
+    // array of UTXOs that get_publisher_utxo parses and sums.
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let esplora_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/address/.+/utxo$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {
+                "txid": "a".repeat(64),
+                "vout": 0,
+                "value": 50_000,
+                "status": { "confirmed": true, "block_height": 1, "block_hash": "b".repeat(64), "block_time": 0 }
+            },
+            {
+                "txid": "c".repeat(64),
+                "vout": 1,
+                "value": 12_345,
+                "status": { "confirmed": true, "block_height": 2, "block_hash": "d".repeat(64), "block_time": 0 }
+            }
+        ])))
+        .mount(&esplora_mock)
+        .await;
+
+    let mut state = mint_test_state();
+    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
+        url: esplora_mock.uri(),
+        is_mainnet: false,
+        network_name: "Mutinynet".to_string(),
+        ws_url: None,
+        track_tx_timeout: None,
+    });
+
+    let req = Request::get("/health/publisher")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+
+    assert_eq!(status, StatusCode::OK, "body={}", body);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("publisher health body is JSON");
+    assert!(
+        v["address"]
+            .as_str()
+            .expect("address present")
+            .starts_with("tb1p"),
+        "publisher address must be Mutinynet bech32 Taproot, got: {:?}",
+        v["address"]
+    );
+    assert_eq!(v["utxo_count"].as_u64().expect("utxo_count u64"), 2);
+    assert_eq!(v["total_sats"].as_u64().expect("total_sats u64"), 62_345);
+}
+
+#[tokio::test]
+async fn health_publisher_returns_503_when_esplora_unreachable() {
+    // Drive the Err arm: mint_test_state() already points esplora at
+    // 127.0.0.1:1 (unreachable), so get_publisher_utxo returns Err
+    // and the handler must map to 503.
+    let state = mint_test_state();
+    let req = Request::get("/health/publisher")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body={}", body);
+    let v: serde_json::Value =
+        serde_json::from_str(&body).expect("publisher health err body is JSON");
+    assert_eq!(
+        v["error"].as_str().expect("error field present"),
+        "Esplora-side error fetching publisher UTXOs"
+    );
+    assert!(
+        v["address"]
+            .as_str()
+            .expect("address present")
+            .starts_with("tb1p"),
+        "publisher address must be returned even on Esplora failure, got: {:?}",
+        v["address"]
+    );
+    assert!(
+        v["detail"].as_str().is_some(),
+        "detail field must be present for diagnostics"
+    );
+}
+
+// =======================================================================
 // POST /api/mint — handler coverage
 // =======================================================================
 //

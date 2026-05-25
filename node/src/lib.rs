@@ -38,8 +38,10 @@ pub mod state;
 pub mod username;
 
 use crate::publisher::EsploraConfig;
+use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
 use lazy_static::lazy_static;
 use sqlx::PgPool;
+use std::str::FromStr;
 
 const DEFAULT_PUBLISHER_KEY: &str =
     "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
@@ -84,6 +86,24 @@ lazy_static! {
             panic!("PUBLISHER_KEY env var must be set for mainnet");
         }
         key
+    };
+
+    /// Taproot publisher address derived once at startup from
+    /// `PUBLISHER_KEY` against the configured `NETWORK_CONFIG`. Folding
+    /// the secp256k1 work into `lazy_static` keeps the request path of
+    /// `publisher_health_handler` pure I/O (no per-request `SecretKey
+    /// ::from_str` / `Address::p2tr`) and removes a structurally
+    /// unreachable `Err` arm — `PUBLISHER_KEY` is validated here, so
+    /// an invalid key panics at startup, not on the first health
+    /// probe. Log-only, NOT a secret (the matching key lives in
+    /// `PUBLISHER_KEY`).
+    pub static ref PUBLISHER_ADDRESS: bitcoin::Address = {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_str(&PUBLISHER_KEY)
+            .expect("PUBLISHER_KEY must be a valid 32-byte hex secp256k1 secret");
+        let key_pair = Keypair::from_secret_key(&secp, &sk);
+        let (xonly, _parity) = XOnlyPublicKey::from_keypair(&key_pair);
+        bitcoin::Address::p2tr(&secp, xonly, None, NETWORK_CONFIG.network())
     };
 
     /// Postgres connection string for the state-layer. Required; the

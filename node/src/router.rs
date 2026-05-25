@@ -1284,31 +1284,9 @@ struct PublisherHealthResponse {
 /// Esplora-side error is intentional: the operator should see the
 /// failure mode, not a fabricated empty response.
 async fn publisher_health_handler(State(state): State<AppState>) -> impl IntoResponse {
-    use bitcoin::secp256k1::{Secp256k1, SecretKey, XOnlyPublicKey};
-    use std::str::FromStr;
+    let publisher_address = &*crate::PUBLISHER_ADDRESS;
 
-    let publisher_key = &*crate::PUBLISHER_KEY;
-    let secp = Secp256k1::new();
-    let sk = match SecretKey::from_str(publisher_key) {
-        Ok(sk) => sk,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "invalid PUBLISHER_KEY",
-                    "detail": e.to_string(),
-                })),
-            )
-                .into_response();
-        }
-    };
-    let key_pair = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &sk);
-    let (xonly, _parity) = XOnlyPublicKey::from_keypair(&key_pair);
-    let network = state.esplora_config.network();
-    let publisher_address = bitcoin::Address::p2tr(&secp, xonly, None, network);
-
-    match crate::publisher::get_publisher_utxo(&publisher_address, &state.esplora_config, None)
-        .await
+    match crate::publisher::get_publisher_utxo(publisher_address, &state.esplora_config, None).await
     {
         Ok(utxos) => {
             let utxo_count = utxos.len() as u64;

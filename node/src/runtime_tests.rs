@@ -148,7 +148,7 @@ async fn start_rest_node_binds_and_serves_health() {
                 );
                 // `/health` is the documented liveness probe whose
                 // body is the literal string "ok" (see the route
-                // registration in `server::create_router`). A 200
+                // registration in `router::create_router`). A 200
                 // status with a different body would still satisfy
                 // the old assertion but signal a regression in the
                 // contract Kuma watches.

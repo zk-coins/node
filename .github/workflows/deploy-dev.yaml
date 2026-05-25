@@ -170,6 +170,9 @@ jobs:
       # commit + reveal pair at typical Mutinynet fee rates needs
       # ~1_500 sats; 50_000 buys ~30 mints before the next top-up.
       # Adjust upward if the suite grows.
+      - name: Ensure jq is installed (preflight dependency)
+        run: command -v jq >/dev/null || brew install jq
+
       - name: Preflight — publisher wallet has UTXOs
         env:
           DEV_API: https://dev-api.zkcoins.app
