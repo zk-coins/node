@@ -74,8 +74,7 @@ pub(crate) fn derive_num_pubkeys_from_smt_with_bound(
             .derive_pub(&SECP256K1, &[ChildNumber::Normal { index: n }])
             .expect("BIP-32 unhardened derivation cannot fail for u32 indices")
             .public_key;
-        let key: [u8; 32] =
-            bitcoin::hashes::sha256::Hash::hash(&pk.serialize()).to_byte_array();
+        let key: [u8; 32] = bitcoin::hashes::sha256::Hash::hash(&pk.serialize()).to_byte_array();
         if smt.get(&key).is_none() {
             return n;
         }
