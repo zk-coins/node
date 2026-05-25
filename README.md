@@ -29,13 +29,13 @@ Full rationale: [docs.zkcoins.app/tech-decisions](https://docs.zkcoins.app/tech-
 
 ## Trust Model
 
-Proof generation runs **inside this server process**. `AccountServer::send_coins` (`server/src/account_node.rs`) calls `self.prover.prove_account_update_with_in_and_out_coins_and_sources(...)` (and the `prove_initial_*` variant for first-time accounts) on every send / receive / mint. ZK proving requires the full private witness, so the server sees, in cleartext:
+Proof generation runs **inside this server process**. `AccountNode::send_coins` (`node/src/account_node.rs`) calls `self.prover.prove_account_update_with_in_and_out_coins_and_sources(...)` (and the `prove_initial_*` variant for first-time accounts) on every send / receive / mint. ZK proving requires the full private witness, so the server sees, in cleartext:
 
 - Sender, recipient, and amount of every coin movement
 - The complete in-coin / out-coin / source-aggregator slot layout per account
 - Account history roots, Merkle proofs, and inclusion-proof witnesses
 - Usernames and their bound coin sets (`UsernameStore`)
-- Postgres rows persisting all of the above (`server/migrations/000{1,2}_*.sql`)
+- Postgres rows persisting all of the above (`node/migrations/000{1,2}_*.sql`)
 
 The **on-chain footprint stays private** — Plonky2 ensures that the public outputs (nullifiers, history roots, Taproot inscriptions) carry no readable transaction data. Block explorers and chain analytics see only opaque 64-byte commitments. The trust boundary is therefore the **server operator**, not the chain.
 
@@ -119,76 +119,76 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 
 #### Health check
 
-- **Module:** `server.rs::main_app` route handler
+- **Module:** `router.rs::main_app` route handler
 - **Behaviour:** returns the literal string `"ok"` with HTTP 200
-- **Tests:** `server.rs::tests::health_returns_ok`
+- **Tests:** `router.rs::tests::health_returns_ok`
 
 #### Network info
 
-- **Module:** `server.rs::info_handler`
+- **Module:** `router.rs::info_handler`
 - **Behaviour:** returns `{ network, capabilities: { address_list, faucet, usernames, lnurl }, username_domain }`. `network` defaults to `Mutinynet` when `IS_MAINNET=false`, `Mainnet` when `true`. `capabilities.{address_list,lnurl}` each reflect whether the corresponding Cargo feature was compiled into this binary, letting clients gate UI on a single server-side source of truth instead of parallel build-time env flags. `capabilities.{faucet,usernames}` are hardcoded `true` — mint and usernames are permanent MVP — and are retained only for back-compat with wallet clients that deserialise the shape. `username_domain` is the external hostname this server serves; **required env var** (server panics on startup if unset). PRD sets `USERNAME_DOMAIN=zkcoins.app`, DEV sets `USERNAME_DOMAIN=dev.zkcoins.app` — distinct from `network` because the same chain can be served from two isolated external hostnames, and the client renders `<hex|username>@<domain>` from this field
-- **Tests:** `server.rs::tests::info_returns_network_name_capabilities_and_username_domain`, `server.rs::tests::info_serialization_format_is_stable`
+- **Tests:** `router.rs::tests::info_returns_network_name_capabilities_and_username_domain`, `router.rs::tests::info_serialization_format_is_stable`
 
 #### Get balance
 
-- **Module:** `server.rs::get_balance_handler` → `account_node.rs::AccountServer::get_account_balance`
+- **Module:** `router.rs::get_balance_handler` → `account_node.rs::AccountNode::get_account_balance`
 - **Behaviour:** address parsed as hex pubkey, looks up the account. Returns `{ balance, username? }`. A well-formed address with no on-chain activity yields `200 OK` with `balance: 0` (canonical zero state, not 404). The minting address returns `u64::MAX`. Malformed input — invalid hex, wrong length, or a missing `address` query parameter — returns `422`
-- **Tests:** `server.rs::tests::balance_*` (6 tests covering happy path, unknown address with and without a claimed username, invalid hex, missing param, wrong length)
+- **Tests:** `router.rs::tests::balance_*` (6 tests covering happy path, unknown address with and without a claimed username, invalid hex, missing param, wrong length)
 
 #### List all addresses
 
-- **Module:** `server.rs::get_address_handler` → `account_node.rs::AccountServer::get_addresses`
+- **Module:** `router.rs::get_address_handler` → `account_node.rs::AccountNode::get_addresses`
 - **Behaviour:** returns all known addresses as hex strings. Intended for explorer/debug use, not user-facing
-- **Tests:** `server.rs::tests::address_returns_list`
+- **Tests:** `router.rs::tests::address_returns_list`
 
 #### Mint coins (single-phase)
 
-- **Module:** `server.rs::mint_handler` → `account_node.rs::send_coins` with the server-held minting account
+- **Module:** `router.rs::mint_handler` → `account_node.rs::send_coins` with the server-held minting account
 - **Behaviour:** server signs commitment itself (no client roundtrip) using the minting key
 - **Proof generation:** `zkcoins_prover::Prover` (the Plonky2 wrapper in [`script-plonky2/`](./script-plonky2/)) — `prove_initial` for new accounts, `prove_account_update` for receivers
 - **Tests:** `account_node.rs::tests::test_create_minting_account`, `test_mint_single_invoice`, `test_mint_repro_live_setup`
 
 #### Send — phase 1 (generate proof)
 
-- **Module:** `server.rs::send_coin_handler` → `verify_send_signature` (Schnorr over `SHA256(account_address || recipient || amount || timestamp)`, ±5 min skew) → `account_node.rs::send_coins`
+- **Module:** `router.rs::send_coin_handler` → `verify_send_signature` (Schnorr over `SHA256(account_address || recipient || amount || timestamp)`, ±5 min skew) → `account_node.rs::send_coins`
 - **Behaviour:** returns `{ proof_id, account_state_hash, output_coins_root }`. Proof is persisted under `data/proofs/<id>.bin` for later commit
-- **Tests:** request-layer tests in `server.rs::tests::send_*` and `send_signature_*` (12 tests covering parser, signature verification, replay). Proof generation itself is not exercised — the Plonky2 cyclic-recursion build is too slow for unit tests (~3–15 min per prove at production parameters); positive proofs are exercised in `program-plonky2/` directly
+- **Tests:** request-layer tests in `router.rs::tests::send_*` and `send_signature_*` (12 tests covering parser, signature verification, replay). Proof generation itself is not exercised — the Plonky2 cyclic-recursion build is too slow for unit tests (~3–15 min per prove at production parameters); positive proofs are exercised in `program-plonky2/` directly
 
 #### Send — phase 2 (commit + broadcast)
 
-- **Module:** `server.rs::commit_handler` → `publisher.rs::create_and_broadcast_inscription`
+- **Module:** `router.rs::commit_handler` → `publisher.rs::create_and_broadcast_inscription`
 - **Behaviour:** verifies the client's Schnorr commitment, builds a Taproot commit+reveal tx pair, mines a txid prefix `4242` (max 400 000 attempts in `publisher.rs::inscription_txs`), broadcasts both txs, then calls `account_node.rs::receive_coin` to deliver the coin to the recipient
-- **Tests:** `server.rs::tests::commit_missing_body_returns_error`, `commit_nonexistent_proof_id_returns_404`. **No happy-path broadcast test** — would require a live Bitcoin signet/regtest
+- **Tests:** `router.rs::tests::commit_missing_body_returns_error`, `commit_nonexistent_proof_id_returns_404`. **No happy-path broadcast test** — would require a live Bitcoin signet/regtest
 
 #### Receive coin
 
-- **Module:** `server.rs::receive_coin_handler` → `account_node.rs::receive_coin`
+- **Module:** `router.rs::receive_coin_handler` → `account_node.rs::receive_coin`
 - **Behaviour:** replay-protected via per-account `coin_history` SMT
 - **Tests:** `account_node.rs::tests::test_receive_duplicate_coin_rejected`, `test_receive_updates_balance`
 
 #### Download coin proof
 
-- **Module:** `server.rs::get_proof_handler` → `ProofStore::get_proof`
+- **Module:** `router.rs::get_proof_handler` → `ProofStore::get_proof`
 - **Behaviour:** streams the binary serialised `CoinProof` (`Vec<u8>` from bincode) with content-type `application/octet-stream`
-- **Tests:** `server.rs::tests::proof_not_found_returns_404`
+- **Tests:** `router.rs::tests::proof_not_found_returns_404`
 
 #### Claim username
 
-- **Module:** `server.rs::claim_username_handler` → `username.rs::UsernameStore::claim`
+- **Module:** `router.rs::claim_username_handler` → `username.rs::UsernameStore::claim`
 - **Behaviour:** verifies Schnorr signature over `SHA256(username || pubkey || timestamp)` (5 min skew); persists to the Postgres `usernames` table via `db::claim_username` (`INSERT … ON CONFLICT DO NOTHING`)
-- **Tests:** `server.rs::tests::claim_username_*` (3 tests) + `username.rs::tests::*` (8 tests covering valid charset, duplicates, persistence)
+- **Tests:** `router.rs::tests::claim_username_*` (3 tests) + `username.rs::tests::*` (8 tests covering valid charset, duplicates, persistence)
 
 #### Resolve username
 
-- **Module:** `server.rs::resolve_username_handler` → `username.rs::UsernameStore::resolve`
+- **Module:** `router.rs::resolve_username_handler` → `username.rs::UsernameStore::resolve`
 - **Behaviour:** if exact username unknown, falls back to hex prefix matching against known addresses. Case-insensitive
-- **Tests:** `server.rs::tests::resolve_unknown_username_returns_404`, `resolve_minting_address_by_hex_prefix`, `username.rs::tests::resolve_is_case_insensitive`
+- **Tests:** `router.rs::tests::resolve_unknown_username_returns_404`, `resolve_minting_address_by_hex_prefix`, `username.rs::tests::resolve_is_case_insensitive`
 
 #### LNURL-Pay metadata and callback
 
-- **Module:** `server.rs::lnurlp_handler`, `server.rs::lnurl_callback_handler`
+- **Module:** `router.rs::lnurlp_handler`, `router.rs::lnurl_callback_handler`
 - **Behaviour:** thin stub implementation of [LNURL-pay](https://github.com/lnurl/luds/blob/luds/06.md). Metadata returned for known usernames; callback returns a phase-2 error (not wired to a real BOLT-11 invoice generator yet)
-- **Tests:** `server.rs::tests::lnurlp_known_address_returns_pay_request`, `lnurlp_unknown_user_returns_404`, `lnurl_pay_callback_returns_phase2_error`
+- **Tests:** `router.rs::tests::lnurlp_known_address_returns_pay_request`, `lnurlp_unknown_user_returns_404`, `lnurl_pay_callback_returns_phase2_error`
 
 #### Bitcoin block scanner
 
@@ -263,7 +263,7 @@ Per-module coverage (CI-gated):
 Requires access to a Bitcoin node. See [Backend docs](https://docs.zkcoins.app/infrastructure/backend).
 
 ```bash
-cargo run -p server
+cargo run -p node
 # Server starts on http://0.0.0.0:4242
 ```
 
@@ -280,10 +280,11 @@ Mint uses a single-phase flow (server holds the minting account key).
 ## Project Structure
 
 ```
-server/                  # Axum REST API
+node/                    # Axum REST API
 ├── src/
 │   ├── main.rs          # Entry point, chain scanner, bind 0.0.0.0:4242
-│   ├── server.rs        # REST endpoints + /health
+│   ├── router.rs        # REST endpoints + /health
+│   ├── runtime.rs       # Bootstrap: lazy_statics, Postgres pool, REST listener
 │   ├── account_node.rs  # Account logic, coin proofs, prover calls
 │   ├── state.rs         # Sparse Merkle Tree + Merkle Mountain Range
 │   ├── scanner.rs       # Bitcoin block scanner (event-driven via scanner_ws, prefix 4242)

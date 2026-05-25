@@ -2382,7 +2382,7 @@ mod tests {
         // prior-slot insert — see
         // [`SparseMerkleTree::generate_inclusion_proof`] which
         // returns the correct siblings against the tree's current
-        // state. Production [`account_server::send_coins`] already
+        // state. Production [`account_node::send_coins`] already
         // does this correctly via `out_coins_tree.generate_inclusion_proof`
         // on the final tree; this restriction is fixture-only.
         //
