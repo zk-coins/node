@@ -101,6 +101,14 @@ pub async fn start_rest_node(
         esplora_config: Arc::new(NETWORK_CONFIG.clone()),
         #[cfg(test)]
         phase2_reached: Arc::new(tokio::sync::Notify::new()),
+        #[cfg(test)]
+        phase3_release: {
+            // Pre-arm so the handler's cfg(test) hold-point is a
+            // no-op for runtime tests that don't exercise the race.
+            let n = Arc::new(tokio::sync::Notify::new());
+            n.notify_one();
+            n
+        },
     };
 
     // Bootstrap the minting account if it isn't already in the DB.

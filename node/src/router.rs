@@ -102,6 +102,17 @@ pub(crate) struct AppState {
     /// `cfg(test)` so the field does not exist in release builds.
     #[cfg(test)]
     pub(crate) phase2_reached: Arc<tokio::sync::Notify>,
+    /// Test-only deterministic hold between `prepare_mint` (phase 2)
+    /// and the phase-3 re-derive. The handler `.notified().await`s
+    /// this AFTER `prepare_mint` returns and BEFORE the re-derive
+    /// reads SMT membership, so the concurrent-mint race test can
+    /// inject `pk_N` between the two without losing the race to a
+    /// fast prover. The notify is pre-armed (`notify_one()` called in
+    /// `test_state` constructors) so production-shaped tests that
+    /// don't care about the hold proceed immediately. Hidden behind
+    /// `cfg(test)` so the field does not exist in release builds.
+    #[cfg(test)]
+    pub(crate) phase3_release: Arc<tokio::sync::Notify>,
 }
 
 // Response types for our API
@@ -905,6 +916,15 @@ async fn mint_handler(
             return send_coins_error_response(e);
         }
     };
+
+    // Test-only deterministic hold between `prepare_mint` and the
+    // phase-3 re-derive. Pre-armed in `test_state` constructors so the
+    // production-shaped tests proceed immediately. The
+    // concurrent-mint race test re-arms it AFTER injecting the SMT
+    // entry to guarantee phase 3 observes the injection. Production
+    // builds compile this out entirely (the field does not exist).
+    #[cfg(test)]
+    state.phase3_release.notified().await;
 
     // Build the BIP-340 commitment over the prover's outputs. Sign with
     // the index-N private key — this is the same key the wallet would

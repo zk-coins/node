@@ -66,6 +66,16 @@ fn test_state() -> AppState {
             track_tx_timeout: None,
         }),
         phase2_reached: Arc::new(tokio::sync::Notify::new()),
+        phase3_release: {
+            // Pre-armed: production-shaped tests proceed immediately
+            // through the cfg(test) hold-point in mint_handler. The
+            // concurrent-mint race test (and any future test that
+            // wants to pause the handler between prove and re-derive)
+            // re-arms it via `notify_one()` after injecting state.
+            let n = Arc::new(tokio::sync::Notify::new());
+            n.notify_one();
+            n
+        },
     }
 }
 
@@ -2239,6 +2249,16 @@ async fn send_with_insufficient_funds_returns_422_with_error_string() {
             track_tx_timeout: None,
         }),
         phase2_reached: Arc::new(tokio::sync::Notify::new()),
+        phase3_release: {
+            // Pre-armed: production-shaped tests proceed immediately
+            // through the cfg(test) hold-point in mint_handler. The
+            // concurrent-mint race test (and any future test that
+            // wants to pause the handler between prove and re-derive)
+            // re-arms it via `notify_one()` after injecting state.
+            let n = Arc::new(tokio::sync::Notify::new());
+            n.notify_one();
+            n
+        },
     };
 
     let secret_bytes = include_bytes!("../minting_secret.bin");
@@ -3533,6 +3553,16 @@ fn mint_test_state() -> AppState {
             track_tx_timeout: None,
         }),
         phase2_reached: Arc::new(tokio::sync::Notify::new()),
+        phase3_release: {
+            // Pre-armed: production-shaped tests proceed immediately
+            // through the cfg(test) hold-point in mint_handler. The
+            // concurrent-mint race test (and any future test that
+            // wants to pause the handler between prove and re-derive)
+            // re-arms it via `notify_one()` after injecting state.
+            let n = Arc::new(tokio::sync::Notify::new());
+            n.notify_one();
+            n
+        },
     }
 }
 
@@ -4499,6 +4529,17 @@ async fn mint_handler_concurrent_mint_during_proof_returns_503() {
     use bitcoin::hashes::Hash;
     let state = mint_test_state();
 
+    // Drain the pre-armed `phase3_release` permit that `mint_test_state`
+    // populates for production-shaped tests. With the permit consumed,
+    // the handler's `state.phase3_release.notified().await` between
+    // `prepare_mint` and the phase-3 re-derive will BLOCK until this
+    // test explicitly calls `notify_one()` AFTER injecting `pk_0`.
+    // This converts the previously-fragile timing race (prover faster
+    // than test's lock acquisition) into a deterministic happens-before
+    // edge: insert lands → notify → handler unblocks → re-derive sees
+    // the bumped count.
+    state.phase3_release.notified().await;
+
     // Pre-subscribe to the phase-2 notify BEFORE spawning the request
     // so a fast handler that acquires `account_node` and fires
     // `notify_one()` immediately cannot lose the signal. `Notified` is
@@ -4540,10 +4581,10 @@ async fn mint_handler_concurrent_mint_during_proof_returns_503() {
         );
 
     // Insert pk_0's key into the SMT so the phase-3 re-derive returns
-    // 1 instead of the captured `expected_num_pubkeys = 0`. Phase 3
-    // acquires the state lock after the prover finishes; the insert
-    // here lands while phase 2 is running its blocking proof work on
-    // the worker thread.
+    // 1 instead of the captured `expected_num_pubkeys = 0`. The
+    // handler is currently blocked on `state.phase3_release` (drained
+    // above) so phase 3 cannot run before this insert lands, even on
+    // a sub-microsecond prover.
     {
         let pk0 = {
             let mc = state.minting_account.lock().unwrap();
@@ -4559,6 +4600,11 @@ async fn mint_handler_concurrent_mint_during_proof_returns_503() {
             .insert(key, zkcoins_program::hash::digest_from_bytes(&[2u8; 32]))
             .expect("inject pk_0 into SMT");
     }
+
+    // Release the handler from the phase3_release hold. It now runs
+    // the phase-3 re-derive against the just-mutated SMT, observes
+    // the bumped count, and returns 503 "Concurrent mint detected".
+    state.phase3_release.notify_one();
 
     let (status, resp_body) =
         tokio::time::timeout(std::time::Duration::from_secs(60), request_task)
