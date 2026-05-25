@@ -217,8 +217,13 @@ pub(crate) async fn broadcast_commit_and_deliver(
         "Broadcasting user commitment ({} bytes)",
         commitment_data.len()
     );
-    if let Err(err) =
-        create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG, Some(&state.pool)).await
+    if let Err(err) = create_and_broadcast_inscription(
+        &commitment_data,
+        crate::db::InscriptionKind::Send,
+        &NETWORK_CONFIG,
+        Some(&state.pool),
+    )
+    .await
     {
         eprintln!("Error broadcasting commit inscription: {}", err);
         return crate::router::handler_error_response(

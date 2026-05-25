@@ -561,6 +561,7 @@ pub async fn get_publisher_utxo(
 /// pre-Phase-B version — no DB writes, no resume hooks.
 pub async fn create_and_broadcast_inscription(
     commitment_data: &[u8],
+    kind: db::InscriptionKind,
     config: &EsploraConfig,
     pool: Option<&PgPool>,
 ) -> Result<(Txid, Txid), Box<dyn std::error::Error + Send + Sync>> {
@@ -627,6 +628,7 @@ pub async fn create_and_broadcast_inscription(
         match db::insert_pending_inscription(
             pool,
             commit_txid.as_byte_array(),
+            kind,
             commitment_data,
             &commit_tx_bytes,
             &reveal_tx_bytes,

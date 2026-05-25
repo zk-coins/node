@@ -556,9 +556,14 @@ async fn create_and_broadcast_inscription_fails_when_no_utxos() {
         .mount(&server)
         .await;
 
-    let err = create_and_broadcast_inscription(b"Hello, zkCoins!", &config, None)
-        .await
-        .expect_err("empty wallet must produce an Err");
+    let err = create_and_broadcast_inscription(
+        b"Hello, zkCoins!",
+        db::InscriptionKind::Mint,
+        &config,
+        None,
+    )
+    .await
+    .expect_err("empty wallet must produce an Err");
 
     assert!(
         err.to_string().contains("No UTXOs available"),
@@ -596,10 +601,14 @@ async fn create_and_broadcast_inscription_succeeds_end_to_end_with_mocked_esplor
         .mount(&server)
         .await;
 
-    let (commit_txid, reveal_txid) =
-        create_and_broadcast_inscription(b"Hello, zkCoins!", &config, None)
-            .await
-            .expect("end-to-end inscription should succeed against mocked Esplora");
+    let (commit_txid, reveal_txid) = create_and_broadcast_inscription(
+        b"Hello, zkCoins!",
+        db::InscriptionKind::Mint,
+        &config,
+        None,
+    )
+    .await
+    .expect("end-to-end inscription should succeed against mocked Esplora");
     assert_ne!(
         commit_txid, reveal_txid,
         "commit and reveal must be distinct transactions"
@@ -716,6 +725,7 @@ async fn seed_pending_row(
     let inserted = db::insert_pending_inscription(
         pool,
         commit_txid.as_byte_array(),
+        db::InscriptionKind::Mint,
         commitment_data,
         &commit_tx_bytes,
         &reveal_tx_bytes,
@@ -761,9 +771,14 @@ async fn broadcast_persists_constructed_row_before_commit_broadcast() {
         .mount(&server)
         .await;
 
-    let _err = create_and_broadcast_inscription(b"phaseb-1", &config, Some(&pool))
-        .await
-        .expect_err("broadcast must fail (400)");
+    let _err = create_and_broadcast_inscription(
+        b"phaseb-1",
+        db::InscriptionKind::Mint,
+        &config,
+        Some(&pool),
+    )
+    .await
+    .expect_err("broadcast must fail (400)");
 
     // Exactly one row, status = constructed (commit broadcast failed
     // so the advance to `commit_broadcast` never fired).
@@ -817,9 +832,14 @@ async fn broadcast_advances_to_commit_broadcast_after_commit_success() {
         .mount(&server)
         .await;
 
-    let _err = create_and_broadcast_inscription(b"phaseb-2", &config, Some(&pool))
-        .await
-        .expect_err("WS timeout (silent mock + no REST fallback) must surface");
+    let _err = create_and_broadcast_inscription(
+        b"phaseb-2",
+        db::InscriptionKind::Mint,
+        &config,
+        Some(&pool),
+    )
+    .await
+    .expect_err("WS timeout (silent mock + no REST fallback) must surface");
 
     // One row, advanced from `constructed` to `commit_broadcast` by
     // the commit-OK hook but stuck there because the reveal step
@@ -867,9 +887,14 @@ async fn broadcast_advances_to_reveal_broadcast_after_reveal_success() {
         .mount(&server)
         .await;
 
-    let _result = create_and_broadcast_inscription(b"phaseb-3", &config, Some(&pool))
-        .await
-        .expect("happy path must succeed");
+    let _result = create_and_broadcast_inscription(
+        b"phaseb-3",
+        db::InscriptionKind::Mint,
+        &config,
+        Some(&pool),
+    )
+    .await
+    .expect("happy path must succeed");
 
     // Final state is `reveal_broadcast` — see Phase E note above.
     assert_eq!(count_pending_rows(&pool).await, 1);
@@ -1211,10 +1236,14 @@ async fn mint_handler_advances_state_synchronously_with_broadcast() {
         .mount(&server)
         .await;
 
-    let (commit_txid, _reveal_txid) =
-        create_and_broadcast_inscription(b"phase-e-1", &config, Some(&pool))
-            .await
-            .expect("happy path must succeed");
+    let (commit_txid, _reveal_txid) = create_and_broadcast_inscription(
+        b"phase-e-1",
+        db::InscriptionKind::Mint,
+        &config,
+        Some(&pool),
+    )
+    .await
+    .expect("happy path must succeed");
 
     // Publisher leg stopped at `reveal_broadcast` — the `mint_handler`
     // caller is what flips it to `complete` after running
@@ -1252,6 +1281,7 @@ async fn scanner_skips_already_integrated_commit_on_replay() {
     db::insert_pending_inscription(
         &pool,
         &commit_txid,
+        db::InscriptionKind::Mint,
         b"phase-e-2",
         b"commit-tx-bytes",
         b"reveal-tx-bytes",
@@ -1303,6 +1333,7 @@ async fn scanner_falls_back_to_state_update_for_commits_not_in_pending() {
     db::insert_pending_inscription(
         &pool,
         &crashed_txid,
+        db::InscriptionKind::Send,
         b"phase-e-3-crashed",
         b"commit-tx-crashed",
         b"reveal-tx-crashed",

@@ -1016,6 +1016,7 @@ async fn mint_handler(
     // next scanner sweep. No in-handler retry.
     let broadcast_outcome = create_and_broadcast_inscription(
         &commitment_data,
+        crate::db::InscriptionKind::Mint,
         &state.esplora_config,
         Some(&state.pool),
     )
@@ -1350,6 +1351,60 @@ async fn commit_handler(
         .await
 }
 
+/// `GET /api/inscriptions/:txid` — operator/forensics lookup of a single
+/// inscription by its commit txid. Surfaces the columns that answer
+/// "what kind of operation was this, and where is it in the publish
+/// pipeline" without exposing the raw commit/reveal/commitment blobs
+/// (those are crash-recovery state, not user-facing).
+///
+/// Returns 404 when no row exists — the inscription either never went
+/// through this server (e.g. external recovery via `recover_inscription`
+/// CLI) or the txid is unknown.
+async fn get_inscription_handler(
+    State(state): State<AppState>,
+    Path(txid_hex): Path<String>,
+) -> axum::response::Response {
+    // Bitcoin convention: display txids are big-endian, but the
+    // `pending_inscriptions.commit_txid` column stores raw little-endian
+    // bytes (matching `bitcoin::Txid::as_byte_array()` semantics — see
+    // `publisher.rs` write site). Reverse on parse so a caller can pass
+    // the same hex an explorer shows.
+    let mut bytes = match hex::decode(txid_hex.trim()) {
+        Ok(b) if b.len() == 32 => b,
+        Ok(_) => {
+            return handler_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "txid must be 32 bytes (64 hex chars)",
+            )
+            .into_response();
+        }
+        Err(_) => {
+            return handler_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "txid is not valid hex",
+            )
+            .into_response();
+        }
+    };
+    bytes.reverse();
+
+    match crate::db::get_inscription_summary_by_commit_txid(&state.pool, &bytes).await {
+        Ok(Some(summary)) => (StatusCode::OK, Json(summary)).into_response(),
+        Ok(None) => {
+            handler_error_response(StatusCode::NOT_FOUND, "No inscription found for this txid")
+                .into_response()
+        }
+        Err(e) => {
+            eprintln!("get_inscription_handler: db error: {}", e);
+            handler_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error while looking up inscription",
+            )
+            .into_response()
+        }
+    }
+}
+
 /// JSON body returned by `GET /health/ready`. `failures` is empty on a
 /// fully ready server; each failing dependency contributes one stable
 /// short tag (`"db"`, `"esplora"`) so a Kuma monitor parses the cause
@@ -1502,6 +1557,7 @@ struct RootEndpoints {
     receive: &'static str,
     commit: &'static str,
     proof: &'static str,
+    inscription: &'static str,
     health: &'static str,
 }
 
@@ -1522,6 +1578,7 @@ async fn root_handler() -> impl IntoResponse {
             receive: "POST /api/receive",
             commit: "POST /api/commit",
             proof: "GET  /api/proof/{id}",
+            inscription: "GET  /api/inscriptions/{txid}",
             health: "GET  /health",
         },
         docs: "https://docs.zkcoins.app",
@@ -1862,6 +1919,7 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/api/proof/:id", get(get_proof_handler))
         .route("/api/commit", post(commit_handler))
         .route("/api/mint", post(mint_handler))
+        .route("/api/inscriptions/:txid", get(get_inscription_handler))
         .route("/api/username/claim", post(claim_username_handler))
         .route(
             "/api/username/resolve/:username",

@@ -449,6 +449,7 @@ async fn pending_inscription_status_by_commit_txid_returns_current_status() {
     insert_pending_inscription(
         &pool,
         &commit_txid,
+        InscriptionKind::Mint,
         commitment,
         commit_tx,
         reveal_tx,
@@ -492,6 +493,7 @@ async fn seed_pending_row(pool: &PgPool, commit_txid: &[u8], status: &str) {
     insert_pending_inscription(
         pool,
         commit_txid,
+        InscriptionKind::Mint,
         b"test-commitment",
         b"test-commit-tx",
         b"test-reveal-tx",

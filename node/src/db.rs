@@ -24,8 +24,47 @@
 // later failure mode for schema drift, which the tests catch on the
 // first run.
 
+use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes, HashDigest};
+
+/// Semantic classification of a `pending_inscriptions` row.
+///
+/// Persisted in the `kind` column added by migration 0006. The two
+/// variants correspond one-to-one with the two `create_and_broadcast_inscription`
+/// callers:
+///
+/// * `Mint` — `router::mint_handler` (server signs the commitment with
+///   the minting account's index-N private key).
+/// * `Send` — `runtime::broadcast_commit_and_deliver`, invoked from
+///   `router::commit_handler` (client signs the commitment with their
+///   wallet key, server only relays it on-chain).
+///
+/// Persisting this is the difference between a DB row that tells you
+/// *what happened* and one that only tells you *that something happened*.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InscriptionKind {
+    Mint,
+    Send,
+}
+
+impl InscriptionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mint => "mint",
+            Self::Send => "send",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "mint" => Some(Self::Mint),
+            "send" => Some(Self::Send),
+            _ => None,
+        }
+    }
+}
 
 /// Connect to `url` and run every migration in `./migrations` against
 /// the pool. Returns the live pool on success.
@@ -424,6 +463,7 @@ pub struct PendingInscriptionRow {
     pub id: i64,
     pub commit_txid: Vec<u8>,
     pub status: String,
+    pub kind: InscriptionKind,
     pub commitment: Vec<u8>,
     pub commit_tx: Vec<u8>,
     pub reveal_tx: Vec<u8>,
@@ -442,6 +482,7 @@ pub struct PendingInscriptionRow {
 pub async fn insert_pending_inscription(
     pool: &PgPool,
     commit_txid: &[u8],
+    kind: InscriptionKind,
     commitment: &[u8],
     commit_tx: &[u8],
     reveal_tx: &[u8],
@@ -449,12 +490,13 @@ pub async fn insert_pending_inscription(
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "INSERT INTO pending_inscriptions \
-         (commit_txid, status, commitment, commit_tx, reveal_tx, commit_output_value) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
+         (commit_txid, status, kind, commitment, commit_tx, reveal_tx, commit_output_value) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
          ON CONFLICT (commit_txid) DO NOTHING",
     )
     .bind(commit_txid)
     .bind(PENDING_STATUS_CONSTRUCTED)
+    .bind(kind.as_str())
     .bind(commitment)
     .bind(commit_tx)
     .bind(reveal_tx)
@@ -523,35 +565,116 @@ pub async fn pending_inscription_status_by_commit_txid(
 pub async fn load_pending_in_progress(
     pool: &PgPool,
 ) -> Result<Vec<PendingInscriptionRow>, sqlx::Error> {
-    // Tuple layout: (id, commit_txid, status, commitment, commit_tx,
-    // reveal_tx, commit_output_value). Aliased to keep the
+    // Tuple layout: (id, commit_txid, status, kind, commitment,
+    // commit_tx, reveal_tx, commit_output_value). Aliased to keep the
     // `sqlx::query_as` annotation under clippy's `type_complexity`
     // threshold.
-    type RawRow = (i64, Vec<u8>, String, Vec<u8>, Vec<u8>, Vec<u8>, i64);
+    type RawRow = (i64, Vec<u8>, String, String, Vec<u8>, Vec<u8>, Vec<u8>, i64);
     let rows: Vec<RawRow> = sqlx::query_as(
-        "SELECT id, commit_txid, status, commitment, commit_tx, reveal_tx, commit_output_value \
+        "SELECT id, commit_txid, status, kind, commitment, commit_tx, reveal_tx, commit_output_value \
          FROM pending_inscriptions \
          WHERE status <> 'complete' \
          ORDER BY id",
     )
     .fetch_all(pool)
     .await?;
-    Ok(rows
-        .into_iter()
+    rows.into_iter()
         .map(
-            |(id, commit_txid, status, commitment, commit_tx, reveal_tx, commit_output_value)| {
-                PendingInscriptionRow {
+            |(
+                id,
+                commit_txid,
+                status,
+                kind,
+                commitment,
+                commit_tx,
+                reveal_tx,
+                commit_output_value,
+            )| {
+                let kind = InscriptionKind::from_db_str(&kind).ok_or_else(|| {
+                    sqlx::Error::Decode(
+                        format!("invalid pending_inscriptions.kind value: {kind:?}").into(),
+                    )
+                })?;
+                Ok(PendingInscriptionRow {
                     id,
                     commit_txid,
                     status,
+                    kind,
                     commitment,
                     commit_tx,
                     reveal_tx,
                     commit_output_value,
-                }
+                })
             },
         )
-        .collect())
+        .collect()
+}
+
+/// Lookup the public-facing view of a single inscription by its commit
+/// txid. Used by the `GET /api/inscriptions/:txid` endpoint to surface
+/// the `(kind, status, value, timestamps)` tuple without exposing the
+/// raw commit/reveal/commitment blobs (which are useful for crash
+/// recovery but not for operator/forensic queries).
+///
+/// Returns `Ok(None)` when no row exists — either because this server
+/// never originated the inscription (e.g. an external recovery via the
+/// `recover_inscription` CLI) or because the txid was never seen here.
+#[derive(Debug, Clone, Serialize)]
+pub struct InscriptionSummary {
+    /// Commit txid as a lowercase hex string. Mirrors the on-chain
+    /// txid shown in block explorers — i.e. big-endian display order,
+    /// the reverse of the raw `bytea` stored in the column.
+    pub commit_txid: String,
+    pub kind: InscriptionKind,
+    pub status: String,
+    pub commit_output_value: i64,
+    /// ISO-8601 / RFC-3339 UTC timestamp, formatted in Postgres so we
+    /// can stay off the `chrono`/`time` sqlx feature flags. Microsecond
+    /// precision; trailing `Z` to make the timezone explicit.
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+pub async fn get_inscription_summary_by_commit_txid(
+    pool: &PgPool,
+    commit_txid: &[u8],
+) -> Result<Option<InscriptionSummary>, sqlx::Error> {
+    type RawRow = (Vec<u8>, String, String, i64, String, String);
+    let row: Option<RawRow> = sqlx::query_as(
+        "SELECT commit_txid, \
+                kind, \
+                status, \
+                commit_output_value, \
+                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
+                to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at \
+         FROM pending_inscriptions \
+         WHERE commit_txid = $1",
+    )
+    .bind(commit_txid)
+    .fetch_optional(pool)
+    .await?;
+    row.map(
+        |(commit_txid_bytes, kind, status, commit_output_value, created_at, updated_at)| {
+            let kind = InscriptionKind::from_db_str(&kind).ok_or_else(|| {
+                sqlx::Error::Decode(
+                    format!("invalid pending_inscriptions.kind value: {kind:?}").into(),
+                )
+            })?;
+            // Reverse to display order — txid in explorers is the
+            // little-endian-stored bytes shown big-endian.
+            let mut display = commit_txid_bytes;
+            display.reverse();
+            Ok(InscriptionSummary {
+                commit_txid: hex::encode(display),
+                kind,
+                status,
+                commit_output_value,
+                created_at,
+                updated_at,
+            })
+        },
+    )
+    .transpose()
 }
 
 // ---- MMR root index persistence (Phase C) ---------------------------------
