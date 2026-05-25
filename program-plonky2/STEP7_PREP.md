@@ -6,12 +6,12 @@
 > Plonky2 Prover, **off-circuit source-side validation as a
 > placeholder while Stage 5d-next-5 Phase 2 was deferred**),
 > `dac0179` (Dockerfile), `d6a3cb9` (inline error-path tests), the
-> test-fixtures port that re-enabled `account_server_tests.rs` +
-> `server_tests.rs` (proof.public_values → proof.public_inputs
+> test-fixtures port that re-enabled `account_node_tests.rs` +
+> `router_tests.rs` (proof.public_values → proof.public_inputs
 > bridge + `[u8;32]` → `HashOut<F>` casts), and the **Step-7
 > follow-up that switched `send_coins` to in-circuit source-side
 > validation** via `prove_*_and_sources` (Stage 5d-next-5 Phase 2b
-> from PR [#23](https://github.com/zk-coins/server/pull/23); the
+> from PR [#23](https://github.com/zk-coins/node/pull/23); the
 > off-circuit pre-check loop is retained as defense-in-depth fast-
 > fail before the prove). See [`../ROADMAP.md`](../ROADMAP.md) "Done"
 > section for the full per-commit timeline.
@@ -50,7 +50,7 @@ avoid editing files Step 5 is also touching.
 
 ## File-by-file inventory
 
-### 1. `server/src/account_server.rs`
+### 1. `node/src/account_node.rs`
 
 | Where | Current | What it becomes | Tag |
 | ----- | ------- | --------------- | --- |
@@ -60,17 +60,17 @@ avoid editing files Step 5 is also touching.
 | L201 | `previous_proof.public_values.read::<ProofData>()` | Same as L132 | 🧩 |
 | L379–380 | `bincode::deserialize::<ProofData>(&proof.public_values.to_vec())` | Same as L132 (no `to_vec` round trip needed if `ProofData` is already a field-element struct) | 🧩 |
 
-### 2. `server/src/server.rs`
+### 2. `node/src/server.rs`
 
 | Where | Current | What it becomes | Tag |
 | ----- | ------- | --------------- | --- |
 | L20 | `use zkcoins_prover::Proof;` | `use zkcoins_prover_plonky2::Proof;` | 🔧 |
 | L15 | `use shared::{Invoice, ProofData};` | unchanged — `ProofData` stays in `shared`, but its underlying definition (re-exported from `zkcoins_program_plonky2`) changes | 🧩 (downstream of `shared/`) |
 | L172, L190, L341 | `bincode::serialize/deserialize` of `CoinProof` (which contains `Proof`) | mostly unchanged — `CoinProof` is opaque-bytes serialised; only fails if the new `Proof` type isn't `serde::Serialize` | 🧩 |
-| L431–432 | `bincode::deserialize::<ProofData>(&coin_proofs[0].proof.public_values.to_vec())` | aligns with L132 of `account_server.rs` — once Step 5 ships the canonical `ProofData::from_proof(&Proof)`, this becomes a one-liner | 🧩 |
+| L431–432 | `bincode::deserialize::<ProofData>(&coin_proofs[0].proof.public_values.to_vec())` | aligns with L132 of `account_node.rs` — once Step 5 ships the canonical `ProofData::from_proof(&Proof)`, this becomes a one-liner | 🧩 |
 | L44–49 | SHA256 over Schnorr message | unchanged — that's BIP-340, stays | — |
 
-### 3. `server/src/state.rs`
+### 3. `node/src/state.rs`
 
 | Where | Current | What it becomes | Tag |
 | ----- | ------- | --------------- | --- |
@@ -78,11 +78,11 @@ avoid editing files Step 5 is also touching.
 | L12 | `use zkcoins_program::merkle::{HashDigest, ZERO_HASH};` | `use zkcoins_program_plonky2::hash::{HashDigest, ZERO_HASH};` | 🔧 |
 | L66–71 | SHA256 hashing of `(smt_root \|\| prev_mmr_root)` for the MMR leaf | **Decision pending**: switch to `hash_concat` (Poseidon) for consistency with the rest of the in-circuit world, OR keep SHA256 for cross-chain readability. The MMR leaves are not in-circuit yet, but they will be once Step 5's monolithic circuit reads `commitment_history_root` from a witness chain. Aligning the off-circuit MMR leaf hash with the in-circuit one means this MUST be Poseidon. | ⚙ → 🔧 once decided |
 
-### 4. `server/src/scanner.rs`
+### 4. `node/src/scanner.rs`
 
 No SP1 references. **Zero changes** unless Step 5 changes the on-chain commitment format (it doesn't per the architectural invariant — Taproot inscription `4242` prefix stays).
 
-### 5. `server/src/main.rs`
+### 5. `node/src/main.rs`
 
 | Where | Current | What it becomes | Tag |
 | ----- | ------- | --------------- | --- |
@@ -90,7 +90,7 @@ No SP1 references. **Zero changes** unless Step 5 changes the on-chain commitmen
 | L90–91 | `State::load_from_files(SMT_PATH, MMR_PATH)` | unchanged signature; depends on persistence helpers existing in `program-plonky2` (see file 3) | 🛠 downstream |
 | L200 | `state.save_to_files(SMT_PATH, MMR_PATH)` | same | 🛠 downstream |
 
-### 6. `server/src/publisher.rs`
+### 6. `node/src/publisher.rs`
 
 No SP1 references. **Zero changes.** Taproot inscription publishing is hash-agnostic.
 
@@ -166,16 +166,16 @@ mismatches" below.
 
 | Category | Files affected | Effort |
 | -------- | -------------- | ------ |
-| 🔧 Mechanical renames / import swaps | account_server.rs, server.rs, state.rs (partial), shared/{lib.rs, commitment.rs}, server/Cargo.toml, root Cargo.toml | ~45 min |
-| 🧩 `HashDigest` semantic shift — `[u8;32]` → `HashOut<F>` (NOT just a type alias swap) | account_server.rs, state.rs, server.rs, server_tests.rs (~30 call sites), shared/commitment.rs (`get_account_state_hash` return type) | ~3–4 hours |
-| 🧩 Proof public-input access — `proof.public_values` (SP1) → `proof.public_inputs` (Plonky2, different element type, different deserialisation) | account_server.rs (3 sites), server.rs (1 site) | ~1 hour |
-| 🛠 `ProgramInputsBuilder` doesn't exist in Plonky2 — server's `send_coins` path needs a different shape (per-slot witnesses instead of batched builder) | account_server.rs (`send_coins`) | ~2–3 hours |
-| 🛠 `Prover::create_account` / `update_account` signatures differ — Plonky2 wrapper uses `prove_initial_with_in_coins` / `prove_account_update_with_in_coins`. Server needs adapter | account_server.rs, server.rs | ~1 hour |
+| 🔧 Mechanical renames / import swaps | account_node.rs, server.rs, state.rs (partial), shared/{lib.rs, commitment.rs}, server/Cargo.toml, root Cargo.toml | ~45 min |
+| 🧩 `HashDigest` semantic shift — `[u8;32]` → `HashOut<F>` (NOT just a type alias swap) | account_node.rs, state.rs, server.rs, router_tests.rs (~30 call sites), shared/commitment.rs (`get_account_state_hash` return type) | ~3–4 hours |
+| 🧩 Proof public-input access — `proof.public_values` (SP1) → `proof.public_inputs` (Plonky2, different element type, different deserialisation) | account_node.rs (3 sites), server.rs (1 site) | ~1 hour |
+| 🛠 `ProgramInputsBuilder` doesn't exist in Plonky2 — server's `send_coins` path needs a different shape (per-slot witnesses instead of batched builder) | account_node.rs (`send_coins`) | ~2–3 hours |
+| 🛠 `Prover::create_account` / `update_account` signatures differ — Plonky2 wrapper uses `prove_initial_with_in_coins` / `prove_account_update_with_in_coins`. Server needs adapter | account_node.rs, server.rs | ~1 hour |
 | 🛠 Persistence helpers (`save_merkle_tree` / `load_merkle_tree` / `save_mmr` / `load_mmr`) | **DONE** in commit `b76bd39` | ✅ |
 | ⚙ Workspace toolchain unification: stable→nightly (entire workspace) | root rust-toolchain, all member Cargo.toml | ~1 hour to migrate + verify shared/server build on nightly |
 | ⚙ MMR leaf hash decision — SHA256 vs Poseidon | state.rs (L66–71) | confirmed Poseidon per arch invariant; ~30 min implement |
 | ⚙ `script/` crate deletion | repo cleanup | ~15 min |
-| Test infrastructure: ~25 `hex::encode(MINTING_ADDRESS)` calls now need `digest_to_bytes(&MINTING_ADDRESS)` first | server_tests.rs, account_server_tests.rs | ~1 hour |
+| Test infrastructure: ~25 `hex::encode(MINTING_ADDRESS)` calls now need `digest_to_bytes(&MINTING_ADDRESS)` first | router_tests.rs, account_node_tests.rs | ~1 hour |
 | State file cleanup | runbook only, not code | trivial |
 
 **REVISED Step 7 estimate: 2 days full-time.** The 🛠 persistence
@@ -192,7 +192,7 @@ reverted to keep the repo buildable):
    the alias name is the same, but the underlying type is different
    (4 × `GoldilocksField` elements vs raw bytes). Implications:
    - `hex::encode(MINTING_ADDRESS)` (used 25+ times in
-     `server_tests.rs`) needs `hex::encode(digest_to_bytes(&MINTING_ADDRESS))`.
+     `router_tests.rs`) needs `hex::encode(digest_to_bytes(&MINTING_ADDRESS))`.
    - `HashOut::default()` for empty initialisation, not `[0u8; 32]`.
    - `serialize().to_vec()` byte concatenation no longer applicable —
      `hash_concat` returns `HashOut`, must `digest_to_bytes` before
@@ -228,7 +228,7 @@ The following Step 7 items become fully concrete only after Step 5 lands:
 1. **`ProofData` deserialisation API**: Step 5's monolithic circuit
    defines the canonical public-input layout. Step 7 picks up
    whatever shape that becomes; until then, the deserialisation
-   sites in `account_server.rs` (L132, L201, L379) and `server.rs`
+   sites in `account_node.rs` (L132, L201, L379) and `router.rs`
    (L431) are unknown shape.
 2. **`ProgramInputsBuilder` equivalent**: SP1's builder for circuit
    inputs has a Plonky2 analogue that Step 5 will introduce as a
