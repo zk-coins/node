@@ -63,7 +63,15 @@ jobs:
           echo "${{ secrets.DEPLOY_PRD_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           echo "${{ secrets.DEPLOY_PRD_SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          # ServerAlive* keep the session alive across long-running
+          # `docker compose recreate` steps where the remote command
+          # produces no stdout for >60s. Mirrors deploy-dev.yaml; see
+          # the comment there for the failure mode that motivated this
+          # (PR #111 merge run 26419696840 — SSH dropped mid-recreate,
+          # exit 255, container actually came up server-side).
           ssh -i ~/.ssh/deploy_key \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=8 \
             -o ProxyCommand="cloudflared access ssh --hostname ${{ secrets.DEPLOY_PRD_HOST }}" \
             ${{ secrets.DEPLOY_PRD_USER }}@${{ secrets.DEPLOY_PRD_HOST }} \
             "zkcoins-node"
