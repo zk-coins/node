@@ -58,6 +58,9 @@ async fn connect_and_migrate_creates_all_tables() {
     let names: Vec<String> = rows.into_iter().map(|r| r.get::<String, _>(0)).collect();
     // _sqlx_migrations is created implicitly by sqlx::migrate!.
     // `minting_meta` lands via 0002_minting_meta.sql (PR-A3).
+    // `pending_inscriptions` lands via 0003_pending_inscriptions.sql
+    // (Phase B). `mmr_root_index` lands via 0004_mmr_root_index.sql
+    // (Phase C).
     assert_eq!(
         names,
         vec![
@@ -65,7 +68,9 @@ async fn connect_and_migrate_creates_all_tables() {
             "accounts".to_string(),
             "latest_block".to_string(),
             "minting_meta".to_string(),
+            "mmr_root_index".to_string(),
             "mmr_state".to_string(),
+            "pending_inscriptions".to_string(),
             "smt_state".to_string(),
             "usernames".to_string(),
         ]

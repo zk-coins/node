@@ -1,5 +1,8 @@
 use super::*;
-use crate::db::{connect_and_migrate, persist_state_tx};
+use crate::db::{
+    connect_and_migrate, insert_root_index, load_root_indices, persist_state_tx,
+    upsert_root_indices,
+};
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
 use sqlx::PgPool;
@@ -7,7 +10,7 @@ use std::str::FromStr;
 use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 use zkcoins_program::circuit::main::MMR_PROOF_PATH_LEN;
-use zkcoins_program::hash::hash_concat;
+use zkcoins_program::hash::{digest_from_bytes, hash_concat};
 
 const HASH_SIZE: usize = 32;
 
@@ -503,4 +506,286 @@ async fn test_get_commitment_proof_returns_err_when_smt_has_key_but_mmr_empty() 
     let mismatched = State::load_from_pg(&pool).await.unwrap();
     let result = mismatched.get_commitment_proof(&commitment.public_key);
     assert!(result.is_err());
+}
+
+// ---- Phase C: mmr_root_index persistence ----------------------------------
+
+/// Drive `State::update` N times and persist each freshly-inserted
+/// `root_indices` entry via [`insert_root_index`]. Returns the populated
+/// state for the caller to inspect / re-load.
+async fn populate_state_with_persistence(pool: &PgPool, count: usize) -> State {
+    let mut state = State::new();
+    for i in 0..count {
+        let key_hex = format!("{:064x}", i + 1);
+        let commitment = create_test_commitment(format!("phase-c-{}", i).as_bytes(), &key_hex);
+        state.update(&[commitment]).expect("update");
+        let (smt_root, leaf_index) = *state
+            .root_indices
+            .get(&state.prev_mmr_root)
+            .expect("update inserted root_indices entry keyed by prev_mmr_root");
+        insert_root_index(pool, &state.prev_mmr_root, &smt_root, leaf_index as u64)
+            .await
+            .expect("insert_root_index");
+        // Also persist SMT + MMR so `load_from_pg` sees a consistent
+        // tree alongside the root_index rows (otherwise the trees come
+        // back empty, which is a less interesting failure mode for
+        // these tests).
+        let (smt_bytes, mmr_bytes) = state.serialize_for_persist().unwrap();
+        persist_state_tx(pool, &smt_bytes, &mmr_bytes, &[0u8; 32])
+            .await
+            .expect("persist_state_tx");
+    }
+    state
+}
+
+#[tokio::test]
+async fn test_root_indices_persist_and_load_roundtrip() {
+    // Drive a handful of updates with per-update persistence, drop the
+    // in-memory state, reload via `State::load_from_pg`, and assert
+    // that the HashMap content + `prev_mmr_root` round-trip.
+    let (pool, _container) = setup_pool().await;
+    let original = populate_state_with_persistence(&pool, 3).await;
+
+    // Sanity: the in-memory map has exactly the number of updates we
+    // ran (each update inserts a fresh `prev_mmr_root` key because the
+    // MMR grows monotonically).
+    assert_eq!(original.root_indices.len(), 3);
+    let original_prev = original.prev_mmr_root;
+    let original_entries: Vec<(HashDigest, (HashDigest, usize))> = original
+        .root_indices
+        .iter()
+        .map(|(k, v)| (*k, *v))
+        .collect();
+    drop(original);
+
+    let loaded = State::load_from_pg(&pool).await.expect("load_from_pg");
+    assert_eq!(loaded.root_indices.len(), 3);
+    for (key, value) in &original_entries {
+        assert_eq!(
+            loaded.root_indices.get(key).copied(),
+            Some(*value),
+            "root_indices entry must round-trip"
+        );
+    }
+    assert_eq!(
+        loaded.prev_mmr_root, original_prev,
+        "prev_mmr_root must be restored from the highest-leaf_index entry"
+    );
+}
+
+#[tokio::test]
+async fn test_load_from_pg_with_empty_root_index_table_yields_empty_map() {
+    // Fresh DB: the table exists but has no rows. `load_from_pg` must
+    // succeed and leave `root_indices` empty + `prev_mmr_root` at
+    // `ZERO_HASH` (matches `State::new`).
+    let (pool, _container) = setup_pool().await;
+    let loaded = State::load_from_pg(&pool).await.expect("load_from_pg");
+    assert!(loaded.root_indices.is_empty());
+    assert_eq!(loaded.prev_mmr_root, ZERO_HASH);
+}
+
+#[tokio::test]
+async fn test_get_mmr_inclusion_proof_after_restart_succeeds() {
+    // The original bug: a container restart cleared `root_indices`, so
+    // any account whose latest proof referenced a `commitment_history_
+    // root` from BEFORE the restart hit
+    // `get_mmr_inclusion_proof -> Err`, and `/api/mint` surfaced 422
+    // `Unable to get mmr inclusion proof for the previous root`.
+    //
+    // After Phase C, every entry persisted by `insert_root_index` is
+    // rebuilt by `load_from_pg`, so each historical
+    // `prev_mmr_root` must resolve to a valid `(smt_root, MMRProof)`
+    // tuple on the reloaded state. Belt-and-braces: also verify the
+    // returned proof against the post-update MMR root in extended form
+    // (matches what a Plonky2 proof commits as `commitment_history_root`).
+    let (pool, _container) = setup_pool().await;
+
+    // Capture each pre-update `prev_mmr_root` during the populate run.
+    let mut prev_roots: Vec<HashDigest> = Vec::new();
+    let mut state = State::new();
+    let n = 4;
+    for i in 0..n {
+        let pre_root = state.mmr.root_extended(MMR_PROOF_PATH_LEN);
+        prev_roots.push(pre_root);
+
+        let key_hex = format!("{:064x}", i + 10);
+        let commitment = create_test_commitment(format!("restart-test-{}", i).as_bytes(), &key_hex);
+        state.update(&[commitment]).expect("update");
+        let (smt_root, leaf_index) = *state
+            .root_indices
+            .get(&state.prev_mmr_root)
+            .expect("update inserted root_indices entry");
+        insert_root_index(&pool, &state.prev_mmr_root, &smt_root, leaf_index as u64)
+            .await
+            .expect("insert_root_index");
+        let (smt_bytes, mmr_bytes) = state.serialize_for_persist().unwrap();
+        persist_state_tx(&pool, &smt_bytes, &mmr_bytes, &[0u8; 32])
+            .await
+            .expect("persist_state_tx");
+    }
+    let final_mmr_root_extended = state.mmr.root_extended(MMR_PROOF_PATH_LEN);
+    drop(state);
+
+    // "Restart" — load a fresh State from the same pool.
+    let restarted = State::load_from_pg(&pool).await.expect("load_from_pg");
+    assert_eq!(restarted.root_indices.len(), n);
+
+    for (i, prev_root) in prev_roots.iter().enumerate() {
+        let (smt_root, proof) = restarted
+            .get_mmr_inclusion_proof(*prev_root)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "historical prev_mmr_root {} must resolve after restart, got Err({})",
+                    i, e
+                )
+            });
+        let leaf = hash_concat(&smt_root, prev_root);
+        let proof_extended = proof.extend_to(MMR_PROOF_PATH_LEN);
+        assert!(
+            proof_extended.verify(leaf, final_mmr_root_extended),
+            "restored proof must verify against the loaded MMR root (entry {})",
+            i
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_upsert_root_indices_batch_path_idempotent() {
+    // Exercise the batch helper (used by future snapshot-serialization
+    // tooling). Two invocations of the same batch must be idempotent
+    // thanks to ON CONFLICT DO NOTHING, and the empty-slice early-return
+    // must also be a no-op. Coverage gate (Phase C) requires every
+    // branch of the helper to be hit.
+    let (pool, _container) = setup_pool().await;
+
+    // Empty batch — early return.
+    upsert_root_indices(&pool, &[]).await.expect("empty batch");
+    assert!(load_root_indices(&pool).await.unwrap().is_empty());
+
+    // Non-empty batch — write three rows, then write the same three
+    // rows again. Second pass must not duplicate, must not error.
+    let entries: Vec<(HashDigest, HashDigest, u64)> = (0..3)
+        .map(|i| {
+            (
+                digest_from_bytes(&[i as u8; 32]),
+                digest_from_bytes(&[(i + 100) as u8; 32]),
+                i as u64,
+            )
+        })
+        .collect();
+    upsert_root_indices(&pool, &entries)
+        .await
+        .expect("first upsert");
+    upsert_root_indices(&pool, &entries)
+        .await
+        .expect("second upsert (idempotent)");
+    let loaded = load_root_indices(&pool).await.expect("load");
+    assert_eq!(loaded.len(), 3);
+    // ORDER BY leaf_index — should match insertion order here.
+    for (i, (prev, smt, idx)) in loaded.iter().enumerate() {
+        assert_eq!(*prev, entries[i].0);
+        assert_eq!(*smt, entries[i].1);
+        assert_eq!(*idx, entries[i].2);
+    }
+}
+
+#[tokio::test]
+async fn test_load_root_indices_rejects_short_prev_root_blob() {
+    // Defensive decode branch in `load_root_indices`: a manually-
+    // inserted row whose `prev_mmr_root` BYTEA is not 32 bytes must
+    // surface as `sqlx::Error::Decode` rather than panicking on the
+    // `try_into::<[u8; 32]>()`.
+    let (pool, _container) = setup_pool().await;
+    sqlx::query(
+        "INSERT INTO mmr_root_index (prev_mmr_root, smt_root, leaf_index) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind(&vec![0xAAu8; 8][..])
+    .bind(&vec![0xBBu8; 32][..])
+    .bind(0_i64)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let err = load_root_indices(&pool)
+        .await
+        .expect_err("expected decode error on short prev_mmr_root");
+    let msg = format!("{}", err);
+    assert!(msg.contains("prev_mmr_root"), "unexpected: {}", msg);
+}
+
+#[tokio::test]
+async fn test_load_root_indices_rejects_short_smt_root_blob() {
+    // Same defensive branch, for the `smt_root` column.
+    let (pool, _container) = setup_pool().await;
+    sqlx::query(
+        "INSERT INTO mmr_root_index (prev_mmr_root, smt_root, leaf_index) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind(&vec![0xAAu8; 32][..])
+    .bind(&vec![0xBBu8; 8][..])
+    .bind(0_i64)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let err = load_root_indices(&pool)
+        .await
+        .expect_err("expected decode error on short smt_root");
+    let msg = format!("{}", err);
+    assert!(msg.contains("smt_root"), "unexpected: {}", msg);
+}
+
+#[tokio::test]
+async fn test_load_root_indices_rejects_negative_leaf_index() {
+    // Defensive branch in `load_root_indices`: BIGINT is signed and the
+    // column has no CHECK constraint, so a manual operator INSERT could
+    // plant a negative value. Surface as decode error.
+    //
+    // ALSO covers the matching `load_from_pg` -> `LoadStateError::Db`
+    // path: the error is wrapped in `LoadStateError::Db` because
+    // `load_root_indices` returns `sqlx::Error` and the `From` impl on
+    // `LoadStateError` re-wraps it.
+    let (pool, _container) = setup_pool().await;
+    sqlx::query(
+        "INSERT INTO mmr_root_index (prev_mmr_root, smt_root, leaf_index) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind(&vec![0xAAu8; 32][..])
+    .bind(&vec![0xBBu8; 32][..])
+    .bind(-1_i64)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let err = load_root_indices(&pool)
+        .await
+        .expect_err("expected decode error on negative leaf_index");
+    let msg = format!("{}", err);
+    assert!(msg.contains("leaf_index"), "unexpected: {}", msg);
+
+    // And the matching `State::load_from_pg` surface — must arrive as
+    // `LoadStateError::Db` (the `From<sqlx::Error>` branch).
+    let err = State::load_from_pg(&pool)
+        .await
+        .expect_err("expected db error from load_from_pg");
+    assert!(
+        matches!(err, crate::state::LoadStateError::Db(_)),
+        "unexpected: {:?}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn test_insert_root_index_is_idempotent_on_conflict() {
+    // Single-row insert is `ON CONFLICT DO NOTHING` — re-issuing the
+    // same `prev_mmr_root` must not error and must not duplicate.
+    let (pool, _container) = setup_pool().await;
+    let prev = digest_from_bytes(&[1u8; 32]);
+    let smt = digest_from_bytes(&[2u8; 32]);
+    insert_root_index(&pool, &prev, &smt, 0)
+        .await
+        .expect("first insert");
+    insert_root_index(&pool, &prev, &smt, 0)
+        .await
+        .expect("second insert (idempotent)");
+    let loaded = load_root_indices(&pool).await.unwrap();
+    assert_eq!(loaded.len(), 1);
 }
