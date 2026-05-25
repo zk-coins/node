@@ -793,7 +793,15 @@ pub async fn broadcast_inscription_txs_with_persistence(
         db::PENDING_STATUS_REVEAL_BROADCAST,
     )
     .await;
-    advance_pending_status(pool, &commit_txid_bytes, db::PENDING_STATUS_COMPLETE).await;
+    // Phase E: the row stays at `reveal_broadcast` here. The caller
+    // (`mint_handler`) advances to `complete` only AFTER it has applied
+    // `state.update` to the in-memory SMT/MMR and persisted the snapshot.
+    // The scanner's pre-`state.update` lookup uses the
+    // `complete` marker to decide whether the inscription has already
+    // been integrated by the mint flow — advancing here would set the
+    // marker before the integration actually happened and let a
+    // mid-flight crash leave a `complete` row whose SMT/MMR were never
+    // updated, which the scanner would then skip on replay.
 
     Ok((commit_txid, reveal_txid))
 }
@@ -935,13 +943,18 @@ async fn resume_single_row(
                 Ok(()) => {}
                 Err(e) if is_inputs_missingorspent_error(&e) => {
                     println!(
-                        "resume: reveal for {} already on chain (txn-already-known); marking complete",
+                        "resume: reveal for {} already on chain (txn-already-known)",
                         commit_txid
                     );
                 }
                 Err(e) => return Err(e.into()),
             }
-            db::update_pending_status(pool, &row.commit_txid, db::PENDING_STATUS_COMPLETE).await?;
+            // Phase E: leave the row at `reveal_broadcast`. The scanner
+            // will observe the commit on chain, see the non-`complete`
+            // status, run `state.update` itself, and only then mark the
+            // row `complete` — the `complete` marker now means "SMT/MMR
+            // contain this inscription's entry", which the resumer
+            // cannot truthfully assert from outside the state lock.
         }
         other => {
             // Forward-compatible: an unknown status (e.g. a future
@@ -958,8 +971,16 @@ async fn resume_single_row(
     Ok(())
 }
 
-/// Broadcast `reveal_tx` and mark the matching row `complete`. Used by
-/// both the `constructed` and `commit_broadcast` resume branches.
+/// Broadcast `reveal_tx` and advance the matching row to
+/// `reveal_broadcast`. Used by both the `constructed` and
+/// `commit_broadcast` resume branches.
+///
+/// Phase E: this no longer flips the row to `complete`. The `complete`
+/// marker now means "SMT/MMR contain this inscription's entry", which
+/// only the in-process mint flow (or the scanner-replay path after
+/// re-running `state.update`) can truthfully assert. The resumer is
+/// outside both code paths, so it stops at `reveal_broadcast` and
+/// lets the scanner finish the integration.
 async fn broadcast_reveal_and_complete(
     pool: &PgPool,
     client: &EsploraAsyncClient<DefaultSleeper>,
@@ -969,16 +990,20 @@ async fn broadcast_reveal_and_complete(
     match client.broadcast(reveal_tx).await {
         Ok(()) => {}
         Err(e) if is_inputs_missingorspent_error(&e) => {
-            // Reveal already on chain — advance.
+            // Reveal already on chain — proceed to advance the row.
             println!(
-                "resume: reveal {} already on chain (txn-already-known); marking complete",
+                "resume: reveal {} already on chain (txn-already-known)",
                 reveal_tx.compute_txid()
             );
         }
         Err(e) => return Err(e.into()),
     }
     db::update_pending_status(pool, commit_txid_bytes, db::PENDING_STATUS_REVEAL_BROADCAST).await?;
-    db::update_pending_status(pool, commit_txid_bytes, db::PENDING_STATUS_COMPLETE).await?;
+    // Phase E: do not advance to `complete` here either. See the
+    // `PENDING_STATUS_REVEAL_BROADCAST` branch in `resume_single_row`
+    // for the rationale — `complete` is now reserved for "SMT/MMR
+    // hold this entry", which the scanner sets after running
+    // `state.update`.
     Ok(())
 }
 
