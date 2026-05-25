@@ -364,14 +364,14 @@ pub async fn broadcast_inscription_txs(
                     );
                 }
                 Ok(None) => {
-                    eprintln!(
+                    println!(
                         "esplora-REST fallback: commit tx {} not found (404); broadcast genuinely failed",
                         commit_txid
                     );
                     return Err(Box::new(crate::scanner_ws::WsError::Timeout));
                 }
                 Err(e) => {
-                    eprintln!(
+                    println!(
                         "esplora-REST fallback failed for {}: {}; propagating original WS timeout",
                         commit_txid, e
                     );
