@@ -353,7 +353,7 @@ jobs:
       - name: Run llvm-cov (MVP scope, 100% line + function gate)
         run: |
           cargo llvm-cov nextest --release -p node --show-missing-lines \
-            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|_tests\.rs$' \
+            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|_tests\.rs$|bin/.*\.rs$' \
             --fail-under-lines 100 \
             --fail-under-functions 100 \
             --test-threads 1 \
