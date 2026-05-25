@@ -191,6 +191,80 @@ pub async fn persist_state_tx(
     tx.commit().await
 }
 
+/// Phase-E variant of [`persist_state_tx`] that writes the SMT, MMR,
+/// and `mmr_root_index` row WITHOUT touching the `latest_block` row.
+///
+/// `mint_handler` calls this after applying `state.update` synchronously
+/// to the in-memory SMT/MMR. The freshly broadcast inscription is not
+/// yet in a Bitcoin block, so the mint handler has no business
+/// overwriting the scanner's `latest_block` pointer — that pointer is
+/// the scanner's resume marker and the only writer that knows which
+/// block holds an inscription is the scanner itself. Splitting the
+/// write keeps the scanner's resume contract intact while still giving
+/// the mint flow the atomic SMT + MMR + root_index bundle that the
+/// "two mints in the same scanner window" race requires.
+///
+/// Other than the missing `latest_block` UPSERT, the body is identical
+/// to `persist_state_tx`: same singleton-row UPSERTs, same
+/// `ON CONFLICT (prev_mmr_root) DO NOTHING` for the root-index row,
+/// same atomic BEGIN/COMMIT envelope so a partial-failure leaves the
+/// trio consistent.
+pub async fn persist_state_without_block_tx(
+    pool: &PgPool,
+    smt: &[u8],
+    mmr: &[u8],
+    root_index_entry: Option<(&HashDigest, &HashDigest, u64)>,
+) -> Result<(), sqlx::Error> {
+    let root_index_bytes = match root_index_entry {
+        None => None,
+        Some((prev_root, smt_root, leaf_index)) => {
+            let leaf_i64 = i64::try_from(leaf_index).map_err(|_| {
+                sqlx::Error::Encode(
+                    format!("leaf_index {} does not fit in i64 (BIGINT)", leaf_index).into(),
+                )
+            })?;
+            Some((
+                digest_to_bytes(prev_root),
+                digest_to_bytes(smt_root),
+                leaf_i64,
+            ))
+        }
+    };
+
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO smt_state (id, data, updated_at) \
+         VALUES (1, $1, NOW()) \
+         ON CONFLICT (id) DO UPDATE \
+         SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at",
+    )
+    .bind(smt)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO mmr_state (id, data, updated_at) \
+         VALUES (1, $1, NOW()) \
+         ON CONFLICT (id) DO UPDATE \
+         SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at",
+    )
+    .bind(mmr)
+    .execute(&mut *tx)
+    .await?;
+    if let Some((prev_bytes, smt_bytes, leaf_i64)) = root_index_bytes {
+        sqlx::query(
+            "INSERT INTO mmr_root_index (prev_mmr_root, smt_root, leaf_index, created_at) \
+             VALUES ($1, $2, $3, NOW()) \
+             ON CONFLICT (prev_mmr_root) DO NOTHING",
+        )
+        .bind(&prev_bytes[..])
+        .bind(&smt_bytes[..])
+        .bind(leaf_i64)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
+}
+
 // ---- Account persistence (PR-A3) ------------------------------------------
 
 /// Load every `(address, data)` pair from the `accounts` table.
@@ -388,6 +462,38 @@ pub async fn update_pending_status(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Look up the current `status` value for a `pending_inscriptions` row
+/// keyed by its `commit_txid`. Returns `Ok(None)` when no row exists
+/// (an external inscription that never went through this server's mint
+/// flow, e.g. an out-of-band manual recovery via the `recover_inscription`
+/// CLI in PR #106, or a fresh database).
+///
+/// Phase E (this commit) wires `mint_handler` to advance `state.update`
+/// synchronously after the on-chain broadcast succeeds and then mark
+/// the row `complete`. The scanner uses this lookup to decide whether
+/// it can skip its own `state.update` call when it later observes the
+/// same commit on chain: a `complete` row means the SMT/MMR already
+/// hold the inscription's entry and a second `smt.insert` / `mmr.append`
+/// would either no-op (idempotent SMT path on identical key+value) or
+/// — worse — diverge the MMR if any byte differs. Any other status,
+/// including a missing row, means the scanner remains responsible for
+/// integrating the inscription.
+///
+/// The `commit_txid` argument is the raw 32-byte little-endian txid of
+/// the inscription's commit transaction, identical to the `commit_txid`
+/// column written by `insert_pending_inscription`.
+pub async fn pending_inscription_status_by_commit_txid(
+    pool: &PgPool,
+    commit_txid: &[u8],
+) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM pending_inscriptions WHERE commit_txid = $1")
+            .bind(commit_txid)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(status,)| status))
 }
 
 /// Load every row whose status is not `complete`, ordered by `id` so

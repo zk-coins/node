@@ -422,3 +422,132 @@ async fn connect_and_migrate_propagates_migration_failure() {
         err
     );
 }
+
+// ---- Phase E: pending_inscription_status_by_commit_txid ------------------
+
+#[tokio::test]
+async fn pending_inscription_status_by_commit_txid_returns_none_for_unknown_txid() {
+    // Scanner's pre-state.update lookup: an external / out-of-band
+    // inscription (not produced by this server's mint flow) has no
+    // `pending_inscriptions` row. The helper must return `None` so the
+    // scanner falls through to its normal state.update path instead of
+    // short-circuiting.
+    let (pool, _container) = setup_pool().await;
+    let status = pending_inscription_status_by_commit_txid(&pool, &[0xABu8; 32])
+        .await
+        .expect("lookup must not error on missing row");
+    assert!(status.is_none());
+}
+
+#[tokio::test]
+async fn pending_inscription_status_by_commit_txid_returns_current_status() {
+    let (pool, _container) = setup_pool().await;
+    let commit_txid = [0xCDu8; 32];
+    let commitment = b"test-commitment";
+    let commit_tx = b"test-commit-tx";
+    let reveal_tx = b"test-reveal-tx";
+    insert_pending_inscription(
+        &pool,
+        &commit_txid,
+        commitment,
+        commit_tx,
+        reveal_tx,
+        12_345,
+    )
+    .await
+    .expect("insert must succeed");
+    assert_eq!(
+        pending_inscription_status_by_commit_txid(&pool, &commit_txid)
+            .await
+            .unwrap(),
+        Some(PENDING_STATUS_CONSTRUCTED.to_string())
+    );
+
+    update_pending_status(&pool, &commit_txid, PENDING_STATUS_REVEAL_BROADCAST)
+        .await
+        .unwrap();
+    assert_eq!(
+        pending_inscription_status_by_commit_txid(&pool, &commit_txid)
+            .await
+            .unwrap(),
+        Some(PENDING_STATUS_REVEAL_BROADCAST.to_string())
+    );
+
+    update_pending_status(&pool, &commit_txid, PENDING_STATUS_COMPLETE)
+        .await
+        .unwrap();
+    assert_eq!(
+        pending_inscription_status_by_commit_txid(&pool, &commit_txid)
+            .await
+            .unwrap(),
+        Some(PENDING_STATUS_COMPLETE.to_string())
+    );
+}
+
+// ---- Phase E: persist_state_without_block_tx -----------------------------
+
+#[tokio::test]
+async fn persist_state_without_block_tx_writes_smt_mmr_and_root_index() {
+    // mint_handler's STATE_ADVANCE path uses the `_without_block`
+    // variant: SMT/MMR/root_index land in one transaction, the
+    // `latest_block` row is left untouched (the scanner is the only
+    // legitimate writer of `latest_block`).
+    let (pool, _container) = setup_pool().await;
+    let smt = vec![0x11u8; 64];
+    let mmr = vec![0x22u8; 128];
+    let prev_root = zkcoins_program::hash::digest_from_bytes(&[0x40u8; 32]);
+    let smt_root = zkcoins_program::hash::digest_from_bytes(&[0x50u8; 32]);
+
+    persist_state_without_block_tx(&pool, &smt, &mmr, Some((&prev_root, &smt_root, 3)))
+        .await
+        .expect("persist_state_without_block_tx must succeed");
+
+    assert_eq!(load_smt(&pool).await.unwrap(), Some(smt));
+    assert_eq!(load_mmr(&pool).await.unwrap(), Some(mmr));
+    // latest_block was NOT written by this helper.
+    assert_eq!(load_latest_block(&pool).await.unwrap(), None);
+    let entries = load_root_indices(&pool).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0], (prev_root, smt_root, 3));
+}
+
+#[tokio::test]
+async fn persist_state_without_block_tx_preserves_existing_latest_block() {
+    // A scanner sweep landed a `latest_block` before the mint flow
+    // ever ran. The mint flow's `persist_state_without_block_tx` call
+    // must NOT rewind that pointer back to the genesis fallback —
+    // splitting the helper from `persist_state_tx` is exactly what
+    // keeps the scanner's resume marker independent of the mint flow.
+    let (pool, _container) = setup_pool().await;
+    let scanner_block = [0x77u8; 32];
+    persist_state_tx(&pool, b"old-smt", b"old-mmr", &scanner_block, None)
+        .await
+        .unwrap();
+
+    persist_state_without_block_tx(&pool, b"new-smt", b"new-mmr", None)
+        .await
+        .unwrap();
+
+    assert_eq!(load_smt(&pool).await.unwrap(), Some(b"new-smt".to_vec()));
+    assert_eq!(load_mmr(&pool).await.unwrap(), Some(b"new-mmr".to_vec()));
+    assert_eq!(
+        load_latest_block(&pool).await.unwrap(),
+        Some(scanner_block),
+        "latest_block must remain untouched after persist_state_without_block_tx"
+    );
+}
+
+#[tokio::test]
+async fn persist_state_without_block_tx_accepts_no_root_index() {
+    // Mirror the `persist_state_tx` no-root-index branch: a call with
+    // `None` writes SMT + MMR only. The mmr_root_index table stays
+    // empty, no error, latest_block untouched.
+    let (pool, _container) = setup_pool().await;
+    persist_state_without_block_tx(&pool, b"smt-only", b"mmr-only", None)
+        .await
+        .expect("no-root-index path must succeed");
+    assert_eq!(load_smt(&pool).await.unwrap(), Some(b"smt-only".to_vec()));
+    assert_eq!(load_mmr(&pool).await.unwrap(), Some(b"mmr-only".to_vec()));
+    assert!(load_root_indices(&pool).await.unwrap().is_empty());
+    assert_eq!(load_latest_block(&pool).await.unwrap(), None);
+}
