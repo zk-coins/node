@@ -23,7 +23,7 @@ use tokio::net::TcpListener;
 
 use crate::account_node::{persist_account, CoinProof};
 use crate::db;
-use crate::publisher::create_and_broadcast_inscription;
+use crate::publisher::{create_and_broadcast_inscription, resume_pending_inscriptions};
 use crate::router::{lock_or_recover, SendCoinResponse};
 use crate::NETWORK_CONFIG;
 
@@ -216,6 +216,26 @@ pub async fn start_rest_node(
             .map_err(|e| anyhow::anyhow!(e))?;
     }
 
+    // Phase B: re-broadcast any pending inscriptions left over from
+    // a previous boot. A crash between commit-broadcast and
+    // reveal-broadcast (or between construction and either broadcast)
+    // leaves a row in `pending_inscriptions` with status != complete;
+    // walk each one to completion before opening the listener so
+    // operators do not see a stuck UTXO until the next mint triggers
+    // the resumer.
+    //
+    // Failures here are LOGGED and SWALLOWED — the operator's escape
+    // hatch is the PR #106 CLI recovery tool, and a transient
+    // Esplora outage on boot must not crash-loop the container.
+    // Mirrors the log-and-continue shape at runtime.rs:109 for the
+    // minting_meta load.
+    if let Err(e) = resume_pending_inscriptions(&pool, &NETWORK_CONFIG).await {
+        eprintln!(
+            "Failed to resume pending inscriptions on bootstrap (continuing anyway): {}",
+            e
+        );
+    }
+
     let app = create_router(state);
 
     println!("REST server started at {}", socket_addr);
@@ -356,7 +376,9 @@ pub(crate) async fn broadcast_commit_and_deliver(
         "Broadcasting user commitment ({} bytes)",
         commitment_data.len()
     );
-    if let Err(err) = create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG).await {
+    if let Err(err) =
+        create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG, Some(&state.pool)).await
+    {
         eprintln!("Error broadcasting commit inscription: {}", err);
         return crate::router::handler_error_response(
             StatusCode::SERVICE_UNAVAILABLE,

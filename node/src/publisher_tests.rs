@@ -7,6 +7,7 @@
 //! exercised against a `wiremock` mock server so no real network is hit.
 
 use super::*;
+use crate::db;
 use bitcoin::blockdata::opcodes;
 use bitcoin::hashes::Hash;
 use bitcoin::script::Instruction;
@@ -16,6 +17,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::str::FromStr;
 use std::time::Duration;
+use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
+use testcontainers_modules::postgres::Postgres;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use wiremock::matchers::{method, path};
@@ -553,7 +556,7 @@ async fn create_and_broadcast_inscription_fails_when_no_utxos() {
         .mount(&server)
         .await;
 
-    let err = create_and_broadcast_inscription(b"Hello, zkCoins!", &config)
+    let err = create_and_broadcast_inscription(b"Hello, zkCoins!", &config, None)
         .await
         .expect_err("empty wallet must produce an Err, not Ok(None)");
 
@@ -593,7 +596,7 @@ async fn create_and_broadcast_inscription_succeeds_end_to_end_with_mocked_esplor
         .mount(&server)
         .await;
 
-    let result = create_and_broadcast_inscription(b"Hello, zkCoins!", &config)
+    let result = create_and_broadcast_inscription(b"Hello, zkCoins!", &config, None)
         .await
         .expect("end-to-end inscription should succeed against mocked Esplora");
 
@@ -611,5 +614,515 @@ async fn create_and_broadcast_inscription_succeeds_end_to_end_with_mocked_esplor
         "reveal txid {} must start with marker {}",
         reveal_txid,
         INSCRIPTION_MARKER_PREFIX
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Phase B: pending_inscriptions persistence + resume
+// -----------------------------------------------------------------------------
+//
+// These tests pair a real Postgres 17 container (via testcontainers) with
+// wiremock-mocked Esplora. They exercise:
+//
+//   1-3) Forward path: `create_and_broadcast_inscription` persists a
+//        `constructed` row BEFORE the commit broadcast, advances it to
+//        `commit_broadcast`, `reveal_broadcast`, and finally `complete`
+//        as each step lands.
+//   4-7) Resume path: `resume_pending_inscriptions` walks each non-
+//        complete row to `complete` regardless of starting status, skips
+//        completed rows, and is idempotent when called a second time.
+//   8)   Resume path tolerance: a `bad-txns-inputs-missingorspent`
+//        rejection from Esplora's commit-broadcast on resume means the
+//        commit already landed on a previous attempt; the resumer
+//        advances and continues with the reveal instead of bailing.
+
+/// Spin up a fresh `postgres:17` container and connect a migrated pool.
+async fn setup_phaseb_pool() -> (PgPool, ContainerAsync<Postgres>) {
+    let container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = container
+        .get_host()
+        .await
+        .expect("failed to get container host");
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("failed to get container port");
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = db::connect_and_migrate(&url)
+        .await
+        .expect("connect_and_migrate failed");
+    (pool, container)
+}
+
+/// Read the current status of a pending row by `commit_txid`. Panics if
+/// no row exists — the caller is asserting that one is present.
+async fn fetch_pending_status(pool: &PgPool, commit_txid: &[u8]) -> String {
+    let row: (String,) =
+        sqlx::query_as("SELECT status FROM pending_inscriptions WHERE commit_txid = $1")
+            .bind(commit_txid)
+            .fetch_one(pool)
+            .await
+            .expect("pending row should exist");
+    row.0
+}
+
+/// Count rows in `pending_inscriptions` (any status).
+async fn count_pending_rows(pool: &PgPool) -> i64 {
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pending_inscriptions")
+        .fetch_one(pool)
+        .await
+        .expect("count query");
+    n
+}
+
+/// Build a (commit, reveal) pair using the test publisher key against the
+/// supplied UTXO. The mining loop inside `inscription_txs` is
+/// deterministic for a given input set so the test can recompute either
+/// txid from the returned txs.
+fn build_test_pair(commitment_data: &[u8]) -> (Transaction, Transaction) {
+    let config = EsploraConfig {
+        url: "http://127.0.0.1:1/api".to_string(),
+        is_mainnet: false,
+        network_name: "Mutinynet".to_string(),
+        ws_url: None,
+        track_tx_timeout: None,
+    };
+    let publisher_address = test_publisher_address(config.network());
+    let outpoints = vec![(fake_outpoint(0), 100_000u64)];
+    inscription_txs(
+        commitment_data,
+        &publisher_address,
+        outpoints,
+        TEST_PUBLISHER_KEY,
+        &config,
+    )
+}
+
+/// Insert a row in the supplied state directly via the db helper. Used
+/// to seed the resume tests without going through the forward path.
+async fn seed_pending_row(
+    pool: &PgPool,
+    commit_tx: &Transaction,
+    reveal_tx: &Transaction,
+    commitment_data: &[u8],
+    status: &str,
+) {
+    let commit_txid = commit_tx.compute_txid();
+    let commit_tx_bytes = bitcoin::consensus::serialize(commit_tx);
+    let reveal_tx_bytes = bitcoin::consensus::serialize(reveal_tx);
+    let commit_output_value = commit_tx.output[0].value.to_sat() as i64;
+    let inserted = db::insert_pending_inscription(
+        pool,
+        commit_txid.as_byte_array(),
+        commitment_data,
+        &commit_tx_bytes,
+        &reveal_tx_bytes,
+        commit_output_value,
+    )
+    .await
+    .expect("seed insert");
+    assert!(inserted, "fresh insert should succeed");
+    if status != db::PENDING_STATUS_CONSTRUCTED {
+        db::update_pending_status(pool, commit_txid.as_byte_array(), status)
+            .await
+            .expect("seed status update");
+    }
+}
+
+#[tokio::test]
+async fn broadcast_persists_constructed_row_before_commit_broadcast() {
+    let (pool, _container) = setup_phaseb_pool().await;
+    let (server, mut config) = setup_mock_esplora().await;
+    config.ws_url = Some(spawn_track_tx_ws("echo").await);
+    let publisher_address = test_publisher_address(config.network());
+
+    let funding_txid = "3333333333333333333333333333333333333333333333333333333333333333";
+    Mock::given(method("GET"))
+        .and(path(format!("/address/{}/utxo", publisher_address)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "txid": funding_txid,
+                "vout": 0,
+                "value": 100_000,
+                "status": { "confirmed": true, "block_height": 100, "block_hash": "0000000000000000000000000000000000000000000000000000000000000001", "block_time": 1700000000 }
+            }
+        ])))
+        .mount(&server)
+        .await;
+    // Reject every POST /tx so the broadcast fails AFTER the
+    // constructed row was persisted. The assertion is that the row
+    // landed on disk BEFORE the broadcast attempt — i.e. it is present
+    // even though the broadcast errored out.
+    Mock::given(method("POST"))
+        .and(path("/tx"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("simulated broadcast failure"))
+        .mount(&server)
+        .await;
+
+    let _err = create_and_broadcast_inscription(b"phaseb-1", &config, Some(&pool))
+        .await
+        .expect_err("broadcast must fail (400)");
+
+    // Exactly one row, status = constructed (commit broadcast failed
+    // so the advance to `commit_broadcast` never fired).
+    assert_eq!(count_pending_rows(&pool).await, 1);
+    let row = sqlx::query_as::<_, (String, Vec<u8>, Vec<u8>, Vec<u8>)>(
+        "SELECT status, commit_tx, reveal_tx, commitment FROM pending_inscriptions",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, db::PENDING_STATUS_CONSTRUCTED);
+    assert!(
+        !row.1.is_empty() && !row.2.is_empty(),
+        "commit_tx and reveal_tx must be persisted as non-empty blobs"
+    );
+    assert_eq!(row.3, b"phaseb-1");
+}
+
+#[tokio::test]
+async fn broadcast_advances_to_commit_broadcast_after_commit_success() {
+    let (pool, _container) = setup_phaseb_pool().await;
+    let (server, mut config) = setup_mock_esplora().await;
+    // Silent WS so the post-commit track-tx wait times out and the
+    // REST fallback (no GET mounted ⇒ 404) propagates the WS timeout.
+    // This stops the broadcast BEFORE the reveal POST fires, leaving
+    // the row in `commit_broadcast`.
+    config.ws_url = Some(spawn_track_tx_ws("silent").await);
+    config.track_tx_timeout = Some(Duration::from_millis(200));
+    let publisher_address = test_publisher_address(config.network());
+
+    Mock::given(method("GET"))
+        .and(path(format!("/address/{}/utxo", publisher_address)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "txid": "3333333333333333333333333333333333333333333333333333333333333333",
+                "vout": 0,
+                "value": 100_000,
+                "status": { "confirmed": true, "block_height": 100, "block_hash": "0000000000000000000000000000000000000000000000000000000000000001", "block_time": 1700000000 }
+            }
+        ])))
+        .mount(&server)
+        .await;
+    // Accept the commit POST (200) — every POST /tx hits this single
+    // mock. The publisher then waits for the WS event that never
+    // arrives, and the broadcast errors out before the reveal POST is
+    // attempted, so we can observe the intermediate `commit_broadcast`
+    // status.
+    Mock::given(method("POST"))
+        .and(path("/tx"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+
+    let _err = create_and_broadcast_inscription(b"phaseb-2", &config, Some(&pool))
+        .await
+        .expect_err("WS timeout (silent mock + no REST fallback) must surface");
+
+    // One row, advanced from `constructed` to `commit_broadcast` by
+    // the commit-OK hook but stuck there because the reveal step
+    // never ran.
+    assert_eq!(count_pending_rows(&pool).await, 1);
+    let (commit_txid_bytes,): (Vec<u8>,) =
+        sqlx::query_as("SELECT commit_txid FROM pending_inscriptions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        fetch_pending_status(&pool, &commit_txid_bytes).await,
+        db::PENDING_STATUS_COMMIT_BROADCAST
+    );
+}
+
+#[tokio::test]
+async fn broadcast_advances_to_reveal_broadcast_and_complete_after_reveal_success() {
+    let (pool, _container) = setup_phaseb_pool().await;
+    let (server, mut config) = setup_mock_esplora().await;
+    config.ws_url = Some(spawn_track_tx_ws("echo").await);
+    let publisher_address = test_publisher_address(config.network());
+
+    Mock::given(method("GET"))
+        .and(path(format!("/address/{}/utxo", publisher_address)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "txid": "3333333333333333333333333333333333333333333333333333333333333333",
+                "vout": 0,
+                "value": 100_000,
+                "status": { "confirmed": true, "block_height": 100, "block_hash": "0000000000000000000000000000000000000000000000000000000000000001", "block_time": 1700000000 }
+            }
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/tx"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+
+    let result = create_and_broadcast_inscription(b"phaseb-3", &config, Some(&pool))
+        .await
+        .expect("happy path must succeed");
+    assert!(result.is_some(), "successful broadcast returns Some((c,r))");
+
+    // Final state is `complete`.
+    assert_eq!(count_pending_rows(&pool).await, 1);
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM pending_inscriptions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, db::PENDING_STATUS_COMPLETE);
+}
+
+#[tokio::test]
+async fn resume_from_commit_broadcast_rebroadcasts_reveal_only() {
+    let (pool, _container) = setup_phaseb_pool().await;
+    let (server, config) = setup_mock_esplora().await;
+
+    let (commit_tx, reveal_tx) = build_test_pair(b"resume-cb");
+    seed_pending_row(
+        &pool,
+        &commit_tx,
+        &reveal_tx,
+        b"resume-cb",
+        db::PENDING_STATUS_COMMIT_BROADCAST,
+    )
+    .await;
+
+    // Accept POST /tx (the resumer only broadcasts the reveal here).
+    Mock::given(method("POST"))
+        .and(path("/tx"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+
+    resume_pending_inscriptions(&pool, &config)
+        .await
+        .expect("resume must succeed");
+
+    let commit_txid_bytes = commit_tx.compute_txid().as_byte_array().to_vec();
+    assert_eq!(
+        fetch_pending_status(&pool, &commit_txid_bytes).await,
+        db::PENDING_STATUS_COMPLETE
+    );
+
+    // Exactly one POST /tx (the reveal). The commit was already on
+    // chain by the time we crashed, so the resumer must not broadcast
+    // it again — that would consume a fresh publisher-wallet UTXO.
+    let received = server.received_requests().await.unwrap();
+    let post_tx_count = received
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::POST && r.url.path() == "/tx")
+        .count();
+    assert_eq!(
+        post_tx_count, 1,
+        "resume(commit_broadcast) must POST /tx exactly once (the reveal)"
+    );
+}
+
+#[tokio::test]
+async fn resume_from_constructed_rebroadcasts_both() {
+    let (pool, _container) = setup_phaseb_pool().await;
+    let (server, config) = setup_mock_esplora().await;
+
+    let (commit_tx, reveal_tx) = build_test_pair(b"resume-co");
+    seed_pending_row(
+        &pool,
+        &commit_tx,
+        &reveal_tx,
+        b"resume-co",
+        db::PENDING_STATUS_CONSTRUCTED,
+    )
+    .await;
+
+    Mock::given(method("POST"))
+        .and(path("/tx"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+
+    resume_pending_inscriptions(&pool, &config)
+        .await
+        .expect("resume must succeed");
+
+    let commit_txid_bytes = commit_tx.compute_txid().as_byte_array().to_vec();
+    assert_eq!(
+        fetch_pending_status(&pool, &commit_txid_bytes).await,
+        db::PENDING_STATUS_COMPLETE
+    );
+
+    // Two POSTs (commit + reveal).
+    let received = server.received_requests().await.unwrap();
+    let post_tx_count = received
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::POST && r.url.path() == "/tx")
+        .count();
+    assert_eq!(
+        post_tx_count, 2,
+        "resume(constructed) must POST /tx twice (commit + reveal)"
+    );
+}
+
+#[tokio::test]
+async fn resume_skips_complete_rows() {
+    let (pool, _container) = setup_phaseb_pool().await;
+    let (server, config) = setup_mock_esplora().await;
+
+    let (commit_tx, reveal_tx) = build_test_pair(b"resume-skip");
+    seed_pending_row(
+        &pool,
+        &commit_tx,
+        &reveal_tx,
+        b"resume-skip",
+        db::PENDING_STATUS_COMPLETE,
+    )
+    .await;
+
+    // No mocks mounted on POST /tx — if the resumer touches Esplora at
+    // all the call will surface as a wiremock-unmatched 404 and the
+    // status flip below would fail because the reveal broadcast would
+    // error out and roll the row back. We assert the resumer is a
+    // no-op by checking the post-state matches the seeded state
+    // exactly.
+    resume_pending_inscriptions(&pool, &config)
+        .await
+        .expect("resume must succeed (no-op)");
+
+    let commit_txid_bytes = commit_tx.compute_txid().as_byte_array().to_vec();
+    assert_eq!(
+        fetch_pending_status(&pool, &commit_txid_bytes).await,
+        db::PENDING_STATUS_COMPLETE
+    );
+    let received = server.received_requests().await.unwrap();
+    assert!(
+        received.is_empty(),
+        "resume(complete) must not hit Esplora; got {} requests",
+        received.len()
+    );
+}
+
+#[tokio::test]
+async fn resume_is_idempotent_when_called_twice() {
+    let (pool, _container) = setup_phaseb_pool().await;
+    let (server, config) = setup_mock_esplora().await;
+
+    let (commit_tx, reveal_tx) = build_test_pair(b"resume-idem");
+    seed_pending_row(
+        &pool,
+        &commit_tx,
+        &reveal_tx,
+        b"resume-idem",
+        db::PENDING_STATUS_REVEAL_BROADCAST,
+    )
+    .await;
+
+    Mock::given(method("POST"))
+        .and(path("/tx"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+
+    // First call: walks the row from `reveal_broadcast` to `complete`.
+    resume_pending_inscriptions(&pool, &config)
+        .await
+        .expect("first resume must succeed");
+    let commit_txid_bytes = commit_tx.compute_txid().as_byte_array().to_vec();
+    assert_eq!(
+        fetch_pending_status(&pool, &commit_txid_bytes).await,
+        db::PENDING_STATUS_COMPLETE
+    );
+
+    let after_first = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::POST && r.url.path() == "/tx")
+        .count();
+
+    // Second call: row is now `complete`, must be a complete no-op.
+    resume_pending_inscriptions(&pool, &config)
+        .await
+        .expect("second resume must succeed (no-op)");
+    let after_second = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::POST && r.url.path() == "/tx")
+        .count();
+    assert_eq!(
+        after_first, after_second,
+        "second resume must not issue additional POST /tx requests"
+    );
+}
+
+#[tokio::test]
+async fn resume_tolerates_bad_inputs_error_on_double_spend() {
+    // The `constructed` retry case: a previous attempt's commit
+    // landed on chain (so the input UTXO is already spent) but we
+    // crashed before recording the success. The resumer re-tries
+    // the commit, Esplora replies 400 with
+    // `bad-txns-inputs-missingorspent`, the resumer must advance
+    // the row and proceed to broadcast the reveal.
+    let (pool, _container) = setup_phaseb_pool().await;
+    let (server, config) = setup_mock_esplora().await;
+
+    let (commit_tx, reveal_tx) = build_test_pair(b"resume-doublespend");
+    seed_pending_row(
+        &pool,
+        &commit_tx,
+        &reveal_tx,
+        b"resume-doublespend",
+        db::PENDING_STATUS_CONSTRUCTED,
+    )
+    .await;
+
+    // Two stacked mocks on the same path: the FIRST request is matched
+    // by the `up_to_n_times(1)` mock (returns 400 +
+    // bad-txns-inputs-missingorspent — the commit-re-broadcast hits
+    // this), every subsequent request falls through to the fallback
+    // mock (200 — the reveal broadcast hits this).
+    //
+    // wiremock matches mocks in LIFO insertion order, so we mount the
+    // fallback FIRST and the up-to-1 rejection second.
+    Mock::given(method("POST"))
+        .and(path("/tx"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/tx"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_string("sendrawtransaction RPC error: bad-txns-inputs-missingorspent"),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    resume_pending_inscriptions(&pool, &config)
+        .await
+        .expect("resume must tolerate the bad-inputs rejection on commit");
+
+    let commit_txid_bytes = commit_tx.compute_txid().as_byte_array().to_vec();
+    assert_eq!(
+        fetch_pending_status(&pool, &commit_txid_bytes).await,
+        db::PENDING_STATUS_COMPLETE,
+        "row must end in complete after the resumer absorbs the double-spend signal and broadcasts the reveal"
+    );
+    let post_tx_count = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::POST && r.url.path() == "/tx")
+        .count();
+    assert_eq!(
+        post_tx_count, 2,
+        "resume must POST /tx twice: rejected commit + accepted reveal"
     );
 }

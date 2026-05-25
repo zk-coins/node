@@ -952,7 +952,8 @@ async fn mint_handler(
     // next scanner sweep and the startup invariant check accepts the
     // state. No in-handler retry.
     if let Err(err) =
-        create_and_broadcast_inscription(&commitment_data, &state.esplora_config).await
+        create_and_broadcast_inscription(&commitment_data, &state.esplora_config, Some(&state.pool))
+            .await
     {
         eprintln!("Error broadcasting mint inscription: {}", err);
         return handler_error_response(

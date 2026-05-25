@@ -355,6 +355,127 @@ pub async fn commit_mint_tx(
     Ok(true)
 }
 
+// ---- Pending inscription persistence (Phase B) ----------------------------
+
+/// State-machine label persisted in `pending_inscriptions.status`.
+///
+/// The four in-progress states (`constructed`, `commit_broadcast`,
+/// `reveal_broadcast`) track the publisher's progress through the
+/// commit + reveal broadcast pair. `complete` is terminal-success;
+/// `failed` is reserved for future use (today the resumer treats
+/// every non-complete row as retryable).
+pub const PENDING_STATUS_CONSTRUCTED: &str = "constructed";
+pub const PENDING_STATUS_COMMIT_BROADCAST: &str = "commit_broadcast";
+pub const PENDING_STATUS_REVEAL_BROADCAST: &str = "reveal_broadcast";
+pub const PENDING_STATUS_COMPLETE: &str = "complete";
+
+/// In-memory representation of a `pending_inscriptions` row loaded by
+/// [`load_pending_in_progress`]. The blob columns are returned raw —
+/// callers deserialize via the same `bitcoin::consensus::deserialize`
+/// shape used at write time.
+#[derive(Debug, Clone)]
+pub struct PendingInscriptionRow {
+    pub id: i64,
+    pub commit_txid: Vec<u8>,
+    pub status: String,
+    pub commitment: Vec<u8>,
+    pub commit_tx: Vec<u8>,
+    pub reveal_tx: Vec<u8>,
+    pub commit_output_value: i64,
+}
+
+/// Insert a fresh `constructed` row before the publisher attempts the
+/// first commit broadcast. `commit_txid` is the deterministic txid of
+/// the supplied `commit_tx` bytes; callers compute it once and pass it
+/// in so retries can match the UNIQUE constraint.
+///
+/// On UNIQUE-violation (a previous attempt persisted the same pair and
+/// crashed before completing), the function returns `Ok(false)` so the
+/// caller can carry on with the existing row instead of double-
+/// inserting. Every other DB error propagates.
+pub async fn insert_pending_inscription(
+    pool: &PgPool,
+    commit_txid: &[u8],
+    commitment: &[u8],
+    commit_tx: &[u8],
+    reveal_tx: &[u8],
+    commit_output_value: i64,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO pending_inscriptions \
+         (commit_txid, status, commitment, commit_tx, reveal_tx, commit_output_value) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (commit_txid) DO NOTHING",
+    )
+    .bind(commit_txid)
+    .bind(PENDING_STATUS_CONSTRUCTED)
+    .bind(commitment)
+    .bind(commit_tx)
+    .bind(reveal_tx)
+    .bind(commit_output_value)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Advance a row to the supplied status. The caller is responsible for
+/// passing a status that the CHECK constraint accepts — using the
+/// `PENDING_STATUS_*` constants guarantees that.
+pub async fn update_pending_status(
+    pool: &PgPool,
+    commit_txid: &[u8],
+    status: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE pending_inscriptions \
+         SET status = $1, updated_at = NOW() \
+         WHERE commit_txid = $2",
+    )
+    .bind(status)
+    .bind(commit_txid)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Load every row whose status is not `complete`, ordered by `id` so
+/// the resumer walks them in insertion order. The partial index
+/// `pending_inscriptions_status_idx` keeps this scan O(pending), not
+/// O(total).
+pub async fn load_pending_in_progress(
+    pool: &PgPool,
+) -> Result<Vec<PendingInscriptionRow>, sqlx::Error> {
+    // Tuple layout: (id, commit_txid, status, commitment, commit_tx,
+    // reveal_tx, commit_output_value). Aliased to keep the
+    // `sqlx::query_as` annotation under clippy's `type_complexity`
+    // threshold.
+    type RawRow = (i64, Vec<u8>, String, Vec<u8>, Vec<u8>, Vec<u8>, i64);
+    let rows: Vec<RawRow> = sqlx::query_as(
+        "SELECT id, commit_txid, status, commitment, commit_tx, reveal_tx, commit_output_value \
+         FROM pending_inscriptions \
+         WHERE status <> 'complete' \
+         ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, commit_txid, status, commitment, commit_tx, reveal_tx, commit_output_value)| {
+                PendingInscriptionRow {
+                    id,
+                    commit_txid,
+                    status,
+                    commitment,
+                    commit_tx,
+                    reveal_tx,
+                    commit_output_value,
+                }
+            },
+        )
+        .collect())
+}
+
 #[cfg(test)]
 #[path = "db_tests.rs"]
 mod tests;
