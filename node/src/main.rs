@@ -162,7 +162,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let (tip_tx, tip_rx) = mpsc::channel::<bitcoin::BlockHash>(64);
     tokio::spawn(run_scanner_ws(ws_config, tip_tx));
 
-    scan_for_inscriptions(network_config, start_block_hash, &move |content_bytes: Vec<u8>, current_block_hash| {
+    scan_for_inscriptions(network_config, start_block_hash, &move |content_bytes: Vec<u8>, commit_txid, current_block_hash| {
         println!("Received content size: {} bytes", content_bytes.len());
 
         // Try to deserialize the content as a Commitment
@@ -178,6 +178,32 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                 }
                 println!("Commitment signature verified successfully");
 
+                // Phase E: if the in-process mint flow has already
+                // advanced this inscription through `state.update` (the
+                // `pending_inscriptions` row is `complete`), the
+                // scanner has nothing to do — its `state.update` call
+                // would be a no-op for the SMT (same key + same value
+                // → idempotent insert) but would diverge the MMR
+                // because `mmr.append` is monotonic. Skipping early
+                // also avoids a redundant `persist_state_tx`. Any
+                // other status (including a missing row, which covers
+                // out-of-band recovery inscriptions and inscriptions
+                // from a previous boot whose mint flow crashed before
+                // marking the row complete) falls through to the
+                // regular state.update path.
+                let commit_txid_bytes = commit_txid.as_byte_array();
+                let pending_status = persist_pending_status_lookup(
+                    &pool_for_callback,
+                    commit_txid_bytes,
+                );
+                if node::scanner::should_skip_scanner_state_update(pending_status.as_deref()) {
+                    println!(
+                        "scanner: commit {} already integrated by mint_handler — skipping state.update",
+                        commit_txid
+                    );
+                    return;
+                }
+
                 // Capture the public_key before moving `commitment` into
                 // `state.update` so we can reference it in the Err arm.
                 let pubkey_for_log = commitment.public_key;
@@ -189,36 +215,9 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                 // to make progress while the previous tx commits.
                 let snapshot = {
                     let mut state_guard = state_for_callback.lock().unwrap();
-                    match state_guard.update(&[commitment]) {
-                        Ok(new_root) => {
-                            // Capture the freshly-inserted root_indices
-                            // entry (Phase C). `State::update`
-                            // guarantees `state.prev_mmr_root` is the
-                            // KEY of the entry it just wrote, so we
-                            // can recover the (smt_root, leaf_index)
-                            // tuple from the map without searching.
-                            let root_index_entry = state_guard
-                                .root_indices
-                                .get(&state_guard.prev_mmr_root)
-                                .copied()
-                                .map(|(smt_root, leaf_index)| {
-                                    (state_guard.prev_mmr_root, smt_root, leaf_index)
-                                });
-                            match state_guard.serialize_for_persist() {
-                                Ok((smt_bytes, mmr_bytes)) => Some((
-                                    new_root,
-                                    smt_bytes,
-                                    mmr_bytes,
-                                    root_index_entry,
-                                )),
-                                Err(e) => {
-                                    eprintln!(
-                                        "Failed to serialize state after update: {} (skipping persist)",
-                                        e
-                                    );
-                                    None
-                                }
-                            }
+                    match state_guard.update_and_snapshot_for_persist(&[commitment]) {
+                        Ok((new_root, smt_bytes, mmr_bytes, root_index_entry)) => {
+                            Some((new_root, smt_bytes, mmr_bytes, root_index_entry))
                         }
                         Err(e) => {
                             // Errors are logged but do NOT panic — the scanner is
@@ -279,10 +278,33 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                         root_index_ref,
                     );
                     match persist_result {
-                        Ok(()) => println!(
-                            "Persisted state. New MMR root: {}",
-                            hex::encode(zkcoins_program::hash::digest_to_bytes(&new_root))
-                        ),
+                        Ok(()) => {
+                            println!(
+                                "Persisted state. New MMR root: {}",
+                                hex::encode(zkcoins_program::hash::digest_to_bytes(&new_root))
+                            );
+                            // Phase E: if this commit came from our own
+                            // mint flow but crashed between broadcast
+                            // Ok and `state.update` (so the row is
+                            // still at `reveal_broadcast`), the scanner
+                            // has just completed the integration; mark
+                            // the row `complete` so a future re-scan
+                            // skips its state.update path. For rows
+                            // that never existed (external / recovery
+                            // inscriptions) the UPDATE simply affects
+                            // zero rows, which is correct.
+                            if pending_status.is_some() {
+                                if let Err(e) = mark_pending_complete_from_sync_context(
+                                    &pool_for_callback,
+                                    commit_txid_bytes,
+                                ) {
+                                    eprintln!(
+                                        "Failed to mark pending_inscriptions {} complete after scanner state.update: {}",
+                                        commit_txid, e
+                                    );
+                                }
+                            }
+                        }
                         Err(e) => eprintln!("persist_state_tx failed: {}", e),
                     }
                 }
@@ -296,4 +318,54 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     .await?;
 
     Ok(())
+}
+
+/// Synchronous wrapper around
+/// [`db::pending_inscription_status_by_commit_txid`] for the scanner
+/// callback's pre-`state.update` lookup (Phase E).
+///
+/// Mirrors [`persist_state_from_sync_context`]: the scanner callback is
+/// a sync `Fn` invoked from a multi_thread tokio worker, and the
+/// `Handle::current().block_on(...)` bare form panics there. We use
+/// `block_in_place` + `Handle::current().block_on(...)`, exactly as the
+/// state-persist helper does. DB errors are swallowed by the call site
+/// (the scanner falls through to its normal `state.update` path on
+/// `None`), so this helper returns the inner `Option<String>` directly
+/// after logging any failure.
+fn persist_pending_status_lookup(pool: &sqlx::PgPool, commit_txid_bytes: &[u8]) -> Option<String> {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(db::pending_inscription_status_by_commit_txid(
+                pool,
+                commit_txid_bytes,
+            ))
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "scanner: pending_inscriptions lookup for commit {} failed: {} (falling through to state.update)",
+                    hex::encode(commit_txid_bytes),
+                    e
+                );
+                None
+            })
+    })
+}
+
+/// Synchronous wrapper around
+/// [`db::update_pending_status`] for the scanner callback's
+/// post-`state.update` advance to `complete` (Phase E).
+///
+/// Same multi_thread tokio bridging story as
+/// [`persist_pending_status_lookup`]. Errors propagate to the caller so
+/// the callback can log them with the right context line.
+fn mark_pending_complete_from_sync_context(
+    pool: &sqlx::PgPool,
+    commit_txid_bytes: &[u8],
+) -> Result<(), sqlx::Error> {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(db::update_pending_status(
+            pool,
+            commit_txid_bytes,
+            db::PENDING_STATUS_COMPLETE,
+        ))
+    })
 }

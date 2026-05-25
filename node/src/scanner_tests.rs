@@ -229,16 +229,21 @@ fn process_transaction_inscriptions_invokes_callback_with_payload() {
     let hash = make_block_hash();
     let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let received_clone = received.clone();
-    let callback: Box<dyn Fn(Vec<u8>, BlockHash) + Send + Sync> = Box::new(move |bytes, h| {
-        received_clone.lock().unwrap().push((bytes, h));
-    });
+    let callback: Box<dyn Fn(Vec<u8>, Txid, BlockHash) + Send + Sync> =
+        Box::new(move |bytes, ctxid, h| {
+            received_clone.lock().unwrap().push((bytes, ctxid, h));
+        });
 
     process_transaction_inscriptions(&tx, hash, callback.as_ref());
 
     let calls = received.lock().unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, payload);
-    assert_eq!(calls[0].1, hash);
+    // commit_txid is the previous_output txid of the reveal input —
+    // `make_tx_with_witness` uses `OutPoint::null()` which carries an
+    // all-zeros txid.
+    assert_eq!(calls[0].1, Txid::all_zeros());
+    assert_eq!(calls[0].2, hash);
 }
 
 #[test]
@@ -260,9 +265,10 @@ fn process_transaction_inscriptions_ignores_inputs_without_witness() {
     let hash = make_block_hash();
     let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let received_clone = received.clone();
-    let callback: Box<dyn Fn(Vec<u8>, BlockHash) + Send + Sync> = Box::new(move |bytes, h| {
-        received_clone.lock().unwrap().push((bytes, h));
-    });
+    let callback: Box<dyn Fn(Vec<u8>, Txid, BlockHash) + Send + Sync> =
+        Box::new(move |bytes, ctxid, h| {
+            received_clone.lock().unwrap().push((bytes, ctxid, h));
+        });
 
     process_transaction_inscriptions(&tx, hash, callback.as_ref());
     assert!(received.lock().unwrap().is_empty());
@@ -292,12 +298,59 @@ fn process_transaction_inscriptions_ignores_witness_without_envelope() {
     let hash = make_block_hash();
     let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let received_clone = received.clone();
-    let callback: Box<dyn Fn(Vec<u8>, BlockHash) + Send + Sync> = Box::new(move |bytes, h| {
-        received_clone.lock().unwrap().push((bytes, h));
-    });
+    let callback: Box<dyn Fn(Vec<u8>, Txid, BlockHash) + Send + Sync> =
+        Box::new(move |bytes, ctxid, h| {
+            received_clone.lock().unwrap().push((bytes, ctxid, h));
+        });
 
     process_transaction_inscriptions(&tx, hash, callback.as_ref());
     assert!(received.lock().unwrap().is_empty());
+}
+
+// ---- Phase E: should_skip_scanner_state_update -----------------------------
+
+#[test]
+fn should_skip_scanner_state_update_returns_true_only_for_complete() {
+    // Mint flow integrated the inscription in-process and marked the
+    // pending row `complete`. Scanner must skip its own `state.update`.
+    assert!(should_skip_scanner_state_update(Some(
+        crate::db::PENDING_STATUS_COMPLETE
+    )));
+}
+
+#[test]
+fn should_skip_scanner_state_update_false_for_missing_row() {
+    // Out-of-band / recovery inscription that never went through this
+    // server's mint flow: no `pending_inscriptions` row, scanner is the
+    // authoritative integration path.
+    assert!(!should_skip_scanner_state_update(None));
+}
+
+#[test]
+fn should_skip_scanner_state_update_false_for_in_progress_states() {
+    // Every non-complete pending status means the mint flow did not
+    // finish the in-process state.update step. The scanner must fall
+    // through and integrate the inscription itself (recovery path).
+    assert!(!should_skip_scanner_state_update(Some(
+        crate::db::PENDING_STATUS_CONSTRUCTED
+    )));
+    assert!(!should_skip_scanner_state_update(Some(
+        crate::db::PENDING_STATUS_COMMIT_BROADCAST
+    )));
+    assert!(!should_skip_scanner_state_update(Some(
+        crate::db::PENDING_STATUS_REVEAL_BROADCAST
+    )));
+}
+
+#[test]
+fn should_skip_scanner_state_update_false_for_unknown_status() {
+    // Forward-compatibility: a future status string (e.g. `failed`)
+    // must NOT cause the scanner to short-circuit. Mirrors the unknown-
+    // status branch in `resume_single_row`.
+    assert!(!should_skip_scanner_state_update(Some(
+        "some-future-status"
+    )));
+    assert!(!should_skip_scanner_state_update(Some("")));
 }
 
 #[test]

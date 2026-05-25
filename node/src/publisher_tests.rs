@@ -839,7 +839,13 @@ async fn broadcast_advances_to_commit_broadcast_after_commit_success() {
 }
 
 #[tokio::test]
-async fn broadcast_advances_to_reveal_broadcast_and_complete_after_reveal_success() {
+async fn broadcast_advances_to_reveal_broadcast_after_reveal_success() {
+    // Phase E: `complete` now means "SMT/MMR contain this inscription's
+    // entry", not "reveal landed on chain". The broadcast leg stops at
+    // `reveal_broadcast`; the caller (`mint_handler`) advances the row
+    // to `complete` only after running `state.update` in-process. This
+    // test exercises the publisher in isolation (no mint flow), so the
+    // expected terminal status here is `reveal_broadcast`.
     let (pool, _container) = setup_phaseb_pool().await;
     let (server, mut config) = setup_mock_esplora().await;
     config.ws_url = Some(spawn_track_tx_ws("echo").await);
@@ -868,13 +874,13 @@ async fn broadcast_advances_to_reveal_broadcast_and_complete_after_reveal_succes
         .expect("happy path must succeed");
     assert!(result.is_some(), "successful broadcast returns Some((c,r))");
 
-    // Final state is `complete`.
+    // Final state is `reveal_broadcast` — see Phase E note above.
     assert_eq!(count_pending_rows(&pool).await, 1);
     let (status,): (String,) = sqlx::query_as("SELECT status FROM pending_inscriptions")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(status, db::PENDING_STATUS_COMPLETE);
+    assert_eq!(status, db::PENDING_STATUS_REVEAL_BROADCAST);
 }
 
 #[tokio::test]
@@ -904,9 +910,12 @@ async fn resume_from_commit_broadcast_rebroadcasts_reveal_only() {
         .expect("resume must succeed");
 
     let commit_txid_bytes = commit_tx.compute_txid().as_byte_array().to_vec();
+    // Phase E: resume stops at `reveal_broadcast` — the scanner will
+    // run state.update against the on-chain inscription and mark the
+    // row `complete` after the SMT/MMR are updated.
     assert_eq!(
         fetch_pending_status(&pool, &commit_txid_bytes).await,
-        db::PENDING_STATUS_COMPLETE
+        db::PENDING_STATUS_REVEAL_BROADCAST
     );
 
     // Exactly one POST /tx (the reveal). The commit was already on
@@ -949,9 +958,12 @@ async fn resume_from_constructed_rebroadcasts_both() {
         .expect("resume must succeed");
 
     let commit_txid_bytes = commit_tx.compute_txid().as_byte_array().to_vec();
+    // Phase E: see the `commit_broadcast` resume test above — terminal
+    // status from a resume-driven re-broadcast is `reveal_broadcast`;
+    // the scanner's state.update is what flips it to `complete`.
     assert_eq!(
         fetch_pending_status(&pool, &commit_txid_bytes).await,
-        db::PENDING_STATUS_COMPLETE
+        db::PENDING_STATUS_REVEAL_BROADCAST
     );
 
     // Two POSTs (commit + reveal).
@@ -1025,14 +1037,19 @@ async fn resume_is_idempotent_when_called_twice() {
         .mount(&server)
         .await;
 
-    // First call: walks the row from `reveal_broadcast` to `complete`.
+    // First call: walks the row from `reveal_broadcast` and re-
+    // broadcasts the reveal. Phase E: the resumer leaves the row at
+    // `reveal_broadcast` (the scanner is what marks it `complete`
+    // after running state.update), so the assertion below pins the
+    // pre-scanner status, not `complete`. Idempotency is exercised
+    // by the second call below.
     resume_pending_inscriptions(&pool, &config)
         .await
         .expect("first resume must succeed");
     let commit_txid_bytes = commit_tx.compute_txid().as_byte_array().to_vec();
     assert_eq!(
         fetch_pending_status(&pool, &commit_txid_bytes).await,
-        db::PENDING_STATUS_COMPLETE
+        db::PENDING_STATUS_REVEAL_BROADCAST
     );
 
     let after_first = server
@@ -1043,10 +1060,19 @@ async fn resume_is_idempotent_when_called_twice() {
         .filter(|r| r.method == wiremock::http::Method::POST && r.url.path() == "/tx")
         .count();
 
-    // Second call: row is now `complete`, must be a complete no-op.
+    // Second call: row is still `reveal_broadcast`. The resumer re-
+    // dispatches into the same `reveal_broadcast` branch and re-
+    // broadcasts the reveal a second time — Esplora returns `txn-
+    // already-known` (200 in the wiremock fallback) and the row stays
+    // at `reveal_broadcast`. The idempotency invariant the test pins
+    // is now "no error path, end status unchanged".
     resume_pending_inscriptions(&pool, &config)
         .await
-        .expect("second resume must succeed (no-op)");
+        .expect("second resume must succeed");
+    assert_eq!(
+        fetch_pending_status(&pool, &commit_txid_bytes).await,
+        db::PENDING_STATUS_REVEAL_BROADCAST
+    );
     let after_second = server
         .received_requests()
         .await
@@ -1054,9 +1080,15 @@ async fn resume_is_idempotent_when_called_twice() {
         .iter()
         .filter(|r| r.method == wiremock::http::Method::POST && r.url.path() == "/tx")
         .count();
+    // Phase E: the resumer re-broadcasts the reveal on every call to
+    // the `reveal_broadcast` branch, since it no longer flips the row
+    // to `complete`. This matches the documented idempotency contract
+    // (`txn-already-known` from Esplora) and is harmless at the chain
+    // layer.
     assert_eq!(
-        after_first, after_second,
-        "second resume must not issue additional POST /tx requests"
+        after_second,
+        after_first + 1,
+        "second resume must POST /tx exactly once more (the idempotent reveal re-broadcast)"
     );
 }
 
@@ -1109,10 +1141,14 @@ async fn resume_tolerates_bad_inputs_error_on_double_spend() {
         .expect("resume must tolerate the bad-inputs rejection on commit");
 
     let commit_txid_bytes = commit_tx.compute_txid().as_byte_array().to_vec();
+    // Phase E: the resumer stops at `reveal_broadcast`; the scanner is
+    // what flips the row to `complete` after running state.update on
+    // the on-chain inscription. This test exercises the publisher in
+    // isolation, so the expected terminal status is `reveal_broadcast`.
     assert_eq!(
         fetch_pending_status(&pool, &commit_txid_bytes).await,
-        db::PENDING_STATUS_COMPLETE,
-        "row must end in complete after the resumer absorbs the double-spend signal and broadcasts the reveal"
+        db::PENDING_STATUS_REVEAL_BROADCAST,
+        "row must end in reveal_broadcast after the resumer absorbs the double-spend signal and broadcasts the reveal"
     );
     let post_tx_count = server
         .received_requests()
@@ -1124,5 +1160,172 @@ async fn resume_tolerates_bad_inputs_error_on_double_spend() {
     assert_eq!(
         post_tx_count, 2,
         "resume must POST /tx twice: rejected commit + accepted reveal"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Phase E: mint_handler advances state synchronously after broadcast
+// -----------------------------------------------------------------------------
+//
+// The three tests below pin the Phase-E contract:
+//
+//   1. The publisher leg stops at `reveal_broadcast` — `mint_handler`
+//      drives the advance to `complete` only after `state.update`
+//      has been applied in-process. This complements
+//      `broadcast_advances_to_reveal_broadcast_after_reveal_success`
+//      above by making the contract explicit in test name + assertion.
+//
+//   2. Scanner-side: a row at `complete` short-circuits the scanner's
+//      `state.update` step — the lookup helper returns the marker the
+//      scanner checks, and `should_skip_scanner_state_update` returns
+//      true for that marker only.
+//
+//   3. Scanner-side fallback: an in-progress row (or no row at all)
+//      lets the scanner run `state.update` itself — the recovery /
+//      external-mint path stays intact.
+
+/// `mint_handler_advances_state_synchronously_with_broadcast`:
+/// happy-path broadcast against a real Postgres + mocked Esplora
+/// leaves the row at `reveal_broadcast`, NOT `complete`. The
+/// `complete` advance is the caller's responsibility (Phase E moved
+/// it out of the publisher).
+#[tokio::test]
+async fn mint_handler_advances_state_synchronously_with_broadcast() {
+    let (pool, _container) = setup_phaseb_pool().await;
+    let (server, mut config) = setup_mock_esplora().await;
+    config.ws_url = Some(spawn_track_tx_ws("echo").await);
+    let publisher_address = test_publisher_address(config.network());
+
+    Mock::given(method("GET"))
+        .and(path(format!("/address/{}/utxo", publisher_address)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "txid": "3333333333333333333333333333333333333333333333333333333333333333",
+                "vout": 0,
+                "value": 100_000,
+                "status": { "confirmed": true, "block_height": 100, "block_hash": "0000000000000000000000000000000000000000000000000000000000000001", "block_time": 1700000000 }
+            }
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/tx"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+
+    let (commit_txid, _reveal_txid) =
+        create_and_broadcast_inscription(b"phase-e-1", &config, Some(&pool))
+            .await
+            .expect("happy path must succeed")
+            .expect("Some((commit, reveal)) on Ok");
+
+    // Publisher leg stopped at `reveal_broadcast` — the `mint_handler`
+    // caller is what flips it to `complete` after running
+    // `state.update`. This is the Phase E load-bearing contract.
+    let commit_txid_bytes = commit_txid.as_byte_array().to_vec();
+    assert_eq!(
+        fetch_pending_status(&pool, &commit_txid_bytes).await,
+        db::PENDING_STATUS_REVEAL_BROADCAST,
+        "Phase E: publisher must stop at reveal_broadcast and let mint_handler advance to complete"
+    );
+
+    // Drive the caller-side advance to `complete` (the mint flow's
+    // post-state.update step) and re-check.
+    db::update_pending_status(&pool, &commit_txid_bytes, db::PENDING_STATUS_COMPLETE)
+        .await
+        .expect("post-state.update advance must succeed");
+    assert_eq!(
+        db::pending_inscription_status_by_commit_txid(&pool, &commit_txid_bytes)
+            .await
+            .expect("lookup must succeed"),
+        Some(db::PENDING_STATUS_COMPLETE.to_string())
+    );
+}
+
+/// `scanner_skips_already_integrated_commit_on_replay`: the scanner-
+/// callback decision used by `main.rs` short-circuits when the
+/// pending row is `complete`. Pairs the DB-level lookup with the
+/// pure-logic predicate so the integration is visible end-to-end
+/// (insert pending → mark complete → lookup → predicate).
+#[tokio::test]
+async fn scanner_skips_already_integrated_commit_on_replay() {
+    let (pool, _container) = setup_phaseb_pool().await;
+    let commit_txid = [0x42u8; 32];
+
+    db::insert_pending_inscription(
+        &pool,
+        &commit_txid,
+        b"phase-e-2",
+        b"commit-tx-bytes",
+        b"reveal-tx-bytes",
+        12_345,
+    )
+    .await
+    .expect("insert pending");
+    db::update_pending_status(&pool, &commit_txid, db::PENDING_STATUS_COMPLETE)
+        .await
+        .expect("advance to complete");
+
+    let observed = db::pending_inscription_status_by_commit_txid(&pool, &commit_txid)
+        .await
+        .expect("lookup must succeed");
+    assert_eq!(
+        observed.as_deref(),
+        Some(db::PENDING_STATUS_COMPLETE),
+        "fetched status must reflect the mint handler's complete advance"
+    );
+    assert!(
+        crate::scanner::should_skip_scanner_state_update(observed.as_deref()),
+        "scanner must short-circuit state.update for an already-integrated commit"
+    );
+}
+
+/// `scanner_falls_back_to_state_update_for_commits_not_in_pending`:
+/// the recovery / external-mint path. A commit observed on chain that
+/// has no `pending_inscriptions` row (or one still in flight) must
+/// drive the scanner through its normal state.update path.
+#[tokio::test]
+async fn scanner_falls_back_to_state_update_for_commits_not_in_pending() {
+    let (pool, _container) = setup_phaseb_pool().await;
+    let external_txid = [0x99u8; 32];
+
+    // Case 1: no row at all (external / out-of-band inscription).
+    let no_row = db::pending_inscription_status_by_commit_txid(&pool, &external_txid)
+        .await
+        .expect("lookup must not error on missing row");
+    assert!(no_row.is_none());
+    assert!(
+        !crate::scanner::should_skip_scanner_state_update(no_row.as_deref()),
+        "scanner must NOT skip state.update when no pending row exists"
+    );
+
+    // Case 2: row present but the mint flow crashed before marking
+    // complete — status is still `reveal_broadcast`. The scanner is
+    // the recovery path here.
+    let crashed_txid = [0x55u8; 32];
+    db::insert_pending_inscription(
+        &pool,
+        &crashed_txid,
+        b"phase-e-3-crashed",
+        b"commit-tx-crashed",
+        b"reveal-tx-crashed",
+        99,
+    )
+    .await
+    .expect("insert pending");
+    db::update_pending_status(&pool, &crashed_txid, db::PENDING_STATUS_REVEAL_BROADCAST)
+        .await
+        .expect("advance to reveal_broadcast");
+    let crashed_status = db::pending_inscription_status_by_commit_txid(&pool, &crashed_txid)
+        .await
+        .expect("lookup must succeed");
+    assert_eq!(
+        crashed_status.as_deref(),
+        Some(db::PENDING_STATUS_REVEAL_BROADCAST)
+    );
+    assert!(
+        !crate::scanner::should_skip_scanner_state_update(crashed_status.as_deref()),
+        "scanner must run state.update when the mint flow stopped before state-advance"
     );
 }

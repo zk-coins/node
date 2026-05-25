@@ -817,6 +817,74 @@ fn derive_num_pubkeys_from_smt_is_xpriv_scoped() {
     assert_eq!(derive_num_pubkeys_from_smt(&xpriv_b, &smt), 0);
 }
 
+// ---- Phase E: update_and_snapshot_for_persist ------------------------------
+
+/// Happy path: `update_and_snapshot_for_persist` applies the same
+/// mutations as `update`, returns the same new MMR root, and produces
+/// snapshot bytes that round-trip through `bincode::deserialize` to the
+/// in-memory SMT/MMR. The freshly-inserted `root_index_entry` matches
+/// `state.prev_mmr_root` → `(smt_root, leaf_index)`.
+#[test]
+fn update_and_snapshot_for_persist_emits_bytes_and_root_index_entry() {
+    let mut state = State::new();
+    let commitment = create_test_commitment(
+        b"phase-e test",
+        "0000000000000000000000000000000000000000000000000000000000000007",
+    );
+
+    let (new_root, smt_bytes, mmr_bytes, root_index_entry) = state
+        .update_and_snapshot_for_persist(std::slice::from_ref(&commitment))
+        .expect("update_and_snapshot_for_persist must succeed");
+
+    assert_eq!(state.mmr.root(), new_root);
+    // The root_index entry's key is the freshly written prev_mmr_root,
+    // and the (smt_root, leaf_index) tuple comes from the SMT/MMR
+    // post-update.
+    let (prev_root, smt_root, leaf_index) =
+        root_index_entry.expect("a fresh update must emit a root_index entry");
+    assert_eq!(prev_root, state.prev_mmr_root);
+    assert_eq!(smt_root, state.smt.root());
+    assert_eq!(leaf_index, state.mmr.leaf_count() - 1);
+
+    // Snapshot bytes round-trip to the same in-memory shape.
+    let smt_back: SparseMerkleTree = bincode::deserialize(&smt_bytes).expect("smt deserialize");
+    let mmr_back: MerkleMountainRange = bincode::deserialize(&mmr_bytes).expect("mmr deserialize");
+    assert_eq!(smt_back.root(), state.smt.root());
+    assert_eq!(mmr_back.root(), state.mmr.root());
+}
+
+/// Error propagation: `update_and_snapshot_for_persist` surfaces the
+/// SMT's `"Key already exists in the tree with different value"` error
+/// when the same public key is inserted twice with distinct messages.
+/// This is the in-memory equivalent of the cross-handler concurrent
+/// mint race that Phase E's STATE_ADVANCE step relies on the tolerant
+/// log branch to handle.
+#[test]
+fn update_and_snapshot_for_persist_propagates_smt_collision() {
+    let mut state = State::new();
+    let first = create_test_commitment(
+        b"first",
+        "0000000000000000000000000000000000000000000000000000000000000008",
+    );
+    state
+        .update_and_snapshot_for_persist(std::slice::from_ref(&first))
+        .expect("first update");
+
+    // Same key, different leaf value → SMT collision.
+    let second = create_test_commitment(
+        b"second",
+        "0000000000000000000000000000000000000000000000000000000000000008",
+    );
+    let err = state
+        .update_and_snapshot_for_persist(std::slice::from_ref(&second))
+        .expect_err("colliding commitment must surface an error");
+    assert!(
+        err.contains("Key already exists"),
+        "unexpected error string: {}",
+        err
+    );
+}
+
 /// Loop-bound panic: every index up to and including `bound` is in the
 /// SMT → the next iteration hits `n >= bound` and panics. Exercises the
 /// safety-net branch of the algorithm; uses the
