@@ -182,7 +182,7 @@ crate's libs as part of `Lint & Build` (the only required check on
 `develop` per PR [#48](https://github.com/zk-coins/node/pull/48)).
 The cyclic-recursion test sweep at production parameters (~22 cyclic
 tests × 3–15 min each) is NOT in CI — `Server + Shared Tests` runs
-`-p server -p shared` only. Decision on whether/how to gate the sweep
+`-p node -p shared` only. Decision on whether/how to gate the sweep
 in CI is tracked in [issue #50](https://github.com/zk-coins/node/issues/50);
 until that lands, contributors run the sweep locally before opening /
 updating a PR that touches this crate (see
