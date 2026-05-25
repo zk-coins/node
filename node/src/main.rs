@@ -16,7 +16,10 @@ use node::scanner_runtime::scan_for_inscriptions;
 use node::scanner_ws::{run_scanner_ws, ScannerWsConfig};
 use node::state::State;
 use node::username;
-use node::{persist_state_from_sync_context, DATABASE_URL, NETWORK_CONFIG};
+use node::{
+    insert_root_index_from_sync_context, persist_state_from_sync_context, DATABASE_URL,
+    NETWORK_CONFIG,
+};
 use shared::commitment::Commitment;
 use std::error::Error as StdError;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -212,10 +215,26 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                             // is the documented monotonic-progress
                             // primitive.
                             scanner_progress_for_callback.fetch_add(1, Ordering::Relaxed);
+                            // Capture the freshly-inserted root_indices
+                            // entry (Phase C). `State::update`
+                            // guarantees `state.prev_mmr_root` is the
+                            // KEY of the entry it just wrote, so we
+                            // can recover the (smt_root, leaf_index)
+                            // tuple from the map without searching.
+                            let root_index_entry = state_guard
+                                .root_indices
+                                .get(&state_guard.prev_mmr_root)
+                                .copied()
+                                .map(|(smt_root, leaf_index)| {
+                                    (state_guard.prev_mmr_root, smt_root, leaf_index)
+                                });
                             match state_guard.serialize_for_persist() {
-                                Ok((smt_bytes, mmr_bytes)) => {
-                                    Some((new_root, smt_bytes, mmr_bytes))
-                                }
+                                Ok((smt_bytes, mmr_bytes)) => Some((
+                                    new_root,
+                                    smt_bytes,
+                                    mmr_bytes,
+                                    root_index_entry,
+                                )),
                                 Err(e) => {
                                     eprintln!(
                                         "Failed to serialize state after update: {} (skipping persist)",
@@ -241,7 +260,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                     }
                 }; // mutex dropped here, BEFORE the async tx below
 
-                if let Some((new_root, smt_bytes, mmr_bytes)) = snapshot {
+                if let Some((new_root, smt_bytes, mmr_bytes, root_index_entry)) = snapshot {
                     let block_hash_bytes = current_block_hash.to_byte_array();
 
                     // The callback runs INSIDE the async
@@ -268,6 +287,29 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                             hex::encode(zkcoins_program::hash::digest_to_bytes(&new_root))
                         ),
                         Err(e) => eprintln!("persist_state_tx failed: {}", e),
+                    }
+
+                    // Persist the freshly-inserted `root_indices` entry
+                    // (Phase C, fix for /api/mint 422 after restart).
+                    // The write is intentionally OUTSIDE the
+                    // SMT/MMR/latest_block transaction: a failure here
+                    // does not corrupt the canonical state, and the
+                    // missing row will be re-derived on a future
+                    // re-scan (the scanner replays past blocks on
+                    // restart, and `update()` is idempotent on
+                    // duplicate commitments at the SMT level — the
+                    // root_index INSERT is itself ON CONFLICT DO
+                    // NOTHING). Logging the failure is sufficient.
+                    if let Some((prev_root, smt_root, leaf_index)) = root_index_entry {
+                        match insert_root_index_from_sync_context(
+                            &pool_for_callback,
+                            &prev_root,
+                            &smt_root,
+                            leaf_index as u64,
+                        ) {
+                            Ok(()) => {}
+                            Err(e) => eprintln!("insert_root_index failed: {}", e),
+                        }
                     }
                 }
             }
