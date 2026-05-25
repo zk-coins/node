@@ -563,7 +563,7 @@ pub async fn create_and_broadcast_inscription(
     commitment_data: &[u8],
     config: &EsploraConfig,
     pool: Option<&PgPool>,
-) -> Result<Option<(Txid, Txid)>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(Txid, Txid), Box<dyn std::error::Error + Send + Sync>> {
     // Generate publisher address
     let publisher_key = &*crate::PUBLISHER_KEY;
     let secp256k1 = Secp256k1::new();
@@ -668,7 +668,7 @@ pub async fn create_and_broadcast_inscription(
             println!("Successfully broadcast transactions:");
             println!("Commit TXID: {}", commit_txid);
             println!("Reveal TXID: {}", reveal_txid);
-            Ok(Some((commit_txid, reveal_txid)))
+            Ok((commit_txid, reveal_txid))
         }
         Err(e) => {
             println!("Failed to broadcast transactions: {}", e);

@@ -558,7 +558,7 @@ async fn create_and_broadcast_inscription_fails_when_no_utxos() {
 
     let err = create_and_broadcast_inscription(b"Hello, zkCoins!", &config, None)
         .await
-        .expect_err("empty wallet must produce an Err, not Ok(None)");
+        .expect_err("empty wallet must produce an Err");
 
     assert!(
         err.to_string().contains("No UTXOs available"),
@@ -596,12 +596,10 @@ async fn create_and_broadcast_inscription_succeeds_end_to_end_with_mocked_esplor
         .mount(&server)
         .await;
 
-    let result = create_and_broadcast_inscription(b"Hello, zkCoins!", &config, None)
-        .await
-        .expect("end-to-end inscription should succeed against mocked Esplora");
-
     let (commit_txid, reveal_txid) =
-        result.expect("on success the function returns Some((commit, reveal))");
+        create_and_broadcast_inscription(b"Hello, zkCoins!", &config, None)
+            .await
+            .expect("end-to-end inscription should succeed against mocked Esplora");
     assert_ne!(
         commit_txid, reveal_txid,
         "commit and reveal must be distinct transactions"
@@ -869,10 +867,9 @@ async fn broadcast_advances_to_reveal_broadcast_after_reveal_success() {
         .mount(&server)
         .await;
 
-    let result = create_and_broadcast_inscription(b"phaseb-3", &config, Some(&pool))
+    let _result = create_and_broadcast_inscription(b"phaseb-3", &config, Some(&pool))
         .await
         .expect("happy path must succeed");
-    assert!(result.is_some(), "successful broadcast returns Some((c,r))");
 
     // Final state is `reveal_broadcast` — see Phase E note above.
     assert_eq!(count_pending_rows(&pool).await, 1);
@@ -1217,8 +1214,7 @@ async fn mint_handler_advances_state_synchronously_with_broadcast() {
     let (commit_txid, _reveal_txid) =
         create_and_broadcast_inscription(b"phase-e-1", &config, Some(&pool))
             .await
-            .expect("happy path must succeed")
-            .expect("Some((commit, reveal)) on Ok");
+            .expect("happy path must succeed");
 
     // Publisher leg stopped at `reveal_broadcast` — the `mint_handler`
     // caller is what flips it to `complete` after running

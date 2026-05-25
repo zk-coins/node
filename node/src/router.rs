@@ -1006,12 +1006,11 @@ async fn mint_handler(
         Some(&state.pool),
     )
     .await;
-    let commit_txid_bytes: Option<[u8; 32]> = match broadcast_outcome {
-        Ok(Some((commit_txid, _reveal_txid))) => {
+    let commit_txid_bytes: [u8; 32] = match broadcast_outcome {
+        Ok((commit_txid, _reveal_txid)) => {
             use bitcoin::hashes::Hash as _;
-            Some(commit_txid.to_byte_array())
+            commit_txid.to_byte_array()
         }
-        Ok(None) => None,
         Err(err) => {
             eprintln!("Error broadcasting mint inscription: {}", err);
             return handler_error_response(
@@ -1094,56 +1093,43 @@ async fn mint_handler(
             );
         }
     };
-    if let Some(ctxid) = commit_txid_bytes {
-        let root_index_ref = root_index_entry.as_ref().map(|(p, s, i)| (p, s, *i as u64));
-        match db::persist_state_and_mark_complete_tx(
-            &state.pool,
-            &smt_bytes,
-            &mmr_bytes,
-            root_index_ref,
-            &ctxid,
-        )
-        .await
-        {
-            Ok(()) => {
-                println!(
-                    "mint_handler: state.update persisted + row marked complete. New MMR root: {}",
-                    hex::encode(zkcoins_program::hash::digest_to_bytes(&new_root))
-                );
-            }
-            Err(e) => {
-                // The atomic tx rolled back: SMT/MMR/root_index AND
-                // the row advance all stayed at their pre-call values
-                // on disk. The in-memory SMT/MMR HAVE already been
-                // mutated (that happened above before the await), so
-                // they are now ahead of disk by exactly one leaf.
-                // On restart, `State::load_from_pg` returns the
-                // pre-update on-disk state and the scanner-replay path
-                // walks the block, observes the row at
-                // `reveal_broadcast`, and integrates the inscription
-                // itself — a clean heal. Return 503 so the caller
-                // knows the durable state did not advance.
-                eprintln!(
-                    "mint_handler: atomic persist + mark-complete failed: {} (scanner-replay will heal)",
-                    e
-                );
-                return handler_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "mint broadcast landed on chain but durable state advance failed; scanner will reconcile",
-                );
-            }
+    let root_index_ref = root_index_entry.as_ref().map(|(p, s, i)| (p, s, *i as u64));
+    match db::persist_state_and_mark_complete_tx(
+        &state.pool,
+        &smt_bytes,
+        &mmr_bytes,
+        root_index_ref,
+        &commit_txid_bytes,
+    )
+    .await
+    {
+        Ok(()) => {
+            println!(
+                "mint_handler: state.update persisted + row marked complete. New MMR root: {}",
+                hex::encode(zkcoins_program::hash::digest_to_bytes(&new_root))
+            );
         }
-    } else {
-        // No commit_txid: the broadcast path returned Ok(None) (the
-        // test-only `Some(&state.pool)` no-pool branch should not
-        // surface here in production; defensive fallback). The
-        // in-memory state is already advanced; no row to mark complete.
-        // Persist SMT/MMR/root_index alone via a degenerate empty
-        // commit_txid is not meaningful, so just log and continue —
-        // production builds always have a commit_txid on success.
-        eprintln!(
-            "mint_handler: state.update advanced in-memory but no commit_txid available; persist skipped"
-        );
+        Err(e) => {
+            // The atomic tx rolled back: SMT/MMR/root_index AND
+            // the row advance all stayed at their pre-call values
+            // on disk. The in-memory SMT/MMR HAVE already been
+            // mutated (that happened above before the await), so
+            // they are now ahead of disk by exactly one leaf.
+            // On restart, `State::load_from_pg` returns the
+            // pre-update on-disk state and the scanner-replay path
+            // walks the block, observes the row at
+            // `reveal_broadcast`, and integrates the inscription
+            // itself — a clean heal. Return 503 so the caller
+            // knows the durable state did not advance.
+            eprintln!(
+                "mint_handler: atomic persist + mark-complete failed: {} (scanner-replay will heal)",
+                e
+            );
+            return handler_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "mint broadcast landed on chain but durable state advance failed; scanner will reconcile",
+            );
+        }
     }
 
     // ---- 4. COMMIT phase (broadcast OK) ---------------------------------
