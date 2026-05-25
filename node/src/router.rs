@@ -1284,9 +1284,10 @@ struct PublisherHealthResponse {
 /// Esplora-side error is intentional: the operator should see the
 /// failure mode, not a fabricated empty response.
 async fn publisher_health_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let publisher_address = &*crate::PUBLISHER_ADDRESS;
+    let publisher_address = crate::PUBLISHER_ADDRESS.clone();
 
-    match crate::publisher::get_publisher_utxo(publisher_address, &state.esplora_config, None).await
+    match crate::publisher::get_publisher_utxo(&publisher_address, &state.esplora_config, None)
+        .await
     {
         Ok(utxos) => {
             let utxo_count = utxos.len() as u64;
