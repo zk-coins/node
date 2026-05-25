@@ -146,23 +146,6 @@ pub fn persist_state_from_sync_context(
     })
 }
 
-/// Sync-from-async bridge for the per-update `mmr_root_index` write
-/// (Phase C). Mirrors `persist_state_from_sync_context` — the scanner
-/// callback is a sync `Fn` running on the multi_thread tokio runtime,
-/// so naive `Handle::current().block_on(...)` would panic. `block_in_place`
-/// is the documented escape hatch.
-pub fn insert_root_index_from_sync_context(
-    pool: &PgPool,
-    prev_root: &HashDigest,
-    smt_root: &HashDigest,
-    leaf_index: u64,
-) -> Result<(), sqlx::Error> {
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current()
-            .block_on(db::insert_root_index(pool, prev_root, smt_root, leaf_index))
-    })
-}
-
 #[cfg(test)]
 #[path = "main_tests.rs"]
 mod tests;
