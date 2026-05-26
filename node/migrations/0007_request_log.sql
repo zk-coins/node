@@ -1,6 +1,6 @@
 -- Full HTTP audit log: every request the node accepts is persisted
 -- with its raw body, headers, and the bytes of the response that was
--- sent back. The server is not a privacy boundary — anyone who wants
+-- sent back. The node is not a privacy boundary — anyone who wants
 -- shielded operation runs their own node; the operator-side
 -- observation surface is fair game.
 --

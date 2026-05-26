@@ -147,10 +147,10 @@ impl AccountNode {
     // TODO: Move to client.
     ///
     /// Test-only after PR-A3 — the production bootstrap rehydrates the
-    /// server from Postgres via `load_from_pg`, never `new`. Kept
+    /// node from Postgres via `load_from_pg`, never `new`. Kept
     /// because every test in `account_node_tests.rs`,
     /// `router_tests.rs`, and `runtime_tests.rs` uses it to
-    /// build a known-empty server before importing fixture accounts.
+    /// build a known-empty node before importing fixture accounts.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(state: Arc<Mutex<State>>) -> Self {
         let accounts = HashMap::new();

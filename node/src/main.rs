@@ -22,7 +22,7 @@ use std::error::Error as StdError;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-// Postgres state-layer carries every persistent slice of server state
+// Postgres state-layer carries every persistent slice of node state
 // after PR-A3: SMT / MMR / latest_block (PR-A2), accounts + usernames
 // (PR-A3), and the minting account's `minting_meta.num_pubkeys` counter
 // (PR-A3). The `accounts.bin`, `usernames.bin`, and
@@ -84,7 +84,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // the bootstrap (same reasoning as the State load above).
     let account_node = account_node::AccountNode::load_from_pg(Arc::clone(&state), &pool)
         .await
-        .expect("load account server from Postgres");
+        .expect("load account node from Postgres");
     println!("Loaded AccountNode from Postgres");
     let username_store = username::UsernameStore::load_from_pg(&pool)
         .await
@@ -110,7 +110,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         )
         .await
         {
-            eprintln!("Account server error: {}", e);
+            eprintln!("Account node error: {}", e);
             std::process::exit(1);
         }
     });
@@ -261,7 +261,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                             // best-effort and we never want a single bad commitment
                             // (replay, client bug, or a re-scan after crash where
                             // the SMT already has this public_key with a different
-                            // leaf value) to take the whole REST server down. The
+                            // leaf value) to take the whole REST API down. The
                             // scanner advances to the next block regardless.
                             eprintln!(
                                 "Skipping commitment for public_key {}: state.update failed: {}",

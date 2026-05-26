@@ -79,7 +79,7 @@ pub async fn start_rest_node(
         // child pubkey for ordinary wallets; for the minting wallet that
         // derivation is meaningless — only the wallet's commitment-signing
         // side is used. Force the address to the canonical constant so
-        // the rest of the server (which reads minting_account.address as
+        // the rest of the node (which reads minting_account.address as
         // the on-chain identity of the minting wallet) is internally
         // consistent. The test harness already constructs the minting
         // account this way (see
@@ -114,7 +114,7 @@ pub async fn start_rest_node(
     let bootstrap_snapshot: Option<(zkcoins_program::hash::HashDigest, Vec<u8>)> = {
         let mut account_node_guard = state.account_node.lock().unwrap();
         if account_node_guard.get_minting_account_address().is_err() {
-            let mut minting_server_account = crate::account_node::Account::new();
+            let mut minting_node_account = crate::account_node::Account::new();
             // The Plonky2 state-transition circuit packs the running
             // balance as a Goldilocks field element via
             // `balance_hi * 2^32 + balance_lo`. Values >= p (the
@@ -123,10 +123,10 @@ pub async fn start_rest_node(
             // which trips a "wire set twice" partition error. Stay
             // safely below 2^48 so the circuit-vs-witness sides agree
             // even after many mint operations.
-            minting_server_account.balance = 1u64 << 48;
+            minting_node_account.balance = 1u64 << 48;
             account_node_guard.import_account(
                 *zkcoins_program::types::MINTING_ADDRESS,
-                minting_server_account,
+                minting_node_account,
             );
             account_node_guard
                 .get_account(&zkcoins_program::types::MINTING_ADDRESS)
@@ -186,8 +186,8 @@ pub async fn start_rest_node(
     let app = create_router(state);
 
     // boot_log: announce the startup event with the connected network,
-    // server version, listen address, and process pid. Best-effort —
-    // a failed boot_log insert must NOT prevent the server from
+    // node version, listen address, and process pid. Best-effort —
+    // a failed boot_log insert must NOT prevent the node from
     // starting (the operator would lose access to a real recovery
     // path on a transient DB blip).
     {
@@ -212,7 +212,7 @@ pub async fn start_rest_node(
         }
     }
 
-    println!("REST server started at {}", socket_addr);
+    println!("REST API started at {}", socket_addr);
     let listener = TcpListener::bind(socket_addr).await?;
     // `into_make_service_with_connect_info::<SocketAddr>()` exposes the
     // peer's TCP socket to extractors — the audit middleware reads it

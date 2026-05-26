@@ -1,8 +1,8 @@
-# Step 7 Prep — SP1 → Plonky2 Server Cutover Inventory
+# Step 7 Prep — SP1 → Plonky2 Node Cutover Inventory
 
 > **✅ STATUS — Step 7 is DONE.** This file is kept as the historical
 > planning record. The actual cutover landed across commits `00adbb4`
-> (workspace + server imports), `c71c9fc` (send_coins wired to the
+> (workspace + node imports), `c71c9fc` (send_coins wired to the
 > Plonky2 Prover, **off-circuit source-side validation as a
 > placeholder while Stage 5d-next-5 Phase 2 was deferred**),
 > `dac0179` (Dockerfile), `d6a3cb9` (inline error-path tests), the
@@ -26,7 +26,7 @@
 
 ---
 
-Read-only inventory of every place in the existing SP1-era server code
+Read-only inventory of every place in the existing SP1-era node code
 that must change for **Step 7** (replace SP1 with Plonky2; no Cargo
 feature flag, no dual backend, no migration — see
 [`../CONTRIBUTING.md`](../CONTRIBUTING.md) § "Working on the Plonky2
@@ -60,7 +60,7 @@ avoid editing files Step 5 is also touching.
 | L201 | `previous_proof.public_values.read::<ProofData>()` | Same as L132 | 🧩 |
 | L379–380 | `bincode::deserialize::<ProofData>(&proof.public_values.to_vec())` | Same as L132 (no `to_vec` round trip needed if `ProofData` is already a field-element struct) | 🧩 |
 
-### 2. `node/src/server.rs`
+### 2. `node/src/router.rs`
 
 | Where | Current | What it becomes | Tag |
 | ----- | ------- | --------------- | --- |
@@ -94,7 +94,7 @@ No SP1 references. **Zero changes** unless Step 5 changes the on-chain commitmen
 
 No SP1 references. **Zero changes.** Taproot inscription publishing is hash-agnostic.
 
-### 7. `server/Cargo.toml`
+### 7. `node/Cargo.toml`
 
 | Where | Current | What it becomes | Tag |
 | ----- | ------- | --------------- | --- |
@@ -119,8 +119,8 @@ No SP1 references. **Zero changes.** Taproot inscription publishing is hash-agno
 
 | Where | Current | What it becomes | Tag |
 | ----- | ------- | --------------- | --- |
-| L2–6 | `members = ["program", "script", "server", "shared"]` | `members = ["program-plonky2", "script-plonky2", "server", "shared"]` if going all-in. Alternative: keep `program` for the off-circuit types we still rely on (but they're already ported to `program-plonky2`, so this is dead). Recommendation: rename in one step. | 🔧 + ⚙ |
-| L7–11 | `exclude = ["program-plonky2"]` (the nightly-toolchain workaround) | **remove the exclude** — `program-plonky2` becomes a workspace member. **But this means the whole workspace needs to support its nightly toolchain.** Two options: (i) move everything to nightly (probably safe since SP1 is being deleted), (ii) keep `program-plonky2` separate and have `server` depend on it via path-with-exclude trick. Recommendation: (i) — the SP1 reason for stable-1.81 is gone after this step. | ⚙ |
+| L2–6 | `members = ["program", "script", "server", "shared"]` | `members = ["program-plonky2", "script-plonky2", "node", "shared"]` if going all-in. Alternative: keep `program` for the off-circuit types we still rely on (but they're already ported to `program-plonky2`, so this is dead). Recommendation: rename in one step. | 🔧 + ⚙ |
+| L7–11 | `exclude = ["program-plonky2"]` (the nightly-toolchain workaround) | **remove the exclude** — `program-plonky2` becomes a workspace member. **But this means the whole workspace needs to support its nightly toolchain.** Two options: (i) move everything to nightly (probably safe since SP1 is being deleted), (ii) keep `program-plonky2` separate and have `node` depend on it via path-with-exclude trick. Recommendation: (i) — the SP1 reason for stable-1.81 is gone after this step. | ⚙ |
 | L23 | `sp1-sdk = "4.0.0"` workspace dep | **delete** | 🔧 |
 | L32–50 | 18× `[patch.crates-io]` SP1 patches | **delete** | 🔧 |
 
@@ -128,7 +128,7 @@ No SP1 references. **Zero changes.** Taproot inscription publishing is hash-agno
 
 | Where | Current | What it becomes | Tag |
 | ----- | ------- | --------------- | --- |
-| L2 | `channel = "1.81.0"` | Two options: (i) `channel = "nightly-2025-04-15"` to match `program-plonky2/rust-toolchain.toml` and unify the workspace, (ii) keep stable for `server`/`shared` if they don't need nightly features. Recommendation: (i) once SP1 is gone, the stable-pin justification is gone too. | ⚙ |
+| L2 | `channel = "1.81.0"` | Two options: (i) `channel = "nightly-2025-04-15"` to match `program-plonky2/rust-toolchain.toml` and unify the workspace, (ii) keep stable for `node`/`shared` if they don't need nightly features. Recommendation: (i) once SP1 is gone, the stable-pin justification is gone too. | ⚙ |
 
 ### 12. Test infrastructure
 
@@ -144,12 +144,12 @@ On cutover (after Step 7's image is built and ready to deploy):
 
 ```bash
 # On the DEV and PRD hosts:
-sudo systemctl stop zkcoin-server
+sudo systemctl stop zkcoin-node
 rm /var/lib/zkcoin/smt.bin /var/lib/zkcoin/mmr.bin /var/lib/zkcoin/mmr.bin.prev_root /var/lib/zkcoin/latest_block.bin
 # accounts.bin — operator's call: delete to force fresh accounts, or keep with the caveat that all stored proofs are now invalid
 # usernames.bin, minting_num_pubkeys.bin — fine to keep, no crypto dependency
-# proofs/*.bin — delete; old proofs are SP1 format, useless to the new server
-sudo systemctl start zkcoin-server
+# proofs/*.bin — delete; old proofs are SP1 format, useless to the new node
+sudo systemctl start zkcoin-node
 ```
 
 The state-file cleanup is part of the deploy runbook, not Step 7's
@@ -166,13 +166,13 @@ mismatches" below.
 
 | Category | Files affected | Effort |
 | -------- | -------------- | ------ |
-| 🔧 Mechanical renames / import swaps | account_node.rs, server.rs, state.rs (partial), shared/{lib.rs, commitment.rs}, server/Cargo.toml, root Cargo.toml | ~45 min |
-| 🧩 `HashDigest` semantic shift — `[u8;32]` → `HashOut<F>` (NOT just a type alias swap) | account_node.rs, state.rs, server.rs, router_tests.rs (~30 call sites), shared/commitment.rs (`get_account_state_hash` return type) | ~3–4 hours |
-| 🧩 Proof public-input access — `proof.public_values` (SP1) → `proof.public_inputs` (Plonky2, different element type, different deserialisation) | account_node.rs (3 sites), server.rs (1 site) | ~1 hour |
-| 🛠 `ProgramInputsBuilder` doesn't exist in Plonky2 — server's `send_coins` path needs a different shape (per-slot witnesses instead of batched builder) | account_node.rs (`send_coins`) | ~2–3 hours |
-| 🛠 `Prover::create_account` / `update_account` signatures differ — Plonky2 wrapper uses `prove_initial_with_in_coins` / `prove_account_update_with_in_coins`. Server needs adapter | account_node.rs, server.rs | ~1 hour |
+| 🔧 Mechanical renames / import swaps | account_node.rs, router.rs, state.rs (partial), shared/{lib.rs, commitment.rs}, node/Cargo.toml, root Cargo.toml | ~45 min |
+| 🧩 `HashDigest` semantic shift — `[u8;32]` → `HashOut<F>` (NOT just a type alias swap) | account_node.rs, state.rs, router.rs, router_tests.rs (~30 call sites), shared/commitment.rs (`get_account_state_hash` return type) | ~3–4 hours |
+| 🧩 Proof public-input access — `proof.public_values` (SP1) → `proof.public_inputs` (Plonky2, different element type, different deserialisation) | account_node.rs (3 sites), router.rs (1 site) | ~1 hour |
+| 🛠 `ProgramInputsBuilder` doesn't exist in Plonky2 — node's `send_coins` path needs a different shape (per-slot witnesses instead of batched builder) | account_node.rs (`send_coins`) | ~2–3 hours |
+| 🛠 `Prover::create_account` / `update_account` signatures differ — Plonky2 wrapper uses `prove_initial_with_in_coins` / `prove_account_update_with_in_coins`. Node needs adapter | account_node.rs, router.rs | ~1 hour |
 | 🛠 Persistence helpers (`save_merkle_tree` / `load_merkle_tree` / `save_mmr` / `load_mmr`) | **DONE** in commit `b76bd39` | ✅ |
-| ⚙ Workspace toolchain unification: stable→nightly (entire workspace) | root rust-toolchain, all member Cargo.toml | ~1 hour to migrate + verify shared/server build on nightly |
+| ⚙ Workspace toolchain unification: stable→nightly (entire workspace) | root rust-toolchain, all member Cargo.toml | ~1 hour to migrate + verify shared/node build on nightly |
 | ⚙ MMR leaf hash decision — SHA256 vs Poseidon | state.rs (L66–71) | confirmed Poseidon per arch invariant; ~30 min implement |
 | ⚙ `script/` crate deletion | repo cleanup | ~15 min |
 | Test infrastructure: ~25 `hex::encode(MINTING_ADDRESS)` calls now need `digest_to_bytes(&MINTING_ADDRESS)` first | router_tests.rs, account_node_tests.rs | ~1 hour |
@@ -207,13 +207,13 @@ reverted to keep the repo buildable):
 3. **`ProgramInputsBuilder` (SP1) has no Plonky2 analogue.** SP1
    batched all inputs into a single struct passed to the prover; the
    Plonky2 monolithic circuit uses per-slot witnesses
-   (`InCoinSlotTargets`). The server's `send_coins` path must
+   (`InCoinSlotTargets`). The node's `send_coins` path must
    restructure from "build inputs → call create/update" to
    "construct in_coins tuples → call prove_initial_with_in_coins".
 4. **`Prover::create_account` / `update_account`** are SP1-specific
    method names; the Plonky2 wrapper uses
    `prove_initial`/`prove_initial_with_in_coins` etc. Either rename
-   wrapper methods or rewrite server call sites.
+   wrapper methods or rewrite node call sites.
 5. **`HASH_SIZE` constant** (SP1: `pub const HASH_SIZE: usize = 32;`)
    not present in program-plonky2. Add as `pub const HASH_SIZE: usize = 32;`
    in `hash` module or update callers to literal `32` /
@@ -245,7 +245,7 @@ The following Step 7 items become fully concrete only after Step 5 lands:
 
 2. **`script/` crate fate:** keep as compat shim or delete? **Recommendation:** delete entirely. No external callers; the closed-test-env invariant says replace, not preserve.
 
-3. **Workspace toolchain unification:** keep `rust-toolchain` stable for the `server`/`shared` crates, or move everything to nightly to match `program-plonky2`? **Recommendation:** move everything to nightly (SP1's stable-pin reason is gone after this step), but verify nothing in `server`/`shared` breaks on nightly first.
+3. **Workspace toolchain unification:** keep `rust-toolchain` stable for the `node`/`shared` crates, or move everything to nightly to match `program-plonky2`? **Recommendation:** move everything to nightly (SP1's stable-pin reason is gone after this step), but verify nothing in `node`/`shared` breaks on nightly first.
 
 These three decisions are not blockers for starting Step 7 work — they
 just need to be settled before the PR is opened for review.

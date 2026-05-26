@@ -7,7 +7,7 @@
 -- Closed test environment (see CONTRIBUTING.md and the project memo
 -- `feedback_zkcoins_closed_test_env`): existing rows are crash-recovery
 -- state for the publisher's commit/reveal pair, expected to be
--- `complete` and empty on a healthy server. Wiping them is the
+-- `complete` and empty on a healthy node. Wiping them is the
 -- documented "alt raus, neu rein" pattern — no backfill, no transition
 -- shim.
 

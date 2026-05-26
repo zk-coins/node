@@ -174,7 +174,7 @@ pub struct ReceiveCoinRequest {
     coin_proof: Proof,
 }
 
-/// Persistent proof store — survives server restarts.
+/// Persistent proof store — survives node restarts.
 /// Each proof is stored as an individual file: /data/proofs/{id}.bin
 pub(crate) struct ProofStore {
     dir: String,
@@ -209,7 +209,7 @@ impl ProofStore {
     }
 
     /// Build a safe file path for a proof ID within the store directory.
-    /// The ID is always a server-generated u64 and the suffix is the
+    /// The ID is always a node-generated u64 and the suffix is the
     /// literal ".bin", so `base.join(...)` cannot escape `base` — no
     /// extra starts_with check is needed.
     fn proof_path(&self, id: u64) -> Option<std::path::PathBuf> {
@@ -296,7 +296,7 @@ pub struct SendCoinResponse {
 ///   the minute-scale prove cost is paid; surfacing the specific
 ///   string lets clients distinguish "fix your inclusion proof" from
 ///   "fix your account selection".
-/// - **404 NOT_FOUND** — sender address is not known to the server.
+/// - **404 NOT_FOUND** — sender address is not known to the node.
 /// - **400 BAD_REQUEST** — request structure violates the API contract
 ///   (e.g. AccountUpdate transition without `prev_commitment_pubkey`).
 /// - **500 INTERNAL_SERVER_ERROR** — the prover failed. Body collapses
@@ -314,7 +314,7 @@ pub(crate) fn map_send_coins_error(err: &str) -> (StatusCode, &'static str) {
         // `get_merkle_proofs` failures — reachable from `send_coins`
         // via the `prev_commitment_pubkey` path. The client supplied
         // the wrong public key, or the previous proof references a
-        // history root the server hasn't seen yet (stale snapshot).
+        // history root the node hasn't seen yet (stale snapshot).
         // Both are caller-fixable, hence 422 rather than 500.
         "Unable to get merkle proofs for provided public key" => (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -433,16 +433,16 @@ pub struct CommitRequest {
 pub struct InfoResponse {
     network: String,
     capabilities: Capabilities,
-    /// External hostname this server serves, used by the client to render
+    /// External hostname this node serves, used by the client to render
     /// `<hex|username>@<domain>`. DEV and PRD share the chain identifier
     /// but live behind different external hostnames, so the client cannot
-    /// derive this from `network` alone — the server reports it directly.
+    /// derive this from `network` alone — the node reports it directly.
     username_domain: String,
 }
 
-/// Server-side feature gates exposed to clients so the app can render
+/// Node-side feature gates exposed to clients so the app can render
 /// capability-driven UI without a parallel build-time env-flag set.
-/// Each bool reflects a compile-time Cargo feature on the server binary,
+/// Each bool reflects a compile-time Cargo feature on the node binary,
 /// except `faucet`: mint is part of the MVP and is always available, so
 /// the field is hardcoded `true`. It is kept on the struct for API
 /// back-compat with wallet clients that introspect `/api/info`.
@@ -1285,7 +1285,7 @@ async fn get_proof_handler(
 ///
 /// **Broadcast-then-deliver invariant (zk-coins/node#89).** Unlike
 /// the mint flow, the `/api/commit` endpoint receives a *proof_id* the
-/// server already generated (in an earlier `/api/send` call), looks up
+/// node already generated (in an earlier `/api/send` call), looks up
 /// the persisted `CoinProof`, broadcasts its commitment, and only then
 /// hands the proof to `receive_coin` for the recipient mutation. The
 /// in-memory mutation lives in [`broadcast_commit_and_deliver`] in
@@ -1358,7 +1358,7 @@ async fn commit_handler(
 /// (those are crash-recovery state, not user-facing).
 ///
 /// Returns 404 when no row exists — the inscription either never went
-/// through this server (e.g. external recovery via `recover_inscription`
+/// through this node (e.g. external recovery via `recover_inscription`
 /// CLI) or the txid is unknown.
 async fn get_inscription_handler(
     State(state): State<AppState>,
@@ -1406,7 +1406,7 @@ async fn get_inscription_handler(
 }
 
 /// JSON body returned by `GET /health/ready`. `failures` is empty on a
-/// fully ready server; each failing dependency contributes one stable
+/// fully ready node; each failing dependency contributes one stable
 /// short tag (`"db"`, `"esplora"`) so a Kuma monitor parses the cause
 /// without having to scrape the status code in isolation.
 #[derive(Serialize)]
@@ -1670,7 +1670,7 @@ async fn claim_username_handler(
     // Verify Schnorr signature over sha256("zkcoins:claim_username" || address_hex || normalised_username || timestamp_le).
     // The wallet MUST sign over the lowercase form (same normalisation
     // as `UsernameStore::validate`) — otherwise the same input that the
-    // server persists is not what the signature commits to, opening
+    // node persists is not what the signature commits to, opening
     // the case-mismatch squat described above.
     let mut hasher = Sha256::new();
     hasher.update(b"zkcoins:claim_username");

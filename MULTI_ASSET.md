@@ -37,7 +37,7 @@ zkCoins today serves one asset: the faucet-minted unit returned by
 `/api/mint`. The minting account is hard-coded (`MINTING_ADDRESS`,
 see [`SPEC.md`](./SPEC.md) §8 "Note on the minting account"), the
 `Invoice` and `Coin` types carry only `amount + recipient`, and the
-account-server's `balance: u64` is a single scalar.
+account-node's `balance: u64` is a single scalar.
 
 Multi-asset opens this to any user: anyone mints a new token under a
 chosen name, distributes it, and retains the right to issue more.
@@ -73,7 +73,7 @@ means a non-trivial protocol-level change.
 
 | # | Decision | Consequence |
 | - | -------- | ----------- |
-| **M1** | **Token creation is permissionless.** Any account can call `/api/asset/create` and mint a new asset. No whitelist, no admin gate, no fee gate. | The server is a pass-through registrar. Spam pressure is handled by the on-chain inscription fee on the genesis transaction's `Commitment`, not by the server. |
+| **M1** | **Token creation is permissionless.** Any account can call `/api/asset/create` and mint a new asset. No whitelist, no admin gate, no fee gate. | The node is a pass-through registrar. Spam pressure is handled by the on-chain inscription fee on the genesis transaction's `Commitment`, not by the node. |
 | **M2** | **Creator retains ongoing mint authority.** The asset's genesis transaction pins a `mint_authority_pubkey` (the creator's compressed secp256k1 pubkey). Subsequent `/api/mint` calls require a fresh Schnorr signature verifiable against that pubkey. No fixed-supply rule. | No "burn the key after genesis" mode. Total supply is open-ended; trust in the asset is trust in the creator not to over-issue. Key rotation is out of scope (see §11, §12.7). |
 | **M3** | **Asset namespace is first-come-first-served on `name`.** The first genesis transaction binding a given `name` wins; later attempts return `409 Conflict`. Normalisation is `name.to_lowercase()` to remove the cheapest look-alike attacks; the trade-off is documented in §10. | `assets.name UNIQUE` at the SQL layer is the enforcement point. No retroactive renaming, no namespace governance. |
 | **M4** | **Privacy pool is a single shared SMT.** `asset_id` is a public field on each coin commitment and a public input on each state-transition proof. Anonymity-set is per-asset (all `asset_id = X` traffic mixes; `asset_id = Y` is a separate pool). | Circuit complexity unchanged modulo one extra public input + one cross-coin equality constraint. Per-asset trees and per-asset MMRs are deferred. |
@@ -239,7 +239,7 @@ The genesis carries five things into the world:
 
 After genesis, the asset creator may issue further units by calling
 `/api/mint { asset_id, recipient, amount, signature, timestamp }`.
-The server:
+The node:
 
 1. Looks up `AssetMeta` by `asset_id`. Rejects if unknown.
 2. Verifies the BIP-340 Schnorr signature over
@@ -248,7 +248,7 @@ The server:
    `mint_authority_pubkey`.
 3. Rejects if the timestamp is older than 300 s or in the future —
    matches the existing replay window in
-   `verify_send_signature` (`node/src/server.rs`).
+   `verify_send_signature` (`node/src/router.rs`).
 4. Runs the prover to produce a state-transition proof that moves
    `amount` units of `asset_id` from the asset's mint-authority
    account into a fresh coin for `recipient`. The same circuit
@@ -256,7 +256,7 @@ The server:
    in-circuit signature gate fires against `mint_authority_pubkey`
    instead of the sender's commitment pubkey (see §5).
 
-The current `/api/mint` is permissioned only by the server's
+The current `/api/mint` is permissioned only by the node's
 faucet config (`feature = "faucet"`, `MINTING_ADDRESS` hard-coded);
 under multi-asset it becomes a signed request from any creator for
 their own asset.
@@ -278,7 +278,7 @@ H("zkcoins:send"
 
 Existing wallets sign over `SHA256(account_address || recipient
 || amount_le || timestamp_le)` with **no** domain prefix — see
-`verify_send_signature` in `node/src/server.rs`. The multi-asset
+`verify_send_signature` in `node/src/router.rs`. The multi-asset
 upgrade does two things to this hash:
 
 1. **Adds `asset_id`** between `amount_le` and `timestamp_le`.
@@ -305,7 +305,7 @@ twice — defense in depth, matching the pattern in
 `node/src/account_node.rs::send_coins` (off-circuit pre-check)
 and `program-plonky2/src/circuit/main.rs` (in-circuit constraint):
 
-- **Off-circuit (server pre-check):** before paying prove cost,
+- **Off-circuit (node pre-check):** before paying prove cost,
   iterate `account.coin_queue` and `invoices`, assert every
   `asset_id` equals the transition's claimed `asset_id`. Reject
   with `400 Mixed assets in single transition` on mismatch.
@@ -423,13 +423,13 @@ constraint becomes "the request is signed by the asset's
 Two viable architectures, mirroring the recurring trade-off in
 `SPEC.md` §12.6:
 
-1. **Off-circuit Schnorr verify (preferred for v1).** The server
+1. **Off-circuit Schnorr verify (preferred for v1).** The node
    verifies the BIP-340 Schnorr signature with the existing
    `secp.verify_schnorr` call (the same path used by
-   `verify_send_signature` in `node/src/server.rs`), and the
+   `verify_send_signature` in `node/src/router.rs`), and the
    in-circuit branch only enforces that the proof's
    `mint_authority_pubkey` public input matches the
-   asset-registry-stored value. The asset registry is server state,
+   asset-registry-stored value. The asset registry is node state,
    not on-chain state — the mainnet hardening track decides whether
    this is acceptable (it is for the closed test environment per
    invariant 2 of [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
@@ -569,14 +569,14 @@ migration window, see §6.3).
 ### 6.3 Migration notes
 
 Per [`CONTRIBUTING.md`](./CONTRIBUTING.md) invariant 2 ("Closed
-test environment — DEV *and* PRD"), the cutover wipes server state
+test environment — DEV *and* PRD"), the cutover wipes node state
 and starts fresh. No live-migration logic.
 
 The recovery procedure from `CONTRIBUTING.md` § "DEV state
-recovery" applies as written: stop the server, truncate every
+recovery" applies as written: stop the node, truncate every
 state-layer table (now including `assets`), drop the proofs
 directory, restart. The pre-multi-asset coins are abandoned on-chain
-(they're random test data); the new server starts at genesis with
+(they're random test data); the new node starts at genesis with
 an empty `assets` table.
 
 PR-A1/A2/A3 already left DEV and PRD with empty Postgres state
@@ -677,7 +677,7 @@ Suggested handler name: `asset_info_handler`.
 ### 7.4 `POST /api/mint` (modified)
 
 The current faucet semantics
-(`feature = "faucet"`, no signature required because the server is
+(`feature = "faucet"`, no signature required because the node is
 the minter) are removed. The new shape:
 
 ```
@@ -774,7 +774,7 @@ on both DEV and PRD anyway) but is functionally subsumed by
 
 ## 8. Wallet (client) impact
 
-This document is server-centric. The wallet (`zk-coins/app`)
+This document is node-centric. The wallet (`zk-coins/app`)
 adapts in four places; full design is out of scope here.
 
 - **Per-asset balance display.** The wallet's home screen renders a
@@ -887,7 +887,7 @@ The mechanics behind decision M2.
   `SHA256("zkcoins:mint" || asset_id || recipient || amount_le ||
   timestamp_le)`, verified against the asset's
   `mint_authority_pubkey`. Same secp256k1 primitive as the send
-  signature (`verify_send_signature` in `node/src/server.rs`); no
+  signature (`verify_send_signature` in `node/src/router.rs`); no
   new crypto primitive.
 - **Replay protection.** 5-minute timestamp window
   (`now.abs_diff(timestamp) > 300 → reject`), matching the
@@ -977,7 +977,7 @@ client-visible breaking change in the upgrade.
 - **Trade-off:** invariant 2 (closed test environment, DEV and
   PRD) makes the capability-flag approach safe — there are no
   external wallets to worry about, and the wallet
-  (zk-coins/app) and server roll out together in lockstep.
+  (zk-coins/app) and node roll out together in lockstep.
   Adding a version field is belt-and-braces that costs nothing
   but pollutes the JSON. Recommend keeping capability-flag only
   unless the maintainer wants the safety net.
@@ -1031,7 +1031,7 @@ without a prefix.
 ### 12.6 Off-circuit vs in-circuit Schnorr for the mint branch
 
 §5.3 picks off-circuit Schnorr verify for the mint and genesis
-branches. The asset registry is server state, not on-chain state.
+branches. The asset registry is node state, not on-chain state.
 
 - **Choice in doc:** off-circuit verify via existing
   `secp.verify_schnorr`. The in-circuit branch only enforces
@@ -1039,7 +1039,7 @@ branches. The asset registry is server state, not on-chain state.
   registry value.
 - **Alternative:** in-circuit BIP-340 Schnorr-on-secp256k1
   gadget. Verifies the mint signature inside the proof itself;
-  removes the server-state trust assumption.
+  removes the node-state trust assumption.
 - **Trade-off:** in-circuit Schnorr-on-secp256k1 is non-trivial
   in Plonky2 (`MIGRATION_RESEARCH.md` §5.4 has the analysis).
   For the closed test environment (invariant 2), off-circuit
@@ -1113,12 +1113,12 @@ per the convention in `BRIDGE_MVP.md` §12.1.
 
 | Phase | Scope | Effort | Risk |
 | ----- | ----- | ------ | ---- |
-| **P1 — Shared types + AssetId plumbing** | `shared/src/lib.rs` gains `AssetId`, `AssetMeta`; `Invoice` gains `asset_id`; `program-plonky2/src/types.rs::Coin`/`CoinTemplate` gain `asset_id`. No behaviour change yet — the field is propagated but the server defaults it to a placeholder `DEFAULT_ASSET_ID` so existing tests pass unchanged. Drop in a `MULTI_ASSET_FIXME` comment at every site that will need real handling in P5. | **S** | Low — mechanical |
+| **P1 — Shared types + AssetId plumbing** | `shared/src/lib.rs` gains `AssetId`, `AssetMeta`; `Invoice` gains `asset_id`; `program-plonky2/src/types.rs::Coin`/`CoinTemplate` gain `asset_id`. No behaviour change yet — the field is propagated but the node defaults it to a placeholder `DEFAULT_ASSET_ID` so existing tests pass unchanged. Drop in a `MULTI_ASSET_FIXME` comment at every site that will need real handling in P5. | **S** | Low — mechanical |
 | **P2 — Circuit extension** | `program-plonky2/src/circuit/main.rs`: bump `N_PROOF_DATA_PUBLIC_INPUTS` to 20, add `asset_id` public input, add per-slot masked-equality gates, extend `calculate_coin_identifier`. Re-run `recursion_shape_probe::dump_phase_2a_pad_bits_sweep` to confirm padding still fits. Coverage gate stays at 100%. The single heaviest lift. | **L** | Medium — cyclic-recursion padding may shift |
 | **P3 — Asset registry endpoints** | `POST /api/asset/create`, `GET /api/asset/list`, `GET /api/asset/info/:id_or_name`. New `assets` table migration. SQL `name UNIQUE` enforcement. Handler tests for the 409-on-conflict race. | **M** | Low — standard HTTP API extension |
 | **P4 — Mint signature verification** | `POST /api/mint` switches from faucet to signed creator-mint. Per-asset `num_pubkeys` counter. The faucet shortcut is removed; the always-on `Capabilities.faucet` is rewired to `multi_asset`. | **M** | Medium — replaces a known-good code path; tests must cover the per-asset replay protection |
 | **P5 — Send + balance + commit shape** | `POST /api/send` extends signed message, `GET /api/balance` becomes per-asset map, single-asset off-circuit pre-check enforces M5, `Capabilities.multi_asset = true`. Backfill the `MULTI_ASSET_FIXME` sites from P1. | **L** | Medium — multiple coupled changes, all wallet-visible |
-| **P6 — Wallet adaptation** | `zk-coins/app`: balance display, send-flow asset picker, create-asset UX. Separate PR(s) in the app repo, gated on `Capabilities.multi_asset` from the server's `/api/info`. | **L** | Medium — UX-heavy, parallel to server work |
+| **P6 — Wallet adaptation** | `zk-coins/app`: balance display, send-flow asset picker, create-asset UX. Separate PR(s) in the app repo, gated on `Capabilities.multi_asset` from the node's `/api/info`. | **L** | Medium — UX-heavy, parallel to node work |
 
 **Aggregate effort: M + L + M + M + L + L ≈ 4 person-months at
 full focus.** Phase 1 can begin immediately; Phase 2 is the heavy
@@ -1185,7 +1185,7 @@ So nobody scope-creeps:
 - `node/src/account_node.rs` — `Account`, `send_coins`, the
   off-circuit pre-check pattern that the new single-asset
   invariant follows.
-- `node/src/server.rs` — `verify_send_signature` (mint signature
+- `node/src/router.rs` — `verify_send_signature` (mint signature
   follows the same 5-minute replay window and message-hash
   pattern), `Capabilities`.
 

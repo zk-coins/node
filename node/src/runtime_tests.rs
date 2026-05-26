@@ -41,7 +41,7 @@ use crate::username::UsernameStore;
 use zkcoins_program::hash::digest_to_bytes;
 use zkcoins_program::types::MINTING_ADDRESS;
 
-/// Boot a fresh `postgres:17` container, run the server migrations
+/// Boot a fresh `postgres:17` container, run the node migrations
 /// against it, and return the live pool plus the container handle.
 /// Dropping the container handle tears the container down, so the
 /// caller keeps it alive for the duration of the test.

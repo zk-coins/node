@@ -338,10 +338,10 @@ CREATE TABLE coin_proof_store (
 CREATE INDEX coin_proof_store_expires_at_idx ON coin_proof_store (expires_at);
 
 -- ===========================================================================
--- 10. boot_log: server lifecycle events
+-- 10. boot_log: node lifecycle events
 -- ===========================================================================
 --
--- Captures the events that happen *before* the HTTP server starts
+-- Captures the events that happen *before* the HTTP API starts
 -- accepting requests (migration run, state load, vault sync, scanner
 -- bootstrap) and the matching shutdown / panic events. Today these are
 -- stdout-only; if a service flapped overnight the `received_at` of the

@@ -2457,7 +2457,7 @@ mod tests {
     /// Build a `CommitmentMerkleProofs` witness for an Initial → AccountUpdate
     /// chain on the same account state.
     ///
-    /// The off-circuit setup mirrors what the server scanner would do:
+    /// The off-circuit setup mirrors what the node scanner would do:
     /// 1. Build the commitment value `c = h(asth || ocr)` for the prev proof.
     /// 2. Build the SMT containing `(pk_hash → c)`.
     /// 3. Fold the SMT root into the history MMR alongside the empty prev
@@ -2523,7 +2523,7 @@ mod tests {
 
         // Bootstrap pattern: Init commits to the EMPTY history
         // (`prev.commitment_history_root == ZERO_HASH`); after Init the
-        // server folds its commitment into the MMR, giving the
+        // node folds its commitment into the MMR, giving the
         // post-fold `history_root_extended` against which Update is
         // proved. The fixture matches that exact layout — (e)'s leaf
         // shape `h(smt_root || ZERO_HASH)` coincides with (d)'s leaf.

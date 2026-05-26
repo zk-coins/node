@@ -1,6 +1,6 @@
 //! Library crate root for `node`.
 //!
-//! The server is primarily a binary (`main.rs`), but a few pieces of
+//! The node is primarily a binary (`main.rs`), but a few pieces of
 //! it must be reachable from out-of-tree integration tests
 //! (`node/tests/api_remote.rs` in particular). Exposing those
 //! modules through a `lib` target keeps the binary side of the crate

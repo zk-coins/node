@@ -321,7 +321,7 @@ fn should_skip_scanner_state_update_returns_true_only_for_complete() {
 #[test]
 fn should_skip_scanner_state_update_false_for_missing_row() {
     // Out-of-band / recovery inscription that never went through this
-    // server's mint flow: no `pending_inscriptions` row, scanner is the
+    // node's mint flow: no `pending_inscriptions` row, scanner is the
     // authoritative integration path.
     assert!(!should_skip_scanner_state_update(None));
 }

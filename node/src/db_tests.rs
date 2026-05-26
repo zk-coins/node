@@ -5,7 +5,7 @@
 // the simplest model — no shared state, no `truncate_all` ordering,
 // no risk of cross-test contamination. The container boot is ~3-5 s
 // each and the suite runs single-threaded under
-// `--test-threads=1` (mirrors the rest of the server test gate), so
+// `--test-threads=1` (mirrors the rest of the node test gate), so
 // the total wall time stays comfortably below a minute even with the
 // per-test container.
 //
@@ -452,7 +452,7 @@ async fn connect_and_migrate_propagates_migration_failure() {
 #[tokio::test]
 async fn pending_inscription_status_by_commit_txid_returns_none_for_unknown_txid() {
     // Scanner's pre-state.update lookup: an external / out-of-band
-    // inscription (not produced by this server's mint flow) has no
+    // inscription (not produced by this node's mint flow) has no
     // `pending_inscriptions` row. The helper must return `None` so the
     // scanner falls through to its normal state.update path instead of
     // short-circuiting.

@@ -1,4 +1,4 @@
-// Postgres state-layer for the zkCoins server.
+// Postgres state-layer for the zkCoins node.
 //
 // Introduced in PR-A1 of the 3-PR Postgres migration series; the
 // schema (see `node/migrations/*.sql`) and the typed API around
@@ -34,11 +34,11 @@ use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes, HashDigest};
 /// variants correspond one-to-one with the two `create_and_broadcast_inscription`
 /// callers:
 ///
-/// * `Mint` — `router::mint_handler` (server signs the commitment with
+/// * `Mint` — `router::mint_handler` (node signs the commitment with
 ///   the minting account's index-N private key).
 /// * `Send` — `runtime::broadcast_commit_and_deliver`, invoked from
 ///   `router::commit_handler` (client signs the commitment with their
-///   wallet key, server only relays it on-chain).
+///   wallet key, node only relays it on-chain).
 ///
 /// Persisting this is the difference between a DB row that tells you
 /// *what happened* and one that only tells you *that something happened*.
@@ -85,7 +85,7 @@ pub async fn connect_and_migrate(url: &str) -> Result<PgPool, sqlx::Error> {
 // ---- Request audit log (migration 0007) ----------------------------------
 //
 // Persist every HTTP request the node accepts, with the raw body and
-// headers and the bytes of the response sent back. The server is not a
+// headers and the bytes of the response sent back. The node is not a
 // privacy boundary — anyone who wants shielded operation runs their own
 // node; the operator-side observation surface is fair game.
 
@@ -924,7 +924,7 @@ pub async fn update_pending_status(
 
 /// Look up the current `status` value for a `pending_inscriptions` row
 /// keyed by its `commit_txid`. Returns `Ok(None)` when no row exists
-/// (an external inscription that never went through this server's mint
+/// (an external inscription that never went through this node's mint
 /// flow, e.g. an out-of-band manual recovery via the `recover_inscription`
 /// CLI in PR #106, or a fresh database).
 ///
@@ -1028,7 +1028,7 @@ pub async fn load_pending_in_progress(
 /// raw commit/reveal/commitment blobs (which are useful for crash
 /// recovery but not for operator/forensic queries).
 ///
-/// Returns `Ok(None)` when no row exists — either because this server
+/// Returns `Ok(None)` when no row exists — either because this node
 /// never originated the inscription (e.g. an external recovery via the
 /// `recover_inscription` CLI) or because the txid was never seen here.
 #[derive(Debug, Clone, Serialize)]

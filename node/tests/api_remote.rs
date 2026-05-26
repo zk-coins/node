@@ -1,4 +1,4 @@
-//! HTTP API end-to-end test suite for the deployed zkCoins server.
+//! HTTP API end-to-end test suite for the deployed zkCoins node.
 //!
 //! This suite is the functional counterpart to the smoke test inside
 //! `.github/workflows/deploy-dev.yaml` (which only probes `/api/info`).
@@ -9,10 +9,10 @@
 //! exercising the API contract happy path against the same backend
 //! the wallet app talks to.
 //!
-//! Scope note: the suite verifies server-visible behaviour (status
+//! Scope note: the suite verifies API-visible behaviour (status
 //! codes, response shapes, balance movements). The commit message
 //! format used in `send_commit_roundtrip_moves_balance` is the
-//! 64-byte `ash || ocr` raw concat, which the server accepts via
+//! 64-byte `ash || ocr` raw concat, which the node accepts via
 //! `Commitment::verify`'s SHA-256 fallback. The canonical wallet
 //! client signs the 32-byte Poseidon `hash_concat(ash, ocr)` digest
 //! (see `shared::ClientAccount::create_commitment`); the two forms
@@ -20,11 +20,11 @@
 //! and the suite never re-spends from the test wallet so the leaf
 //! shape is observationally indistinguishable in-scope.
 //!
-//! The DEV server is shared by other workflows (per-PR app E2E,
+//! The DEV node is shared by other workflows (per-PR app E2E,
 //! interactive testing). To keep this suite race-free we always:
 //!   - mint into freshly-generated wallets (no fixed addresses)
 //!   - assert strictly on 4xx codes (client-fixable contract bugs)
-//!   - assert strictly on 5xx codes as well (server-side regressions
+//!   - assert strictly on 5xx codes as well (node-side regressions
 //!     are real bugs, not flakes — the deploy-dev preflight verifies
 //!     publisher wallet + /health/ready BEFORE this suite runs, so a
 //!     503 here is unambiguous: it means something regressed)
@@ -35,7 +35,7 @@
 //!
 //! Configuration:
 //!   - `ZKCOINS_API_URL` (default `https://dev-api.zkcoins.app`) —
-//!     the base URL of the server under test.
+//!     the base URL of the node under test.
 
 use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
 use bitcoin::secp256k1::{self as secp, Keypair, Message, PublicKey, SecretKey};
@@ -110,26 +110,29 @@ fn url(path: &str) -> String {
 /// (any value, even empty) downgrades the CI panic back to a silent
 /// skip. The dev-api / prd-api Docker images intentionally ship the
 /// MVP-only feature set (`Dockerfile` `ARG FEATURES=`), so when the
-/// suite runs `--all-features` against a feature-trimmed *server*
+/// suite runs `--all-features` against a feature-trimmed *node*
 /// the gated `address_list` / `lnurl` tests must skip cleanly instead
 /// of panicking the CI canary. The env var documents this as an
-/// opt-in: workflows that point the suite at a trimmed server set it,
-/// workflows that point it at a fully-featured server leave it unset
+/// opt-in: workflows that point the suite at a trimmed node set it,
+/// workflows that point it at a fully-featured node leave it unset
 /// so the canary stays armed.
+///
+/// The env-var name keeps the legacy `_SERVER` suffix as a stable
+/// contract with `.github/workflows/deploy-dev.yaml`; the prose above
+/// reflects the post-rename "node" terminology.
 macro_rules! feature_skip {
     ($feature:expr, $test:expr) => {{
-        let allow_trimmed_server =
-            std::env::var("ZKCOINS_E2E_ALLOW_FEATURE_TRIMMED_SERVER").is_ok();
-        if std::env::var("CI").is_ok() && !allow_trimmed_server {
+        let allow_trimmed_node = std::env::var("ZKCOINS_E2E_ALLOW_FEATURE_TRIMMED_SERVER").is_ok();
+        if std::env::var("CI").is_ok() && !allow_trimmed_node {
             panic!(
                 "feature `{}` disabled but running in CI — all-features build is required \
-                 (set ZKCOINS_E2E_ALLOW_FEATURE_TRIMMED_SERVER=1 if the target server is \
+                 (set ZKCOINS_E2E_ALLOW_FEATURE_TRIMMED_SERVER=1 if the target node is \
                  intentionally feature-trimmed, e.g. the MVP-only DEV image)",
                 $feature
             );
         }
         eprintln!(
-            "SKIP {}: feature `{}` disabled on this server",
+            "SKIP {}: feature `{}` disabled on this node",
             $test, $feature
         );
         return;
@@ -149,9 +152,9 @@ macro_rules! feature_skip {
 // rest of the test if the relevant feature flag is `false`.
 //
 // `ZKCOINS_FORCE_DISABLE_FEATURES` (comma-separated list, e.g.
-// `address_list,lnurl`) overrides any flag returned by the server
+// `address_list,lnurl`) overrides any flag returned by the node
 // to `false`. This is the local dry-run hook — point the suite at the
-// live DEV server, force features off, and confirm that every gated
+// live DEV node, force features off, and confirm that every gated
 // test prints `SKIP …` instead of hitting a disabled-on-paper but
 // actually-running endpoint. Forcing `faucet` or `usernames` off is a
 // no-op (the routes are always registered) and the flags are ignored.
@@ -225,7 +228,7 @@ async fn fetch_capabilities(client: &reqwest::Client) -> Capabilities {
 
 // ---------------------------------------------------------------------------
 // TestWallet — fresh-per-test random key + helpers for signing the four
-// request shapes the server accepts (send / commit / username-claim).
+// request shapes the node accepts (send / commit / username-claim).
 // ---------------------------------------------------------------------------
 
 struct TestWallet {
@@ -237,7 +240,7 @@ impl TestWallet {
     fn new() -> Self {
         let mut seed = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut seed);
-        // Signet matches the mutinynet flavour the DEV server runs on;
+        // Signet matches the mutinynet flavour the DEV node runs on;
         // the network choice only affects xpub serialisation prefixes,
         // not the derived secp256k1 keys we sign with.
         let xpriv = Xpriv::new_master(Network::Signet, &seed).expect("derive xpriv from seed");
@@ -267,7 +270,7 @@ impl TestWallet {
         Keypair::from_secret_key(&self.secp, &self.seckey(idx))
     }
 
-    /// The hex address that the server treats as the account identifier.
+    /// The hex address that the node treats as the account identifier.
     /// Mirrors `shared::AccountState::new` → `sha256(compressed_pubkey)`.
     fn address_hex(&self) -> String {
         let pk = self.pubkey(0);
@@ -297,7 +300,7 @@ impl TestWallet {
 
     /// Sign the commit message: the BIP-340 Schnorr signature is
     /// produced by `Commitment::new`, which SHA256s any non-32-byte
-    /// payload before signing. The server reconstructs the
+    /// payload before signing. The node reconstructs the
     /// `Commitment` struct from `(public_key, signature, message)`
     /// and re-verifies it the same way.
     fn sign_commit(&self, message_bytes: &[u8]) -> String {
@@ -309,7 +312,7 @@ impl TestWallet {
     /// Sign the username-claim preimage:
     /// `SHA256("zkcoins:claim_username" || address_hex_str || normalised_username_str || timestamp_le8)`.
     ///
-    /// The server canonicalises the username with `to_lowercase()`
+    /// The node canonicalises the username with `to_lowercase()`
     /// before hashing; wallets must sign over the same lowercase form
     /// or verification fails. The helper mirrors that to keep the
     /// signature path honest end-to-end.
@@ -523,7 +526,7 @@ async fn address_list_returns_addresses() {
 
 #[tokio::test]
 async fn proof_for_huge_id_returns_404() {
-    // u64::MAX is guaranteed to exceed any real proof_id the server
+    // u64::MAX is guaranteed to exceed any real proof_id the node
     // has issued, so the file-on-disk lookup misses and returns 404.
     let resp = http_client()
         .get(url(&format!("/api/proof/{}", u64::MAX)))
@@ -678,7 +681,7 @@ async fn send_bad_address_hex_returns_422() {
 #[tokio::test]
 async fn send_unknown_account_returns_404() {
     // Well-formed body, valid signatures, but the sender account has
-    // no balance / state on the server, so `send_coins` returns
+    // no balance / state on the node, so `send_coins` returns
     // "Unknown account address" → 404.
     let alice = TestWallet::new();
     let bob = TestWallet::new();
@@ -806,7 +809,7 @@ async fn commit_unknown_proof_id_returns_404() {
 #[tokio::test]
 async fn commit_bad_message_hex_returns_422_or_404() {
     let alice = TestWallet::new();
-    // proof_id=1 may or may not exist on the server. If it exists, the
+    // proof_id=1 may or may not exist on the node. If it exists, the
     // handler reaches the hex-decode step and returns 422. If not, the
     // proof-store miss short-circuits at 404. Both are acceptable for
     // this negative-path coverage.
@@ -901,7 +904,7 @@ async fn claim_username_stale_timestamp_returns_401() {
 }
 
 // ---------------------------------------------------------------------------
-// Section 3 — happy-path roundtrips against the deployed server
+// Section 3 — happy-path roundtrips against the deployed node
 // ---------------------------------------------------------------------------
 
 /// Roundtrip A — mint into a fresh wallet and observe the balance.
@@ -962,7 +965,7 @@ async fn mint_roundtrip_lands_balance_and_proof() {
         bincode::deserialize(&proof_bytes).expect("decode CoinProof bincode");
     assert!(
         coin_proof.commitment.is_some(),
-        "mint coin proof should carry a server-signed commitment"
+        "mint coin proof should carry a node-signed commitment"
     );
     assert_eq!(coin_proof.coin.amount, MINT_AMOUNT);
 }
@@ -970,7 +973,7 @@ async fn mint_roundtrip_lands_balance_and_proof() {
 /// Roundtrip B — full mint → send → commit pipeline.
 ///
 /// The send half requires the previous commitment's signing key as
-/// `prev_commitment_pubkey`. After a mint that's the server's minting
+/// `prev_commitment_pubkey`. After a mint that's the node's minting
 /// pubkey, embedded in the mint's `CoinProof.commitment`.
 #[tokio::test]
 async fn send_commit_roundtrip_moves_balance() {
@@ -1085,7 +1088,7 @@ async fn send_commit_roundtrip_moves_balance() {
 
     // Value-bearing assertions on the response payload: each hash
     // field must decode to exactly 32 bytes and be non-zero. A
-    // shape-only `.is_some()` check was masking server bugs that
+    // shape-only `.is_some()` check was masking node bugs that
     // returned a placeholder zero-hash or a truncated hex string.
     let ash_hex = send_body["account_state_hash"]
         .as_str()

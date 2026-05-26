@@ -8,7 +8,7 @@ use crate::account_node::{Account, AccountNode};
 use crate::state::State;
 
 /// Build a `PgPool` that points at nowhere — every query against it
-/// fails fast with a connect error. Used by the server-handler test
+/// fails fast with a connect error. Used by the node-handler test
 /// suite below so the handlers' persistence-side `.await` lines run
 /// the error branch (which mirrors the legacy file-IO best-effort
 /// semantics: log + continue, never fail the response). The matching
@@ -975,7 +975,7 @@ async fn claim_username_mixed_case_input_normalised_before_hashing() {
         );
     }
 
-    // Send the mixed-case form. The server normalises, hashes over
+    // Send the mixed-case form. The node normalises, hashes over
     // the lowercase form, and the signature verifies.
     let body = serde_json::json!({
         "username": user_input,
@@ -1003,9 +1003,9 @@ async fn claim_username_mixed_case_input_normalised_before_hashing() {
 
 /// Counterpart to the test above: a wallet that signs over the RAW
 /// mixed-case input (legacy/buggy behaviour) must be rejected by the
-/// server, because the server hashes the normalised form. Without
+/// node, because the node hashes the normalised form. Without
 /// this, the case-mismatch squat is reachable: attacker signs `"Bob"`,
-/// server persists `"bob"`, the legitimate `bob` owner is locked out.
+/// node persists `"bob"`, the legitimate `bob` owner is locked out.
 #[tokio::test]
 async fn claim_username_raw_case_signature_rejected() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -1058,7 +1058,7 @@ async fn claim_username_raw_case_signature_rejected() {
     assert_eq!(
         status,
         StatusCode::UNAUTHORIZED,
-        "raw-case signature must fail; server hashes normalised form"
+        "raw-case signature must fail; node hashes normalised form"
     );
 }
 
@@ -1417,7 +1417,7 @@ async fn claim_username_invalid_signature_format_returns_422() {
     assert_eq!(resp.reason, "Invalid signature format");
 }
 
-/// Pool with no reachable server: `db::claim_username` returns an error
+/// Pool with no reachable Postgres: `db::claim_username` returns an error
 /// after the in-memory `precheck` passes. The handler must map that
 /// onto a 503. Mirrors `claim_propagates_db_error_when_pool_is_dead`
 /// from `username_tests.rs`, but exercises the handler's error arm.
@@ -2971,10 +2971,10 @@ fn lock_or_recover_account_node_poisoned() {
     // copy of lock_or_recover's poison-recovery closure.
     let state_arc = Arc::new(Mutex::new(State::new()));
     let node = Arc::new(Mutex::new(AccountNode::new(Arc::clone(&state_arc))));
-    let server_clone = Arc::clone(&node);
+    let node_clone = Arc::clone(&node);
 
     let _ = std::thread::spawn(move || {
-        let _guard = server_clone.lock().unwrap();
+        let _guard = node_clone.lock().unwrap();
         panic!("intentional poison");
     })
     .join();
@@ -3046,7 +3046,7 @@ fn map_send_coins_error_unable_to_get_merkle_proofs_is_422() {
 #[test]
 fn map_send_coins_error_unable_to_get_mmr_inclusion_proof_is_422() {
     // Reachable from send_coins via get_merkle_proofs (account_node::236).
-    // Caller's previous_proof references a history root the server's MMR
+    // Caller's previous_proof references a history root the node's MMR
     // hasn't observed yet — stale snapshot, caller-fixable.
     let (status, body) = crate::router::map_send_coins_error(
         "Unable to get mmr inclusion proof for the previous root",
@@ -3062,7 +3062,7 @@ fn map_send_coins_error_unable_to_get_mmr_inclusion_proof_is_422() {
 fn map_send_coins_error_proof_public_inputs_too_short_is_500() {
     // Reachable from send_coins via get_merkle_proofs (account_node::232).
     // The proof bytes stored against the account are too short to
-    // decode N_PROOF_DATA_PUBLIC_INPUTS field elements — server-side
+    // decode N_PROOF_DATA_PUBLIC_INPUTS field elements — node-side
     // corruption or version mismatch, not caller-fixable.
     let (status, body) = crate::router::map_send_coins_error("Proof public_inputs too short");
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -3156,7 +3156,7 @@ fn map_send_coins_error_unknown_string_is_500_internal_error() {
     // A new `send_coins` error string we haven't mapped yet must NOT
     // accidentally surface as 200 OK / 4xx. The default arm is 500 with
     // a generic "internal error" body so the wallet treats it as a
-    // server problem and the operator finds the unmapped string in the
+    // node problem and the operator finds the unmapped string in the
     // `eprintln!` log.
     let (status, body) = crate::router::map_send_coins_error("a string we never added");
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -3188,7 +3188,7 @@ async fn send_with_unknown_account_returns_404_with_error_string() {
         .private_key;
 
     // An address that is well-formed (hex, 32 bytes) but never claimed
-    // an account on the server.
+    // an account on the node.
     let account_address = "0x".to_string() + &hex::encode([0xAAu8; 32]);
     let recipient = "0x".to_string() + &hex::encode([1u8; 32]);
     let amount: u64 = 50;
@@ -3549,8 +3549,8 @@ fn mint_test_state_without_minting_account() -> AppState {
     let state = mint_test_state();
     {
         let mut node = state.account_node.lock().unwrap();
-        // Reset to a brand-new server with no accounts at all. The
-        // `Arc<Mutex<State>>` inside `server` is replaced too, but the
+        // Reset to a brand-new node with no accounts at all. The
+        // `Arc<Mutex<State>>` inside `node` is replaced too, but the
         // shared `state_inner` is dropped on overwrite which is fine
         // — nothing else holds it after `mint_test_state` returns.
         *node = AccountNode::new(Arc::new(Mutex::new(State::new())));
@@ -3660,7 +3660,7 @@ async fn mint_insufficient_funds_returns_422() {
 /// no-state-advance contract that the prepare-then-commit refactor
 /// introduced: after a broadcast failure the in-memory
 /// `minting_account.num_pubkeys` MUST still be 0, the minting
-/// `Account` in the server's map MUST still have an empty
+/// `Account` in the node's map MUST still have an empty
 /// `coin_queue`, `proof = None`, and the unchanged seed balance, and
 /// the recipient account MUST NOT exist yet. Before this PR the
 /// handler had already bumped the counter + mutated the minting
@@ -3678,8 +3678,8 @@ async fn mint_broadcast_failure_returns_503() {
     let minting_coin_queue_len_before: usize;
     let minting_proof_some_before: bool;
     {
-        let server_guard = state.account_node.lock().unwrap();
-        let acct = server_guard
+        let account_node_guard = state.account_node.lock().unwrap();
+        let acct = account_node_guard
             .get_account(&zkcoins_program::types::MINTING_ADDRESS)
             .expect("minting account seeded by mint_test_state");
         minting_balance_before = acct.balance;
@@ -3721,8 +3721,8 @@ async fn mint_broadcast_failure_returns_503() {
         "in-memory minting_account.num_pubkeys must NOT advance on broadcast failure (zk-coins/node#89)"
     );
     {
-        let server_guard = state.account_node.lock().unwrap();
-        let acct_after = server_guard
+        let account_node_guard = state.account_node.lock().unwrap();
+        let acct_after = account_node_guard
             .get_account(&zkcoins_program::types::MINTING_ADDRESS)
             .expect("minting account still present after failed mint");
         assert_eq!(
@@ -3740,7 +3740,7 @@ async fn mint_broadcast_failure_returns_503() {
             "minting Account proof must NOT be set by a failed-broadcast mint"
         );
         assert!(
-            server_guard.get_account(&recipient_addr).is_none(),
+            account_node_guard.get_account(&recipient_addr).is_none(),
             "recipient account must NOT be created when broadcast fails"
         );
     }

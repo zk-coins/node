@@ -71,7 +71,7 @@ pub(crate) fn filter_marker_txids(txids: Vec<Txid>, marker_bytes: &[u8]) -> Vec<
 /// inscriptions broadcast by `publisher::create_and_broadcast_inscription`
 /// pin their reveal's `input[0]` to the commit's vout 0, so the
 /// commit_txid surfaced here matches the `commit_txid` column in
-/// `pending_inscriptions` for every inscription this server originated.
+/// `pending_inscriptions` for every inscription this node originated.
 pub(crate) fn process_transaction_inscriptions(
     tx: &Transaction,
     current_block_hash: BlockHash,
