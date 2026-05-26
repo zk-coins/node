@@ -667,7 +667,17 @@ async fn persist_state_and_mark_complete_tx_rollback_on_failure_leaves_state_unt
     // UPDATE inside the helper will fail with "relation does not
     // exist", the transaction rolls back, and the smt/mmr UPSERTs
     // performed earlier in the same tx are undone.
-    sqlx::query("DROP TABLE pending_inscriptions")
+    //
+    // CASCADE is required after migration 0010 added FK constraints
+    // from `tx_mining_log.commit_txid` and
+    // `coin_proof_store.consumed_by_commit_txid` to
+    // `pending_inscriptions(commit_txid)`. Without CASCADE the DROP
+    // is rejected by Postgres with "cannot drop table … because
+    // other objects depend on it". The dependent tables and their FK
+    // constraints get dropped along with the parent — fine for this
+    // test, which is exercising a synthetic mid-tx failure, not a
+    // real schema change.
+    sqlx::query("DROP TABLE pending_inscriptions CASCADE")
         .execute(&pool)
         .await
         .unwrap();
