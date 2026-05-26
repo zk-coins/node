@@ -1938,9 +1938,19 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/.well-known/lnurlp/:username", get(lnurlp_handler))
         .route("/lnurl/pay/:username", get(lnurl_callback_handler));
 
-    app.with_state(state)
+    // Audit middleware sits OUTSIDE `with_state` because it carries its
+    // own `State<AppState>` extractor. Layered after CORS so the audit
+    // log records the final, CORS-decorated response — `Access-Control-*`
+    // headers and all. The `from_fn_with_state` adapter clones the
+    // state for every request (state itself is `Arc`-backed, so the
+    // clone is cheap).
+    app.with_state(state.clone())
         .fallback(|| async { StatusCode::NOT_FOUND })
         .layer(cors)
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            crate::audit::audit_log_middleware,
+        ))
 }
 
 #[cfg(test)]

@@ -26,6 +26,7 @@
 #![allow(clippy::new_without_default)]
 
 pub mod account_node;
+pub mod audit;
 pub mod db;
 pub mod publisher;
 pub mod router;

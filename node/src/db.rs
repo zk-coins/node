@@ -82,6 +82,57 @@ pub async fn connect_and_migrate(url: &str) -> Result<PgPool, sqlx::Error> {
     Ok(pool)
 }
 
+// ---- Request audit log (migration 0007) ----------------------------------
+//
+// Persist every HTTP request the node accepts, with the raw body and
+// headers and the bytes of the response sent back. The server is not a
+// privacy boundary — anyone who wants shielded operation runs their own
+// node; the operator-side observation surface is fair game.
+
+/// In-memory view of a `request_log` row. Built by the audit middleware
+/// (`audit::audit_log_middleware`) and shipped to `insert_request_log`
+/// from a fire-and-forget tokio task so audit writes never block the
+/// response back to the client.
+#[derive(Debug, Clone)]
+pub struct RequestLogEntry {
+    pub method: String,
+    pub path: String,
+    pub query: Option<String>,
+    pub remote_addr: Option<String>,
+    pub user_agent: Option<String>,
+    pub request_headers: serde_json::Value,
+    pub request_body: Vec<u8>,
+    pub response_status: i16,
+    pub response_headers: serde_json::Value,
+    pub response_body: Vec<u8>,
+    pub duration_us: i64,
+}
+
+pub async fn insert_request_log(pool: &PgPool, entry: &RequestLogEntry) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO request_log \
+         (method, path, query, remote_addr, user_agent, \
+          request_headers, request_body, \
+          response_status, response_headers, response_body, \
+          duration_us) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+    )
+    .bind(&entry.method)
+    .bind(&entry.path)
+    .bind(entry.query.as_deref())
+    .bind(entry.remote_addr.as_deref())
+    .bind(entry.user_agent.as_deref())
+    .bind(&entry.request_headers)
+    .bind(&entry.request_body)
+    .bind(entry.response_status)
+    .bind(&entry.response_headers)
+    .bind(&entry.response_body)
+    .bind(entry.duration_us)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 // ---- State persistence (PR-A2) --------------------------------------------
 
 /// Load the bincode-serialized Sparse Merkle Tree blob.
