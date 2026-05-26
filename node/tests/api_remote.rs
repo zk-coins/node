@@ -483,6 +483,19 @@ async fn balance_invalid_hex_returns_422() {
         .await
         .expect("GET /api/balance (bad hex)");
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // The balance handler returns a `BalanceResponse` (not a
+    // `SendCoinResponse`) on the 422 branches — so the body has
+    // `balance: 0` and no `error` field. This anchors the contract:
+    // any future refactor that swaps the body for a `handler_error_response`
+    // envelope (with an `error: "Invalid hex"` string, matching the
+    // app's `KNOWN_SERVER_ERRORS`) must update this assertion.
+    let body: Value = resp.json().await.expect("balance body JSON");
+    assert_eq!(body["balance"], 0, "422 balance body must report balance 0");
+    assert!(
+        body.get("error").is_none(),
+        "balance 422 body must not carry an `error` field today (got {:?})",
+        body.get("error")
+    );
 }
 
 #[tokio::test]
@@ -495,6 +508,14 @@ async fn balance_wrong_length_returns_422() {
         .await
         .expect("GET /api/balance (short hex)");
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // Same envelope shape as the invalid-hex branch above.
+    let body: Value = resp.json().await.expect("balance body JSON");
+    assert_eq!(body["balance"], 0, "422 balance body must report balance 0");
+    assert!(
+        body.get("error").is_none(),
+        "balance 422 body must not carry an `error` field today (got {:?})",
+        body.get("error")
+    );
 }
 
 #[tokio::test]
@@ -1650,6 +1671,66 @@ async fn balance_response_has_no_username_for_unclaimed_wallet() {
             other
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Section 5 — error-envelope contract
+//
+// Every non-2xx response the wallet app cares about MUST deserialise
+// as `{ success: false, error: <non-empty string> }`. The error string
+// is the lockstep anchor against `app/src/lib/api/errorMessages.ts ::
+// KNOWN_SERVER_ERRORS` — if the server renames a string without
+// updating the app's mapping, the user-facing message degrades to
+// `Serverfehler <status>: <raw>`.
+// ---------------------------------------------------------------------------
+
+/// Error contract #6 — every 4xx send body is a structured envelope.
+///
+/// Asserts only the SHAPE of the body (`success: false`, `error`
+/// non-empty string). The exact string is covered per-error by the
+/// extended negative-path tests above and by the lockstep inventory
+/// test below.
+#[tokio::test]
+async fn send_returns_structured_error_envelope() {
+    // Use the "unknown account" path: a well-formed body with a
+    // freshly-generated wallet that has never minted. Picked because
+    // it is the cheapest provocation that exercises the
+    // `send_coins_error_response` branch (the 422 invalid-hex paths
+    // go through `handler_error_response`, which has its own envelope
+    // shape — both are checked by the per-string assertions).
+    let alice = TestWallet::new();
+    let bob = TestWallet::new();
+    let amount: u64 = 1;
+    let ts = unix_now();
+    let signature = alice.sign_send(&alice.address_hex(), &bob.address_hex(), amount, ts);
+    let resp = http_client()
+        .post(url("/api/send"))
+        .json(&json!({
+            "account_address": alice.address_hex(),
+            "recipient": bob.address_hex(),
+            "amount": amount,
+            "public_key": hex::encode(alice.pubkey(0).serialize()),
+            "next_public_key": hex::encode(alice.pubkey(1).serialize()),
+            "prev_commitment_pubkey": Option::<String>::None,
+            "signature": Some(signature),
+            "timestamp": Some(ts),
+        }))
+        .send()
+        .await
+        .expect("POST /api/send envelope check");
+    let status = resp.status();
+    assert!(status.is_client_error(), "expected 4xx, got {}", status);
+    let body: Value = resp.json().await.expect("envelope body must be JSON");
+    assert_eq!(
+        body["success"],
+        Value::Bool(false),
+        "envelope must carry success=false, got {:?}",
+        body["success"]
+    );
+    let error = body["error"]
+        .as_str()
+        .expect("envelope must carry an `error` string");
+    assert!(!error.is_empty(), "envelope `error` must be non-empty");
 }
 
 // ---------------------------------------------------------------------------
