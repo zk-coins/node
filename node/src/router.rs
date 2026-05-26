@@ -1735,9 +1735,37 @@ async fn claim_username_handler(
     // before; the second writer hits `rows_affected == 0` and the
     // handler maps that to a 409. The post-commit insert is idempotent
     // — re-inserting the same `(normalized, address)` is a no-op.
+    // Decode signature bytes once so the claim-log row carries the
+    // exact signature bytes the caller submitted, regardless of the
+    // outcome below.
+    let signature_bytes = hex::decode(&request.signature).unwrap_or_default();
+
+    // username_claim_log helper: fire-and-forget, captures every
+    // outcome that reaches the in-memory / SQL layer (precheck reject,
+    // SQL race-loser, success). Pure-validation rejects above are
+    // already captured via request_log on the audit path.
+    let log_claim = |success: bool, reject_reason: Option<&str>| {
+        let entry = crate::db::UsernameClaimLogEntry {
+            requested_username: request.username.clone(),
+            normalized_username: normalized_username.clone(),
+            address: address_bytes.to_vec(),
+            signature: signature_bytes.clone(),
+            success,
+            reject_reason: reject_reason.map(|s| s.to_string()),
+            request_log_id: None,
+        };
+        let pool = state.pool.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::db::insert_username_claim_log(&pool, &entry).await {
+                eprintln!("Failed to persist username_claim_log: {}", e);
+            }
+        });
+    };
+
     if let Err(reason) =
         lock_or_recover(&state.username_store).precheck(&normalized_username, &address)
     {
+        log_claim(false, Some(reason));
         // `precheck` returns the static collision strings the wallet
         // surfaces verbatim. The status is `409 CONFLICT` for either
         // collision variant — same shape as the SQL-layer race below.
@@ -1757,6 +1785,7 @@ async fn claim_username_handler(
             Ok(b) => b,
             Err(db_err) => {
                 eprintln!("Failed to persist username claim: {}", db_err);
+                log_claim(false, Some(&format!("db error: {}", db_err)));
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(LnurlErrorResponse {
@@ -1768,6 +1797,7 @@ async fn claim_username_handler(
             }
         };
     if !inserted {
+        log_claim(false, Some("race lost on ON CONFLICT"));
         // Concurrent claimer won the `ON CONFLICT` race for the same
         // name. Surface as the same 409 a precheck collision would.
         return (
@@ -1781,6 +1811,8 @@ async fn claim_username_handler(
     }
 
     lock_or_recover(&state.username_store).commit_after_db(normalized_username.clone(), address);
+
+    log_claim(true, None);
 
     (
         StatusCode::OK,

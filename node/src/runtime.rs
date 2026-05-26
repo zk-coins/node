@@ -185,6 +185,33 @@ pub async fn start_rest_node(
 
     let app = create_router(state);
 
+    // boot_log: announce the startup event with the connected network,
+    // server version, listen address, and process pid. Best-effort —
+    // a failed boot_log insert must NOT prevent the server from
+    // starting (the operator would lose access to a real recovery
+    // path on a transient DB blip).
+    {
+        let boot_entry = crate::db::BootLogEntry {
+            event_type: "startup".to_string(),
+            message: format!(
+                "zkcoins-node {} starting on {} (network={})",
+                env!("CARGO_PKG_VERSION"),
+                socket_addr,
+                NETWORK_CONFIG.network_name,
+            ),
+            metadata: Some(serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "network": NETWORK_CONFIG.network_name,
+                "socket_addr": socket_addr.to_string(),
+                "pid": std::process::id(),
+                "is_mainnet": NETWORK_CONFIG.is_mainnet,
+            })),
+        };
+        if let Err(e) = crate::db::insert_boot_log(&pool, &boot_entry).await {
+            eprintln!("Failed to persist boot_log startup event: {}", e);
+        }
+    }
+
     println!("REST server started at {}", socket_addr);
     let listener = TcpListener::bind(socket_addr).await?;
     // `into_make_service_with_connect_info::<SocketAddr>()` exposes the
