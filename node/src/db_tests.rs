@@ -443,12 +443,15 @@ async fn pending_inscription_status_by_commit_txid_returns_none_for_unknown_txid
 async fn pending_inscription_status_by_commit_txid_returns_current_status() {
     let (pool, _container) = setup_pool().await;
     let commit_txid = [0xCDu8; 32];
+    let reveal_txid = [0xCEu8; 32];
     let commitment = b"test-commitment";
     let commit_tx = b"test-commit-tx";
     let reveal_tx = b"test-reveal-tx";
     insert_pending_inscription(
         &pool,
         &commit_txid,
+        &reveal_txid,
+        InscriptionKind::Mint,
         commitment,
         commit_tx,
         reveal_tx,
@@ -489,9 +492,15 @@ async fn pending_inscription_status_by_commit_txid_returns_current_status() {
 /// Helper: insert a `pending_inscriptions` row in the given starting
 /// status so the atomic-tx tests can exercise the mark-complete step.
 async fn seed_pending_row(pool: &PgPool, commit_txid: &[u8], status: &str) {
+    // Synthetic reveal txid for tests — not derived from the seed
+    // bytes since this helper is only used to drive the status state
+    // machine, not the reveal-txid lookup.
+    let reveal_txid: [u8; 32] = [0xAB; 32];
     insert_pending_inscription(
         pool,
         commit_txid,
+        &reveal_txid,
+        InscriptionKind::Mint,
         b"test-commitment",
         b"test-commit-tx",
         b"test-reveal-tx",

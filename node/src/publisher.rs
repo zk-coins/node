@@ -98,13 +98,26 @@ fn min_fee(tx: &Transaction, witness_weight: Option<Weight>) -> u64 {
     weight.div_ceil(4)
 }
 
+/// Telemetry from `inscription_txs`' reveal-txid prefix-mining loop.
+/// Returned alongside the constructed transactions so the caller can
+/// persist a row to `tx_mining_log` for forensics — answering "did the
+/// mining stall?" / "how much CPU did this Send cost?" from SQL.
+#[derive(Debug, Clone)]
+pub struct MiningStats {
+    pub target_prefix: String,
+    pub nonces_tried: i64,
+    pub duration_us: i64,
+    pub final_nonce: Option<i64>,
+    pub final_txid: bitcoin::Txid,
+}
+
 pub fn inscription_txs(
     commitment_data: &[u8],
     publisher_address: &Address,
     outpoints_with_sats: Vec<(OutPoint, u64)>,
     publisher_key: &str,
     config: &EsploraConfig,
-) -> (Transaction, Transaction) {
+) -> (Transaction, Transaction, MiningStats) {
     // Create secp context and keys
     let secp256k1 = Secp256k1::new();
     let sk = SecretKey::from_str(publisher_key).unwrap();
@@ -185,7 +198,7 @@ pub fn inscription_txs(
     let commit_txid = commit_tx.compute_txid();
     let commit_output_value = commit_tx.output[0].value.to_sat();
 
-    let reveal_tx = build_reveal_only_inner(
+    let (reveal_tx, stats) = build_reveal_only_inner(
         commit_txid,
         commit_output_value,
         publisher_address,
@@ -195,7 +208,7 @@ pub fn inscription_txs(
         &secp256k1,
     );
 
-    (commit_tx, reveal_tx)
+    (commit_tx, reveal_tx, stats)
 }
 
 /// Internal helper carrying the script-path anchor artefacts that both
@@ -283,7 +296,7 @@ pub fn build_reveal_only(
         taproot_spend_info,
     } = build_taproot_anchor(commitment_data, public_key, network);
 
-    let reveal_tx = build_reveal_only_inner(
+    let (reveal_tx, _stats) = build_reveal_only_inner(
         commit_txid,
         commit_output_value,
         publisher_address,
@@ -308,7 +321,7 @@ fn build_reveal_only_inner(
     reveal_script: &ScriptBuf,
     taproot_spend_info: &bitcoin::taproot::TaprootSpendInfo,
     secp256k1: &Secp256k1<secp256k1::All>,
-) -> Transaction {
+) -> (Transaction, MiningStats) {
     // The reveal spends the commit anchor; mirror the prevout `TxOut`
     // used for signing so the legacy and recovery paths produce a
     // byte-identical witness for the same inputs. The scriptPubKey is
@@ -350,7 +363,12 @@ fn build_reveal_only_inner(
         .control_block(&(reveal_script.clone(), LeafVersion::TapScript))
         .unwrap();
 
+    let mining_start = std::time::Instant::now();
+    let mut found_nonce: Option<u32> = None;
+    let mut nonces_seen: u32 = 0;
+
     for nonce in 0..MAX_MINING_ATTEMPTS {
+        nonces_seen = nonce;
         // Update the nSequence for mining
         reveal_tx.input[0].sequence = Sequence(nonce);
 
@@ -380,6 +398,7 @@ fn build_reveal_only_inner(
 
         if txid_bytes.starts_with(&target_prefix) {
             println!("Found matching txid: {} with nSequence: {}", txid, nonce);
+            found_nonce = Some(nonce);
             break;
         }
 
@@ -392,7 +411,16 @@ fn build_reveal_only_inner(
         }
     }
 
-    reveal_tx
+    let final_txid = reveal_tx.compute_txid();
+    let stats = MiningStats {
+        target_prefix: INSCRIPTION_MARKER_PREFIX.to_string(),
+        nonces_tried: i64::from(nonces_seen) + 1,
+        duration_us: i64::try_from(mining_start.elapsed().as_micros()).unwrap_or(i64::MAX),
+        final_nonce: found_nonce.map(i64::from),
+        final_txid,
+    };
+
+    (reveal_tx, stats)
 }
 
 /// Broadcasts the commit and reveal transactions to the Bitcoin
@@ -561,6 +589,7 @@ pub async fn get_publisher_utxo(
 /// pre-Phase-B version — no DB writes, no resume hooks.
 pub async fn create_and_broadcast_inscription(
     commitment_data: &[u8],
+    kind: db::InscriptionKind,
     config: &EsploraConfig,
     pool: Option<&PgPool>,
 ) -> Result<(Txid, Txid), Box<dyn std::error::Error + Send + Sync>> {
@@ -598,7 +627,7 @@ pub async fn create_and_broadcast_inscription(
     }
 
     // Create the inscription transactions
-    let (commit_tx, reveal_tx) = inscription_txs(
+    let (commit_tx, reveal_tx, mining_stats) = inscription_txs(
         commitment_data,
         &publisher_address,
         outpoints_with_sats,
@@ -627,6 +656,8 @@ pub async fn create_and_broadcast_inscription(
         match db::insert_pending_inscription(
             pool,
             commit_txid.as_byte_array(),
+            reveal_txid.as_byte_array(),
+            kind,
             commitment_data,
             &commit_tx_bytes,
             &reveal_tx_bytes,
@@ -660,6 +691,27 @@ pub async fn create_and_broadcast_inscription(
                 return Err(format!("persist pending inscription: {}", e).into());
             }
         }
+
+        // tx_mining_log: persist the reveal-txid prefix-mining effort
+        // (nonces tried, duration, final nonce + txid). Fire-and-forget
+        // because mining-stat loss is preferable to a Send failing on
+        // a transient DB blip.
+        {
+            let pool = pool.clone();
+            let mining_entry = db::TxMiningLogEntry {
+                target_prefix: mining_stats.target_prefix.clone(),
+                nonces_tried: mining_stats.nonces_tried,
+                duration_us: mining_stats.duration_us,
+                final_nonce: mining_stats.final_nonce,
+                final_txid: mining_stats.final_txid.as_byte_array().to_vec(),
+                commit_txid: Some(commit_txid.as_byte_array().to_vec()),
+            };
+            tokio::spawn(async move {
+                if let Err(e) = db::insert_tx_mining_log(&pool, &mining_entry).await {
+                    eprintln!("Failed to persist tx_mining_log: {}", e);
+                }
+            });
+        }
     }
 
     // Broadcast the transactions
@@ -672,6 +724,22 @@ pub async fn create_and_broadcast_inscription(
         }
         Err(e) => {
             println!("Failed to broadcast transactions: {}", e);
+            // Mark the row as definitively failed: status = 'failed' AND
+            // failure_reason set in one UPDATE. The status discriminator
+            // matches the error chain text so the operator can answer
+            // "why did this Send not land?" from SQL alone, and the
+            // CHECK-allowed `failed` value is no longer dead code.
+            if let Some(pool) = pool {
+                let reason = format!("{}", e);
+                if let Err(persist_err) =
+                    db::mark_pending_failed(pool, commit_txid.as_byte_array(), &reason).await
+                {
+                    eprintln!(
+                        "Failed to mark pending_inscriptions row as failed for {}: {}",
+                        commit_txid, persist_err
+                    );
+                }
+            }
             Err(e)
         }
     }

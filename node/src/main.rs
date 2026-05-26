@@ -139,6 +139,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 
     // Clones for the scanner callback closure.
     let pool_for_callback = Arc::clone(&pool);
+    let pool_for_scanner = (*pool).clone();
     let state_for_callback = Arc::clone(&state);
 
     // Event-driven chain ingestion (issue #84). The previous
@@ -162,7 +163,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let (tip_tx, tip_rx) = mpsc::channel::<bitcoin::BlockHash>(64);
     tokio::spawn(run_scanner_ws(ws_config, tip_tx));
 
-    scan_for_inscriptions(network_config, start_block_hash, &move |content_bytes: Vec<u8>, commit_txid, current_block_hash| {
+    scan_for_inscriptions(network_config, start_block_hash, Some(pool_for_scanner), &move |content_bytes: Vec<u8>, commit_txid, current_block_hash| {
         println!("Received content size: {} bytes", content_bytes.len());
 
         // Try to deserialize the content as a Commitment
@@ -196,6 +197,42 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                     &pool_for_callback,
                     commit_txid_bytes,
                 );
+
+                // observed_inscriptions: every commitment the scanner
+                // extracts from on-chain gets a row, regardless of
+                // whether `state.update` runs. `source` flags whether
+                // this came from our own publisher (pending row exists)
+                // or another operator's node / a recovery CLI. Captured
+                // here — once per call — so the row's `commitment` /
+                // `public_key` columns survive even if the early-return
+                // below short-circuits the rest of the callback.
+                {
+                    let source: &'static str = if pending_status.is_some() {
+                        "own"
+                    } else {
+                        "external"
+                    };
+                    let entry = node::db::ObservedInscriptionEntry {
+                        commit_txid: commit_txid_bytes.to_vec(),
+                        block_hash: Some(current_block_hash.to_byte_array().to_vec()),
+                        block_height: None, // not in scanner callback scope today
+                        source,
+                        commitment: content_bytes.clone(),
+                        public_key: commitment.public_key.serialize().to_vec(),
+                        integrated: false, // will be flipped post-state.update below
+                    };
+                    let pool = (*pool_for_callback).clone();
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async move {
+                            if let Err(e) =
+                                node::db::insert_observed_inscription(&pool, &entry).await
+                            {
+                                eprintln!("Failed to persist observed_inscription: {}", e);
+                            }
+                        });
+                    });
+                }
+
                 if node::scanner::should_skip_scanner_state_update(pending_status.as_deref()) {
                     println!(
                         "scanner: commit {} already integrated by mint_handler — skipping state.update",
@@ -304,6 +341,35 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                                     );
                                 }
                             }
+
+                            // Flip the matching `observed_inscriptions`
+                            // row to `integrated = true, integrated_at
+                            // = NOW()`. The row was inserted earlier
+                            // in this callback with `integrated =
+                            // false`; the UPDATE is the second half of
+                            // the two-step lifecycle (insert at
+                            // observation, mark integrated after the
+                            // SMT/MMR write lands). Idempotent — the
+                            // WHERE filter is keyed on `integrated =
+                            // FALSE` so re-runs (scanner replay) are a
+                            // no-op.
+                            let pool_clone = (*pool_for_callback).clone();
+                            let txid_bytes = commit_txid_bytes.to_vec();
+                            tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current().block_on(async move {
+                                    if let Err(e) = node::db::mark_observed_inscription_integrated(
+                                        &pool_clone,
+                                        &txid_bytes,
+                                    )
+                                    .await
+                                    {
+                                        eprintln!(
+                                            "Failed to flip observed_inscriptions.integrated: {}",
+                                            e
+                                        );
+                                    }
+                                });
+                            });
                         }
                         Err(e) => eprintln!("persist_state_tx failed: {}", e),
                     }
