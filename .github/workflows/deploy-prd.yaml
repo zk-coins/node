@@ -135,6 +135,13 @@ jobs:
           sccache --show-stats
 
       - name: Run API E2E suite against PRD (skip roundtrips)
+        env:
+          # PRD image is MVP-only by policy (see Dockerfile FEATURES
+          # arg — "both DEV and PRD images ship the MVP-only feature
+          # set so the two environments run the identical binary").
+          # The gated address-list/lnurl tests skip cleanly instead of
+          # panicking the CI canary. Mirrors deploy-dev.yaml.
+          ZKCOINS_E2E_ALLOW_FEATURE_TRIMMED_SERVER: "true"
         run: cargo test -p node --release --all-features --test api_remote -- --test-threads=1 --nocapture --skip _roundtrip_
 
       - name: sccache stats (post-build)

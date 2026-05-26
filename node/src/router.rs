@@ -1016,6 +1016,7 @@ async fn mint_handler(
     // next scanner sweep. No in-handler retry.
     let broadcast_outcome = create_and_broadcast_inscription(
         &commitment_data,
+        crate::db::InscriptionKind::Mint,
         &state.esplora_config,
         Some(&state.pool),
     )
@@ -1350,6 +1351,60 @@ async fn commit_handler(
         .await
 }
 
+/// `GET /api/inscriptions/:txid` — operator/forensics lookup of a single
+/// inscription by its commit txid. Surfaces the columns that answer
+/// "what kind of operation was this, and where is it in the publish
+/// pipeline" without exposing the raw commit/reveal/commitment blobs
+/// (those are crash-recovery state, not user-facing).
+///
+/// Returns 404 when no row exists — the inscription either never went
+/// through this node (e.g. external recovery via `recover_inscription`
+/// CLI) or the txid is unknown.
+async fn get_inscription_handler(
+    State(state): State<AppState>,
+    Path(txid_hex): Path<String>,
+) -> axum::response::Response {
+    // Bitcoin convention: display txids are big-endian, but the
+    // `pending_inscriptions.commit_txid` column stores raw little-endian
+    // bytes (matching `bitcoin::Txid::as_byte_array()` semantics — see
+    // `publisher.rs` write site). Reverse on parse so a caller can pass
+    // the same hex an explorer shows.
+    let mut bytes = match hex::decode(txid_hex.trim()) {
+        Ok(b) if b.len() == 32 => b,
+        Ok(_) => {
+            return handler_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "txid must be 32 bytes (64 hex chars)",
+            )
+            .into_response();
+        }
+        Err(_) => {
+            return handler_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "txid is not valid hex",
+            )
+            .into_response();
+        }
+    };
+    bytes.reverse();
+
+    match crate::db::get_inscription_summary_by_commit_txid(&state.pool, &bytes).await {
+        Ok(Some(summary)) => (StatusCode::OK, Json(summary)).into_response(),
+        Ok(None) => {
+            handler_error_response(StatusCode::NOT_FOUND, "No inscription found for this txid")
+                .into_response()
+        }
+        Err(e) => {
+            eprintln!("get_inscription_handler: db error: {}", e);
+            handler_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error while looking up inscription",
+            )
+            .into_response()
+        }
+    }
+}
+
 /// JSON body returned by `GET /health/ready`. `failures` is empty on a
 /// fully ready node; each failing dependency contributes one stable
 /// short tag (`"db"`, `"esplora"`) so a Kuma monitor parses the cause
@@ -1502,6 +1557,7 @@ struct RootEndpoints {
     receive: &'static str,
     commit: &'static str,
     proof: &'static str,
+    inscription: &'static str,
     health: &'static str,
 }
 
@@ -1522,6 +1578,7 @@ async fn root_handler() -> impl IntoResponse {
             receive: "POST /api/receive",
             commit: "POST /api/commit",
             proof: "GET  /api/proof/{id}",
+            inscription: "GET  /api/inscriptions/{txid}",
             health: "GET  /health",
         },
         docs: "https://docs.zkcoins.app",
@@ -1678,9 +1735,37 @@ async fn claim_username_handler(
     // before; the second writer hits `rows_affected == 0` and the
     // handler maps that to a 409. The post-commit insert is idempotent
     // — re-inserting the same `(normalized, address)` is a no-op.
+    // Decode signature bytes once so the claim-log row carries the
+    // exact signature bytes the caller submitted, regardless of the
+    // outcome below.
+    let signature_bytes = hex::decode(&request.signature).unwrap_or_default();
+
+    // username_claim_log helper: fire-and-forget, captures every
+    // outcome that reaches the in-memory / SQL layer (precheck reject,
+    // SQL race-loser, success). Pure-validation rejects above are
+    // already captured via request_log on the audit path.
+    let log_claim = |success: bool, reject_reason: Option<&str>| {
+        let entry = crate::db::UsernameClaimLogEntry {
+            requested_username: request.username.clone(),
+            normalized_username: normalized_username.clone(),
+            address: address_bytes.to_vec(),
+            signature: signature_bytes.clone(),
+            success,
+            reject_reason: reject_reason.map(|s| s.to_string()),
+            request_log_id: None,
+        };
+        let pool = state.pool.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::db::insert_username_claim_log(&pool, &entry).await {
+                eprintln!("Failed to persist username_claim_log: {}", e);
+            }
+        });
+    };
+
     if let Err(reason) =
         lock_or_recover(&state.username_store).precheck(&normalized_username, &address)
     {
+        log_claim(false, Some(reason));
         // `precheck` returns the static collision strings the wallet
         // surfaces verbatim. The status is `409 CONFLICT` for either
         // collision variant — same shape as the SQL-layer race below.
@@ -1700,6 +1785,7 @@ async fn claim_username_handler(
             Ok(b) => b,
             Err(db_err) => {
                 eprintln!("Failed to persist username claim: {}", db_err);
+                log_claim(false, Some(&format!("db error: {}", db_err)));
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(LnurlErrorResponse {
@@ -1711,6 +1797,7 @@ async fn claim_username_handler(
             }
         };
     if !inserted {
+        log_claim(false, Some("race lost on ON CONFLICT"));
         // Concurrent claimer won the `ON CONFLICT` race for the same
         // name. Surface as the same 409 a precheck collision would.
         return (
@@ -1724,6 +1811,8 @@ async fn claim_username_handler(
     }
 
     lock_or_recover(&state.username_store).commit_after_db(normalized_username.clone(), address);
+
+    log_claim(true, None);
 
     (
         StatusCode::OK,
@@ -1862,6 +1951,7 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/api/proof/:id", get(get_proof_handler))
         .route("/api/commit", post(commit_handler))
         .route("/api/mint", post(mint_handler))
+        .route("/api/inscriptions/:txid", get(get_inscription_handler))
         .route("/api/username/claim", post(claim_username_handler))
         .route(
             "/api/username/resolve/:username",
@@ -1880,9 +1970,19 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/.well-known/lnurlp/:username", get(lnurlp_handler))
         .route("/lnurl/pay/:username", get(lnurl_callback_handler));
 
-    app.with_state(state)
+    // Audit middleware sits OUTSIDE `with_state` because it carries its
+    // own `State<AppState>` extractor. Layered after CORS so the audit
+    // log records the final, CORS-decorated response — `Access-Control-*`
+    // headers and all. The `from_fn_with_state` adapter clones the
+    // state for every request (state itself is `Arc`-backed, so the
+    // clone is cheap).
+    app.with_state(state.clone())
         .fallback(|| async { StatusCode::NOT_FOUND })
         .layer(cors)
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            crate::audit::audit_log_middleware,
+        ))
 }
 
 #[cfg(test)]

@@ -213,6 +213,13 @@ async fn load_latest_block_rejects_wrong_length() {
     // and assert the loader returns an `sqlx::Error::Decode` rather
     // than panicking or silently truncating.
     let (pool, _container) = setup_pool().await;
+    // Drop the 0010 length CHECK so the corrupt-row plant succeeds;
+    // the subject of this test is the Rust-side defense in
+    // `load_latest_block`, not the DB-level CHECK.
+    sqlx::query("ALTER TABLE latest_block DROP CONSTRAINT latest_block_hash_length")
+        .execute(&pool)
+        .await
+        .expect("drop latest_block_hash_length");
     sqlx::query("INSERT INTO latest_block (id, block_hash) VALUES (1, $1)")
         .bind(vec![0u8; 7])
         .execute(&pool)
@@ -443,12 +450,15 @@ async fn pending_inscription_status_by_commit_txid_returns_none_for_unknown_txid
 async fn pending_inscription_status_by_commit_txid_returns_current_status() {
     let (pool, _container) = setup_pool().await;
     let commit_txid = [0xCDu8; 32];
+    let reveal_txid = [0xCEu8; 32];
     let commitment = b"test-commitment";
     let commit_tx = b"test-commit-tx";
     let reveal_tx = b"test-reveal-tx";
     insert_pending_inscription(
         &pool,
         &commit_txid,
+        &reveal_txid,
+        InscriptionKind::Mint,
         commitment,
         commit_tx,
         reveal_tx,
@@ -489,9 +499,15 @@ async fn pending_inscription_status_by_commit_txid_returns_current_status() {
 /// Helper: insert a `pending_inscriptions` row in the given starting
 /// status so the atomic-tx tests can exercise the mark-complete step.
 async fn seed_pending_row(pool: &PgPool, commit_txid: &[u8], status: &str) {
+    // Synthetic reveal txid for tests — not derived from the seed
+    // bytes since this helper is only used to drive the status state
+    // machine, not the reveal-txid lookup.
+    let reveal_txid: [u8; 32] = [0xAB; 32];
     insert_pending_inscription(
         pool,
         commit_txid,
+        &reveal_txid,
+        InscriptionKind::Mint,
         b"test-commitment",
         b"test-commit-tx",
         b"test-reveal-tx",

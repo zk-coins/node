@@ -185,9 +185,46 @@ pub async fn start_rest_node(
 
     let app = create_router(state);
 
+    // boot_log: announce the startup event with the connected network,
+    // node version, listen address, and process pid. Best-effort —
+    // a failed boot_log insert must NOT prevent the node from
+    // starting (the operator would lose access to a real recovery
+    // path on a transient DB blip).
+    {
+        let boot_entry = crate::db::BootLogEntry {
+            event_type: "startup".to_string(),
+            message: format!(
+                "zkcoins-node {} starting on {} (network={})",
+                env!("CARGO_PKG_VERSION"),
+                socket_addr,
+                NETWORK_CONFIG.network_name,
+            ),
+            metadata: Some(serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "network": NETWORK_CONFIG.network_name,
+                "socket_addr": socket_addr.to_string(),
+                "pid": std::process::id(),
+                "is_mainnet": NETWORK_CONFIG.is_mainnet,
+            })),
+        };
+        if let Err(e) = crate::db::insert_boot_log(&pool, &boot_entry).await {
+            eprintln!("Failed to persist boot_log startup event: {}", e);
+        }
+    }
+
     println!("REST API started at {}", socket_addr);
     let listener = TcpListener::bind(socket_addr).await?;
-    axum::serve(listener, app).await?;
+    // `into_make_service_with_connect_info::<SocketAddr>()` exposes the
+    // peer's TCP socket to extractors — the audit middleware reads it
+    // through `ConnectInfo<SocketAddr>` and writes it to
+    // `request_log.remote_addr`. Without this the audit row's
+    // `remote_addr` column is always NULL (the default `into_make_service`
+    // never inserts a `ConnectInfo` extension).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
@@ -217,8 +254,13 @@ pub(crate) async fn broadcast_commit_and_deliver(
         "Broadcasting user commitment ({} bytes)",
         commitment_data.len()
     );
-    if let Err(err) =
-        create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG, Some(&state.pool)).await
+    if let Err(err) = create_and_broadcast_inscription(
+        &commitment_data,
+        crate::db::InscriptionKind::Send,
+        &NETWORK_CONFIG,
+        Some(&state.pool),
+    )
+    .await
     {
         eprintln!("Error broadcasting commit inscription: {}", err);
         return crate::router::handler_error_response(
