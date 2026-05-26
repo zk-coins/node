@@ -699,6 +699,12 @@ async fn send_bad_address_hex_returns_422() {
     // — this should fail at the hex-decode step (handler-level 422,
     // not axum-level deserialization 422).
     let alice = TestWallet::new();
+    // Signature/timestamp are present so the request passes the
+    // "Missing signature" / "Missing timestamp" / timestamp-window gates
+    // upstream; the test exercises the per-field hex validator that
+    // runs after the auth gates.
+    let ts = unix_now();
+    let signature = alice.sign_send("0xZZZZZZ", &alice.address_hex(), 1, ts);
     let body = json!({
         "account_address": "0xZZZZZZ",
         "recipient": alice.address_hex(),
@@ -706,8 +712,8 @@ async fn send_bad_address_hex_returns_422() {
         "public_key": hex::encode(alice.pubkey(0).serialize()),
         "next_public_key": hex::encode(alice.pubkey(1).serialize()),
         "prev_commitment_pubkey": Option::<String>::None,
-        "signature": Option::<String>::None,
-        "timestamp": Option::<u64>::None,
+        "signature": Some(signature),
+        "timestamp": Some(ts),
     });
     let resp = http_client()
         .post(url("/api/send"))
@@ -2032,40 +2038,16 @@ async fn error_strings_match_known_app_mapping() {
         .expect("mint coin proof has commitment")
         .public_key;
 
-    // "prev_commitment_pubkey required for account update" — well-formed
-    // send body after a mint, but with prev_commitment_pubkey omitted.
-    // The send_coins inner path reaches the AccountUpdate transition
-    // because alice already has an account snapshot from the mint.
-    {
-        let amount: u64 = 1;
-        let ts = unix_now();
-        let signature = alice.sign_send(&alice.address_hex(), &bob.address_hex(), amount, ts);
-        let resp = client
-            .post(url("/api/send"))
-            .json(&json!({
-                "account_address": alice.address_hex(),
-                "recipient": bob.address_hex(),
-                "amount": amount,
-                "public_key": hex::encode(alice.pubkey(0).serialize()),
-                "next_public_key": hex::encode(alice.pubkey(1).serialize()),
-                "prev_commitment_pubkey": Option::<String>::None,
-                "signature": Some(signature),
-                "timestamp": Some(ts),
-            }))
-            .send()
-            .await
-            .expect("send without prev_commitment_pubkey");
-        assert_eq!(
-            resp.status(),
-            StatusCode::BAD_REQUEST,
-            "missing prev_commitment_pubkey on update must be 400"
-        );
-        let body: Value = resp.json().await.expect("body JSON");
-        assert_eq!(
-            body["error"],
-            "prev_commitment_pubkey required for account update"
-        );
-    }
+    // "prev_commitment_pubkey required for account update" — covered by
+    // `router_tests::map_send_coins_error_prev_commitment_pubkey_required_is_400`
+    // and `account_node_tests::*prev_commitment_pubkey*`. Live-provoking
+    // it from the HTTP surface needs a second send on a wallet whose
+    // `account.proof` is already populated — alice has only received a
+    // mint here, so the inner path takes the AccountCreation branch
+    // and never reaches the AccountUpdate gate. We could chain a full
+    // mint→send→commit and then a second send, but the additional
+    // on-chain cost (publisher UTXO per inscription) outweighs the
+    // value of duplicating coverage that the unit tests already give.
 
     // "Insufficient funds" — send MINT_AMOUNT + 1 (one sat over balance).
     {
