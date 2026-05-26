@@ -25,9 +25,9 @@ pub type PublicKey = [u8; 33];
 pub type Address = HashDigest;
 
 /// Minting account address. Currently a placeholder derived from a
-/// domain-separated tag — the server will replace this with the actual
+/// domain-separated tag — the node will replace this with the actual
 /// Poseidon hash of the live minting public key as part of ROADMAP step 7
-/// ("Server: replace SP1 with Plonky2"). See SPEC.md §12.1 and divergence
+/// ("Node: replace SP1 with Plonky2"). See SPEC.md §12.1 and divergence
 /// D11 in MIGRATION_RESEARCH.md §3.
 pub static MINTING_ADDRESS: std::sync::LazyLock<HashDigest> =
     std::sync::LazyLock::new(|| hash_bytes(b"zkcoins:minting-address:placeholder:v1"));
@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn minting_address_is_stable() {
-        // The placeholder MUST stay deterministic across calls; the server
+        // The placeholder MUST stay deterministic across calls; the node
         // wiring will replace this with the real Poseidon hash of the live
         // minting public key (see D11 in MIGRATION_RESEARCH.md).
         assert_eq!(*MINTING_ADDRESS, *MINTING_ADDRESS);

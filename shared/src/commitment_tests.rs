@@ -1,8 +1,8 @@
 //! Negative-path tests for the BIP-340 Schnorr `Commitment`.
 //!
 //! `Commitment::verify` is security-critical: it gates whether a signed
-//! account state will be accepted by the server. These tests exercise it
-//! in isolation (no server, no SMT) and pin down the boundaries between
+//! account state will be accepted by the node. These tests exercise it
+//! in isolation (no node, no SMT) and pin down the boundaries between
 //! the "raw 32-byte digest" code path and the "SHA256-hashed message"
 //! code path inside `Commitment::new` / `Commitment::verify`.
 
