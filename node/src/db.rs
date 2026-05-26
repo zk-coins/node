@@ -133,6 +133,296 @@ pub async fn insert_request_log(pool: &PgPool, entry: &RequestLogEntry) -> Resul
     Ok(())
 }
 
+// ---- Full database trail (migration 0008) ---------------------------------
+//
+// Helpers for the tables added in `0008_full_database_trail.sql`. Each
+// `insert_*` is a single-row insert; the caller decides whether to
+// `await` synchronously (mint flow, where the persisted row should land
+// before the request returns) or fire-and-forget via `tokio::spawn`
+// (high-volume / non-critical paths like esplora REST chatter).
+
+#[derive(Debug, Clone)]
+pub struct EsploraLogEntry {
+    pub direction: &'static str, // 'outbound_http' | 'outbound_ws' | 'inbound_ws'
+    pub method: Option<String>,
+    pub url: String,
+    pub request_body: Option<Vec<u8>>,
+    pub response_status: Option<i16>,
+    pub response_body: Option<Vec<u8>>,
+    pub duration_us: Option<i64>,
+    pub triggered_by: Option<String>,
+}
+
+pub async fn insert_esplora_log(pool: &PgPool, entry: &EsploraLogEntry) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO esplora_log \
+         (direction, method, url, request_body, response_status, response_body, \
+          duration_us, triggered_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(entry.direction)
+    .bind(entry.method.as_deref())
+    .bind(&entry.url)
+    .bind(entry.request_body.as_deref())
+    .bind(entry.response_status)
+    .bind(entry.response_body.as_deref())
+    .bind(entry.duration_us)
+    .bind(entry.triggered_by.as_deref())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct ErrorLogEntry {
+    pub severity: &'static str, // 'warn' | 'error' | 'fatal'
+    pub source: String,
+    pub message: String,
+    pub error_chain: Option<String>,
+    pub request_log_id: Option<i64>,
+}
+
+pub async fn insert_error_log(pool: &PgPool, entry: &ErrorLogEntry) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO error_log \
+         (severity, source, message, error_chain, request_log_id) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(entry.severity)
+    .bind(&entry.source)
+    .bind(&entry.message)
+    .bind(entry.error_chain.as_deref())
+    .bind(entry.request_log_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockLogEntry {
+    pub block_hash: Vec<u8>,
+    pub block_height: i64,
+    pub inscription_count: i32,
+    pub processing_duration_us: Option<i64>,
+}
+
+/// Insert (or no-op on UNIQUE conflict — replayed blocks land twice
+/// when the scanner restarts mid-stream). Marks `processed_at = NOW()`
+/// in the same statement so the row reflects "scanner saw + processed
+/// this block".
+pub async fn insert_block_log(pool: &PgPool, entry: &BlockLogEntry) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO block_log \
+         (block_hash, block_height, processed_at, inscription_count, processing_duration_us) \
+         VALUES ($1, $2, NOW(), $3, $4) \
+         ON CONFLICT (block_hash) DO NOTHING",
+    )
+    .bind(&entry.block_hash)
+    .bind(entry.block_height)
+    .bind(entry.inscription_count)
+    .bind(entry.processing_duration_us)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct ObservedInscriptionEntry {
+    pub commit_txid: Vec<u8>,
+    pub block_hash: Option<Vec<u8>>,
+    pub block_height: Option<i64>,
+    pub source: &'static str, // 'own' | 'external'
+    pub commitment: Vec<u8>,
+    pub public_key: Vec<u8>,
+    pub integrated: bool,
+}
+
+pub async fn insert_observed_inscription(
+    pool: &PgPool,
+    entry: &ObservedInscriptionEntry,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO observed_inscriptions \
+         (commit_txid, block_hash, block_height, source, commitment, public_key, integrated, integrated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, CASE WHEN $7 THEN NOW() ELSE NULL END) \
+         ON CONFLICT (commit_txid) DO NOTHING",
+    )
+    .bind(&entry.commit_txid)
+    .bind(entry.block_hash.as_deref())
+    .bind(entry.block_height)
+    .bind(entry.source)
+    .bind(&entry.commitment)
+    .bind(&entry.public_key)
+    .bind(entry.integrated)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct StateUpdateLogEntry {
+    pub trigger: &'static str, // 'mint' | 'send' | 'scanner_replay' | 'recovery'
+    pub commit_txid: Option<Vec<u8>>,
+    pub prev_mmr_root: Vec<u8>,
+    pub new_mmr_root: Vec<u8>,
+    pub smt_root_before: Vec<u8>,
+    pub smt_root_after: Vec<u8>,
+    pub commitment_count: i32,
+}
+
+pub async fn insert_state_update_log(
+    pool: &PgPool,
+    entry: &StateUpdateLogEntry,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO state_update_log \
+         (trigger, commit_txid, prev_mmr_root, new_mmr_root, \
+          smt_root_before, smt_root_after, commitment_count) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(entry.trigger)
+    .bind(entry.commit_txid.as_deref())
+    .bind(&entry.prev_mmr_root)
+    .bind(&entry.new_mmr_root)
+    .bind(&entry.smt_root_before)
+    .bind(&entry.smt_root_after)
+    .bind(entry.commitment_count)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct AccountHistoryEntry {
+    pub address: Vec<u8>,
+    pub prev_data: Option<Vec<u8>>,
+    pub new_data: Vec<u8>,
+    pub source: &'static str, // 'mint' | 'send' | 'receive' | 'scanner' | 'recovery'
+    pub triggering_commit_txid: Option<Vec<u8>>,
+    pub triggering_request_log_id: Option<i64>,
+}
+
+pub async fn insert_account_history(
+    pool: &PgPool,
+    entry: &AccountHistoryEntry,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO account_history \
+         (address, prev_data, new_data, source, triggering_commit_txid, triggering_request_log_id) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(&entry.address)
+    .bind(entry.prev_data.as_deref())
+    .bind(&entry.new_data)
+    .bind(entry.source)
+    .bind(entry.triggering_commit_txid.as_deref())
+    .bind(entry.triggering_request_log_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct UsernameClaimLogEntry {
+    pub requested_username: String,
+    pub normalized_username: String,
+    pub address: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub success: bool,
+    pub reject_reason: Option<String>,
+    pub request_log_id: Option<i64>,
+}
+
+pub async fn insert_username_claim_log(
+    pool: &PgPool,
+    entry: &UsernameClaimLogEntry,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO username_claim_log \
+         (requested_username, normalized_username, address, signature, \
+          success, reject_reason, request_log_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(&entry.requested_username)
+    .bind(&entry.normalized_username)
+    .bind(&entry.address)
+    .bind(&entry.signature)
+    .bind(entry.success)
+    .bind(entry.reject_reason.as_deref())
+    .bind(entry.request_log_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct TxMiningLogEntry {
+    pub target_prefix: String,
+    pub nonces_tried: i64,
+    pub duration_us: i64,
+    pub final_nonce: Option<i64>,
+    pub final_txid: Vec<u8>,
+    pub commit_txid: Option<Vec<u8>>,
+}
+
+pub async fn insert_tx_mining_log(
+    pool: &PgPool,
+    entry: &TxMiningLogEntry,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO tx_mining_log \
+         (target_prefix, nonces_tried, duration_us, final_nonce, final_txid, commit_txid) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(&entry.target_prefix)
+    .bind(entry.nonces_tried)
+    .bind(entry.duration_us)
+    .bind(entry.final_nonce)
+    .bind(&entry.final_txid)
+    .bind(entry.commit_txid.as_deref())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct BootLogEntry {
+    pub event_type: String,
+    pub message: String,
+    pub metadata: Option<serde_json::Value>,
+}
+
+pub async fn insert_boot_log(pool: &PgPool, entry: &BootLogEntry) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO boot_log (event_type, message, metadata) VALUES ($1, $2, $3)")
+        .bind(&entry.event_type)
+        .bind(&entry.message)
+        .bind(entry.metadata.as_ref())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Update `pending_inscriptions.failure_reason` for a row already in
+/// the `failed` status (or about to be advanced to it). Called from
+/// the publisher's error paths so the operator can answer "why?" from
+/// SQL alone.
+pub async fn update_pending_failure_reason(
+    pool: &PgPool,
+    commit_txid: &[u8],
+    failure_reason: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE pending_inscriptions \
+         SET failure_reason = $1, updated_at = NOW() \
+         WHERE commit_txid = $2",
+    )
+    .bind(failure_reason)
+    .bind(commit_txid)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 // ---- State persistence (PR-A2) --------------------------------------------
 
 /// Load the bincode-serialized Sparse Merkle Tree blob.
@@ -513,12 +803,14 @@ pub const PENDING_STATUS_COMPLETE: &str = "complete";
 pub struct PendingInscriptionRow {
     pub id: i64,
     pub commit_txid: Vec<u8>,
+    pub reveal_txid: Option<Vec<u8>>,
     pub status: String,
     pub kind: InscriptionKind,
     pub commitment: Vec<u8>,
     pub commit_tx: Vec<u8>,
     pub reveal_tx: Vec<u8>,
     pub commit_output_value: i64,
+    pub failure_reason: Option<String>,
 }
 
 /// Insert a fresh `constructed` row before the publisher attempts the
@@ -530,9 +822,11 @@ pub struct PendingInscriptionRow {
 /// crashed before completing), the function returns `Ok(false)` so the
 /// caller can carry on with the existing row instead of double-
 /// inserting. Every other DB error propagates.
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_pending_inscription(
     pool: &PgPool,
     commit_txid: &[u8],
+    reveal_txid: &[u8],
     kind: InscriptionKind,
     commitment: &[u8],
     commit_tx: &[u8],
@@ -541,11 +835,12 @@ pub async fn insert_pending_inscription(
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "INSERT INTO pending_inscriptions \
-         (commit_txid, status, kind, commitment, commit_tx, reveal_tx, commit_output_value) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         (commit_txid, reveal_txid, status, kind, commitment, commit_tx, reveal_tx, commit_output_value) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
          ON CONFLICT (commit_txid) DO NOTHING",
     )
     .bind(commit_txid)
+    .bind(reveal_txid)
     .bind(PENDING_STATUS_CONSTRUCTED)
     .bind(kind.as_str())
     .bind(commitment)
@@ -616,13 +911,25 @@ pub async fn pending_inscription_status_by_commit_txid(
 pub async fn load_pending_in_progress(
     pool: &PgPool,
 ) -> Result<Vec<PendingInscriptionRow>, sqlx::Error> {
-    // Tuple layout: (id, commit_txid, status, kind, commitment,
-    // commit_tx, reveal_tx, commit_output_value). Aliased to keep the
-    // `sqlx::query_as` annotation under clippy's `type_complexity`
-    // threshold.
-    type RawRow = (i64, Vec<u8>, String, String, Vec<u8>, Vec<u8>, Vec<u8>, i64);
+    // Tuple layout: (id, commit_txid, reveal_txid, status, kind,
+    // commitment, commit_tx, reveal_tx, commit_output_value,
+    // failure_reason). Aliased to keep the `sqlx::query_as`
+    // annotation under clippy's `type_complexity` threshold.
+    type RawRow = (
+        i64,
+        Vec<u8>,
+        Option<Vec<u8>>,
+        String,
+        String,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+        Option<String>,
+    );
     let rows: Vec<RawRow> = sqlx::query_as(
-        "SELECT id, commit_txid, status, kind, commitment, commit_tx, reveal_tx, commit_output_value \
+        "SELECT id, commit_txid, reveal_txid, status, kind, commitment, commit_tx, reveal_tx, \
+                commit_output_value, failure_reason \
          FROM pending_inscriptions \
          WHERE status <> 'complete' \
          ORDER BY id",
@@ -634,12 +941,14 @@ pub async fn load_pending_in_progress(
             |(
                 id,
                 commit_txid,
+                reveal_txid,
                 status,
                 kind,
                 commitment,
                 commit_tx,
                 reveal_tx,
                 commit_output_value,
+                failure_reason,
             )| {
                 let kind = InscriptionKind::from_db_str(&kind).ok_or_else(|| {
                     sqlx::Error::Decode(
@@ -649,12 +958,14 @@ pub async fn load_pending_in_progress(
                 Ok(PendingInscriptionRow {
                     id,
                     commit_txid,
+                    reveal_txid,
                     status,
                     kind,
                     commitment,
                     commit_tx,
                     reveal_tx,
                     commit_output_value,
+                    failure_reason,
                 })
             },
         )
@@ -676,9 +987,15 @@ pub struct InscriptionSummary {
     /// txid shown in block explorers — i.e. big-endian display order,
     /// the reverse of the raw `bytea` stored in the column.
     pub commit_txid: String,
+    /// Reveal txid in the same display-order convention. `None` only
+    /// for rows that pre-date migration 0008 (no production rows, see
+    /// migration 0006 wipe).
+    pub reveal_txid: Option<String>,
     pub kind: InscriptionKind,
     pub status: String,
     pub commit_output_value: i64,
+    /// Error chain when `status = 'failed'`, otherwise `None`.
+    pub failure_reason: Option<String>,
     /// ISO-8601 / RFC-3339 UTC timestamp, formatted in Postgres so we
     /// can stay off the `chrono`/`time` sqlx feature flags. Microsecond
     /// precision; trailing `Z` to make the timezone explicit.
@@ -690,12 +1007,23 @@ pub async fn get_inscription_summary_by_commit_txid(
     pool: &PgPool,
     commit_txid: &[u8],
 ) -> Result<Option<InscriptionSummary>, sqlx::Error> {
-    type RawRow = (Vec<u8>, String, String, i64, String, String);
+    type RawRow = (
+        Vec<u8>,
+        Option<Vec<u8>>,
+        String,
+        String,
+        i64,
+        Option<String>,
+        String,
+        String,
+    );
     let row: Option<RawRow> = sqlx::query_as(
         "SELECT commit_txid, \
+                reveal_txid, \
                 kind, \
                 status, \
                 commit_output_value, \
+                failure_reason, \
                 to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
                 to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at \
          FROM pending_inscriptions \
@@ -705,7 +1033,16 @@ pub async fn get_inscription_summary_by_commit_txid(
     .fetch_optional(pool)
     .await?;
     row.map(
-        |(commit_txid_bytes, kind, status, commit_output_value, created_at, updated_at)| {
+        |(
+            commit_txid_bytes,
+            reveal_txid_bytes,
+            kind,
+            status,
+            commit_output_value,
+            failure_reason,
+            created_at,
+            updated_at,
+        )| {
             let kind = InscriptionKind::from_db_str(&kind).ok_or_else(|| {
                 sqlx::Error::Decode(
                     format!("invalid pending_inscriptions.kind value: {kind:?}").into(),
@@ -713,13 +1050,19 @@ pub async fn get_inscription_summary_by_commit_txid(
             })?;
             // Reverse to display order — txid in explorers is the
             // little-endian-stored bytes shown big-endian.
-            let mut display = commit_txid_bytes;
-            display.reverse();
+            let mut commit_display = commit_txid_bytes;
+            commit_display.reverse();
+            let reveal_txid = reveal_txid_bytes.map(|mut b| {
+                b.reverse();
+                hex::encode(b)
+            });
             Ok(InscriptionSummary {
-                commit_txid: hex::encode(display),
+                commit_txid: hex::encode(commit_display),
+                reveal_txid,
                 kind,
                 status,
                 commit_output_value,
+                failure_reason,
                 created_at,
                 updated_at,
             })

@@ -132,7 +132,7 @@ fn inscription_txs_produces_taproot_commit_and_reveal_with_marker_prefix() {
     let publisher_address = test_publisher_address(config.network());
     let outpoints = vec![(fake_outpoint(0), 100_000u64)];
 
-    let (commit_tx, reveal_tx) = inscription_txs(
+    let (commit_tx, reveal_tx, _stats) = inscription_txs(
         b"Hello, zkCoins!",
         &publisher_address,
         outpoints,
@@ -173,7 +173,7 @@ fn inscription_txs_embeds_commitment_data_in_reveal_script() {
     let payload = b"Hello, zkCoins!".to_vec();
     let outpoints = vec![(fake_outpoint(0), 100_000u64)];
 
-    let (_commit_tx, reveal_tx) = inscription_txs(
+    let (_commit_tx, reveal_tx, _stats) = inscription_txs(
         &payload,
         &publisher_address,
         outpoints,
@@ -241,7 +241,7 @@ fn inscription_txs_chunks_large_commitment_data() {
     let payload: Vec<u8> = (0..600).map(|i| (i % 255 + 1) as u8).collect();
     let outpoints = vec![(fake_outpoint(0), 200_000u64)];
 
-    let (_commit_tx, reveal_tx) = inscription_txs(
+    let (_commit_tx, reveal_tx, _stats) = inscription_txs(
         &payload,
         &publisher_address,
         outpoints,
@@ -300,7 +300,7 @@ fn inscription_txs_signs_commit_input_with_taproot_keyspend() {
     let publisher_address = test_publisher_address(config.network());
     let outpoints = vec![(fake_outpoint(0), 100_000u64)];
 
-    let (commit_tx, _reveal_tx) = inscription_txs(
+    let (commit_tx, _reveal_tx, _stats) = inscription_txs(
         b"Hello, zkCoins!",
         &publisher_address,
         outpoints,
@@ -443,7 +443,7 @@ async fn broadcast_inscription_txs_returns_both_txids_on_success() {
     // Build a real (commit, reveal) pair — broadcast just serialises and
     // POSTs them, so the txids the function returns are the ones we
     // computed locally.
-    let (commit_tx, reveal_tx) = inscription_txs(
+    let (commit_tx, reveal_tx, _stats) = inscription_txs(
         b"Hello, zkCoins!",
         &publisher_address,
         outpoints,
@@ -483,7 +483,7 @@ async fn broadcast_inscription_txs_errors_when_track_tx_event_never_arrives() {
     let publisher_address = test_publisher_address(config.network());
     let outpoints = vec![(fake_outpoint(0), 100_000u64)];
 
-    let (commit_tx, reveal_tx) = inscription_txs(
+    let (commit_tx, reveal_tx, _stats) = inscription_txs(
         b"Hello, zkCoins!",
         &publisher_address,
         outpoints,
@@ -516,7 +516,7 @@ async fn broadcast_inscription_txs_propagates_esplora_error() {
     let publisher_address = test_publisher_address(config.network());
     let outpoints = vec![(fake_outpoint(0), 100_000u64)];
 
-    let (commit_tx, reveal_tx) = inscription_txs(
+    let (commit_tx, reveal_tx, _stats) = inscription_txs(
         b"Hello, zkCoins!",
         &publisher_address,
         outpoints,
@@ -700,13 +700,14 @@ fn build_test_pair(commitment_data: &[u8]) -> (Transaction, Transaction) {
     };
     let publisher_address = test_publisher_address(config.network());
     let outpoints = vec![(fake_outpoint(0), 100_000u64)];
-    inscription_txs(
+    let (commit_tx, reveal_tx, _stats) = inscription_txs(
         commitment_data,
         &publisher_address,
         outpoints,
         TEST_PUBLISHER_KEY,
         &config,
-    )
+    );
+    (commit_tx, reveal_tx)
 }
 
 /// Insert a row in the supplied state directly via the db helper. Used
@@ -719,12 +720,14 @@ async fn seed_pending_row(
     status: &str,
 ) {
     let commit_txid = commit_tx.compute_txid();
+    let reveal_txid = reveal_tx.compute_txid();
     let commit_tx_bytes = bitcoin::consensus::serialize(commit_tx);
     let reveal_tx_bytes = bitcoin::consensus::serialize(reveal_tx);
     let commit_output_value = commit_tx.output[0].value.to_sat() as i64;
     let inserted = db::insert_pending_inscription(
         pool,
         commit_txid.as_byte_array(),
+        reveal_txid.as_byte_array(),
         db::InscriptionKind::Mint,
         commitment_data,
         &commit_tx_bytes,
@@ -1277,10 +1280,12 @@ async fn mint_handler_advances_state_synchronously_with_broadcast() {
 async fn scanner_skips_already_integrated_commit_on_replay() {
     let (pool, _container) = setup_phaseb_pool().await;
     let commit_txid = [0x42u8; 32];
+    let reveal_txid = [0x43u8; 32];
 
     db::insert_pending_inscription(
         &pool,
         &commit_txid,
+        &reveal_txid,
         db::InscriptionKind::Mint,
         b"phase-e-2",
         b"commit-tx-bytes",
@@ -1330,9 +1335,11 @@ async fn scanner_falls_back_to_state_update_for_commits_not_in_pending() {
     // complete — status is still `reveal_broadcast`. The scanner is
     // the recovery path here.
     let crashed_txid = [0x55u8; 32];
+    let crashed_reveal_txid = [0x56u8; 32];
     db::insert_pending_inscription(
         &pool,
         &crashed_txid,
+        &crashed_reveal_txid,
         db::InscriptionKind::Send,
         b"phase-e-3-crashed",
         b"commit-tx-crashed",
