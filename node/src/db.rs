@@ -446,24 +446,31 @@ pub async fn insert_boot_log(pool: &PgPool, entry: &BootLogEntry) -> Result<(), 
     Ok(())
 }
 
-/// Mark a `pending_inscriptions` row as definitively failed: status =
-/// `'failed'` and `failure_reason` set, both in one UPDATE. Pairs the
-/// status discriminator with the error-chain text so the resume path
-/// can skip permanently-failed rows AND the operator can answer
-/// "why?" from SQL alone. Called from the publisher's error paths.
+/// Record the most recent broadcast error against a
+/// `pending_inscriptions` row WITHOUT changing its `status`.
 ///
-/// Note: the existing `resume_pending_inscriptions` still loads
-/// `status <> 'complete'` and re-drives `failed` rows. If a stricter
-/// policy is wanted later (skip `failed` outright), that's a one-line
-/// SQL change in `load_pending_in_progress`.
-pub async fn mark_pending_failed(
+/// The status discriminator carries state-machine semantics that the
+/// resume path depends on: a `commit_broadcast` row means "commit
+/// landed on chain, only the reveal needs to be re-driven" while
+/// `constructed` means "neither leg landed yet, broadcast both". A
+/// blanket promotion to `status = 'failed'` on every error would
+/// erase that distinction and force resume to re-broadcast a commit
+/// that already landed (the chain rejects it with
+/// `txn-already-known` so the recovery is graceful, but the state
+/// machine has lost its truth).
+///
+/// `failure_reason` is therefore the only column this helper mutates.
+/// `status = 'failed'` stays reserved for truly-terminal callers
+/// (retry exhaustion, operator-initiated abort) — none of which exist
+/// yet, but the CHECK enum keeps the spot ready.
+pub async fn update_pending_failure_reason(
     pool: &PgPool,
     commit_txid: &[u8],
     failure_reason: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE pending_inscriptions \
-         SET status = 'failed', failure_reason = $1, updated_at = NOW() \
+         SET failure_reason = $1, updated_at = NOW() \
          WHERE commit_txid = $2",
     )
     .bind(failure_reason)

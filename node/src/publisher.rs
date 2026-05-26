@@ -724,18 +724,27 @@ pub async fn create_and_broadcast_inscription(
         }
         Err(e) => {
             println!("Failed to broadcast transactions: {}", e);
-            // Mark the row as definitively failed: status = 'failed' AND
-            // failure_reason set in one UPDATE. The status discriminator
-            // matches the error chain text so the operator can answer
-            // "why did this Send not land?" from SQL alone, and the
-            // CHECK-allowed `failed` value is no longer dead code.
+            // Record the error chain on the row without changing the
+            // status discriminator: the broadcast may have advanced
+            // the state machine to `commit_broadcast` (commit landed
+            // on chain but reveal failed) and the resume path needs
+            // to keep that distinction so it re-broadcasts only the
+            // reveal. A blanket `status = 'failed'` would erase the
+            // distinction and force resume to re-attempt the commit
+            // (chain returns `txn-already-known` and recovers, but
+            // the row would have lost its truth in the meantime).
+            //
+            // `status = 'failed'` is reserved for truly-terminal
+            // callers (retry exhaustion, operator abort) — none yet,
+            // but the CHECK enum keeps the slot ready.
             if let Some(pool) = pool {
                 let reason = format!("{}", e);
                 if let Err(persist_err) =
-                    db::mark_pending_failed(pool, commit_txid.as_byte_array(), &reason).await
+                    db::update_pending_failure_reason(pool, commit_txid.as_byte_array(), &reason)
+                        .await
                 {
                     eprintln!(
-                        "Failed to mark pending_inscriptions row as failed for {}: {}",
+                        "Failed to persist failure_reason for {}: {}",
                         commit_txid, persist_err
                     );
                 }
