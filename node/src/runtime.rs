@@ -187,7 +187,17 @@ pub async fn start_rest_node(
 
     println!("REST server started at {}", socket_addr);
     let listener = TcpListener::bind(socket_addr).await?;
-    axum::serve(listener, app).await?;
+    // `into_make_service_with_connect_info::<SocketAddr>()` exposes the
+    // peer's TCP socket to extractors — the audit middleware reads it
+    // through `ConnectInfo<SocketAddr>` and writes it to
+    // `request_log.remote_addr`. Without this the audit row's
+    // `remote_addr` column is always NULL (the default `into_make_service`
+    // never inserts a `ConnectInfo` extension).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
