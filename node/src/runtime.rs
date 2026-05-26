@@ -283,7 +283,9 @@ pub(crate) async fn broadcast_commit_and_deliver(
     };
     if let Some(bytes) = snapshot {
         let addr_bytes = zkcoins_program::hash::digest_to_bytes(&recipient);
-        if let Err(e) = db::upsert_account(&state.pool, &addr_bytes, &bytes).await {
+        if let Err(e) =
+            db::upsert_account_with_source(&state.pool, &addr_bytes, &bytes, "receive").await
+        {
             eprintln!("Failed to upsert account after commit: {}", e);
         }
     }

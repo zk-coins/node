@@ -739,6 +739,45 @@ pub async fn load_all_accounts(pool: &PgPool) -> Result<Vec<(Vec<u8>, Vec<u8>)>,
 /// Upsert a single account row. The bincode blob in `data` is
 /// considered authoritative — concurrent writers must serialize at
 /// the application layer (`Arc<Mutex<AccountNode>>` in main.rs).
+/// Upsert an account row and tag the matching `account_history` entry
+/// with `source` (one of `'mint','send','receive','scanner','recovery'`).
+///
+/// The trigger added by migration 0008 reads `current_setting('zkcoins
+/// .account_source', TRUE)` so the caller can override the default
+/// `'scanner'`. `set_config(..., is_local := true)` is the safe,
+/// parameterized equivalent of `SET LOCAL` — the value goes through
+/// sqlx's bind path so no string interpolation is involved, and the
+/// setting only lives for the duration of this transaction. The
+/// surrounding `BEGIN/COMMIT` is required because `is_local := true`
+/// is a no-op outside a transaction.
+pub async fn upsert_account_with_source(
+    pool: &PgPool,
+    address: &[u8],
+    data: &[u8],
+    source: &str,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT set_config('zkcoins.account_source', $1, true)")
+        .bind(source)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO accounts (address, data, updated_at) \
+         VALUES ($1, $2, NOW()) \
+         ON CONFLICT (address) DO UPDATE \
+         SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at",
+    )
+    .bind(address)
+    .bind(data)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
+}
+
+/// Upsert an account with `account_history.source = 'scanner'` —
+/// the default for callers without semantic context (state replay,
+/// recovery CLI, persist_account from the scanner callback).
+/// Semantically-aware callers should use `upsert_account_with_source`.
 pub async fn upsert_account(pool: &PgPool, address: &[u8], data: &[u8]) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO accounts (address, data, updated_at) \
@@ -822,6 +861,13 @@ pub async fn resolve_username(pool: &PgPool, name: &str) -> Result<Option<Vec<u8
 /// account land, or none do.
 pub async fn commit_mint_tx(pool: &PgPool, accounts: &[(&[u8], &[u8])]) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
+    // Tag every `account_history` row written by the trigger as
+    // `source = 'mint'`. `set_config(..., is_local := true)` only
+    // takes effect for the lifetime of THIS transaction, so the
+    // tag does not bleed into adjacent / concurrent transactions.
+    sqlx::query("SELECT set_config('zkcoins.account_source', 'mint', true)")
+        .execute(&mut *tx)
+        .await?;
     for (address, data) in accounts {
         sqlx::query(
             "INSERT INTO accounts (address, data, updated_at) \

@@ -604,7 +604,9 @@ async fn receive_coin_handler(
     match snapshot {
         Some(bytes) => {
             let addr_bytes = digest_to_bytes(&recipient);
-            if let Err(e) = db::upsert_account(&state.pool, &addr_bytes, &bytes).await {
+            if let Err(e) =
+                db::upsert_account_with_source(&state.pool, &addr_bytes, &bytes, "receive").await
+            {
                 eprintln!("Failed to upsert recipient account after receive: {}", e);
             }
             Json(SendCoinResponse {
@@ -751,8 +753,13 @@ async fn send_coin_handler(
             // We log and continue rather than failing the request,
             // which mirrors the pre-Postgres `save_to_file` semantics.
             let addr_bytes = digest_to_bytes(&from_address);
-            if let Err(e) =
-                db::upsert_account(&state.pool, &addr_bytes, &updated_account_bytes).await
+            if let Err(e) = db::upsert_account_with_source(
+                &state.pool,
+                &addr_bytes,
+                &updated_account_bytes,
+                "send",
+            )
+            .await
             {
                 eprintln!("Failed to upsert sender account after send: {}", e);
             }
