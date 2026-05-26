@@ -56,21 +56,38 @@ async fn connect_and_migrate_creates_all_tables() {
     .await
     .expect("introspection query failed");
     let names: Vec<String> = rows.into_iter().map(|r| r.get::<String, _>(0)).collect();
-    // _sqlx_migrations is created implicitly by sqlx::migrate!.
-    // `pending_inscriptions` lands via 0003_pending_inscriptions.sql
-    // (Phase B). `mmr_root_index` lands via 0004_mmr_root_index.sql
-    // (Phase C). `minting_meta` is created by 0002 then dropped by
-    // 0005 (Phase D), so it is absent from the final schema.
+    // Full expected schema after all migrations 0001-0010 (alphabetic
+    // by `ORDER BY table_name`). `_sqlx_migrations` is created
+    // implicitly by `sqlx::migrate!`. `minting_meta` (0002) is
+    // dropped by 0005 (Phase D), absent from the final schema.
+    //
+    // Counts:
+    //   * Pre-#113 schema (0001-0005):   8 tables
+    //   * After 0006 (kind):             8 tables (ALTER only)
+    //   * After 0007 (request_log):      9 tables
+    //   * After 0008 (full DB trail):   19 tables + 1 trigger
+    //   * After 0009 / 0010:            19 tables (polish only)
     assert_eq!(
         names,
         vec![
             "_sqlx_migrations".to_string(),
+            "account_history".to_string(),
             "accounts".to_string(),
+            "block_log".to_string(),
+            "boot_log".to_string(),
+            "coin_proof_store".to_string(),
+            "error_log".to_string(),
+            "esplora_log".to_string(),
             "latest_block".to_string(),
             "mmr_root_index".to_string(),
             "mmr_state".to_string(),
+            "observed_inscriptions".to_string(),
             "pending_inscriptions".to_string(),
+            "request_log".to_string(),
             "smt_state".to_string(),
+            "state_update_log".to_string(),
+            "tx_mining_log".to_string(),
+            "username_claim_log".to_string(),
             "usernames".to_string(),
         ]
     );
