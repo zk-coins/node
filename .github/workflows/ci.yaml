@@ -171,7 +171,7 @@ jobs:
       # this, runs against the public Mutinynet API can take >60 s per
       # test. Mirrors the pre-push hook.
       ESPLORA_URL: http://127.0.0.1:1/api
-      # `USERNAME_DOMAIN` is required by the server bootstrap (no
+      # `USERNAME_DOMAIN` is required by the node bootstrap (no
       # default — see node/src/main.rs and issue #95). The test value
       # is irrelevant for the `info_returns_*` assertions (they only
       # check non-empty + shape).
@@ -265,7 +265,7 @@ jobs:
       # plus smart scheduling (slow tests start first). `--test-threads 1`
       # is preserved — the repo invariant is that tests run serially to
       # avoid testcontainers port races and shared-state pollution.
-      # `api_remote` is the live-DEV-server verification integration test
+      # `api_remote` is the live-DEV-node verification integration test
       # (node/tests/api_remote.rs). It targets `https://dev-api.zkcoins.app`
       # by default and is meant to run AFTER a deploy, from the `api-e2e`
       # job in deploy-dev.yaml — not against whatever DEV currently runs
@@ -346,7 +346,7 @@ jobs:
       #
       # The `api_remote` integration test (node/tests/api_remote.rs)
       # is excluded for the same reason as in `node-tests` above: it
-      # targets the live DEV server and belongs in the post-deploy
+      # targets the live DEV node and belongs in the post-deploy
       # `api-e2e` job, not the hermetic coverage gate. The MVP coverage
       # scope is measured by the rest of the suite, which covers the
       # in-process axum handlers via oneshot().
