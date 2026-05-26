@@ -341,6 +341,35 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                                     );
                                 }
                             }
+
+                            // Flip the matching `observed_inscriptions`
+                            // row to `integrated = true, integrated_at
+                            // = NOW()`. The row was inserted earlier
+                            // in this callback with `integrated =
+                            // false`; the UPDATE is the second half of
+                            // the two-step lifecycle (insert at
+                            // observation, mark integrated after the
+                            // SMT/MMR write lands). Idempotent — the
+                            // WHERE filter is keyed on `integrated =
+                            // FALSE` so re-runs (scanner replay) are a
+                            // no-op.
+                            let pool_clone = (*pool_for_callback).clone();
+                            let txid_bytes = commit_txid_bytes.to_vec();
+                            tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current().block_on(async move {
+                                    if let Err(e) = node::db::mark_observed_inscription_integrated(
+                                        &pool_clone,
+                                        &txid_bytes,
+                                    )
+                                    .await
+                                    {
+                                        eprintln!(
+                                            "Failed to flip observed_inscriptions.integrated: {}",
+                                            e
+                                        );
+                                    }
+                                });
+                            });
                         }
                         Err(e) => eprintln!("persist_state_tx failed: {}", e),
                     }
