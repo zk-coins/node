@@ -95,6 +95,24 @@ pub const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(90);
 /// trip the watchdog).
 pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Capacity of the bounded `mpsc` channel feeding the dedicated
+/// writer task in `connect_and_drain`. Fixed at `1` on purpose:
+///
+/// - Strict back-pressure. A second ping cannot queue until the
+///   first one has fully flushed onto the wire, so the producer
+///   side (the `select!` loop) observes a stalled writer
+///   immediately rather than absorbing it into a growing queue.
+/// - Latest-ping-wins is acceptable because we never have anything
+///   useful to "catch up" on — a stale ping in the queue would buy
+///   us nothing the next live ping wouldn't.
+/// - No unbounded queue. If the peer accepts TCP but never reads
+///   (a stalled writer), the producer's `out_tx.send(...).await`
+///   is the natural choke-point; combined with the
+///   `liveness_timeout`-bounded `tokio::time::timeout` wrapper
+///   around that send, a wedged writer becomes a reconnect rather
+///   than a deadlocked task.
+pub const WRITER_QUEUE_CAPACITY: usize = 1;
+
 /// Compile-time assertion that the ping cadence leaves enough margin
 /// inside the watchdog window. Encoded as a `const` evaluation so
 /// any future tweak to either constant trips the build instead of
@@ -365,11 +383,13 @@ async fn connect_and_drain(
     // do `out_tx.send(Ping).await`, and the writer task takes care of
     // the actual wire-level send outside any `select!` boundary.
     //
-    // The channel is bounded at 1 so a stalled writer applies
-    // immediate back-pressure to the main loop (the second ping tick
-    // would block) — far preferable to growing an unbounded queue of
-    // pings against a peer that cannot drain them.
-    let (out_tx, mut out_rx) = mpsc::channel::<WsMessage>(1);
+    // The channel is bounded at `WRITER_QUEUE_CAPACITY` (= 1) so a
+    // stalled writer applies immediate back-pressure to the main loop
+    // (the second ping tick would block) — far preferable to growing
+    // an unbounded queue of pings against a peer that cannot drain
+    // them. The constant lives at the top of the file alongside the
+    // other tunables and carries the full rationale.
+    let (out_tx, mut out_rx) = mpsc::channel::<WsMessage>(WRITER_QUEUE_CAPACITY);
     let writer = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
             // `feed` queues the frame into the sink's internal
@@ -448,9 +468,31 @@ async fn connect_and_drain(
             // error here means the writer task has exited (e.g. the
             // peer closed mid-write) — surface as a stream error so
             // the reconnect loop kicks in.
+            //
+            // Backpressure-deadlock guard: if the peer accepts TCP but
+            // never reads, the writer task wedges in `sink.flush()`
+            // forever. The 1-slot `out_tx` then fills with the first
+            // unflushed ping, and a subsequent `out_tx.send(...).await`
+            // would block this arm indefinitely — preventing the
+            // `select!` from advancing to the watchdog arm too. We wrap
+            // the send in `tokio::time::timeout(liveness_timeout, ...)`
+            // so a wedged writer surfaces as a reconnect-triggering
+            // error within the same upper bound the watchdog uses for
+            // "this connection is dead", keeping the two failure modes
+            // semantically aligned.
             _ = ping_ticker.tick() => {
-                if let Err(e) = out_tx.send(WsMessage::Ping(PING_PAYLOAD.to_vec())).await {
-                    return Err(WsError::Stream(format!("ping send failed: {}", e)));
+                let send_fut = out_tx.send(WsMessage::Ping(PING_PAYLOAD.to_vec()));
+                match tokio::time::timeout(config.liveness_timeout, send_fut).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        return Err(WsError::Stream(format!("ping send failed: {}", e)));
+                    }
+                    Err(_) => {
+                        return Err(WsError::Stream(format!(
+                            "ping send stalled for {:?} (writer wedged, peer not reading)",
+                            config.liveness_timeout
+                        )));
+                    }
                 }
             }
 

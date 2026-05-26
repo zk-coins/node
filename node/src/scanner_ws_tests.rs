@@ -656,15 +656,159 @@ async fn run_scanner_ws_reconnects_when_ping_send_errors() {
     let observed = connection_count.load(std::sync::atomic::Ordering::SeqCst);
     assert!(
         observed >= 2,
-        "expected ≥ 2 connections (server dropped socket — scanner must \
-         reconnect via the ping-send-error path, well inside the 30 s \
-         liveness watchdog window); saw {} connections",
+        "scanner must reconnect via the close-detection path \
+         (ping-send-error OR read-error) — observed only {} connections \
+         in the budget window, well inside the 30 s liveness watchdog",
         observed,
     );
 
     // The server never sent any block frames, only the implicit
     // subscribe-then-drop. The channel must therefore be empty —
     // failure-path reconnects must not inject phantom tips.
+    assert!(
+        rx.try_recv().is_err(),
+        "scanner must not publish any BlockHash when no block frames are sent",
+    );
+
+    handle.abort();
+}
+
+/// Writer-send-timeout reconnect: exercises the
+/// `tokio::time::timeout(liveness_timeout, out_tx.send(...))` guard
+/// added around the ping arm's `out_tx.send` to defuse the
+/// backpressure-deadlock window. The deadlock shape it defuses:
+///
+/// 1. The peer accepts the TCP socket and completes the WS upgrade,
+///    but then never reads from the socket again. The OS-level TCP
+///    send window on the scanner side fills up.
+/// 2. The dedicated writer task wedges inside `sink.flush().await`
+///    waiting for the kernel to drain that buffer.
+/// 3. The 1-slot `out_tx` channel fills with the first un-flushed
+///    ping (writer holds it, can't progress).
+/// 4. The next `ping_ticker.tick()` fires; its body calls
+///    `out_tx.send(...).await`, which now blocks because the queue
+///    is full and the writer can't drain it.
+/// 5. WITHOUT the timeout wrap, this `.await` sits forever — the
+///    enclosing `select!` has already exited (the ping arm won),
+///    so the watchdog arm can't fire to break the deadlock.
+/// 6. WITH the timeout wrap, the wedge surfaces as a stream error
+///    inside `liveness_timeout`, the outer reconnect loop kicks in,
+///    and a fresh TCP connection lands at the server.
+///
+/// Setup: we shrink the server-side `SO_RCVBUF` on the listener to
+/// the OS-minimum BEFORE `accept()`, so each accepted socket inherits
+/// a tiny receive buffer (a few KB). Combined with a server that
+/// reads exactly one frame (the subscribe) and then parks on
+/// `pending()`, the client's kernel send buffer + the server's
+/// receive buffer fill up after a handful of pings, and `flush()`
+/// wedges inside the test budget.
+///
+/// `liveness_timeout = 300 ms` + `ping_interval = 50 ms` match the
+/// reviewer's spec: the wedge bites well before either the watchdog
+/// or the test-budget timeout, so observing ≥ 2 server-side accepts
+/// inside ~3 s is positive evidence that a non-deadlock reconnect
+/// path drove the reconnect.
+#[cfg(unix)]
+#[tokio::test]
+async fn run_scanner_ws_reconnects_when_writer_send_times_out() {
+    use std::os::unix::io::AsRawFd;
+
+    // Bind a std listener first so we can `setsockopt(SO_RCVBUF)`
+    // BEFORE handing it to tokio. Accepted sockets inherit the small
+    // receive buffer, which is what fills the client's send window
+    // and wedges `sink.flush()`. The exact size is platform-clamped:
+    // Linux rounds up to its minimum (typically ~2 KB); macOS honors
+    // it closer to the literal value. Either way the result is small
+    // enough that a handful of WS Ping frames + WS framing overhead
+    // saturate it inside the test budget.
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    std_listener.set_nonblocking(true).unwrap();
+    {
+        let fd = std_listener.as_raw_fd();
+        let bufsize: libc::c_int = 1024;
+        // SAFETY: `fd` is a live socket file descriptor owned by
+        // `std_listener` for the duration of this call; the option
+        // name and value pointer are well-formed per setsockopt(2);
+        // the return value is checked below.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &bufsize as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&bufsize) as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "setsockopt SO_RCVBUF must succeed");
+    }
+    let listener = TcpListener::from_std(std_listener).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("ws://{}", addr);
+
+    let connection_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cc_for_server = std::sync::Arc::clone(&connection_count);
+
+    tokio::spawn(async move {
+        // Per-connection handler: complete the WS handshake, read the
+        // subscribe frame so the scanner observably transitions into
+        // its steady-state select loop, then PARK without reading
+        // anything else. The server-side socket's receive buffer
+        // (shrunk via SO_RCVBUF on the listener above) fills up after
+        // a handful of pings; the client's `sink.flush()` then wedges
+        // on TCP backpressure, the 1-slot `out_tx` fills, and the
+        // next `out_tx.send(...).await` in the ping arm hits the new
+        // `liveness_timeout` wrap.
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            cc_for_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut ws = match tokio_tungstenite::accept_async(stream).await {
+                    Ok(ws) => ws,
+                    Err(_) => return,
+                };
+                // Read the subscribe frame so the handshake is fully
+                // observable as complete; subsequent reads are
+                // intentionally omitted so the receive buffer fills.
+                let _ = ws.next().await;
+                // Hold the socket open forever — do NOT read anything
+                // else. The scanner's pings will pile up in the
+                // (small) kernel buffer and wedge the writer.
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+
+    let (tx, mut rx) = mpsc::channel::<BlockHash>(8);
+    // `liveness_timeout = 300 ms`: short enough that the timeout-wrap
+    // around `out_tx.send` fires inside the test budget, long enough
+    // that we don't race a slow CI scheduler.
+    // `ping_interval = 50 ms`: fast enough to fill the 1-slot writer
+    // queue + saturate the small receive buffer well before the
+    // first watchdog window elapses.
+    let config = ScannerWsConfig {
+        url,
+        http_url: "http://127.0.0.1:1/api".to_string(),
+        reconnect_min: Duration::from_millis(10),
+        reconnect_max: Duration::from_millis(50),
+        liveness_timeout: Duration::from_millis(300),
+        ping_interval: Duration::from_millis(50),
+    };
+    let handle = tokio::spawn(run_scanner_ws(config, tx));
+
+    // Budget: ≫ liveness_timeout + reconnect_max so at least one
+    // reconnect cycle is observable, ≪ any realistic CI flake budget.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let observed = connection_count.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        observed >= 2,
+        "scanner must reconnect when the writer wedges — observed only \
+         {} connections in the budget window (timeout-wrap path OR \
+         watchdog path, both valid reconnect drivers)",
+        observed,
+    );
+
+    // No block frames were ever sent, so the channel must be empty.
     assert!(
         rx.try_recv().is_err(),
         "scanner must not publish any BlockHash when no block frames are sent",

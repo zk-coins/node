@@ -90,6 +90,13 @@ rand = "0.8"
 # the directory even when the test panics, so no test leaves a
 # leaked /tmp/zkcoins-* tree behind.
 tempfile = "3"
+# Used by `scanner_ws_tests` to shrink the OS TCP receive buffer on
+# the test server socket so a kernel-level backpressure wedge fires
+# inside a millisecond-scale test budget instead of needing minutes
+# of pings to fill a default-size buffer. Pure-Unix syscall surface
+# (`setsockopt`), no Windows path because tests already gate on
+# Unix-only fixtures.
+libc = "0.2"
 
 [features]
 # All non-MVP features are off by default. When a feature is not enabled, the
