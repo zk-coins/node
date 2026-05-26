@@ -564,9 +564,15 @@ async fn test_load_from_pg_rejects_wrong_address_length() {
     // the actual subject of this test: the Rust-side
     // `LoadAccountNodeError::BadAddressLength` defense in
     // `load_from_pg`. Drop the constraint inside this per-test
-    // container so the corrupt-row plant succeeds; the constraint
-    // is itself covered indirectly by the migration test that runs
-    // `connect_and_migrate` here.
+    // container so the corrupt-row plant succeeds. The 0008
+    // `accounts_history_trigger` would also fail on the matching
+    // `account_history_address_length` CHECK if it fired against
+    // the 7-byte address, so disable the trigger for this test —
+    // we are not exercising the history path here.
+    sqlx::query("ALTER TABLE accounts DISABLE TRIGGER accounts_history_trigger")
+        .execute(&pool)
+        .await
+        .expect("disable accounts_history_trigger");
     sqlx::query("ALTER TABLE accounts DROP CONSTRAINT accounts_address_length")
         .execute(&pool)
         .await
