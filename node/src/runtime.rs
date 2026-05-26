@@ -24,6 +24,8 @@ use crate::db;
 use crate::publisher::{create_and_broadcast_inscription, resume_pending_inscriptions};
 use crate::router::{lock_or_recover, SendCoinResponse};
 use crate::NETWORK_CONFIG;
+use shared::ProofData;
+use zkcoins_program::hash::digest_to_bytes;
 
 use bitcoin::bip32::Xpriv;
 use shared::ClientAccount;
@@ -229,6 +231,22 @@ pub(crate) async fn broadcast_commit_and_deliver(
 
     let mut updated_proof = coin_proof;
     updated_proof.commitment = Some(commitment);
+    // Extract the prover's post-state hash pair from the stored
+    // CoinProof's public_inputs so the response carries the same
+    // (account_state_hash, output_coins_root) the wallet client used
+    // to build the commitment in the first place. Lets the client
+    // confirm the server's post-commit snapshot matches what it just
+    // signed without a second `/api/proof/:id` round-trip. Derivation
+    // is identical to the one in `mint_handler` and `send_coin_handler`.
+    let pis: [zkcoins_program::F; zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] =
+        updated_proof.proof.public_inputs
+            [..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
+            .try_into()
+            .expect("Plonky2 Proof emits N_PROOF_DATA_PUBLIC_INPUTS field elements");
+    let proof_data = ProofData::from_field_elements(&pis);
+    let ash_hex = Some(hex::encode(digest_to_bytes(&proof_data.account_state_hash)));
+    let ocr_hex = Some(hex::encode(digest_to_bytes(&proof_data.output_coins_root)));
+
     let recipient = updated_proof.coin.recipient;
     let snapshot: Option<Vec<u8>> = {
         let mut account_node_guard = lock_or_recover(&state.account_node);
@@ -240,7 +258,7 @@ pub(crate) async fn broadcast_commit_and_deliver(
             .map(AccountNode::serialize_account)
     };
     if let Some(bytes) = snapshot {
-        let addr_bytes = zkcoins_program::hash::digest_to_bytes(&recipient);
+        let addr_bytes = digest_to_bytes(&recipient);
         if let Err(e) = db::upsert_account(&state.pool, &addr_bytes, &bytes).await {
             eprintln!("Failed to upsert account after commit: {}", e);
         }
@@ -252,8 +270,8 @@ pub(crate) async fn broadcast_commit_and_deliver(
             success: true,
             error: None,
             proof_id: Some(proof_id),
-            account_state_hash: None,
-            output_coins_root: None,
+            account_state_hash: ash_hex,
+            output_coins_root: ocr_hex,
         }),
     )
 }
