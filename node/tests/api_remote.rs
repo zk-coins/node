@@ -1240,6 +1240,419 @@ async fn username_claim_resolve_lnurlp_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
+// Section 4 — value-bearing field coverage on wallet-app-facing routes
+//
+// The roundtrip tests above prove the happy path executes end-to-end;
+// the tests in this section assert the EXACT shape and content of
+// every response field the wallet app reads. A field that ships as
+// `null` / `""` / `"0x00...0"` instead of a real value passes
+// `.is_some()` but breaks the wallet — the assertions here catch that
+// class of regression at the API layer instead of in the wallet's
+// integration test loop.
+// ---------------------------------------------------------------------------
+
+/// Field coverage #1 — mint response carries the post-mint
+/// commitment fields (`account_state_hash`, `output_coins_root`).
+///
+/// **Contract expectation.** The wallet app needs the same SMT-root
+/// pair from the mint response that the send response already carries,
+/// so its local account snapshot can advance without a second round
+/// trip. Mirror of the strong-assertion block in
+/// `send_commit_roundtrip_moves_balance:1090-1109`: each hash field
+/// MUST be present, decode to exactly 32 bytes of hex, and be non-zero.
+/// A shape-only `.is_some()` check would mask a server bug that
+/// returned a placeholder zero-hash or a truncated hex string.
+///
+/// **Today the mint handler ships these fields as `None`** (see
+/// `router::mint_handler`'s tail and the matching `None`s in
+/// `runtime::broadcast_commit_and_deliver`), and the response struct
+/// serialises them with `skip_serializing_if = Option::is_none`. The
+/// test therefore fails against the current server — it is written
+/// against the expected contract, not the current implementation, so
+/// CI surfaces the gap until the server is updated to populate the
+/// fields. See the task brief for the lockstep rationale.
+#[tokio::test]
+async fn mint_response_carries_state_hash_and_coins_root() {
+    let client = http_client();
+    let alice = TestWallet::new();
+
+    assert_minting_balance_in_bounds(&client).await;
+
+    let mint_resp = client
+        .post(url("/api/mint"))
+        .json(&json!({
+            "account_address": alice.address_hex(),
+            "amount": MINT_AMOUNT,
+        }))
+        .send()
+        .await
+        .expect("POST /api/mint");
+    assert_eq!(mint_resp.status(), StatusCode::OK, "mint must succeed");
+    let body: Value = mint_resp.json().await.expect("mint body JSON");
+
+    assert_eq!(
+        body["success"],
+        Value::Bool(true),
+        "mint success must be true"
+    );
+    let proof_id = body["proof_id"]
+        .as_u64()
+        .expect("proof_id present and a u64");
+    assert!(
+        proof_id > 0,
+        "proof_id must be a positive u64, got {}",
+        proof_id
+    );
+
+    // Value-bearing assertions on the two post-mint hash fields.
+    // Mirrors the send-response block in
+    // `send_commit_roundtrip_moves_balance:1090-1109` verbatim — the
+    // mint client consumes the same pair to advance its local
+    // account snapshot, so the same shape guarantees apply.
+    let ash_hex = body["account_state_hash"]
+        .as_str()
+        .expect("account_state_hash present on mint response")
+        .to_string();
+    let ash_bytes = hex::decode(&ash_hex).expect("account_state_hash is hex");
+    assert_eq!(
+        ash_bytes.len(),
+        32,
+        "account_state_hash must be 32 bytes (got {})",
+        ash_bytes.len()
+    );
+    assert!(
+        ash_bytes.iter().any(|&b| b != 0),
+        "account_state_hash must be non-zero on a real mint"
+    );
+
+    let ocr_hex = body["output_coins_root"]
+        .as_str()
+        .expect("output_coins_root present on mint response")
+        .to_string();
+    let ocr_bytes = hex::decode(&ocr_hex).expect("output_coins_root is hex");
+    assert_eq!(
+        ocr_bytes.len(),
+        32,
+        "output_coins_root must be 32 bytes (got {})",
+        ocr_bytes.len()
+    );
+    assert!(
+        ocr_bytes.iter().any(|&b| b != 0),
+        "output_coins_root must be non-zero on a real mint"
+    );
+
+    // Balance must land — the proof is fetchable AND the balance is
+    // credited. Value-bearing check on the side effect.
+    let observed = poll_balance_at_least(&client, &alice.address_hex(), MINT_AMOUNT).await;
+    assert!(
+        observed >= MINT_AMOUNT,
+        "balance never reached mint amount; got {observed}"
+    );
+}
+
+/// Field coverage #2 — commit response carries the post-commit
+/// commitment fields (`account_state_hash`, `output_coins_root`).
+///
+/// **Contract expectation.** Same as the mint test above — the wallet
+/// app needs the SMT-root pair from the commit response so its local
+/// account snapshot advances atomically with the broadcast. Each hash
+/// field MUST be present, decode to exactly 32 bytes of hex, and be
+/// non-zero. The full mint → send → commit pipeline is exercised
+/// because the commit step is otherwise unreachable.
+///
+/// **Today the commit handler ships these fields as `None`** (see
+/// `runtime::broadcast_commit_and_deliver`'s tail). The test is
+/// written against the expected contract and fails against the
+/// current server until the runtime is updated to populate the
+/// fields.
+#[tokio::test]
+async fn commit_response_carries_state_hash_and_coins_root() {
+    let client = http_client();
+    let alice = TestWallet::new();
+    let bob = TestWallet::new();
+
+    assert_minting_balance_in_bounds(&client).await;
+
+    // ---- Mint ----
+    let mint_resp = client
+        .post(url("/api/mint"))
+        .json(&json!({
+            "account_address": alice.address_hex(),
+            "amount": MINT_AMOUNT,
+        }))
+        .send()
+        .await
+        .expect("POST /api/mint");
+    assert_eq!(mint_resp.status(), StatusCode::OK, "mint must succeed");
+    let mint_body: Value = mint_resp.json().await.expect("mint body JSON");
+    let mint_proof_id = mint_body["proof_id"].as_u64().expect("mint proof_id");
+
+    let _ = poll_balance_at_least(&client, &alice.address_hex(), MINT_AMOUNT).await;
+
+    // ---- Fetch the mint proof for prev_commitment_pubkey ----
+    let proof_resp = client
+        .get(url(&format!("/api/proof/{}", mint_proof_id)))
+        .send()
+        .await
+        .expect("GET mint proof");
+    assert_eq!(proof_resp.status(), StatusCode::OK);
+    let proof_bytes = proof_resp.bytes().await.expect("mint proof bytes");
+    let mint_coin_proof: CoinProof = bincode::deserialize(&proof_bytes).expect("decode CoinProof");
+    let prev_pk = mint_coin_proof
+        .commitment
+        .as_ref()
+        .expect("mint coin proof has commitment")
+        .public_key;
+
+    // ---- Send ----
+    let amount = SEND_AMOUNT;
+    let ts = unix_now();
+    let signature = alice.sign_send(&alice.address_hex(), &bob.address_hex(), amount, ts);
+    let send_resp = client
+        .post(url("/api/send"))
+        .json(&json!({
+            "account_address": alice.address_hex(),
+            "recipient": bob.address_hex(),
+            "amount": amount,
+            "public_key": hex::encode(alice.pubkey(0).serialize()),
+            "next_public_key": hex::encode(alice.pubkey(1).serialize()),
+            "prev_commitment_pubkey": hex::encode(prev_pk.serialize()),
+            "signature": signature,
+            "timestamp": ts,
+        }))
+        .send()
+        .await
+        .expect("POST /api/send");
+    assert_eq!(send_resp.status(), StatusCode::OK, "send must succeed");
+    let send_body: Value = send_resp.json().await.expect("send body JSON");
+    let send_proof_id = send_body["proof_id"].as_u64().expect("send proof_id");
+    let ash_hex = send_body["account_state_hash"]
+        .as_str()
+        .expect("send body carries account_state_hash")
+        .to_string();
+    let ocr_hex = send_body["output_coins_root"]
+        .as_str()
+        .expect("send body carries output_coins_root")
+        .to_string();
+    let ash_bytes = hex::decode(&ash_hex).expect("ash hex");
+    let ocr_bytes = hex::decode(&ocr_hex).expect("ocr hex");
+
+    // ---- Commit ----
+    let mut commit_message = Vec::with_capacity(64);
+    commit_message.extend_from_slice(&ash_bytes);
+    commit_message.extend_from_slice(&ocr_bytes);
+    let commit_sig = alice.sign_commit(&commit_message);
+    let commit_resp = client
+        .post(url("/api/commit"))
+        .json(&json!({
+            "proof_id": send_proof_id,
+            "public_key": hex::encode(alice.pubkey(0).serialize()),
+            "signature": commit_sig,
+            "message": hex::encode(&commit_message),
+        }))
+        .send()
+        .await
+        .expect("POST /api/commit");
+    assert_eq!(commit_resp.status(), StatusCode::OK, "commit must succeed");
+    let commit_body: Value = commit_resp.json().await.expect("commit body JSON");
+
+    assert_eq!(
+        commit_body["success"],
+        Value::Bool(true),
+        "commit success must be true"
+    );
+    let echoed_proof_id = commit_body["proof_id"]
+        .as_u64()
+        .expect("commit proof_id present and a u64");
+    assert_eq!(
+        echoed_proof_id, send_proof_id,
+        "commit must echo the send proof_id (got {}, sent {})",
+        echoed_proof_id, send_proof_id
+    );
+
+    // Value-bearing assertions on the post-commit hash fields. Same
+    // contract as the send response (see
+    // `send_commit_roundtrip_moves_balance:1090-1109`).
+    let commit_ash_hex = commit_body["account_state_hash"]
+        .as_str()
+        .expect("account_state_hash present on commit response")
+        .to_string();
+    let commit_ash_bytes = hex::decode(&commit_ash_hex).expect("commit ash is hex");
+    assert_eq!(
+        commit_ash_bytes.len(),
+        32,
+        "commit account_state_hash must be 32 bytes (got {})",
+        commit_ash_bytes.len()
+    );
+    assert!(
+        commit_ash_bytes.iter().any(|&b| b != 0),
+        "commit account_state_hash must be non-zero"
+    );
+
+    let commit_ocr_hex = commit_body["output_coins_root"]
+        .as_str()
+        .expect("output_coins_root present on commit response")
+        .to_string();
+    let commit_ocr_bytes = hex::decode(&commit_ocr_hex).expect("commit ocr is hex");
+    assert_eq!(
+        commit_ocr_bytes.len(),
+        32,
+        "commit output_coins_root must be 32 bytes (got {})",
+        commit_ocr_bytes.len()
+    );
+    assert!(
+        commit_ocr_bytes.iter().any(|&b| b != 0),
+        "commit output_coins_root must be non-zero"
+    );
+}
+
+/// Field coverage #3 — `/api/balance` carries the claimed username.
+///
+/// `BalanceResponse.username` is `Option<String>` with
+/// `skip_serializing_if = Option::is_none`. After a successful
+/// `/api/username/claim`, querying balance for the claimed address
+/// MUST surface the exact (lowercased) username in the response body.
+/// The wallet app reads this to render the "@<username>" badge next
+/// to a balance figure without making a second round-trip.
+#[tokio::test]
+async fn balance_response_carries_username_after_claim() {
+    let client = http_client();
+    let caps = fetch_capabilities(&client).await;
+    // `usernames` is permanent MVP per `fetch_capabilities`, so the
+    // skip path is unreachable in practice — keep the gate honest in
+    // case a future feature trim disables it.
+    if !caps.usernames {
+        feature_skip!("usernames", "balance_response_carries_username_after_claim");
+    }
+
+    let alice = TestWallet::new();
+    let username = format!("u_{}", random_suffix());
+    let ts = unix_now();
+    let signature = alice.sign_username_claim(&alice.address_hex(), &username, ts);
+    let claim_resp = client
+        .post(url("/api/username/claim"))
+        .json(&json!({
+            "username": username,
+            "address": alice.address_hex(),
+            "public_key": hex::encode(alice.pubkey(0).serialize()),
+            "signature": signature,
+            "timestamp": ts,
+        }))
+        .send()
+        .await
+        .expect("POST /api/username/claim");
+    assert_eq!(claim_resp.status(), StatusCode::OK, "claim must succeed");
+
+    // GET /api/balance and assert the username surfaces.
+    let bal_resp = client
+        .get(url(&format!(
+            "/api/balance?address={}",
+            alice.address_hex()
+        )))
+        .send()
+        .await
+        .expect("GET /api/balance after claim");
+    assert_eq!(bal_resp.status(), StatusCode::OK);
+    let body: Value = bal_resp.json().await.expect("balance body JSON");
+    // Server canonicalises usernames to lowercase before persisting,
+    // so the round-trip must compare against the lowercased form.
+    let want = username.to_lowercase();
+    assert_eq!(
+        body["username"].as_str(),
+        Some(want.as_str()),
+        "balance body must carry the just-claimed username, got {:?}",
+        body["username"]
+    );
+}
+
+/// Field coverage #4 — `/api/username/claim` echoes the claimed
+/// address. The roundtrip test asserts `username` only; the wallet
+/// app reads BOTH fields (username + address) and uses the echoed
+/// address to verify the claim landed on the wallet's own address
+/// before persisting locally — a value-bearing assertion on `address`
+/// is therefore required.
+#[tokio::test]
+async fn claim_response_carries_address() {
+    let client = http_client();
+    let caps = fetch_capabilities(&client).await;
+    if !caps.usernames {
+        feature_skip!("usernames", "claim_response_carries_address");
+    }
+    let alice = TestWallet::new();
+    let username = format!("u_{}", random_suffix());
+    let ts = unix_now();
+    let signature = alice.sign_username_claim(&alice.address_hex(), &username, ts);
+    let claim_resp = client
+        .post(url("/api/username/claim"))
+        .json(&json!({
+            "username": username,
+            "address": alice.address_hex(),
+            "public_key": hex::encode(alice.pubkey(0).serialize()),
+            "signature": signature,
+            "timestamp": ts,
+        }))
+        .send()
+        .await
+        .expect("POST /api/username/claim");
+    assert_eq!(claim_resp.status(), StatusCode::OK, "claim must succeed");
+    let body: Value = claim_resp.json().await.expect("claim body JSON");
+    assert_eq!(
+        body["username"].as_str(),
+        Some(username.to_lowercase().as_str()),
+        "claim response must echo the lowercased username, got {:?}",
+        body["username"]
+    );
+    assert_eq!(
+        body["address"].as_str(),
+        Some(alice.address_hex().as_str()),
+        "claim response must echo the claimed address verbatim, got {:?}",
+        body["address"]
+    );
+}
+
+/// Field coverage #5 — `/api/balance` omits `username` for an unclaimed
+/// wallet. `BalanceResponse.username` is `Option<String>` with
+/// `skip_serializing_if = Option::is_none`, so an unclaimed account
+/// MUST produce a JSON body that either omits the field entirely
+/// (preferred) or sets it to `null`. The wallet app's response schema
+/// permits both shapes; the assertion fails if the server returns
+/// e.g. `""` (empty string) instead, which would render as a phantom
+/// empty username in the UI.
+#[tokio::test]
+async fn balance_response_has_no_username_for_unclaimed_wallet() {
+    let client = http_client();
+    let wallet = TestWallet::new();
+    // No claim happens — the wallet is fresh.
+    let resp = client
+        .get(url(&format!(
+            "/api/balance?address={}",
+            wallet.address_hex()
+        )))
+        .send()
+        .await
+        .expect("GET /api/balance for unclaimed wallet");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.expect("balance body JSON");
+    assert_eq!(
+        body["balance"], 0,
+        "fresh wallet must have zero balance, got {:?}",
+        body["balance"]
+    );
+    match body.get("username") {
+        // Preferred: field omitted entirely (`skip_serializing_if` path).
+        None => {}
+        // Permitted: explicit `null`.
+        Some(Value::Null) => {}
+        // Anything else (empty string, real string) is a contract
+        // violation — the wallet app would mis-render it.
+        Some(other) => panic!(
+            "unclaimed wallet must produce no `username` (or null), got {:?}",
+            other
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
