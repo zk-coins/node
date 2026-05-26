@@ -44,24 +44,108 @@ use sqlx::PgPool;
 use std::str::FromStr;
 use zkcoins_program::hash::HashDigest;
 
-lazy_static! {
-    pub static ref NETWORK_CONFIG: EsploraConfig = {
-        let url = std::env::var("ESPLORA_URL")
-            .unwrap_or_else(|_| "https://mutinynet.com/api".to_string());
-        let is_mainnet = std::env::var("IS_MAINNET")
-            .map(|v| v == "true")
-            .unwrap_or(false);
-        let network_name = std::env::var("NETWORK_NAME")
-            .unwrap_or_else(|_| if is_mainnet { "Mainnet".to_string() } else { "Mutinynet".to_string() });
-        let ws_url = std::env::var("ESPLORA_WS_URL").ok();
-        println!(
-            "Network config: {} ({}) ws={}",
-            network_name,
-            url,
-            ws_url.as_deref().unwrap_or(crate::scanner_ws::DEFAULT_ESPLORA_WS_URL)
-        );
-        EsploraConfig { url, is_mainnet, network_name, ws_url, track_tx_timeout: None }
+/// Pure builder for `NETWORK_CONFIG`. Extracted so the env-resolution
+/// logic — in particular the panic-on-missing rules below — is
+/// unit-testable without touching the process-wide environment or the
+/// `lazy_static` cell (whose state would leak across tests in the same
+/// binary).
+///
+/// ## Mainnet vs Mutinynet defaults
+///
+/// `ESPLORA_URL` and `ESPLORA_WS_URL` have Mutinynet defaults
+/// (`https://mutinynet.com/api`, `wss://mutinynet.com/api/v1/ws`)
+/// throughout the codebase. They are convenient for DEV (Mutinynet
+/// the chain) and harmless for unit/integration tests. But on Mainnet
+/// they are silent footguns: an `IS_MAINNET=true` deployment that
+/// forgets to set either env publishes Mutinynet block events into
+/// the scanner and / or fetches the wrong chain over REST. The
+/// failure mode is asymmetric — an HTTP-only mismatch panics quickly
+/// on the first publisher round-trip, but the event-driven scanner
+/// (#84) sits in a 5 s HTTP-retry loop with no forward progress and
+/// a green `/health/ready`.
+///
+/// To remove the footgun, both URLs are **required env vars when
+/// `IS_MAINNET=true`** — the panic mirrors the existing pattern for
+/// `PUBLISHER_KEY`, `USERNAME_DOMAIN`, and `DATABASE_URL`. Empty-
+/// string values are treated as unset on the Mainnet path so a
+/// misconfigured compose file (`ESPLORA_URL=`) panics with the same
+/// diagnostic instead of silently producing `EsploraConfig.url = ""`.
+/// When `IS_MAINNET` is unset or `false`, the Mutinynet defaults
+/// continue to apply — DEV, the pre-push hook, and the M3 Ultra
+/// coverage gate are all unaffected.
+///
+/// ## Scope of the guard
+///
+/// Only the `NETWORK_CONFIG` access path is hardened here.
+/// `scanner_ws::ScannerWsConfig::from_env` and `publisher.rs` still
+/// call `std::env::var("ESPLORA_WS_URL")` independently with a
+/// Mutinynet fallback. In the production binary the panic in this
+/// builder fires before any of those reads — `main.rs` dereferences
+/// `NETWORK_CONFIG` during bootstrap — so the structural bypass is
+/// unreachable today. A follow-up that has those sites consume
+/// `NETWORK_CONFIG.ws_url` (or an explicit `&EsploraConfig`) directly
+/// would close the bypass for future entry points and is tracked as
+/// a separate refactor.
+pub fn build_network_config_from_env<F>(env: F) -> EsploraConfig
+where
+    F: Fn(&str) -> Option<String>,
+{
+    // Treat empty strings as "unset" on the Mainnet path. Without
+    // this, `ESPLORA_URL=` in a compose file bypasses the `expect`
+    // below and leaves `EsploraConfig.url = ""` — the same class of
+    // silent misconfiguration the panic is designed to surface.
+    let env_or_unset = |k: &str| env(k).filter(|v| !v.trim().is_empty());
+    let is_mainnet = env_or_unset("IS_MAINNET").as_deref() == Some("true");
+    let url = if is_mainnet {
+        env_or_unset("ESPLORA_URL").expect(
+            "IS_MAINNET=true requires ESPLORA_URL to be set to a non-empty value — \
+             the Mutinynet default is unsafe on Mainnet. Set ESPLORA_URL \
+             to a Mainnet HTTP Esplora endpoint (e.g. http://electrs-mainnet:3000 \
+             on the DFX Mainnet stack, or https://mempool.space/api)",
+        )
+    } else {
+        env_or_unset("ESPLORA_URL").unwrap_or_else(|| "https://mutinynet.com/api".to_string())
     };
+    let ws_url = if is_mainnet {
+        Some(env_or_unset("ESPLORA_WS_URL").expect(
+            "IS_MAINNET=true requires ESPLORA_WS_URL to be set to a non-empty value — \
+             the Mutinynet default (wss://mutinynet.com/api/v1/ws) is unsafe on \
+             Mainnet: the event-driven scanner subscribes to Mutinynet block \
+             events and 404s against the Mainnet HTTP Esplora in a 5 s retry \
+             loop with no forward progress (zk-coins/node #84). Set \
+             ESPLORA_WS_URL to a Mainnet mempool.space-compatible WebSocket \
+             (e.g. wss://mempool.space/api/v1/ws)",
+        ))
+    } else {
+        env_or_unset("ESPLORA_WS_URL")
+    };
+    let network_name = env_or_unset("NETWORK_NAME").unwrap_or_else(|| {
+        if is_mainnet {
+            "Mainnet".to_string()
+        } else {
+            "Mutinynet".to_string()
+        }
+    });
+    println!(
+        "Network config: {} ({}) ws={}",
+        network_name,
+        url,
+        ws_url
+            .as_deref()
+            .unwrap_or(crate::scanner_ws::DEFAULT_ESPLORA_WS_URL)
+    );
+    EsploraConfig {
+        url,
+        is_mainnet,
+        network_name,
+        ws_url,
+        track_tx_timeout: None,
+    }
+}
+
+lazy_static! {
+    pub static ref NETWORK_CONFIG: EsploraConfig =
+        build_network_config_from_env(|k| std::env::var(k).ok());
 
     /// Domain used by the client to render `<hex|username>@<domain>`.
     /// Distinct from `network_name` because the same Bitcoin network
