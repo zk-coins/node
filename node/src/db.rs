@@ -157,7 +157,11 @@ pub struct EsploraLogEntry {
     pub response_status: Option<i16>,
     pub response_body: Option<Vec<u8>>,
     pub duration_us: Option<i64>,
-    pub triggered_by: Option<String>,
+    /// One of `'mint' | 'send' | 'scanner' | 'recovery' | 'health'
+    /// | 'resume'`. Renamed from `triggered_by` in migration 0010 to
+    /// align with `state_update_log.trigger_source` (same name + same
+    /// CHECK vocabulary). `None` for paths without semantic context.
+    pub trigger_source: Option<String>,
     /// FK to `request_log.id` when the outbound call was issued
     /// inside an HTTP handler. `None` for scanner / publisher /
     /// background tasks. Added in migration 0009.
@@ -168,7 +172,7 @@ pub async fn insert_esplora_log(pool: &PgPool, entry: &EsploraLogEntry) -> Resul
     sqlx::query(
         "INSERT INTO esplora_log \
          (direction, method, url, request_body, response_status, response_body, \
-          duration_us, triggered_by, triggering_request_log_id) \
+          duration_us, trigger_source, triggering_request_log_id) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(entry.direction)
@@ -178,7 +182,7 @@ pub async fn insert_esplora_log(pool: &PgPool, entry: &EsploraLogEntry) -> Resul
     .bind(entry.response_status)
     .bind(entry.response_body.as_deref())
     .bind(entry.duration_us)
-    .bind(entry.triggered_by.as_deref())
+    .bind(entry.trigger_source.as_deref())
     .bind(entry.triggering_request_log_id)
     .execute(pool)
     .await?;
@@ -213,7 +217,11 @@ pub async fn insert_error_log(pool: &PgPool, entry: &ErrorLogEntry) -> Result<()
 #[derive(Debug, Clone)]
 pub struct BlockLogEntry {
     pub block_hash: Vec<u8>,
-    pub block_height: i64,
+    /// Block height as reported by Esplora's `get_block_status`. `None`
+    /// when the upstream did not return a height — the previous
+    /// sentinel `-1` was magic-value-driven, NULL is the type-safe
+    /// alternative (migration 0010 drops the NOT NULL).
+    pub block_height: Option<i64>,
     pub inscription_count: i32,
     pub processing_duration_us: Option<i64>,
 }
