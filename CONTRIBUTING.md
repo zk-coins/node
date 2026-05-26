@@ -2,7 +2,7 @@
 
 This guide covers everything you need to develop, test, and deploy the zkCoins backend.
 
-The first section, "Working on the Plonky2 Migration", documents the project invariants, the decision recipe for "should this go in the MVP?", the pre-push checklist, and the known foot-guns. It applies to all work on `develop` after the 2026-05-18 SP1 → Plonky2 cutover. The rest of this file is the dev guide for day-to-day server work.
+The first section, "Working on the Plonky2 Migration", documents the project invariants, the decision recipe for "should this go in the MVP?", the pre-push checklist, and the known foot-guns. It applies to all work on `develop` after the 2026-05-18 SP1 → Plonky2 cutover. The rest of this file is the dev guide for day-to-day node work.
 
 ---
 
@@ -31,7 +31,7 @@ documents in the order given below.
 
 ### No polling — events only
 
-Bitcoin / Esplora signals on the server's hot path are subscribed to,
+Bitcoin / Esplora signals on the node's hot path are subscribed to,
 never polled. The scanner consumes block events from the
 mempool.space-compatible WebSocket stream (`scanner_ws.rs`,
 `ESPLORA_WS_URL`, default `wss://mutinynet.com/api/v1/ws`); the
@@ -83,7 +83,7 @@ with the rationale.
 The five constraints below are decided and apply across every PR on
 `develop`.
 
-1. **Server-side compute architecture.** The server generates every ZK
+1. **Node-side compute architecture.** The node generates every ZK
    proof, holds every Merkle tree, broadcasts every Taproot inscription.
    The wallet holds only the user's private key and signs BIP-340 Schnorr
    over `SHA256(serialize(asth) ‖ serialize(ocr))`. No in-browser
@@ -91,8 +91,8 @@ The five constraints below are decided and apply across every PR on
 2. **Closed test environment** — DEV *and* PRD. No external users, no
    real money, no migration of existing state. Step 7 of the ROADMAP
    deleted the SP1 path outright; no Cargo feature flag, no dual
-   backend. At cutover (PR [#17](https://github.com/zk-coins/node/pull/17), 2026-05-18) the server state files
-   were wiped and the new Plonky2 server started fresh.
+   backend. At cutover (PR [#17](https://github.com/zk-coins/node/pull/17), 2026-05-18) the node state files
+   were wiped and the new Plonky2 node started fresh.
 3. **Hardware target: Mac Studio M3 Ultra, 96 GB unified RAM, single
    host.** All on-box compute resources are available (Performance +
    Efficiency cores, the integrated Apple GPU reachable via Metal,
@@ -109,7 +109,7 @@ The five constraints below are decided and apply across every PR on
    from inside the affected crate. Current state on `program-plonky2`:
    100% lines / functions / regions, 115 default-run tests (+ 2
    `#[ignore]`d `recursion_shape_probe` diagnostics). The authoritative
-   coverage gate for `server` runs in CI on the self-hosted M3 Ultra
+   coverage gate for `node` runs in CI on the self-hosted M3 Ultra
    runner (`.github/workflows/ci.yaml`, `Coverage Gate` job, gated
    behind the `ci:full` label on PRs). See `ROADMAP.md` § "Done" for
    the live test count and breakdown.
@@ -141,8 +141,8 @@ first "no".
 
 1. **Is X on the critical path for the one-shot user loop?** (create
    account → mint → send → receive → balance) If no, defer to post-MVP.
-2. **Does X compromise invariant 1 (server-side compute)?** If yes,
-   redesign so all heavy compute is server-side.
+2. **Does X compromise invariant 1 (node-side compute)?** If yes,
+   redesign so all heavy compute is node-side.
 3. **Does X require external hardware or cloud services (invariant 3)?**
    If yes, redesign.
 4. **Does X assume migration logic (invariant 2)?** If yes, redesign
@@ -229,7 +229,7 @@ Condensed pointers into [`MIGRATION_RESEARCH.md`](./MIGRATION_RESEARCH.md) §7:
 git clone https://github.com/zk-coins/node.git
 cd node
 USERNAME_DOMAIN=test.zkcoins.local cargo run -p node
-# Server starts on http://0.0.0.0:4242
+# Node starts on http://0.0.0.0:4242
 ```
 
 ## Local Development with Postgres
@@ -316,11 +316,11 @@ before any main-merge.
 ## Project Structure
 
 ```
-server/
-├── server/                # Axum REST API server
+node/
+├── node/                  # Axum REST API
 │   └── src/
 │       ├── main.rs        # Entry point, chain scanner, bind address
-│       ├── server.rs      # REST endpoints (mint, send, balance, proof)
+│       ├── router.rs      # REST endpoints (mint, send, balance, proof)
 │       ├── account_node.rs  # Account management, coin proofs, prover calls
 │       ├── state.rs       # Sparse Merkle Tree + Merkle Mountain Range
 │       ├── scanner.rs     # Bitcoin block scanner (Taproot Inscriptions)
@@ -351,8 +351,8 @@ server/
 
 | Branch | Purpose | Deploy target |
 |---|---|---|
-| `develop` | Default branch, active development | DEV server |
-| `main` | Production releases | PRD server |
+| `develop` | Default branch, active development | DEV node |
+| `main` | Production releases | PRD node |
 
 - **Push to `develop` via feature branch + PR** (branch ruleset active)
 - **`main` is protected** — changes only via PR
@@ -365,7 +365,7 @@ English, concise, *what* not *how*:
 ```
 # Good
 Bind to 0.0.0.0 instead of 127.0.0.1 for Docker access
-Decouple server from SP1: optional zkvm feature, stub prover
+Decouple node from SP1: optional zkvm feature, stub prover
 Add rand features to bitcoin dependency
 
 # Bad
@@ -415,7 +415,7 @@ let block = fetch_block(hash).unwrap();
 ### Request Flow
 
 ```
-Client Request → Axum Router → server.rs (endpoint) → account_node.rs (logic)
+Client Request → Axum Router → router.rs (endpoint) → account_node.rs (logic)
                                                           ├── Prover (Plonky2)
                                                           ├── State (SMT + MMR)
                                                           └── Publisher (Bitcoin)
@@ -423,7 +423,7 @@ Client Request → Axum Router → server.rs (endpoint) → account_node.rs (log
 
 ### Key Patterns
 
-**Thread-safe state:** All shared state is `Arc<Mutex<State>>`. The server acquires a lock, reads/writes, releases.
+**Thread-safe state:** All shared state is `Arc<Mutex<State>>`. The node acquires a lock, reads/writes, releases.
 
 **Account model:** Each account is `Address → Account` in a HashMap:
 ```rust
@@ -444,7 +444,7 @@ Plonky2 prover.
 
 ### Bitcoin Integration
 
-The server continuously scans the Bitcoin blockchain:
+The node continuously scans the Bitcoin blockchain:
 
 1. `scanner_ws.rs` subscribes to the mempool.space-compatible WebSocket
    (`ESPLORA_WS_URL`) and pushes block events into a channel; no
@@ -476,15 +476,15 @@ for the historical pickup record.
 
 The node reads its configuration exclusively from environment variables;
 no `.env` file is loaded by the process. The table below covers every
-variable the server actually reads (`node/src/lib.rs`, `runtime.rs`,
+variable the node actually reads (`node/src/lib.rs`, `runtime.rs`,
 `scanner_ws.rs`, `publisher.rs`). Required variables panic the bootstrap
 on startup if unset — there is no silent fallback.
 
 | Variable | Default | Description |
 |---|---|---|
-| `DATABASE_URL` | _(required, no default)_ | Postgres connection string for the state-layer (e.g. `postgresql://zkcoins:<pw>@postgres:5432/zkcoins`). Server panics on startup if unset. |
-| `PUBLISHER_KEY` | _(required, no default)_ | 32-byte hex private key for Taproot inscription publishing. **Required on every network — DEV, signet, and mainnet.** No fallback default exists: the previous `1234…` placeholder was a publicly-known test key that drainer bots swept within minutes of any on-chain top-up (4 historical drains confirmed). Server panics on startup if unset. Generate locally via `openssl rand -hex 32`. In any deployed environment, source it from your secret manager — **never commit a real key**. |
-| `USERNAME_DOMAIN` | _(required, no default)_ | External hostname returned by `/api/info`; server panics on startup if unset (see PR [#36](https://github.com/zk-coins/node/pull/36) for the regression that introduced the global panic hook). |
+| `DATABASE_URL` | _(required, no default)_ | Postgres connection string for the state-layer (e.g. `postgresql://zkcoins:<pw>@postgres:5432/zkcoins`). Node panics on startup if unset. |
+| `PUBLISHER_KEY` | _(required, no default)_ | 32-byte hex private key for Taproot inscription publishing. **Required on every network — DEV, signet, and mainnet.** No fallback default exists: the previous `1234…` placeholder was a publicly-known test key that drainer bots swept within minutes of any on-chain top-up (4 historical drains confirmed). Node panics on startup if unset. Generate locally via `openssl rand -hex 32`. In any deployed environment, source it from your secret manager — **never commit a real key**. |
+| `USERNAME_DOMAIN` | _(required, no default)_ | External hostname returned by `/api/info`; node panics on startup if unset (see PR [#36](https://github.com/zk-coins/node/pull/36) for the regression that introduced the global panic hook). |
 | `POSTGRES_PASSWORD` | _(required, no default for the DB container)_ | Read by the Postgres container, not by the node process itself; the node's `DATABASE_URL` already embeds the password. Listed here because it is part of the local-dev bootstrap (see `Local Development with Postgres` below). |
 | `ESPLORA_URL` | `https://mutinynet.com/api` | Esplora REST API endpoint (electrs or public). |
 | `ESPLORA_WS_URL` | `wss://mutinynet.com/api/v1/ws` | Esplora WebSocket endpoint consumed by `scanner_ws` (issue #84). DEV/PRD override only when the upstream WS path changes. |
@@ -524,14 +524,14 @@ Docker builds use nightly Rust auto-installed via the workspace `rust-toolchain`
 
 ## Persistent State
 
-After the PR-A1/PR-A2/PR-A3 Postgres migration series, all persistent server state lives in a Postgres 17 database (`DATABASE_URL` env var). The only on-disk state remaining is the per-proof file store. The state-layer schema (`node/migrations/*.sql`) is applied idempotently on every boot by `db::connect_and_migrate`.
+After the PR-A1/PR-A2/PR-A3 Postgres migration series, all persistent node state lives in a Postgres 17 database (`DATABASE_URL` env var). The only on-disk state remaining is the per-proof file store. The state-layer schema (`node/migrations/*.sql`) is applied idempotently on every boot by `db::connect_and_migrate`.
 
 | Location                                | Format                                                     | Purpose                                                                                                                                                                                                                                                                          |
 | --------------------------------------- | ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `smt_state` row (singleton, `id = 1`)   | bincode `SparseMerkleTree` in a `BYTEA` column             | Sparse Merkle Tree of every commitment ever processed (key = sha256(public_key), leaf = account_state_hash).                                                                                                                                                                     |
 | `mmr_state` row (singleton, `id = 1`)   | bincode `MerkleMountainRange` in a `BYTEA` column          | Append-only Merkle Mountain Range of `hash(smt_root ‖ prev_mmr_root)` leaves; one entry per processed commitment.                                                                                                                                                                |
 | `latest_block` row (singleton, `id = 1`) | 32-byte block hash in a `BYTEA` column                     | Last Bitcoin block whose inscriptions were fully processed and persisted. Scanner resumes from `latest_block + 1` after a restart. Written in the same `BEGIN; UPSERT; UPSERT; UPSERT; COMMIT` transaction as the SMT and MMR (issue #11 fix).                                   |
-| `accounts` table (one row per address)  | 32-byte `address` PRIMARY KEY + bincode `Account` `BYTEA`  | Server-side account ledger — per-address balance, coin_queue, coin_history (SMT), and latest proof. Includes the minting account. Upserted per mutation by the send / receive / mint handlers.                                                                                  |
+| `accounts` table (one row per address)  | 32-byte `address` PRIMARY KEY + bincode `Account` `BYTEA`  | Node-side account ledger — per-address balance, coin_queue, coin_history (SMT), and latest proof. Includes the minting account. Upserted per mutation by the send / receive / mint handlers.                                                                                  |
 | `usernames` table (one row per name)    | `TEXT` name PRIMARY KEY + 32-byte `address` `BYTEA`        | Bidirectional map of claimed usernames ↔ addresses. Race-free claims via `INSERT … ON CONFLICT (name) DO NOTHING`. Always present — usernames are permanent MVP.                                                                                                                  |
 | `minting_meta` row (singleton, `id = 1`) | `BIGINT` num_pubkeys                                       | Counter of how many mint commitments have been issued; **must** survive restart, otherwise the next mint sends a stale `prev_commitment_pubkey` and `send_coins` returns `prev_commitment_pubkey required for account update`. Always present — mint is permanent MVP.            |
 | `proofs/<id>.bin` (on-disk file)        | bincode `CoinProof`                                        | Individual per-send proof + commitment, indexed by `proof_id`. Append-only. **Not** in Postgres because the per-proof blobs are large Plonky2 proof bytes and the directory layout makes recovery trivial. Path configurable via `PROOFS_DIR` (default `./proofs`).               |
@@ -540,27 +540,27 @@ Writes are atomic at the row / transaction level (`ON CONFLICT DO UPDATE` for si
 
 ### DEV state recovery
 
-If the DEV server gets into a bad state (panic loop, mint failures with `prev_commitment_pubkey required`, balance never rising after a successful mint, etc.), the recovery procedure is to truncate the Postgres state-layer tables (and drop the on-disk proofs directory):
+If the DEV node gets into a bad state (panic loop, mint failures with `prev_commitment_pubkey required`, balance never rising after a successful mint, etc.), the recovery procedure is to truncate the Postgres state-layer tables (and drop the on-disk proofs directory):
 
 ```bash
-# On the host running the server (DEV or PRD):
+# On the host running the node (DEV or PRD):
 docker stop zkcoins-node
 # Truncate every state-layer table. _sqlx_migrations is intentionally
 # left in place so connect_and_migrate skips re-applying the schema.
 docker exec -i zkcoins-postgres psql -U zkcoins -d zkcoins -c \
   'TRUNCATE accounts, usernames, smt_state, mmr_state, latest_block, minting_meta;'
 # Drop the per-proof files (proof_id state resets at next boot).
-docker run --rm -v zkcoins_server-data:/data alpine sh -c 'rm -rf /data/proofs'
+docker run --rm -v zkcoins_node-data:/data alpine sh -c 'rm -rf /data/proofs'
 docker start zkcoins-node
 ```
 
-The server starts from genesis on next boot: `Loaded State from Postgres` (empty), `Loaded AccountNode from Postgres` (empty), `No saved block hash found, fetching latest from Esplora`. Past test wallets are abandoned on-chain (they're random) but the SMT is re-built from the chain tip onwards. This is **destructive** — never run it on PRD without a known-needed reason.
+The node starts from genesis on next boot: `Loaded State from Postgres` (empty), `Loaded AccountNode from Postgres` (empty), `No saved block hash found, fetching latest from Esplora`. Past test wallets are abandoned on-chain (they're random) but the SMT is re-built from the chain tip onwards. This is **destructive** — never run it on PRD without a known-needed reason.
 
 The E2E regen workflow on the app repo wipes this state before every run as part of the per-PR cadence in `app/e2e/README.md § 11.3`.
 
-### Bitcoin Node
+### Bitcoin Core
 
-The server needs a Bitcoin node with an Esplora-compatible indexer (electrs). In production, it connects via the shared Docker network `bitcoin` to `electrs-mainnet:3000` (DEV: `electrs-mutinynet:3000`). The underlying bitcoind requires:
+The node needs Bitcoin Core with an Esplora-compatible indexer (electrs). In production, it connects via the shared Docker network `bitcoin` to `electrs-mainnet:3000` (DEV: `electrs-mutinynet:3000`). The underlying bitcoind requires:
 - `txindex=1`
 - `rest=1`
 - `server=1`

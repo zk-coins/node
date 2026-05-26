@@ -34,7 +34,7 @@ A Plonky2 IVC skeleton (`fn main()` with `println!` demos, no tests) that:
 
 ### What it isn't
 
-Despite the repo name, it contains **none** of: SMT, MMR, AccountState, Coin, ProofData, Schnorr verification, recipient model, Bitcoin link, tests, server, scanner. The single `main.rs` is a Plonky2 tutorial-grade IVC demo with no zkCoins semantics.
+Despite the repo name, it contains **none** of: SMT, MMR, AccountState, Coin, ProofData, Schnorr verification, recipient model, Bitcoin link, tests, node, scanner. The single `main.rs` is a Plonky2 tutorial-grade IVC demo with no zkCoins semantics.
 
 ### Adoption decisions
 
@@ -182,7 +182,7 @@ The following decisions are taken. Each is reversible but reversing them means a
 
 5. **Privacy (D2/D10)** → **deferred to v2.** Plaintext recipient addresses for v1. Linkability across multiple coins to the same recipient is a known limitation, called out as a mainnet blocker in SPEC §15.
 
-6. **Fee model (D6)** → **no fee in v1.** We are the publisher (DFX/zkCoins-operated server), so there is no publisher to compensate. Self-funded operation.
+6. **Fee model (D6)** → **no fee in v1.** We are the publisher (DFX/zkCoins-operated node), so there is no publisher to compensate. Self-funded operation.
 
 Hash-function boundary visualisation:
 
@@ -211,7 +211,7 @@ Key adjustments made since the original outline:
 
 - **Step ordering of gadgets** (was: hash → SMT non-inclusion+insert → MMR-append → SHA256). Actual: MMR inclusion → SMT inclusion → SMT non-inclusion verify. The original list mentioned an MMR-append and a SHA256 gadget which turned out to not be needed (MMR is built off-circuit by the scanner; SHA256 lives at the Bitcoin-signing boundary, not in-circuit — see §5.4).
 - **No Cargo feature flag for dual backend.** The closed-test-environment decision means step 7 replaces SP1 with Plonky2 outright (see ROADMAP step 7).
-- **Server scanner + state DO change** (Poseidon SMT/MMR, not SHA256). Only the on-chain commitment *format* — a single Schnorr inscription with txid prefix `4242` — stays unchanged.
+- **Node scanner + state DO change** (Poseidon SMT/MMR, not SHA256). Only the on-chain commitment *format* — a single Schnorr inscription with txid prefix `4242` — stays unchanged.
 
 ---
 
@@ -378,7 +378,7 @@ we're verifying commitment openings inside the predicate.
 
 ### 7.6 Tests serialised, memory-resident binaries linger — **LOW, but operationally costly**
 
-**Discovered:** orphan `server-f8087395d1b79585` process consuming 35 GB
+**Discovered:** orphan `node-f8087395d1b79585` process consuming 35 GB
 of swap reservation hours after `cargo test` finished.
 
 **Cause:** when a background `cargo test` is aborted (or completes but
@@ -857,8 +857,8 @@ Dropped the recursive verify; kept only the SMT inclusion of the
 coin in the witnessed `source_output_coins_root` + SPEC §8 (c)(d)(e)
 chain for the source's commitment in `history_root`. Idea: the
 "source is a valid prior transition" property is enforced by the
-trusted server only folding validly-proved commitments into the
-history MMR — sufficient for server-heavy MVP.
+trusted node only folding validly-proved commitments into the
+history MMR — sufficient for node-heavy MVP.
 
 The outer build then failed with a different error: the cyclic
 fixed-point check `goal_data != common` failed at `circuit_builder.rs:1067`
@@ -873,11 +873,11 @@ diverged in ways that NoopGate padding alone cannot reconcile.
 
 #### Decision
 
-**Defer to Stage 5d-next-5 (post-MVP).** For the zkCoins server-heavy
-MVP architecture (server generates all proofs, wallet holds only
-private key, single trusted server), the security property "in-coin
+**Defer to Stage 5d-next-5 (post-MVP).** For the zkCoins node-heavy
+MVP architecture (node generates all proofs, wallet holds only
+private key, single trusted node), the security property "in-coin
 came from a valid prior transition" can be enforced **off-circuit**:
-the server only folds commitments of validly-proved transitions into
+the node only folds commitments of validly-proved transitions into
 the history MMR. So in-circuit SMT inclusion of the coin in the
 witnessed `source_output_coins_root` + CMP chain for the source's
 commitment in `history_root` would be sufficient — but even that
@@ -1256,11 +1256,11 @@ the fixed-point iteration in `common_data_for_recursion_c_inner` then
 needs `ConstantGate::new(2)` injection in pass 3 and
 `pad_bits = outer_degree - 1` to converge.
 
-### 7.23 `MINTING_ADDRESS` panic in `tokio::spawn`-ed task swallows server bootstrap — **MEDIUM, codified**
+### 7.23 `MINTING_ADDRESS` panic in `tokio::spawn`-ed task swallows node bootstrap — **MEDIUM, codified**
 
 **Discovered:** first auto-deploy of `zkcoins/node:beta` on the DEV
 host post-PR [#17](https://github.com/zk-coins/node/pull/17). The
-container started, the REST server bound `0.0.0.0:4242`, but
+container started, the REST API bound `0.0.0.0:4242`, but
 `https://dev-api.zkcoins.app/health` returned Cloudflare 502 for hours.
 `docker compose ps` showed the container as `Up (unhealthy)` — the
 tokio worker that owned the HTTP listener panicked on every cold boot
@@ -1271,7 +1271,7 @@ processing blocks. No restart, no monitor, no visible failure in
 **Root cause:** the Plonky2 migration moved `MINTING_ADDRESS` to a
 well-known constant (`hash_bytes(b"zkcoins:minting-address:placeholder:v1")`
 in `program-plonky2/src/types.rs`). The SP1-era `ClientAccount::new`
-in `server` still derived `address` from the privkey's first child
+in `node` still derived `address` from the privkey's first child
 pubkey; the `assert_eq!` in `start_rest_node` between the two could
 never hold again. **And** a panic inside a `tokio::spawn`-ed task by
 default only kills the task — the process happily continued in zombie
@@ -1302,7 +1302,7 @@ state for 8 h with the listener dead and the scanner alive.
    PR loses its green check, and the regression surfaces immediately
    instead of hours later. Mirrored to deploy-prd in PR [#51](https://github.com/zk-coins/node/pull/51).
 
-**Lesson:** in async server code, NEVER let a spawned task panic
+**Lesson:** in async node code, NEVER let a spawned task panic
 silently. Either install a global panic hook (the cheap fix taken
 here) or wrap every spawned future in a `Result`-returning closure
 that explicitly propagates the panic to the main task via a watcher
