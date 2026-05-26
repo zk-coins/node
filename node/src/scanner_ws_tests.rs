@@ -113,6 +113,10 @@ async fn run_scanner_ws_publishes_blocks_from_server() {
         reconnect_min: Duration::from_millis(10),
         reconnect_max: Duration::from_millis(50),
         liveness_timeout: Duration::from_secs(5),
+        // Pin the ping cadence well above the test budget — the
+        // happy-path coverage here is about block delivery, not the
+        // keepalive (separate test below).
+        ping_interval: Duration::from_secs(60),
     };
     let handle = tokio::spawn(run_scanner_ws(config, tx));
 
@@ -170,6 +174,9 @@ async fn run_scanner_ws_reconnects_after_server_close() {
         reconnect_min: Duration::from_millis(10),
         reconnect_max: Duration::from_millis(50),
         liveness_timeout: Duration::from_secs(5),
+        // Same rationale as the previous test — keepalive is not
+        // under examination here.
+        ping_interval: Duration::from_secs(60),
     };
     let handle = tokio::spawn(run_scanner_ws(config, tx));
 
@@ -246,6 +253,14 @@ async fn run_scanner_ws_force_reconnects_on_liveness_timeout() {
         reconnect_max: Duration::from_millis(50),
         // Aggressive watchdog so the test stays fast.
         liveness_timeout: Duration::from_millis(300),
+        // For this test the handler explicitly STOPS reading on
+        // server side after the first block — so an outbound ping
+        // gets no auto-Pong reply. Pin ping_interval well above the
+        // 300 ms watchdog so the watchdog fires for the documented
+        // "no inbound frame in window" reason rather than racing the
+        // ping-pong round-trip. The keepalive-specific behaviour is
+        // covered by the dedicated tests further down.
+        ping_interval: Duration::from_secs(60),
     };
     let handle = tokio::spawn(run_scanner_ws(config, tx));
 
@@ -374,4 +389,187 @@ fn scanner_ws_config_from_env_uses_defaults_when_unset() {
     assert_eq!(DEFAULT_ESPLORA_WS_URL, "wss://mutinynet.com/api/v1/ws");
     assert_eq!(DEFAULT_LIVENESS_TIMEOUT, Duration::from_secs(90));
     assert!(DEFAULT_RECONNECT_MIN < DEFAULT_RECONNECT_MAX);
+}
+
+// -----------------------------------------------------------------------------
+// Ping keepalive — RFC 6455 §5.5 Pong-driven liveness
+// -----------------------------------------------------------------------------
+
+/// Sanity: the default ping cadence leaves room for at least one
+/// full ping + pong round-trip inside the watchdog window with
+/// margin. A drifted constant (e.g. someone bumping
+/// `DEFAULT_PING_INTERVAL` to 60s without raising the watchdog)
+/// would silently reintroduce the spurious-reconnect class this
+/// keepalive is here to fix; the assertion turns that into a
+/// build-time test failure.
+#[test]
+fn ping_interval_is_strictly_below_half_liveness_timeout() {
+    assert!(
+        DEFAULT_PING_INTERVAL * 2 < DEFAULT_LIVENESS_TIMEOUT,
+        "DEFAULT_PING_INTERVAL ({:?}) must be < DEFAULT_LIVENESS_TIMEOUT/2 ({:?})",
+        DEFAULT_PING_INTERVAL,
+        DEFAULT_LIVENESS_TIMEOUT,
+    );
+    // And it should be non-trivially smaller than the watchdog
+    // itself; a value within one tick of the watchdog would race
+    // the watchdog under any timer jitter.
+    assert!(DEFAULT_PING_INTERVAL < DEFAULT_LIVENESS_TIMEOUT);
+}
+
+/// Quiet-server test: the server completes the subscribe handshake,
+/// sends no further block frames, but DOES keep draining its read
+/// half. Tungstenite auto-pongs every inbound Ping, so each of our
+/// keepalive pings produces an inbound Pong on the scanner's reader
+/// and resets the liveness deadline. With keepalive working the
+/// scanner stays connected through several watchdog windows back-to-
+/// back; without keepalive (the pre-fix shape) the watchdog would
+/// fire after one window and the test handler would see a second
+/// `accept()`.
+#[tokio::test]
+async fn run_scanner_ws_pongs_keep_connection_alive_past_liveness_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("ws://{}", addr);
+
+    // Track how many connections the scanner opens. If the keepalive
+    // works, this stays at 1 for the entire test window. If the
+    // keepalive is broken, the watchdog fires and the scanner
+    // reconnects (count goes ≥ 2 well inside our budget).
+    let connection_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cc_for_server = std::sync::Arc::clone(&connection_count);
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            cc_for_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            // Consume the subscribe frame and then keep draining the
+            // socket forever. tungstenite auto-queues a Pong reply
+            // for every inbound Ping while the stream is being polled,
+            // so the scanner sees a Pong on every keepalive tick.
+            // Crucially we send NO block frames — the only thing
+            // reaching the scanner's reader is the pong stream.
+            while let Some(msg) = ws.next().await {
+                if msg.is_err() {
+                    break;
+                }
+                // Drop the message and continue. We never send any
+                // application-level frame.
+            }
+        }
+    });
+
+    let (tx, mut rx) = mpsc::channel::<BlockHash>(8);
+    // Watchdog short enough that the test stays fast; ping interval
+    // strictly < watchdog/2 (matching the production invariant) so a
+    // pong fits comfortably inside every watchdog window.
+    let config = ScannerWsConfig {
+        url,
+        http_url: "http://127.0.0.1:1/api".to_string(),
+        reconnect_min: Duration::from_millis(10),
+        reconnect_max: Duration::from_millis(50),
+        liveness_timeout: Duration::from_millis(400),
+        ping_interval: Duration::from_millis(100),
+    };
+    let handle = tokio::spawn(run_scanner_ws(config, tx));
+
+    // Wait for >> liveness_timeout. Without keepalive the scanner
+    // would fire the watchdog after ~400 ms and reconnect; with
+    // keepalive the connection_count stays at 1.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // Block channel must be empty (server sent no block frames at
+    // all) — keepalive must not introduce phantom tip events.
+    assert!(
+        rx.try_recv().is_err(),
+        "scanner must not publish any BlockHash when the server only echoes pings"
+    );
+
+    let observed = connection_count.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        observed, 1,
+        "expected exactly 1 connection (keepalive should prevent the watchdog reconnect); \
+         saw {} connections, which means the watchdog fired",
+        observed,
+    );
+
+    handle.abort();
+}
+
+/// Failure-mode test: the server completes the subscribe handshake
+/// and then stops reading entirely. Outbound pings pile up in the
+/// server's TCP receive buffer; no Pong ever comes back; nothing
+/// resets the deadline. The watchdog MUST fire after
+/// `liveness_timeout` and the scanner MUST reconnect. Asserts the
+/// brief's "no pong + no event in 90 s = connection genuinely dead"
+/// semantic.
+#[tokio::test]
+async fn run_scanner_ws_watchdog_fires_when_pongs_are_dropped() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("ws://{}", addr);
+
+    let connection_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cc_for_server = std::sync::Arc::clone(&connection_count);
+
+    tokio::spawn(async move {
+        // Accept connections in a loop and hand each off to a
+        // dedicated task that parks forever — that way subsequent
+        // accepts can run while earlier connections are still being
+        // held open. The scanner reconnects after the watchdog, so
+        // the listener must keep accepting beyond the first
+        // connection for the test to observe count ≥ 2.
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            cc_for_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                // Read exactly the subscribe frame so the handshake
+                // completes, then stop touching the socket. The pings
+                // the scanner sends from now on are never observed
+                // and never auto-ponged; the scanner's deadline must
+                // elapse.
+                let _ = ws.next().await;
+                // Hold the socket open so the scanner's only path
+                // out is the watchdog.
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+
+    let (tx, mut rx) = mpsc::channel::<BlockHash>(8);
+    let config = ScannerWsConfig {
+        url,
+        http_url: "http://127.0.0.1:1/api".to_string(),
+        reconnect_min: Duration::from_millis(10),
+        reconnect_max: Duration::from_millis(50),
+        liveness_timeout: Duration::from_millis(300),
+        // Ping cadence is well inside the watchdog window — but
+        // since the server never auto-pongs, the watchdog still
+        // fires.
+        ping_interval: Duration::from_millis(100),
+    };
+    let handle = tokio::spawn(run_scanner_ws(config, tx));
+
+    // Allow the watchdog to fire at least once and the scanner to
+    // open a fresh connection. 1.5 s is enough for several watchdog
+    // windows back to back.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let observed = connection_count.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        observed >= 2,
+        "expected ≥ 2 connections (watchdog must fire when pongs are dropped); \
+         saw {} connections",
+        observed,
+    );
+
+    // No block frames ever flowed, so the scanner channel must be
+    // empty — keepalive doesn't conjure tips out of dropped pongs.
+    assert!(
+        rx.try_recv().is_err(),
+        "scanner must not publish any BlockHash when no block frames are sent",
+    );
+
+    handle.abort();
 }

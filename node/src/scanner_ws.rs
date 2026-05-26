@@ -29,6 +29,15 @@
 //!   the `tokio::time::` reference in event-driven code (documented
 //!   in CONTRIBUTING.md, enforced by the CI lint added in the same
 //!   PR).
+//! - 30 s client-side Ping keepalive (`ping_interval`). A tokio
+//!   `interval` ticker running alongside the reader sends a
+//!   `WsMessage::Ping` to the peer every `ping_interval`. RFC 6455
+//!   §5.5 mandates a Pong response, which arrives on the same
+//!   reader and resets the liveness watchdog. Without this, a quiet
+//!   Mainnet-tier upstream (10-min mean block time) had nothing
+//!   flowing in the watchdog window and reconnected every ~2 min;
+//!   the keepalive turns the watchdog into the half-open detector
+//!   it was always meant to be (no pong + no event = dead).
 //! - On reconnect, fetch the current tip via the existing
 //!   `EsploraClient::get_tip_hash` and push that hash into the
 //!   channel too. This plugs the gap that opened while we were
@@ -75,6 +84,26 @@ pub const DEFAULT_ESPLORA_WS_URL: &str = "wss://mutinynet.com/api/v1/ws";
 /// frame at all (including `pong` / keep-alives) is a strong "the
 /// socket is half-open" signal.
 pub const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Default cadence of the client-side Ping keepalive. The scanner
+/// sends `WsMessage::Ping` to the peer every `DEFAULT_PING_INTERVAL`;
+/// the peer's mandatory Pong reply (RFC 6455 §5.5) arrives on the
+/// same reader and resets the liveness watchdog. Must stay strictly
+/// less than `DEFAULT_LIVENESS_TIMEOUT / 2` so that at least one
+/// ping + pong round-trip fits inside every watchdog window even on
+/// a marginal link (a single dropped pong should not be enough to
+/// trip the watchdog).
+pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Compile-time assertion that the ping cadence leaves enough margin
+/// inside the watchdog window. Encoded as a `const` evaluation so
+/// any future tweak to either constant trips the build instead of
+/// quietly drifting into a configuration where the watchdog could
+/// fire between pings.
+const _PING_INTERVAL_FITS_LIVENESS: () = assert!(
+    DEFAULT_PING_INTERVAL.as_millis() * 2 < DEFAULT_LIVENESS_TIMEOUT.as_millis(),
+    "DEFAULT_PING_INTERVAL must be < DEFAULT_LIVENESS_TIMEOUT / 2"
+);
 
 /// Default initial reconnect delay. Doubled on each consecutive
 /// failure up to `DEFAULT_RECONNECT_MAX`.
@@ -173,6 +202,13 @@ pub struct ScannerWsConfig {
     /// Force-reconnect deadline for `ws.next()`. A silent half-open
     /// socket would otherwise wedge the scanner indefinitely.
     pub liveness_timeout: Duration,
+    /// Cadence of the client-side Ping keepalive. Each tick sends a
+    /// `WsMessage::Ping` frame; the peer's Pong reply (RFC 6455
+    /// §5.5) flows back through `ws.next()` and resets the liveness
+    /// watchdog. Without keepalive a quiet Mainnet upstream produced
+    /// nothing on the reader for minutes at a time and the watchdog
+    /// reconnected every ~2 min unnecessarily.
+    pub ping_interval: Duration,
 }
 
 impl ScannerWsConfig {
@@ -190,6 +226,7 @@ impl ScannerWsConfig {
             reconnect_min: DEFAULT_RECONNECT_MIN,
             reconnect_max: DEFAULT_RECONNECT_MAX,
             liveness_timeout: DEFAULT_LIVENESS_TIMEOUT,
+            ping_interval: DEFAULT_PING_INTERVAL,
         }
     }
 }
@@ -271,65 +308,128 @@ pub async fn run_scanner_ws(config: ScannerWsConfig, tip_tx: mpsc::Sender<BlockH
     }
 }
 
+/// Sentinel payload sent in every outbound Ping frame. The peer is
+/// required by RFC 6455 §5.5 to echo the payload back in its Pong;
+/// the value itself is otherwise irrelevant to the scanner.
+const PING_PAYLOAD: &[u8] = b"zkcoins-scanner-keepalive";
+
 /// Single connect → subscribe → drain cycle. Returns Ok on a clean
 /// close, Err on any failure. Caller schedules the reconnect.
+///
+/// The reader and the ping ticker run inside a single `tokio::select!`
+/// on a split stream: the reader half (`SplitStream`) feeds the frame
+/// loop, the writer half (`SplitSink`) carries the periodic
+/// `WsMessage::Ping`. Splitting (vs. two tasks) keeps error
+/// propagation linear and avoids a shutdown handshake between halves;
+/// `select!` (vs. polling the ticker between reads) preserves the
+/// invariant that the liveness deadline is reset ONLY by inbound
+/// frames, not by our own send activity.
 async fn connect_and_drain(
     config: &ScannerWsConfig,
     tip_tx: &mpsc::Sender<BlockHash>,
 ) -> Result<(), WsError> {
-    let mut ws = connect_with_timeout(&config.url).await?;
+    let ws = connect_with_timeout(&config.url).await?;
     println!("scanner_ws: connected to {}", config.url);
 
+    let (mut sink, mut stream) = ws.split();
+
     let subscribe = serde_json::json!({ "action": "want", "data": ["blocks"] }).to_string();
-    ws.send(WsMessage::Text(subscribe))
+    sink.send(WsMessage::Text(subscribe))
         .await
         .map_err(|e| WsError::Subscribe(e.to_string()))?;
 
+    // Client-side Ping keepalive. The ticker's first tick fires
+    // immediately (default tokio behaviour); that's fine — sending an
+    // initial ping right after subscribe gives us the fastest possible
+    // confirmation that the peer is live. `Burst` is the default
+    // missed-tick behaviour; if a tick is missed (e.g. busy reader)
+    // we explicitly opt into `Delay` below so we never send a flurry
+    // of pings to "catch up". The line below carries the required
+    // `scanner-polling-ok:` marker for the CI lint enforcing
+    // CONTRIBUTING.md § "No polling — events only".
+    let mut ping_ticker = tokio::time::interval(config.ping_interval); // scanner-polling-ok: client-side WS Ping keepalive cadence (RFC 6455 §5.5), not a chain-tip poll
+    ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Track the liveness deadline manually rather than wrapping each
+    // `stream.next()` in `tokio::time::timeout`, because `select!`
+    // drops the losing branch's future on every iteration. With a
+    // wrapper-based watchdog the timer would silently reset every
+    // time the ping arm fires, defeating the watchdog. The manual
+    // deadline is reset ONLY when an inbound frame arrives — exactly
+    // the invariant we want.
+    let mut deadline = tokio::time::Instant::now() + config.liveness_timeout;
+
     loop {
-        let next = tokio::time::timeout(config.liveness_timeout, ws.next()).await;
-        let frame = match next {
-            Ok(Some(Ok(m))) => m,
-            Ok(Some(Err(e))) => return Err(WsError::Stream(e.to_string())),
-            Ok(None) => return Ok(()), // clean close
-            Err(_) => {
+        tokio::select! {
+            biased;
+
+            // Liveness watchdog. Fires only if no inbound frame has
+            // arrived for `liveness_timeout`. A live peer answers our
+            // pings, so this should only fire on a genuinely dead
+            // socket.
+            _ = tokio::time::sleep_until(deadline) => { // scanner-polling-ok: liveness watchdog deadline, not a chain-tip poll
                 return Err(WsError::Stream(format!(
                     "no frame in {:?} (liveness watchdog)",
                     config.liveness_timeout
                 )));
             }
-        };
 
-        match frame {
-            WsMessage::Text(text) => {
-                for hash in parse_ws_frame(&text) {
-                    if tip_tx.send(hash).await.is_err() {
-                        // Receiver dropped → scanner_runtime is
-                        // shutting down; drop any remaining hashes in
-                        // this frame (anchor_on_current_tip on the
-                        // next session would replay the latest tip
-                        // anyway). Issue #84 review (round 4) MAJOR 3.
-                        return Err(WsError::Stream("receiver dropped".into()));
-                    }
+            // Outbound ping. RFC 6455 §5.5 requires the peer to reply
+            // with a Pong carrying the same payload; that Pong arrives
+            // on `stream.next()` and resets the deadline.
+            _ = ping_ticker.tick() => {
+                if let Err(e) = sink.send(WsMessage::Ping(PING_PAYLOAD.to_vec())).await {
+                    return Err(WsError::Stream(format!("ping send failed: {}", e)));
                 }
             }
-            WsMessage::Binary(_) => {
-                // Esplora WS does not send binary frames for the
-                // `blocks` subscription, but tungstenite delivers
-                // protocol frames here too. Ignore quietly.
+
+            // Inbound frame. Any frame — Text, Binary, Ping, Pong,
+            // Close — counts as evidence the socket is alive and
+            // resets the deadline. The frame variant then drives the
+            // per-shape handling below.
+            next = stream.next() => {
+                let frame = match next {
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) => return Err(WsError::Stream(e.to_string())),
+                    None => return Ok(()), // clean close
+                };
+                deadline = tokio::time::Instant::now() + config.liveness_timeout;
+
+                match frame {
+                    WsMessage::Text(text) => {
+                        for hash in parse_ws_frame(&text) {
+                            if tip_tx.send(hash).await.is_err() {
+                                // Receiver dropped → scanner_runtime is
+                                // shutting down; drop any remaining hashes in
+                                // this frame (anchor_on_current_tip on the
+                                // next session would replay the latest tip
+                                // anyway). Issue #84 review (round 4) MAJOR 3.
+                                return Err(WsError::Stream("receiver dropped".into()));
+                            }
+                        }
+                    }
+                    WsMessage::Binary(_) => {
+                        // Esplora WS does not send binary frames for the
+                        // `blocks` subscription, but tungstenite delivers
+                        // protocol frames here too. Ignore quietly.
+                    }
+                    WsMessage::Ping(_) | WsMessage::Pong(_) => {
+                        // tungstenite auto-responds to inbound Pings;
+                        // inbound Pongs are the response to OUR outbound
+                        // keepalive pings. Either way, the deadline
+                        // reset above is the whole job — nothing to do.
+                    }
+                    WsMessage::Close(_) => return Ok(()),
+                    // The `Frame` variant of `tungstenite::Message` only
+                    // surfaces under the `frame` cargo feature, which we do
+                    // not enable. Keep the arm here as a defensive catch-all
+                    // so a future tungstenite upgrade that flips the feature
+                    // default does not break the build via a non-exhaustive
+                    // match warning.
+                    #[allow(unreachable_patterns)]
+                    WsMessage::Frame(_) => {}
+                }
             }
-            WsMessage::Ping(_) | WsMessage::Pong(_) => {
-                // tungstenite handles ping/pong internally; nothing
-                // to do.
-            }
-            WsMessage::Close(_) => return Ok(()),
-            // The `Frame` variant of `tungstenite::Message` only
-            // surfaces under the `frame` cargo feature, which we do
-            // not enable. Keep the arm here as a defensive catch-all
-            // so a future tungstenite upgrade that flips the feature
-            // default does not break the build via a non-exhaustive
-            // match warning.
-            #[allow(unreachable_patterns)]
-            WsMessage::Frame(_) => {}
         }
     }
 }
