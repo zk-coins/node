@@ -101,7 +101,7 @@ pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(30);
 /// quietly drifting into a configuration where the watchdog could
 /// fire between pings.
 const _PING_INTERVAL_FITS_LIVENESS: () = assert!(
-    DEFAULT_PING_INTERVAL.as_millis() * 2 < DEFAULT_LIVENESS_TIMEOUT.as_millis(),
+    DEFAULT_PING_INTERVAL.as_millis() < DEFAULT_LIVENESS_TIMEOUT.as_millis() / 2,
     "DEFAULT_PING_INTERVAL must be < DEFAULT_LIVENESS_TIMEOUT / 2"
 );
 
@@ -316,14 +316,24 @@ const PING_PAYLOAD: &[u8] = b"zkcoins-scanner-keepalive";
 /// Single connect → subscribe → drain cycle. Returns Ok on a clean
 /// close, Err on any failure. Caller schedules the reconnect.
 ///
-/// The reader and the ping ticker run inside a single `tokio::select!`
-/// on a split stream: the reader half (`SplitStream`) feeds the frame
-/// loop, the writer half (`SplitSink`) carries the periodic
-/// `WsMessage::Ping`. Splitting (vs. two tasks) keeps error
-/// propagation linear and avoids a shutdown handshake between halves;
-/// `select!` (vs. polling the ticker between reads) preserves the
-/// invariant that the liveness deadline is reset ONLY by inbound
-/// frames, not by our own send activity.
+/// Architecture: the WS stream is split into a reader (`SplitStream`)
+/// and a writer (`SplitSink`). The writer half is moved into a
+/// dedicated `tokio::spawn`ed writer task that drains a 1-slot
+/// `tokio::sync::mpsc::Receiver<WsMessage>` and runs `feed` + `flush`
+/// against the sink. The main loop's `tokio::select!` polls only the
+/// reader, the liveness watchdog, and an mpsc `out_tx.send().await`
+/// driven by the ping ticker.
+///
+/// Why the writer-task split (and not `sink.send(...).await` inline
+/// in the select): `SinkExt::send` is NOT cancel-safe — if the read
+/// arm wins a race against a half-completed send, the send-future is
+/// dropped and the sink can be left in a torn state mid-frame. By
+/// contrast `tokio::sync::mpsc::Sender::send().await` IS cancel-safe,
+/// and the writer task awaits the actual wire-level send to
+/// completion outside any `select!` boundary, so the sink is never
+/// cancelled mid-poll. The `select!`-on-ticker invariant that the
+/// liveness deadline is reset ONLY by inbound frames (never by our
+/// own send activity) is preserved exactly as before.
 async fn connect_and_drain(
     config: &ScannerWsConfig,
     tip_tx: &mpsc::Sender<BlockHash>,
@@ -337,6 +347,57 @@ async fn connect_and_drain(
     sink.send(WsMessage::Text(subscribe))
         .await
         .map_err(|e| WsError::Subscribe(e.to_string()))?;
+
+    // Outbound writer task. Owns `sink` outright and drives every
+    // outbound frame to completion via `feed` + `flush` — the
+    // `feed`/`flush` split keeps the partial-write window the
+    // narrowest the API allows. The writer's body is plain
+    // `loop { rx.recv().await ... }`, with no `select!` around the
+    // send, so the send-future is never cancelled mid-poll and the
+    // sink can never be left in a torn state.
+    //
+    // The main loop talks to this task via `tokio::sync::mpsc::Sender`,
+    // whose `send().await` IS cancel-safe (documented: dropping the
+    // future before completion is sound — the message is never
+    // delivered, but the channel and sender remain consistent). This
+    // is the cancel-safety argument for the ping arm in the `select!`
+    // below: instead of `sink.send(Ping).await` (NOT cancel-safe) we
+    // do `out_tx.send(Ping).await`, and the writer task takes care of
+    // the actual wire-level send outside any `select!` boundary.
+    //
+    // The channel is bounded at 1 so a stalled writer applies
+    // immediate back-pressure to the main loop (the second ping tick
+    // would block) — far preferable to growing an unbounded queue of
+    // pings against a peer that cannot drain them.
+    let (out_tx, mut out_rx) = mpsc::channel::<WsMessage>(1);
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            // `feed` queues the frame into the sink's internal
+            // buffer; `flush` drives it onto the wire. Splitting (vs.
+            // `send`) bounds the partial-write window and makes the
+            // two halves explicit. On error we surface it to the main
+            // loop by dropping `out_tx` from the writer side (closing
+            // the channel from the producer's perspective is achieved
+            // by the writer task exiting); the main loop's next
+            // `out_tx.send` will then fail and trigger reconnect.
+            sink.feed(msg).await?;
+            sink.flush().await?;
+        }
+        Ok::<(), tokio_tungstenite::tungstenite::Error>(())
+    });
+    // Always abort the writer when this function returns, regardless
+    // of how we exit. Without this, a returning main-loop iteration
+    // could leave the writer task parked in `out_rx.recv().await` and
+    // leak the `sink` (and thus the underlying TCP socket) until the
+    // tokio runtime tears down. `AbortOnDrop` makes that cleanup
+    // deterministic and exception-safe.
+    struct AbortOnDrop(tokio::task::JoinHandle<Result<(), tokio_tungstenite::tungstenite::Error>>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _writer_guard = AbortOnDrop(writer);
 
     // Client-side Ping keepalive. The ticker's first tick fires
     // immediately (default tokio behaviour); that's fine — sending an
@@ -377,8 +438,18 @@ async fn connect_and_drain(
             // Outbound ping. RFC 6455 §5.5 requires the peer to reply
             // with a Pong carrying the same payload; that Pong arrives
             // on `stream.next()` and resets the deadline.
+            //
+            // Cancel-safety: `tokio::sync::mpsc::Sender::send().await`
+            // is documented as cancel-safe, so if the read arm wins
+            // this race the half-completed send-future can be dropped
+            // without corrupting the channel or the underlying sink.
+            // The actual wire-level write happens inside the dedicated
+            // writer task above, never inside this `select!`. A send
+            // error here means the writer task has exited (e.g. the
+            // peer closed mid-write) — surface as a stream error so
+            // the reconnect loop kicks in.
             _ = ping_ticker.tick() => {
-                if let Err(e) = sink.send(WsMessage::Ping(PING_PAYLOAD.to_vec())).await {
+                if let Err(e) = out_tx.send(WsMessage::Ping(PING_PAYLOAD.to_vec())).await {
                     return Err(WsError::Stream(format!("ping send failed: {}", e)));
                 }
             }
@@ -387,6 +458,11 @@ async fn connect_and_drain(
             // Close — counts as evidence the socket is alive and
             // resets the deadline. The frame variant then drives the
             // per-shape handling below.
+            //
+            // Cancel-safety: `StreamExt::next` is documented as
+            // cancel-safe (futures-util 0.3), so dropping this arm's
+            // future when another arm wins is sound — no frame is
+            // lost.
             next = stream.next() => {
                 let frame = match next {
                     Some(Ok(m)) => m,

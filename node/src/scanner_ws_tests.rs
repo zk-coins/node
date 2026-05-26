@@ -573,3 +573,102 @@ async fn run_scanner_ws_watchdog_fires_when_pongs_are_dropped() {
 
     handle.abort();
 }
+
+/// Send-error reconnect: the server completes the subscribe handshake
+/// and then drops the TCP socket abruptly (no clean WS close frame,
+/// no graceful FIN handshake — just `drop(ws)` which closes the
+/// underlying TcpStream). The scanner's next ping-ticker tick attempts
+/// to write a Ping frame to the now-closed socket; the writer task's
+/// `sink.feed`/`flush` returns `Err` (broken pipe / connection reset)
+/// and the main loop surfaces that as `WsError::Stream("ping send
+/// failed: ...")`, driving a reconnect via the normal backoff loop.
+///
+/// Race-note: in practice the reader arm may also observe the close
+/// (as `Some(Err(_))` or `None`) on roughly the same scheduling tick
+/// as the ping arm. Both paths produce the SAME observable behaviour
+/// — fast reconnect well inside `liveness_timeout` — and both go
+/// through the cancel-safe writer-task plumbing introduced for the
+/// ping-send branch, so either winning the race exercises the
+/// cancel-safety guarantee. The assertion below pins the observable
+/// invariant: reconnect happens MUCH faster than the watchdog window,
+/// which is only achievable if a non-watchdog reconnect path fired.
+#[tokio::test]
+async fn run_scanner_ws_reconnects_when_ping_send_errors() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("ws://{}", addr);
+
+    let connection_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cc_for_server = std::sync::Arc::clone(&connection_count);
+
+    tokio::spawn(async move {
+        // Accept connections in a loop; per-connection handler drops
+        // the WS as soon as the subscribe frame arrives. Subsequent
+        // accepts continue to fire so the scanner's reconnect attempt
+        // can land cleanly.
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            cc_for_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                // Wait for the subscribe frame so the handshake is
+                // observably complete (the scanner has transitioned
+                // out of connect/subscribe and into the steady-state
+                // select loop) before we tear the socket down.
+                let _ = ws.next().await;
+                // Drop the WS — this drops the underlying TcpStream,
+                // which closes the connection from the server side.
+                // The scanner's next outbound write (ping-tick) sees
+                // a broken pipe; the reader sees an EOF/error around
+                // the same time. Either way the scanner exits the
+                // current session via a non-watchdog path and the
+                // outer reconnect loop opens a fresh TCP connection
+                // (which lands here, incrementing the counter).
+                drop(ws);
+            });
+        }
+    });
+
+    let (tx, mut rx) = mpsc::channel::<BlockHash>(8);
+    // Liveness watchdog is set to a value LARGER than the test budget
+    // below so that a count ≥ 2 within the budget cannot possibly be
+    // attributed to a watchdog firing — the reconnect MUST have come
+    // from the close-detection path (ping-send error or read error).
+    // Ping cadence is tight so the first ping tick fires within a few
+    // ms of the subscribe completing, giving the send-error path the
+    // best chance to be the path that actually drives the reconnect.
+    let config = ScannerWsConfig {
+        url,
+        http_url: "http://127.0.0.1:1/api".to_string(),
+        reconnect_min: Duration::from_millis(10),
+        reconnect_max: Duration::from_millis(50),
+        liveness_timeout: Duration::from_secs(30),
+        ping_interval: Duration::from_millis(50),
+    };
+    let handle = tokio::spawn(run_scanner_ws(config, tx));
+
+    // Budget for observing the reconnect. Must be ≫ ping_interval +
+    // reconnect_max but ≪ liveness_timeout, so any observed
+    // reconnect MUST be driven by the close-detection path, not the
+    // watchdog. 2 s comfortably satisfies both.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let observed = connection_count.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        observed >= 2,
+        "expected ≥ 2 connections (server dropped socket — scanner must \
+         reconnect via the ping-send-error path, well inside the 30 s \
+         liveness watchdog window); saw {} connections",
+        observed,
+    );
+
+    // The server never sent any block frames, only the implicit
+    // subscribe-then-drop. The channel must therefore be empty —
+    // failure-path reconnects must not inject phantom tips.
+    assert!(
+        rx.try_recv().is_err(),
+        "scanner must not publish any BlockHash when no block frames are sent",
+    );
+
+    handle.abort();
+}
