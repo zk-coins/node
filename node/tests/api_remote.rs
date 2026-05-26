@@ -1914,20 +1914,35 @@ async fn error_strings_match_known_app_mapping() {
     }
 
     // "Missing signature" — well-formed send body but signature: null.
-    //
-    // Implementation detail: `router::verify_send_signature` is only
-    // CALLED when `request.signature.is_some()` (see
-    // `router::send_handler:626`), so the `Ok_or("Missing signature")`
-    // path inside that helper is currently unreachable from the HTTP
-    // surface. Today the server silently skips signature verification
-    // when the field is absent — i.e. "Missing signature" is only
-    // produced by the deterministic unit test
-    // `router_tests::verify_send_signature_missing_signature`. The
-    // string remains in `KNOWN_SERVER_ERRORS` because (a) flipping
-    // signatures to required would re-activate the branch and (b) the
-    // wallet app must already handle the string if the server ever
-    // tightens the contract. Tracked by the inventory below; do NOT
-    // assert the server emits it today.
+    // The signed handlers (`send_handler`, `claim_username_handler`)
+    // reject absent `signature` fields with 401 BEFORE crypto
+    // verification runs. The matching `"Missing timestamp"` 401 covers
+    // an absent `timestamp` field. Both gates land before
+    // `verify_send_signature` so a clock-skew or empty-credential
+    // misconfiguration surfaces distinctly instead of collapsing into
+    // `"Signature verification failed"`.
+    {
+        let alice = TestWallet::new();
+        let body = json!({
+            "account_address": alice.address_hex(),
+            "recipient": TestWallet::new().address_hex(),
+            "amount": 1u64,
+            "public_key": hex::encode(alice.pubkey(0).serialize()),
+            "next_public_key": hex::encode(alice.pubkey(1).serialize()),
+            "prev_commitment_pubkey": Option::<String>::None,
+            "timestamp": unix_now(),
+            // signature deliberately omitted
+        });
+        let resp = http_client()
+            .post(url("/api/send"))
+            .json(&body)
+            .send()
+            .await
+            .expect("send missing signature");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body: Value = resp.json().await.expect("body JSON");
+        assert_eq!(body["error"], "Missing signature");
+    }
 
     // ---- Mismatches: app uses a generic placeholder, server emits a
     //      more-specific string. Document each here. -----------------
@@ -2134,10 +2149,9 @@ async fn error_strings_match_known_app_mapping() {
     //      require the server to invent a new error string)
     //
     // "Missing signature"
-    //   → router_tests::verify_send_signature_missing_signature
-    //     (today's `send_handler` only invokes
-    //      `verify_send_signature` when `signature.is_some()` — see
-    //      the inline comment in the unreachable provocation block above)
+    //   → router_tests::verify_send_signature_missing_signature for the
+    //     helper-level unit; the live provocation in the block above
+    //     exercises the handler-level 401.
     //
     // "Broadcast failed"
     //   → operator-only: requires the publisher's broadcast leg to
