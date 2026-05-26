@@ -168,3 +168,7 @@ pub(crate) async fn audit_log_middleware(
 
     Response::from_parts(resp_parts, Body::from(resp_bytes))
 }
+
+#[cfg(test)]
+#[path = "audit_tests.rs"]
+mod tests;

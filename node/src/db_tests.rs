@@ -774,3 +774,386 @@ async fn persist_state_and_mark_complete_tx_idempotent_on_already_complete_row()
         "guarded UPDATE must NOT bump updated_at on already-complete row"
     );
 }
+
+// ============================================================================
+// Coverage tests for migration 0006-0010 helpers (added in this PR stack).
+// Each test exercises one insert path against a fresh test container so the
+// 100% line/function gate stays green.
+// ============================================================================
+
+#[test]
+fn inscription_kind_from_db_str_returns_none_for_invalid() {
+    // The `_ => None` arm in `from_db_str` is reached only by bogus
+    // input — every DB row goes through the CHECK constraint
+    // ('mint' | 'send'). Tested directly.
+    assert!(InscriptionKind::from_db_str("nope").is_none());
+    assert!(InscriptionKind::from_db_str("").is_none());
+}
+
+#[tokio::test]
+async fn insert_request_log_writes_row() {
+    let (pool, _container) = setup_pool().await;
+    let entry = RequestLogEntry {
+        method: "POST".into(),
+        path: "/api/mint".into(),
+        query: Some("debug=1".into()),
+        remote_addr: Some("127.0.0.1:54321".into()),
+        client_ip: Some("203.0.113.7".into()),
+        user_agent: Some("wallet/1.0".into()),
+        request_headers: serde_json::json!({"content-type": "application/json"}),
+        request_body: b"{}".to_vec(),
+        response_status: 200,
+        response_headers: serde_json::json!({"x-trace-id": "abc"}),
+        response_body: b"{\"ok\":true}".to_vec(),
+        duration_us: 1234,
+    };
+    insert_request_log(&pool, &entry).await.unwrap();
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM request_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn insert_esplora_log_writes_row() {
+    let (pool, _container) = setup_pool().await;
+    let entry = EsploraLogEntry {
+        direction: "outbound_http",
+        method: Some("POST".into()),
+        url: "http://example/tx".into(),
+        request_body: Some(b"raw".to_vec()),
+        response_status: Some(200),
+        response_body: Some(b"ok".to_vec()),
+        duration_us: Some(42),
+        trigger_source: Some("mint".into()),
+        triggering_request_log_id: None,
+    };
+    insert_esplora_log(&pool, &entry).await.unwrap();
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM esplora_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn insert_error_log_writes_row() {
+    let (pool, _container) = setup_pool().await;
+    let entry = ErrorLogEntry {
+        severity: "error",
+        source: "publisher::broadcast".into(),
+        message: "broadcast failed".into(),
+        error_chain: Some("io: connection refused".into()),
+        request_log_id: None,
+    };
+    insert_error_log(&pool, &entry).await.unwrap();
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM error_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn insert_block_log_writes_row_and_is_idempotent() {
+    let (pool, _container) = setup_pool().await;
+    let entry = BlockLogEntry {
+        block_hash: vec![0x11; 32],
+        block_height: Some(7),
+        inscription_count: 2,
+        processing_duration_us: Some(99),
+    };
+    insert_block_log(&pool, &entry).await.unwrap();
+    // ON CONFLICT (block_hash) DO NOTHING — second insert is a no-op.
+    insert_block_log(&pool, &entry).await.unwrap();
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM block_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn insert_observed_inscription_and_mark_integrated() {
+    let (pool, _container) = setup_pool().await;
+    let commit_txid = vec![0x22; 32];
+    let entry = ObservedInscriptionEntry {
+        commit_txid: commit_txid.clone(),
+        block_hash: Some(vec![0x33; 32]),
+        block_height: Some(42),
+        source: "external",
+        commitment: vec![0xAA; 145],
+        public_key: vec![0x03; 33],
+        integrated: false,
+    };
+    insert_observed_inscription(&pool, &entry).await.unwrap();
+    // Idempotent ON CONFLICT — second insert is a no-op.
+    insert_observed_inscription(&pool, &entry).await.unwrap();
+
+    // Pre-flip: integrated=false, integrated_at IS NULL.
+    let (pre_integrated,): (bool,) =
+        sqlx::query_as("SELECT integrated FROM observed_inscriptions WHERE commit_txid = $1")
+            .bind(&commit_txid[..])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!pre_integrated);
+
+    mark_observed_inscription_integrated(&pool, &commit_txid)
+        .await
+        .unwrap();
+
+    // Post-flip: both columns advanced; the logical-pair CHECK from 0010
+    // would have rejected a half-update.
+    let (post_integrated, has_ts): (bool, bool) = sqlx::query_as(
+        "SELECT integrated, integrated_at IS NOT NULL FROM observed_inscriptions WHERE commit_txid = $1",
+    )
+    .bind(&commit_txid[..])
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(post_integrated);
+    assert!(has_ts);
+
+    // Second flip is a no-op (WHERE integrated = FALSE filter).
+    mark_observed_inscription_integrated(&pool, &commit_txid)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn insert_state_update_log_writes_row() {
+    let (pool, _container) = setup_pool().await;
+    let entry = StateUpdateLogEntry {
+        trigger_source: "mint",
+        commit_txid: Some(vec![0x44; 32]),
+        prev_mmr_root: vec![0x55; 32],
+        new_mmr_root: vec![0x66; 32],
+        smt_root_before: vec![0x77; 32],
+        smt_root_after: vec![0x88; 32],
+        commitment_count: 1,
+    };
+    insert_state_update_log(&pool, &entry).await.unwrap();
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM state_update_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn insert_account_history_writes_row_directly() {
+    let (pool, _container) = setup_pool().await;
+    let entry = AccountHistoryEntry {
+        address: vec![0x99; 32],
+        prev_data: None,
+        new_data: b"new-blob".to_vec(),
+        source: "recovery",
+        triggering_commit_txid: None,
+        triggering_request_log_id: None,
+    };
+    insert_account_history(&pool, &entry).await.unwrap();
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM account_history")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn insert_username_claim_log_writes_row() {
+    let (pool, _container) = setup_pool().await;
+    let entry = UsernameClaimLogEntry {
+        requested_username: "Alice".into(),
+        normalized_username: "alice".into(),
+        address: vec![0xAA; 32],
+        signature: vec![0xBB; 64],
+        success: true,
+        reject_reason: None,
+        request_log_id: None,
+    };
+    insert_username_claim_log(&pool, &entry).await.unwrap();
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM username_claim_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn insert_tx_mining_log_writes_row() {
+    let (pool, _container) = setup_pool().await;
+    // The 0010 FK from `tx_mining_log.commit_txid` to
+    // `pending_inscriptions(commit_txid)` requires the parent row first.
+    let commit_txid = [0xCC; 32];
+    let reveal_txid = [0xDD; 32];
+    insert_pending_inscription(
+        &pool,
+        &commit_txid,
+        &reveal_txid,
+        InscriptionKind::Mint,
+        b"commitment",
+        b"commit-tx",
+        b"reveal-tx",
+        1000,
+    )
+    .await
+    .unwrap();
+
+    let entry = TxMiningLogEntry {
+        target_prefix: "4242".into(),
+        nonces_tried: 100,
+        duration_us: 1234,
+        final_nonce: Some(99),
+        final_txid: vec![0xEE; 32],
+        commit_txid: Some(commit_txid.to_vec()),
+    };
+    insert_tx_mining_log(&pool, &entry).await.unwrap();
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM tx_mining_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn insert_boot_log_writes_row() {
+    let (pool, _container) = setup_pool().await;
+    let entry = BootLogEntry {
+        event_type: "startup".into(),
+        message: "node started".into(),
+        metadata: Some(serde_json::json!({"pid": 42})),
+    };
+    insert_boot_log(&pool, &entry).await.unwrap();
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM boot_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn update_pending_failure_reason_records_error_without_changing_status() {
+    let (pool, _container) = setup_pool().await;
+    let commit_txid = [0x77; 32];
+    let reveal_txid = [0x78; 32];
+    insert_pending_inscription(
+        &pool,
+        &commit_txid,
+        &reveal_txid,
+        InscriptionKind::Send,
+        b"c",
+        b"ctx",
+        b"rtx",
+        500,
+    )
+    .await
+    .unwrap();
+    update_pending_status(&pool, &commit_txid, PENDING_STATUS_COMMIT_BROADCAST)
+        .await
+        .unwrap();
+
+    update_pending_failure_reason(&pool, &commit_txid, "boom")
+        .await
+        .unwrap();
+
+    let (status, reason): (String, Option<String>) = sqlx::query_as(
+        "SELECT status, failure_reason FROM pending_inscriptions WHERE commit_txid = $1",
+    )
+    .bind(&commit_txid[..])
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, PENDING_STATUS_COMMIT_BROADCAST);
+    assert_eq!(reason.as_deref(), Some("boom"));
+}
+
+#[tokio::test]
+async fn upsert_account_with_source_tags_history_via_trigger() {
+    let (pool, _container) = setup_pool().await;
+    let address = vec![0x10; 32];
+    upsert_account_with_source(&pool, &address, b"v1", "mint")
+        .await
+        .unwrap();
+    let (src, prev_data): (String, Option<Vec<u8>>) =
+        sqlx::query_as("SELECT source, prev_data FROM account_history WHERE address = $1")
+            .bind(&address[..])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(src, "mint");
+    assert!(prev_data.is_none(), "first insert has no prev_data");
+
+    // Second upsert: trigger sees TG_OP='UPDATE' and OLD.data != NEW.data,
+    // writes another row with prev_data=Some(b"v1").
+    upsert_account_with_source(&pool, &address, b"v2", "send")
+        .await
+        .unwrap();
+    let rows: Vec<(String, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT source, prev_data FROM account_history WHERE address = $1 ORDER BY id",
+    )
+    .bind(&address[..])
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1].0, "send");
+    assert_eq!(rows[1].1.as_deref(), Some(b"v1".as_ref()));
+}
+
+#[tokio::test]
+async fn get_inscription_summary_returns_none_for_unknown_txid() {
+    let (pool, _container) = setup_pool().await;
+    let res = get_inscription_summary_by_commit_txid(&pool, &[0xFE; 32])
+        .await
+        .unwrap();
+    assert!(res.is_none());
+}
+
+#[tokio::test]
+async fn get_inscription_summary_returns_full_row() {
+    let (pool, _container) = setup_pool().await;
+    let commit_txid = [0x12; 32];
+    let reveal_txid = [0x34; 32];
+    insert_pending_inscription(
+        &pool,
+        &commit_txid,
+        &reveal_txid,
+        InscriptionKind::Mint,
+        b"c",
+        b"ctx",
+        b"rtx",
+        9_001,
+    )
+    .await
+    .unwrap();
+    update_pending_failure_reason(&pool, &commit_txid, "transient esplora 503")
+        .await
+        .unwrap();
+
+    let summary = get_inscription_summary_by_commit_txid(&pool, &commit_txid)
+        .await
+        .unwrap()
+        .expect("row must be returned");
+    // Display form: reverse of stored bytes.
+    let mut display = commit_txid.to_vec();
+    display.reverse();
+    assert_eq!(summary.commit_txid, hex::encode(display));
+    let mut reveal_display = reveal_txid.to_vec();
+    reveal_display.reverse();
+    assert_eq!(
+        summary.reveal_txid.as_deref(),
+        Some(hex::encode(reveal_display).as_str())
+    );
+    assert_eq!(summary.kind, InscriptionKind::Mint);
+    assert_eq!(summary.status, PENDING_STATUS_CONSTRUCTED);
+    assert_eq!(summary.commit_output_value, 9_001);
+    assert_eq!(
+        summary.failure_reason.as_deref(),
+        Some("transient esplora 503")
+    );
+    // Timestamps formatted via to_char — same shape on both columns.
+    assert!(summary.created_at.ends_with('Z'));
+    assert!(summary.updated_at.ends_with('Z'));
+}

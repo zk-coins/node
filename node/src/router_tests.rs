@@ -5272,3 +5272,210 @@ async fn mint_handler_two_sequential_mints_with_different_recipients_advance_cle
         "on-disk mmr_root_index must have 2 entries after two successful atomic txs"
     );
 }
+
+// =======================================================================
+// Coverage tests for GET /api/inscriptions/:txid (added in #113).
+// =======================================================================
+
+mod inscriptions_endpoint_tests {
+    use super::*;
+    use crate::db::{connect_and_migrate, insert_pending_inscription, InscriptionKind};
+    use crate::router::create_router;
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    async fn live_pool_router() -> (
+        Router,
+        Arc<sqlx::PgPool>,
+        testcontainers::ContainerAsync<Postgres>,
+    ) {
+        let container = Postgres::default()
+            .with_tag("17")
+            .start()
+            .await
+            .expect("postgres container");
+        let host = container.get_host().await.unwrap();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+        let pool = Arc::new(connect_and_migrate(&url).await.expect("migrate"));
+        let state = live_test_state(pool.clone());
+        let app = create_router(state);
+        (app, pool, container)
+    }
+
+    #[tokio::test]
+    async fn get_inscription_bad_hex_returns_422() {
+        let (app, _pool, _c) = live_pool_router().await;
+        let req = Request::get("/api/inscriptions/zzzz")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn get_inscription_wrong_length_returns_422() {
+        let (app, _pool, _c) = live_pool_router().await;
+        let req = Request::get("/api/inscriptions/abcd")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn get_inscription_unknown_txid_returns_404() {
+        let (app, _pool, _c) = live_pool_router().await;
+        let unknown = "f".repeat(64);
+        let req = Request::get(format!("/api/inscriptions/{}", unknown))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_inscription_known_txid_returns_200_with_summary() {
+        let (app, pool, _c) = live_pool_router().await;
+        // Plant a row directly via the DB helper. The endpoint accepts
+        // the display-order (big-endian) hex; we reverse the stored
+        // little-endian bytes to construct the URL.
+        let stored_commit: [u8; 32] = [0x42; 32];
+        let stored_reveal: [u8; 32] = [0x43; 32];
+        insert_pending_inscription(
+            &pool,
+            &stored_commit,
+            &stored_reveal,
+            InscriptionKind::Mint,
+            b"c",
+            b"ctx",
+            b"rtx",
+            777,
+        )
+        .await
+        .unwrap();
+        let mut display = stored_commit.to_vec();
+        display.reverse();
+        let display_hex = hex::encode(display);
+
+        let req = Request::get(format!("/api/inscriptions/{}", display_hex))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["kind"], "mint");
+        assert_eq!(v["status"], "constructed");
+        assert_eq!(v["commit_output_value"], 777);
+    }
+
+    #[tokio::test]
+    async fn get_inscription_db_error_returns_500() {
+        let (app, pool, _c) = live_pool_router().await;
+        // DROP the table out from under the handler so the SELECT fails.
+        // CASCADE because tx_mining_log / coin_proof_store have FKs to it.
+        sqlx::query("DROP TABLE pending_inscriptions CASCADE")
+            .execute(pool.as_ref())
+            .await
+            .unwrap();
+        let txid = "0".repeat(64);
+        let req = Request::get(format!("/api/inscriptions/{}", txid))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}
+
+// =======================================================================
+// Coverage test for the username_claim_log fire-and-forget spawn body.
+// The existing `claim_username_with_valid_signature` test exercises the
+// spawn call site but doesn't wait long enough for the task to complete
+// — this test specifically drives the spawn-body code path (line 1766)
+// and asserts the row landed.
+// =======================================================================
+
+#[tokio::test]
+async fn claim_username_precheck_reject_persists_log_row() {
+    use crate::db::connect_and_migrate;
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("postgres container");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(connect_and_migrate(&url).await.expect("migrate"));
+    let state = live_test_state(pool.clone());
+
+    // Pre-populate the in-memory UsernameStore with a conflicting name
+    // so the handler's `precheck` rejects the claim → log_claim(false,
+    // Some(reason)) → tokio::spawn(insert_username_claim_log).
+    {
+        let mut store = state.username_store.lock().unwrap();
+        let other_addr = zkcoins_program::hash::digest_from_bytes(&[0x11; 32]);
+        store.commit_after_db("alice".into(), other_addr);
+    }
+
+    let secp = secp::Secp256k1::new();
+    let secret = bitcoin::secp256k1::SecretKey::from_slice(&[0x33; 32]).unwrap();
+    let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+    let address: [u8; 32] = Sha256::digest(public_key.serialize()).into();
+    let address_hex = hex::encode(address);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut hasher = Sha256::new();
+    hasher.update(b"zkcoins:claim_username");
+    hasher.update(address_hex.as_bytes());
+    hasher.update(b"alice");
+    hasher.update(now.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    let msg = Message::from_digest(hash);
+    let kp = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &secret);
+    let sig = secp.sign_schnorr(&msg, &kp);
+
+    let body = serde_json::json!({
+        "username": "alice",
+        "address": address_hex,
+        "public_key": public_key.to_string(),
+        "signature": hex::encode(sig.serialize()),
+        "timestamp": now,
+    });
+    let req = Request::post("/api/username/claim")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let app = create_router(state);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // Wait for the fire-and-forget tokio::spawn to land the
+    // username_claim_log row.
+    for _ in 0..40 {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM username_claim_log")
+            .fetch_one(pool.as_ref())
+            .await
+            .unwrap();
+        if count >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let (success, reject_reason): (bool, Option<String>) =
+        sqlx::query_as("SELECT success, reject_reason FROM username_claim_log")
+            .fetch_one(pool.as_ref())
+            .await
+            .unwrap();
+    assert!(!success);
+    assert!(reject_reason.is_some());
+}
