@@ -392,7 +392,7 @@ fn test_receive_updates_balance() {
     );
 }
 
-/// Reproduces the exact configuration of /api/mint on the live DEV server:
+/// Reproduces the exact configuration of /api/mint on the live DEV node:
 /// recipient = raw [1u8; 32] bytes, amount = 1.
 #[test]
 fn test_mint_repro_live_setup() {
@@ -756,7 +756,7 @@ fn test_receive_coin_rejects_replay_via_coin_history() {
 /// Construction: do a real mint → recipient receive flow so that
 /// the recipient's `account.coin_queue[0]` carries an HONEST
 /// `inclusion_proof` produced by `out_coins_tree.generate_inclusion_proof`.
-/// Then reach into the server's internal `accounts` map and flip
+/// Then reach into the node's internal `accounts` map and flip
 /// one sibling on the queued entry's `inclusion_proof`. The next
 /// `send_coins` call from that recipient must surface the
 /// "In-coin not present in source's output_coins_root" error.
@@ -802,7 +802,7 @@ fn test_send_coins_rejects_tampered_source_proof_inclusion() {
         .expect("recipient receive_coin");
 
     // Tamper the queued `inclusion_proof.siblings[0]` directly on the
-    // server's internal `accounts` map. The honest off-circuit
+    // node's internal `accounts` map. The honest off-circuit
     // `source_inclusion.verify` walks the path siblings; flipping
     // the topmost sibling produces a recomputed root that doesn't
     // match the source's committed `output_coins_root`.

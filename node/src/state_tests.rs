@@ -148,7 +148,7 @@ async fn test_persist_and_load_state_roundtrip() {
 
 #[tokio::test]
 async fn test_load_from_pg_empty_returns_fresh_state() {
-    // No rows in smt_state / mmr_state means a fresh server: both
+    // No rows in smt_state / mmr_state means a fresh node: both
     // trees must come back empty — equivalent to State::new().
     let (pool, _container) = setup_pool().await;
     let loaded = State::load_from_pg(&pool).await.expect("load_from_pg");

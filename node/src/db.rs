@@ -1,4 +1,4 @@
-// Postgres state-layer for the zkCoins server.
+// Postgres state-layer for the zkCoins node.
 //
 // Introduced in PR-A1 of the 3-PR Postgres migration series; the
 // schema (see `node/migrations/*.sql`) and the typed API around
@@ -486,7 +486,7 @@ pub async fn update_pending_status(
 
 /// Look up the current `status` value for a `pending_inscriptions` row
 /// keyed by its `commit_txid`. Returns `Ok(None)` when no row exists
-/// (an external inscription that never went through this server's mint
+/// (an external inscription that never went through this node's mint
 /// flow, e.g. an out-of-band manual recovery via the `recover_inscription`
 /// CLI in PR #106, or a fresh database).
 ///

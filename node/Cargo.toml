@@ -69,12 +69,12 @@ wiremock = "0.6"
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 # HTTP client for the `api_remote` integration test, which exercises
-# the deployed DEV server end-to-end. rustls (not native-tls) to keep
+# the deployed DEV node end-to-end. rustls (not native-tls) to keep
 # the test runner self-contained on CI hosts without openssl headers.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Random key + suffix generation for the `api_remote` suite so each
 # run picks a fresh wallet and avoids collisions with concurrent
-# DEV-server consumers.
+# DEV-node consumers.
 rand = "0.8"
 # Auto-cleaning scratch directories for the ProofStore tests in
 # `router_tests`. Replaces the ad-hoc `std::env::temp_dir() + nanos
