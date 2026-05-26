@@ -41,7 +41,7 @@
 --     instead of a silent state-machine drift.
 --   * The partial index on `status <> 'complete'` keeps the resumer's
 --     boot-time scan O(pending) instead of O(total). After enough
---     mints this list will be perpetually empty on a healthy server.
+--     mints this list will be perpetually empty on a healthy node.
 
 CREATE TABLE pending_inscriptions (
     id           BIGSERIAL PRIMARY KEY,
