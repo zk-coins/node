@@ -99,6 +99,12 @@ pub struct RequestLogEntry {
     pub path: String,
     pub query: Option<String>,
     pub remote_addr: Option<String>,
+    /// Real client IP, resolved by the audit middleware from
+    /// `CF-Connecting-IP` (Cloudflare Tunnel — the path zkcoins-node
+    /// actually serves on) with fallback to the first segment of
+    /// `X-Forwarded-For`, then `remote_addr`. Stored separately so
+    /// forensics can `WHERE client_ip = …` without parsing JSONB.
+    pub client_ip: Option<String>,
     pub user_agent: Option<String>,
     pub request_headers: serde_json::Value,
     pub request_body: Vec<u8>,
@@ -111,16 +117,17 @@ pub struct RequestLogEntry {
 pub async fn insert_request_log(pool: &PgPool, entry: &RequestLogEntry) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO request_log \
-         (method, path, query, remote_addr, user_agent, \
+         (method, path, query, remote_addr, client_ip, user_agent, \
           request_headers, request_body, \
           response_status, response_headers, response_body, \
           duration_us) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(&entry.method)
     .bind(&entry.path)
     .bind(entry.query.as_deref())
     .bind(entry.remote_addr.as_deref())
+    .bind(entry.client_ip.as_deref())
     .bind(entry.user_agent.as_deref())
     .bind(&entry.request_headers)
     .bind(&entry.request_body)
@@ -150,15 +157,23 @@ pub struct EsploraLogEntry {
     pub response_status: Option<i16>,
     pub response_body: Option<Vec<u8>>,
     pub duration_us: Option<i64>,
-    pub triggered_by: Option<String>,
+    /// One of `'mint' | 'send' | 'scanner' | 'recovery' | 'health'
+    /// | 'resume'`. Renamed from `triggered_by` in migration 0010 to
+    /// align with `state_update_log.trigger_source` (same name + same
+    /// CHECK vocabulary). `None` for paths without semantic context.
+    pub trigger_source: Option<String>,
+    /// FK to `request_log.id` when the outbound call was issued
+    /// inside an HTTP handler. `None` for scanner / publisher /
+    /// background tasks. Added in migration 0009.
+    pub triggering_request_log_id: Option<i64>,
 }
 
 pub async fn insert_esplora_log(pool: &PgPool, entry: &EsploraLogEntry) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO esplora_log \
          (direction, method, url, request_body, response_status, response_body, \
-          duration_us, triggered_by) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+          duration_us, trigger_source, triggering_request_log_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(entry.direction)
     .bind(entry.method.as_deref())
@@ -167,7 +182,8 @@ pub async fn insert_esplora_log(pool: &PgPool, entry: &EsploraLogEntry) -> Resul
     .bind(entry.response_status)
     .bind(entry.response_body.as_deref())
     .bind(entry.duration_us)
-    .bind(entry.triggered_by.as_deref())
+    .bind(entry.trigger_source.as_deref())
+    .bind(entry.triggering_request_log_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -201,7 +217,11 @@ pub async fn insert_error_log(pool: &PgPool, entry: &ErrorLogEntry) -> Result<()
 #[derive(Debug, Clone)]
 pub struct BlockLogEntry {
     pub block_hash: Vec<u8>,
-    pub block_height: i64,
+    /// Block height as reported by Esplora's `get_block_status`. `None`
+    /// when the upstream did not return a height — the previous
+    /// sentinel `-1` was magic-value-driven, NULL is the type-safe
+    /// alternative (migration 0010 drops the NOT NULL).
+    pub block_height: Option<i64>,
     pub inscription_count: i32,
     pub processing_duration_us: Option<i64>,
 }
@@ -259,9 +279,33 @@ pub async fn insert_observed_inscription(
     Ok(())
 }
 
+/// Flip an existing `observed_inscriptions` row to `integrated = true`
+/// with `integrated_at = NOW()`. Called from the scanner callback
+/// after `state.update` + the atomic `persist_state_tx` successfully
+/// land the commitment in SMT/MMR. Idempotent — re-running the trigger
+/// on a row that's already integrated is a no-op (the WHERE filters
+/// out the already-flipped rows).
+pub async fn mark_observed_inscription_integrated(
+    pool: &PgPool,
+    commit_txid: &[u8],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE observed_inscriptions \
+         SET integrated = TRUE, integrated_at = NOW() \
+         WHERE commit_txid = $1 AND integrated = FALSE",
+    )
+    .bind(commit_txid)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct StateUpdateLogEntry {
-    pub trigger: &'static str, // 'mint' | 'send' | 'scanner_replay' | 'recovery'
+    /// 'mint' | 'send' | 'scanner_replay' | 'recovery'. Renamed from
+    /// `trigger` in migration 0009 — the SQL keyword collision made
+    /// reads confusing.
+    pub trigger_source: &'static str,
     pub commit_txid: Option<Vec<u8>>,
     pub prev_mmr_root: Vec<u8>,
     pub new_mmr_root: Vec<u8>,
@@ -276,11 +320,11 @@ pub async fn insert_state_update_log(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO state_update_log \
-         (trigger, commit_txid, prev_mmr_root, new_mmr_root, \
+         (trigger_source, commit_txid, prev_mmr_root, new_mmr_root, \
           smt_root_before, smt_root_after, commitment_count) \
          VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
-    .bind(entry.trigger)
+    .bind(entry.trigger_source)
     .bind(entry.commit_txid.as_deref())
     .bind(&entry.prev_mmr_root)
     .bind(&entry.new_mmr_root)
@@ -402,18 +446,24 @@ pub async fn insert_boot_log(pool: &PgPool, entry: &BootLogEntry) -> Result<(), 
     Ok(())
 }
 
-/// Update `pending_inscriptions.failure_reason` for a row already in
-/// the `failed` status (or about to be advanced to it). Called from
-/// the publisher's error paths so the operator can answer "why?" from
-/// SQL alone.
-pub async fn update_pending_failure_reason(
+/// Mark a `pending_inscriptions` row as definitively failed: status =
+/// `'failed'` and `failure_reason` set, both in one UPDATE. Pairs the
+/// status discriminator with the error-chain text so the resume path
+/// can skip permanently-failed rows AND the operator can answer
+/// "why?" from SQL alone. Called from the publisher's error paths.
+///
+/// Note: the existing `resume_pending_inscriptions` still loads
+/// `status <> 'complete'` and re-drives `failed` rows. If a stricter
+/// policy is wanted later (skip `failed` outright), that's a one-line
+/// SQL change in `load_pending_in_progress`.
+pub async fn mark_pending_failed(
     pool: &PgPool,
     commit_txid: &[u8],
     failure_reason: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE pending_inscriptions \
-         SET failure_reason = $1, updated_at = NOW() \
+         SET status = 'failed', failure_reason = $1, updated_at = NOW() \
          WHERE commit_txid = $2",
     )
     .bind(failure_reason)

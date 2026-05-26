@@ -180,7 +180,7 @@ impl<S: Sleeper> InscriptionScanner<S> {
             if let Some(pool) = &self.pool {
                 let block_entry = crate::db::BlockLogEntry {
                     block_hash: <bitcoin::BlockHash as AsRef<[u8]>>::as_ref(&current_hash).to_vec(),
-                    block_height: block_status.height.map(i64::from).unwrap_or(-1),
+                    block_height: block_status.height.map(i64::from),
                     inscription_count,
                     processing_duration_us: i64::try_from(block_start.elapsed().as_micros()).ok(),
                 };

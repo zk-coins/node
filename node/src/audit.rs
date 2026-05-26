@@ -108,6 +108,29 @@ pub(crate) async fn audit_log_middleware(
         .get(axum::http::header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    // Real client IP — zkcoins-node always runs behind a Cloudflare
+    // Tunnel, so the TCP peer (`remote_addr`) is the local cloudflared
+    // socket, not the user. Cloudflare injects the real client IP into
+    // `CF-Connecting-IP`. If a different proxy is ever in front of the
+    // tunnel (test setups, future direct ingress), fall back to the
+    // first segment of `X-Forwarded-For`, then to `remote_addr` as a
+    // last resort.
+    let client_ip = req_parts
+        .headers
+        .get("cf-connecting-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            req_parts
+                .headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.split(',').next())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| remote_addr.clone());
     let request_headers = headers_to_json(&req_parts.headers);
 
     // Reconstruct the request with the buffered body and forward.
@@ -123,6 +146,7 @@ pub(crate) async fn audit_log_middleware(
         path,
         query,
         remote_addr,
+        client_ip,
         user_agent,
         request_headers,
         request_body: req_bytes.to_vec(),
