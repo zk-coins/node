@@ -10,13 +10,11 @@ use bitcoin::{
 use commitment::Commitment;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
-use zkcoins_program::{
-    merkle::{hash_concat, HashDigest},
-    AccountState, Amount,
-};
+use zkcoins_program::hash::{digest_to_bytes, hash_concat, HashDigest, ZERO_HASH};
+use zkcoins_program::types::{AccountState, Amount};
 
 pub mod commitment;
-pub use zkcoins_program::ProofData;
+pub use zkcoins_program::types::ProofData;
 
 lazy_static! {
     pub static ref SECP256K1: Secp256k1<All> = Secp256k1::new();
@@ -66,14 +64,19 @@ impl ClientAccount {
             .private_key
     }
 
+    /// Compute the BIP-340 Schnorr commitment over the canonical
+    /// `(account_state_hash || output_coins_root)` digest. The digest
+    /// is Poseidon, serialised to 32 bytes via `digest_to_bytes` for
+    /// signing; Schnorr signing itself remains SHA256-based per BIP-340.
     pub fn create_commitment(
         &self,
         account_state_hash: &HashDigest,
         output_coins_root: &HashDigest,
     ) -> Commitment {
+        let combined = hash_concat(account_state_hash, output_coins_root);
         Commitment::new(
             &self.current_private_key(),
-            hash_concat(account_state_hash, output_coins_root).to_vec(),
+            digest_to_bytes(&combined).to_vec(),
         )
         .expect("Should be able to create commitment")
     }
@@ -88,11 +91,11 @@ impl ClientAccount {
 
     pub fn new(private_key: Xpriv) -> Self {
         let mut client_account = ClientAccount {
-            address: [0u8; 32],
+            address: ZERO_HASH,
             num_pubkeys: 0,
             private_key,
         };
-        let account = AccountState::new(client_account.generate_public_key(0).serialize().to_vec());
+        let account = AccountState::new(client_account.generate_public_key(0).serialize());
         client_account.address = account.owner;
         client_account
     }

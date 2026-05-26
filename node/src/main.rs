@@ -1,0 +1,371 @@
+//! Binary entrypoint for `node`.
+//!
+//! Modules live in `lib.rs`; this file only wires the bootstrap
+//! (panic hook, Postgres pool, scanner task, REST listener) together.
+//! Splitting the modules out of the binary lets out-of-tree
+//! integration tests (`node/tests/api_remote.rs`) import the
+//! handler response types and the `CoinProof` struct without
+//! duplicating definitions or making the binary itself reachable
+//! from a `cargo test --test ...` target.
+
+use node::account_node;
+use node::db;
+use node::publisher::EsploraConfig;
+use node::runtime::start_rest_node;
+use node::scanner_runtime::scan_for_inscriptions;
+use node::scanner_ws::{run_scanner_ws, ScannerWsConfig};
+use node::state::State;
+use node::username;
+use node::{persist_state_from_sync_context, DATABASE_URL, NETWORK_CONFIG};
+use shared::commitment::Commitment;
+use std::error::Error as StdError;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
+
+// Postgres state-layer carries every persistent slice of server state
+// after PR-A3: SMT / MMR / latest_block (PR-A2), accounts + usernames
+// (PR-A3), and the minting account's `minting_meta.num_pubkeys` counter
+// (PR-A3). The `accounts.bin`, `usernames.bin`, and
+// `minting_num_pubkeys.bin` sibling files no longer exist, and the
+// `atomic_write` helper that supported them is removed — the only
+// remaining on-disk writes are the per-proof files under
+// `${PROOFS_DIR:-./proofs}/{id}.bin`, owned by `ProofStore` in
+// `router.rs`.
+const ACCOUNT_NODE_ADDR: &str = "0.0.0.0:4242";
+
+use bitcoin::hashes::Hash;
+use bitcoin::BlockHash;
+use esplora_client::{
+    r#async::DefaultSleeper, AsyncClient as EsploraAsyncClient, Builder as EsploraBuilder,
+};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn StdError>> {
+    // A panic in any tokio worker — for example the bootstrap task that
+    // owns the HTTP listener — by default only kills that task. The rest
+    // of the process (notably the chain scanner) keeps running, the
+    // container stays `Up`, but the REST port is never bound. Cloudflare
+    // sees the upstream as alive-but-unresponsive and serves 502s for
+    // hours. Override the panic hook so any panic anywhere aborts the
+    // whole process; `restart: unless-stopped` in compose then crash-
+    // loops the container until the underlying cause is fixed, which is
+    // far easier to spot than a silent zombie.
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_panic_hook(info);
+        std::process::exit(1);
+    }));
+
+    // Open the Postgres pool and run pending migrations BEFORE any
+    // state load — `connect_and_migrate` is idempotent (sqlx tracks
+    // applied migrations in `_sqlx_migrations`) and so safe to call on
+    // every boot. A connect failure here aborts the whole bootstrap;
+    // there is no useful "degraded" mode without persistent state.
+    let pool = Arc::new(
+        db::connect_and_migrate(&DATABASE_URL)
+            .await
+            .expect("connect and migrate database"),
+    );
+    println!("Connected to Postgres state-layer");
+
+    // Load existing state from Postgres (PR-A2). When SMT/MMR rows are
+    // absent (fresh DB), `load_from_pg` returns an empty State —
+    // equivalent to the previous file-based `State::new()` fallback.
+    let state = Arc::new(Mutex::new(
+        State::load_from_pg(&pool)
+            .await
+            .expect("load state from Postgres"),
+    ));
+    println!("Loaded State from Postgres");
+
+    // Reload AccountNode + UsernameStore from Postgres. The matching
+    // file-based loaders from PR-A1/A2 are gone — these two calls are
+    // the single source of truth after PR-A3. A DB error here aborts
+    // the bootstrap (same reasoning as the State load above).
+    let account_node = account_node::AccountNode::load_from_pg(Arc::clone(&state), &pool)
+        .await
+        .expect("load account server from Postgres");
+    println!("Loaded AccountNode from Postgres");
+    let username_store = username::UsernameStore::load_from_pg(&pool)
+        .await
+        .expect("load username store from Postgres");
+    println!("Loaded UsernameStore from Postgres");
+
+    // Spawn the account_node as a separate task. A bootstrap error
+    // here (Postgres unreachable, listener bind failure) used to be
+    // `eprintln!`'d and dropped on the floor by this `tokio::spawn`
+    // block — the scanner kept running, the container stayed `Up`,
+    // and Cloudflare served 502s for hours because nothing was bound
+    // to the listener port. Aborting the whole process on bootstrap
+    // failure means the orchestrator crash-loops the container and
+    // alerting fires on the loop, matching the panic-hook behaviour
+    // above (zk-coins/node#89 round-2 MAJOR 2).
+    let pool_for_rest = Arc::clone(&pool);
+    tokio::spawn(async move {
+        if let Err(e) = start_rest_node(
+            account_node,
+            username_store,
+            ACCOUNT_NODE_ADDR,
+            pool_for_rest,
+        )
+        .await
+        {
+            eprintln!("Account server error: {}", e);
+            std::process::exit(1);
+        }
+    });
+
+    // Try to load the latest block hash from Postgres or fall back to
+    // Esplora's current tip. The Postgres row is written atomically
+    // alongside the SMT/MMR snapshot in the scanner callback, which is
+    // the structural fix for issue #11.
+    let network_config: &EsploraConfig = &NETWORK_CONFIG;
+    let start_block_hash = match db::load_latest_block(&pool).await? {
+        Some(hash_bytes) => {
+            let hash = BlockHash::from_byte_array(hash_bytes);
+            println!("Resuming from previously saved block: {}", hash);
+            hash
+        }
+        None => {
+            println!("No saved block hash found, fetching latest from Esplora...");
+            let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(EsploraBuilder::new(
+                &network_config.url,
+            ))?;
+            let tip_hash = client.get_tip_hash().await?;
+            println!("Fetched latest tip hash from Esplora: {}", tip_hash);
+            tip_hash
+        }
+    };
+
+    // Clones for the scanner callback closure.
+    let pool_for_callback = Arc::clone(&pool);
+    let state_for_callback = Arc::clone(&state);
+
+    // Event-driven chain ingestion (issue #84). The previous
+    // implementation polled `get_tip_hash` every 30 s, gating
+    // visibility on `/api/mint` and `/api/send` by up to a full
+    // block-time + poll-interval. `scanner_ws::run_scanner_ws`
+    // subscribes to the Esplora WebSocket stream and publishes
+    // each new tip into the bounded channel below; the scanner
+    // runtime drains the channel and walks forward through the
+    // block-status `next_best` chain between events.
+    //
+    // Channel depth = 64: plenty of headroom for the burst the
+    // initial `blocks` seed produces on subscribe (3-15 entries
+    // observed), bounded so a stuck consumer cannot grow the
+    // queue without bound.
+    let ws_config = ScannerWsConfig::from_env();
+    println!(
+        "Event-driven scanner: WS={} (override via ESPLORA_WS_URL)",
+        ws_config.url
+    );
+    let (tip_tx, tip_rx) = mpsc::channel::<bitcoin::BlockHash>(64);
+    tokio::spawn(run_scanner_ws(ws_config, tip_tx));
+
+    scan_for_inscriptions(network_config, start_block_hash, &move |content_bytes: Vec<u8>, commit_txid, current_block_hash| {
+        println!("Received content size: {} bytes", content_bytes.len());
+
+        // Try to deserialize the content as a Commitment
+        match bincode::deserialize::<Commitment>(&content_bytes) {
+            Ok(commitment) => {
+                println!("Successfully deserialized as commitment");
+                println!("Public key: {}", commitment.public_key);
+
+                // Verify the commitment
+                if !commitment.verify() {
+                    println!("Commitment verification failed, not adding to state");
+                    return;
+                }
+                println!("Commitment signature verified successfully");
+
+                // Phase E: if the in-process mint flow has already
+                // advanced this inscription through `state.update` (the
+                // `pending_inscriptions` row is `complete`), the
+                // scanner has nothing to do — its `state.update` call
+                // would be a no-op for the SMT (same key + same value
+                // → idempotent insert) but would diverge the MMR
+                // because `mmr.append` is monotonic. Skipping early
+                // also avoids a redundant `persist_state_tx`. Any
+                // other status (including a missing row, which covers
+                // out-of-band recovery inscriptions and inscriptions
+                // from a previous boot whose mint flow crashed before
+                // marking the row complete) falls through to the
+                // regular state.update path.
+                let commit_txid_bytes = commit_txid.as_byte_array();
+                let pending_status = persist_pending_status_lookup(
+                    &pool_for_callback,
+                    commit_txid_bytes,
+                );
+                if node::scanner::should_skip_scanner_state_update(pending_status.as_deref()) {
+                    println!(
+                        "scanner: commit {} already integrated by mint_handler — skipping state.update",
+                        commit_txid
+                    );
+                    return;
+                }
+
+                // Capture the public_key before moving `commitment` into
+                // `state.update` so we can reference it in the Err arm.
+                let pubkey_for_log = commitment.public_key;
+
+                // Lock-scope: do the state mutation, capture the bytes
+                // needed for persistence, then DROP THE LOCK before the
+                // async DB call. Holding `std::sync::Mutex` across an
+                // .await is unsound; also we want subsequent commitments
+                // to make progress while the previous tx commits.
+                let snapshot = {
+                    let mut state_guard = state_for_callback.lock().unwrap();
+                    match state_guard.update_and_snapshot_for_persist(&[commitment]) {
+                        Ok((new_root, smt_bytes, mmr_bytes, root_index_entry)) => {
+                            Some((new_root, smt_bytes, mmr_bytes, root_index_entry))
+                        }
+                        Err(e) => {
+                            // Errors are logged but do NOT panic — the scanner is
+                            // best-effort and we never want a single bad commitment
+                            // (replay, client bug, or a re-scan after crash where
+                            // the SMT already has this public_key with a different
+                            // leaf value) to take the whole REST server down. The
+                            // scanner advances to the next block regardless.
+                            eprintln!(
+                                "Skipping commitment for public_key {}: state.update failed: {}",
+                                pubkey_for_log, e
+                            );
+                            None
+                        }
+                    }
+                }; // mutex dropped here, BEFORE the async tx below
+
+                if let Some((new_root, smt_bytes, mmr_bytes, root_index_entry)) = snapshot {
+                    let block_hash_bytes = current_block_hash.to_byte_array();
+
+                    // The callback runs INSIDE the async
+                    // `scan_for_inscriptions` task on a multi_thread
+                    // tokio runtime, so we cannot just
+                    // `Handle::current().block_on(...)` — the docs say
+                    // "may panic when called from a thread that is part
+                    // of the current Tokio runtime" and on
+                    // `#[tokio::main]` (multi_thread by default) it
+                    // does panic the first time a real inscription is
+                    // scanned. The fix is the documented
+                    // `block_in_place(|| Handle::current().block_on(…))`
+                    // pattern, encapsulated in
+                    // `persist_state_from_sync_context`.
+                    //
+                    // The freshly-inserted `mmr_root_index` row rides
+                    // along in the SAME transaction (Phase C). Folding
+                    // it in here closes the crash window the previous
+                    // two-call shape opened: a crash between the state
+                    // snapshot and the standalone root_index INSERT
+                    // resumed the scanner from a `latest_block` whose
+                    // MMR already contained the new leaf, so the
+                    // re-scanned commit advanced the MMR a second
+                    // time, the new `prev_mmr_root` diverged, and the
+                    // originally-missing row was never healed. With
+                    // both writes atomic, a crash before COMMIT leaves
+                    // the saved `latest_block` BEFORE this block; the
+                    // re-scan replays `state.update` against the same
+                    // unchanged MMR and writes the same row again
+                    // (ON CONFLICT DO NOTHING is a no-op when it
+                    // already landed).
+                    let root_index_ref = root_index_entry
+                        .as_ref()
+                        .map(|(p, s, i)| (p, s, *i as u64));
+                    let persist_result = persist_state_from_sync_context(
+                        &pool_for_callback,
+                        &smt_bytes,
+                        &mmr_bytes,
+                        &block_hash_bytes,
+                        root_index_ref,
+                    );
+                    match persist_result {
+                        Ok(()) => {
+                            println!(
+                                "Persisted state. New MMR root: {}",
+                                hex::encode(zkcoins_program::hash::digest_to_bytes(&new_root))
+                            );
+                            // Phase E: if this commit came from our own
+                            // mint flow but crashed between broadcast
+                            // Ok and `state.update` (so the row is
+                            // still at `reveal_broadcast`), the scanner
+                            // has just completed the integration; mark
+                            // the row `complete` so a future re-scan
+                            // skips its state.update path. For rows
+                            // that never existed (external / recovery
+                            // inscriptions) the UPDATE simply affects
+                            // zero rows, which is correct.
+                            if pending_status.is_some() {
+                                if let Err(e) = mark_pending_complete_from_sync_context(
+                                    &pool_for_callback,
+                                    commit_txid_bytes,
+                                ) {
+                                    eprintln!(
+                                        "Failed to mark pending_inscriptions {} complete after scanner state.update: {}",
+                                        commit_txid, e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("persist_state_tx failed: {}", e),
+                    }
+                }
+            }
+            Err(e) => {
+                // Print more detailed debug information
+                println!("Found inscription with our message but failed to deserialize as commitment\nError: {}", e);
+            }
+        }
+    }, tip_rx)
+    .await?;
+
+    Ok(())
+}
+
+/// Synchronous wrapper around
+/// [`db::pending_inscription_status_by_commit_txid`] for the scanner
+/// callback's pre-`state.update` lookup (Phase E).
+///
+/// Mirrors [`persist_state_from_sync_context`]: the scanner callback is
+/// a sync `Fn` invoked from a multi_thread tokio worker, and the
+/// `Handle::current().block_on(...)` bare form panics there. We use
+/// `block_in_place` + `Handle::current().block_on(...)`, exactly as the
+/// state-persist helper does. DB errors are swallowed by the call site
+/// (the scanner falls through to its normal `state.update` path on
+/// `None`), so this helper returns the inner `Option<String>` directly
+/// after logging any failure.
+fn persist_pending_status_lookup(pool: &sqlx::PgPool, commit_txid_bytes: &[u8]) -> Option<String> {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(db::pending_inscription_status_by_commit_txid(
+                pool,
+                commit_txid_bytes,
+            ))
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "scanner: pending_inscriptions lookup for commit {} failed: {} (falling through to state.update)",
+                    hex::encode(commit_txid_bytes),
+                    e
+                );
+                None
+            })
+    })
+}
+
+/// Synchronous wrapper around
+/// [`db::update_pending_status`] for the scanner callback's
+/// post-`state.update` advance to `complete` (Phase E).
+///
+/// Same multi_thread tokio bridging story as
+/// [`persist_pending_status_lookup`]. Errors propagate to the caller so
+/// the callback can log them with the right context line.
+fn mark_pending_complete_from_sync_context(
+    pool: &sqlx::PgPool,
+    commit_txid_bytes: &[u8],
+) -> Result<(), sqlx::Error> {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(db::update_pending_status(
+            pool,
+            commit_txid_bytes,
+            db::PENDING_STATUS_COMPLETE,
+        ))
+    })
+}

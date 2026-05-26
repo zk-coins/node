@@ -5,8 +5,17 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Serialize PRD deploys. Unlike Deploy DEV (cancel-in-progress: true,
+# "newest commit wins") production deploys must NEVER be killed mid-
+# flight: cancelling halfway through `docker compose recreate` is
+# exactly what produced the half-renamed Created-state container
+# that took DEV down. Queue subsequent deploys instead.
+concurrency:
+  group: deploy-prd
+  cancel-in-progress: false
+
 env:
-  DOCKER_TAGS: zkcoin/server:latest
+  DOCKER_TAGS: zkcoins/node:latest
 
 permissions:
   contents: read
@@ -35,6 +44,13 @@ jobs:
           push: true
           tags: ${{ env.DOCKER_TAGS }}
           platforms: linux/arm64
+          # Registry-backed buildx cache. Same `zkcoins/node:buildcache`
+          # tag is shared with Deploy DEV — DEV and PRD compile the same
+          # Rust workspace so cache hits cross-deploy. `type=registry`
+          # over `type=gha` because GHA cache caps at 10 GB with LRU
+          # eviction; Docker Hub holds the tag indefinitely.
+          cache-from: type=registry,ref=zkcoins/node:buildcache
+          cache-to: type=registry,ref=zkcoins/node:buildcache,mode=max
 
       - name: Install cloudflared
         run: |
@@ -47,7 +63,103 @@ jobs:
           echo "${{ secrets.DEPLOY_PRD_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           echo "${{ secrets.DEPLOY_PRD_SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          # ServerAlive* keep the session alive across long-running
+          # `docker compose recreate` steps where the remote command
+          # produces no stdout for >60s. Mirrors deploy-dev.yaml; see
+          # the comment there for the failure mode that motivated this
+          # (PR #111 merge run 26419696840 — SSH dropped mid-recreate,
+          # exit 255, container actually came up server-side).
           ssh -i ~/.ssh/deploy_key \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=8 \
             -o ProxyCommand="cloudflared access ssh --hostname ${{ secrets.DEPLOY_PRD_HOST }}" \
             ${{ secrets.DEPLOY_PRD_USER }}@${{ secrets.DEPLOY_PRD_HOST }} \
-            "zkcoins-server"
+            "zkcoins-node"
+
+      # Post-deploy smoke test: hit the public PRD endpoint until
+      # /api/info answers 200 or we give up. Mirrors the Deploy DEV
+      # post-deploy probe. Without this a runtime-bootstrap panic
+      # leaves the container Up-but-unresponsive on PRD while the
+      # workflow reports success — the exact failure mode that took
+      # DEV down silently before the Plonky2 migration fix.
+      - name: Smoke test public PRD endpoint
+        run: |
+          set -euo pipefail
+          URL="https://api.zkcoins.app/api/info"
+          for i in $(seq 1 30); do
+            code=$(curl -sS -o /tmp/info.json -w '%{http_code}' --max-time 10 "$URL" || echo "000")
+            if [ "$code" = "200" ]; then
+              echo "PRD /api/info responded 200 after ${i} attempt(s):"
+              cat /tmp/info.json
+              echo
+              exit 0
+            fi
+            echo "[$i/30] $URL -> ${code} (waiting 10 s)"
+            sleep 10
+          done
+          echo "::error::PRD /api/info never returned 200 within ~5 min after deploy"
+          exit 1
+
+  # Functional verification of the deployed PRD server. Mirrors the
+  # Deploy DEV api-e2e job, but excludes the three roundtrip tests —
+  # they would consume real publisher UTXOs and write coins into the
+  # production SMT/MMR. `--skip _roundtrip_` is a substring match; the
+  # only test names matching are the three mint/send-commit/username
+  # roundtrips (verified via grep against the suite).
+  api-e2e:
+    name: API E2E against PRD (non-mutating subset)
+    needs: build-and-deploy
+    runs-on: [self-hosted, m3-ultra]
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+      ZKCOINS_API_URL: https://api.zkcoins.app
+      # The bootstrap `lazy_static`s panic if these are unset; the
+      # integration test only talks to the deployed server but the
+      # lib's panic-on-load behaviour is unconditional. Values are
+      # placeholders — nothing in the read-only test path reads them.
+      USERNAME_DOMAIN: zkcoins.app
+      ESPLORA_URL: http://127.0.0.1:1/api
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Ensure sccache + cargo-nextest are installed
+        run: |
+          command -v sccache >/dev/null || brew install sccache
+          command -v cargo-nextest >/dev/null || brew install cargo-nextest
+          sccache --start-server >/dev/null 2>&1 || true
+          sccache --show-stats
+
+      - name: Run API E2E suite against PRD (skip roundtrips)
+        run: cargo test -p node --release --all-features --test api_remote -- --test-threads=1 --nocapture --skip _roundtrip_
+
+      - name: sccache stats (post-build)
+        if: always()
+        run: sccache --show-stats
+
+  # Telegram alert on workflow failure. Separate job (not an inline step)
+  # so job-level failures — timeout, OOM, runner crash — still fire the
+  # alert; runs on the cheapest runner since the curl never needs to touch
+  # the self-hosted M3 Ultra. See ci.yaml > notify-failure for the
+  # firing-matrix rationale.
+  notify-failure:
+    name: Telegram alert on failure
+    needs: [build-and-deploy, api-e2e]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Telegram alert
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          TEXT=$'❌ <b>'"${{ github.workflow }}"$'</b> failed\n<b>Repo:</b> '"${{ github.repository }}"$'\n<b>Branch:</b> '"${{ github.ref_name }}"$'\n<b>Run:</b> '"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+               --data-urlencode "chat_id=${TG_CHAT}" \
+               --data-urlencode "text=${TEXT}" \
+               -d "parse_mode=HTML" \
+               -d "disable_web_page_preview=true"

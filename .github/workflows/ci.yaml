@@ -1,20 +1,66 @@
 name: CI
 
 on:
-  push:
-    branches: [develop]
-  # Only trigger on PRs targeting develop (feature → develop). The
-  # release PR (develop → main) is opened automatically and would
-  # otherwise fire a second CI run for every push to develop — those
-  # duplicate runs surfaced as "fail" entries on the release PR's
-  # check list whenever the concurrency block cancelled the older
-  # one. The push event already covers develop, and its run is
-  # associated with the same SHA on the release PR.
+  # CI runs on every pull request regardless of target branch. This
+  # makes the default safe for stacked PRs (PR-A → PR-B → PR-C where
+  # each PR's base is the previous PR's branch) and any other workflow
+  # that opens a PR against a non-`develop` branch — previously such
+  # PRs were silently skipped because `branches: [develop]` filtered
+  # them out, and the only fix was to hand-edit ci.yaml on each new
+  # feature stack. Letting every PR trigger CI is cheap (the heavy
+  # M3 Ultra jobs are still gated behind the `ci:full` label below)
+  # and matches what most repos default to.
+  #
+  # `push: develop` is intentionally absent. Every commit reaching
+  # `develop` is already covered by the open Release PR (`Release:
+  # develop -> main`, created by auto-release-pr.yaml) — that PR's
+  # `synchronize` event runs CI on the new HEAD, and because the
+  # Release PR carries the `ci:full` label the heavy gate runs too.
+  # Adding `on: push: branches: [develop]` would queue a second
+  # workflow instance on the same SHA, doubling self-hosted-runner
+  # load on a check the Release PR's `synchronize` already provides.
+  # (Under the PR-number grouping in the concurrency block below the
+  # two runs would land in DIFFERENT groups — push keyed by
+  # `refs/heads/develop`, PR keyed by the Release PR's number — so
+  # the block would not deduplicate them.)
+  #
+  # `ready_for_review` is added so the workflow fires the moment a
+  # draft PR is marked ready — drafts themselves skip CI via the
+  # `if:` guard on each job (saves self-hosted-runner time while
+  # work is still in progress).
+  #
+  # `labeled` / `unlabeled` are added so toggling the `ci:full`
+  # label triggers (or removes) the heavy self-hosted-runner jobs
+  # on demand — see the `node-tests` job below.
   pull_request:
-    branches: [develop]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
 concurrency:
-  group: ci-${{ github.event.pull_request.head.sha || github.sha }}
+  # Group by PR number so a new push to the same PR cancels the
+  # in-flight Heavy run on the outdated commit. The m3-ultra pool
+  # (6 runner agents on dfx01) is shared with every other open PR —
+  # letting an obsolete 60-90-min run finish wastes a slot another
+  # PR could use. Grouping by SHA (the previous approach) put every
+  # commit in its own group, so `cancel-in-progress: true` never
+  # fired and back-to-back pushes queued sequentially.
+  # Falls back to `github.ref` for push/dispatch events (where there
+  # is no `pull_request.number`), so e.g. a `workflow_dispatch` on
+  # the same ref serializes too.
+  #
+  # Label events (`labeled` / `unlabeled`) get their own isolated
+  # group keyed by `run_id`, so toggling a label on a PR does NOT
+  # cancel an in-flight 60-90-min Heavy run on the same PR — most
+  # label toggles are unrelated (`bug`, `priority/*`, …) and killing
+  # the Heavy run for them would be a footgun. Trade-off: removing
+  # `ci:full` mid-run does NOT auto-stop a Heavy run that is already
+  # executing; cancel it manually with `gh run cancel` if you really
+  # need to free an agent.
+  group: >-
+    ${{
+      (github.event.action == 'labeled' || github.event.action == 'unlabeled')
+        && format('ci-{0}-label-{1}', github.workflow, github.run_id)
+        || format('ci-{0}-{1}', github.workflow, github.event.pull_request.number || github.ref)
+    }}
   cancel-in-progress: true
 
 permissions:
@@ -22,20 +68,25 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Force Esplora broadcasts to fail fast in CI. Some unit tests
-  # exercise the commit pipeline that ends in a real HTTP broadcast;
-  # without this, the runs against the public Mutinynet API can take
-  # >60 s per test and tip the job over the timeout.
-  ESPLORA_URL: "http://127.0.0.1:1/api"
-  # Force the SP1 mock prover for every test in this workflow. The
-  # default prover targets real Groth16/Plonk circuits and a single
-  # send_coin/receive_coin test then takes ~20+ minutes on an x86_64
-  # runner. Mock proofs return instantly and exercise the same plumbing.
-  SP1_PROVER: mock
 
+# `lint-and-build` catches what GitHub-hosted Linux can cheaply catch:
+# cross-platform compile bitrot and lint regressions.
+#
+# `node-tests` + `coverage` are the authoritative test + coverage gate.
+# They run on the m3-ultra self-hosted runner pool (label `m3-ultra`,
+# 6 agents on dfx01) — the documented hardware target (CONTRIBUTING.md
+# § "Working on the Plonky2 Migration"). On `ubuntu-latest` the full
+# suite repeatedly hit the 75-min timeout (issue #30); on the M3 Ultra
+# it is ~60-90 min for a Rust change. Moving the gate into CI rather
+# than the developer's laptop unblocks the developer on push
+# (issue #40).
+#
+# Runner ops: see scripts/ci-runner/README.md.
 jobs:
   lint-and-build:
     name: Lint & Build
+    # Skip on draft PRs; downstream `needs:` jobs inherit the skip.
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -62,107 +113,276 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: Run clippy (server + shared, MVP feature set)
-        run: cargo clippy -p server -p shared -- -D warnings
+      - name: Run clippy (node + shared, MVP feature set)
+        run: cargo clippy -p node -p shared -- -D warnings
 
-      - name: Run clippy (server, all features)
-        run: cargo clippy -p server --all-features -- -D warnings
+      - name: Run clippy (node, all features)
+        run: cargo clippy -p node --all-features -- -D warnings
 
-      - name: Run clippy (program lib)
-        run: cargo clippy -p zkcoins-program --lib -- -D warnings
+      - name: Run clippy (program + prover libs)
+        run: cargo clippy -p zkcoins-program-plonky2 -p zkcoins-prover-plonky2 --lib -- -D warnings
 
-      - name: Build server (MVP feature set — the PRD image)
-        run: cargo build -p server
+      # Issue #84: the chain-tip wait path and the publisher's
+      # commit→reveal propagation wait must be event-driven (WS /
+      # ZMQ), not polled. The grep below fails the build if a
+      # `tokio::time::{sleep,sleep_until,interval}` or
+      # `std::thread::sleep` call sneaks back into the scanner /
+      # publisher modules without the documented opt-out marker. See
+      # CONTRIBUTING.md § "No polling — events only" for the per-line
+      # `scanner-polling-ok:` escape hatch and the rationale for each
+      # currently-grandfathered occurrence. The marker is a plain
+      # comment token (not an `#[allow(...)]` attribute) so future
+      # contributors cannot mistake it for a real lint suppression
+      # (issue #84 round-4 MINOR 4).
+      - name: Forbid polling patterns in scanner/publisher
+        run: |
+          set -e
+          FOUND=$(grep -rEn 'tokio::time::(sleep|sleep_until|interval)|std::thread::sleep' node/src/scanner.rs node/src/scanner_runtime.rs node/src/scanner_ws.rs node/src/scanner_ws_parse.rs node/src/publisher.rs 2>/dev/null | grep -v 'scanner-polling-ok:' || true)
+          if [ -n "$FOUND" ]; then
+            echo "::error::Polling pattern (tokio::time::sleep|sleep_until|interval or std::thread::sleep) detected in event-driven hot paths. See issue #84."
+            echo "$FOUND"
+            exit 1
+          fi
+          echo "Scanner/publisher polling check: OK"
 
-      - name: Build server (all features — the DEV image)
-        run: cargo build -p server --all-features
+      - name: Build node (MVP feature set — the DEV + PRD image)
+        run: cargo build -p node
 
-  tests:
-    name: Tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+      - name: Build node (all features — self-host opt-in build)
+        run: cargo build -p node --all-features
+
+  node-tests:
+    name: Node + Shared Tests (M3 Ultra)
+    # Heavy job (~60-90 min on a self-hosted M3 Ultra runner — one of
+    # 6 agents on dfx01 sharing the host's 96 GB / 28 cores). Gated
+    # behind the `ci:full` label so we don't burn runner time on every
+    # speculative PR — apply the label when the PR is ready for the
+    # authoritative test+coverage gate. The Release PR
+    # (`develop -> main`) gets the label applied automatically by
+    # auto-release-pr.yaml. (See `coverage` job below for why the same
+    # guard is repeated there.)
+    if: contains(github.event.pull_request.labels.*.name, 'ci:full')
+    needs: lint-and-build
+    runs-on: [self-hosted, m3-ultra]
+    timeout-minutes: 120
+    env:
+      # Force Esplora broadcasts to fail fast. Some unit tests exercise
+      # the commit pipeline that ends in a real HTTP broadcast; without
+      # this, runs against the public Mutinynet API can take >60 s per
+      # test. Mirrors the pre-push hook.
+      ESPLORA_URL: http://127.0.0.1:1/api
+      # `USERNAME_DOMAIN` is required by the server bootstrap (no
+      # default — see node/src/main.rs and issue #95). The test value
+      # is irrelevant for the `info_returns_*` assertions (they only
+      # check non-empty + shape).
+      USERNAME_DOMAIN: test.zkcoins.local
+      # `PUBLISHER_KEY` is required on every network (no default — see
+      # `node/src/lib.rs`). The previous `1234567890abcdef…` fallback
+      # was a publicly-known test key that drainer bots swept within
+      # minutes of any on-chain top-up; the fallback was removed
+      # network-wide in the "require PUBLISHER_KEY on every network"
+      # hardening. The value below is a syntactically valid 32-byte
+      # hex placeholder (`0000…0001`) chosen so a future grep for the
+      # burned `1234…` key returns empty across the repo + CI config;
+      # it is NOT a secret and MUST NEVER be reused on any chain that
+      # holds value. The same value is hard-coded in the test mocks at
+      # `node/src/router_tests.rs` so the wiremock'd publisher address
+      # path matches the lazy_static-derived `PUBLISHER_ADDRESS`.
+      PUBLISHER_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
+      # `db_tests` use the `testcontainers` crate, which talks to the local
+      # Docker daemon. The self-hosted runner runs Colima (not Docker
+      # Desktop), whose socket lives under the runner user's home
+      # directory. `testcontainers` defaults to `/var/run/docker.sock`,
+      # which does not exist on Colima, so the `Set DOCKER_HOST` step
+      # below points it at the real socket via `$HOME` — same value the
+      # `docker info` step picks up implicitly via the default `docker`
+      # context.
+      # `sccache` wraps `rustc` and caches compiled crates across CI
+      # runs. The M3 Ultra runner agents are self-hosted, so the cache
+      # lives on local disk and survives between jobs — the speedup is
+      # biggest for PR pushes that re-touch the same dependency set.
+      RUSTC_WRAPPER: sccache
+      # Bump cache cap above sccache's 10-GiB default. The cache is
+      # user-level (~/Library/Caches/Mozilla.sccache) and shared by every
+      # m3-ultra agent on the host; with 3+ parallel agents the 10-GiB
+      # default thrashed — writes from one agent evicted hits another
+      # had not consumed yet. 50 GiB fits the current working set with
+      # room to grow; the host has >600 GiB free disk. The server only
+      # reads SCCACHE_CACHE_SIZE at start, so the install step below
+      # restarts it when the running cap differs from this value.
+      SCCACHE_CACHE_SIZE: "50G"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust 1.81.0
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.81.0"
+      # The launchd-spawned runner agent inherits a minimal PATH that
+      # includes /opt/homebrew/bin (where a stable Rust lives) but not
+      # ~/.cargo/bin (where rustup proxies live). Without this step,
+      # `cargo` resolves to Homebrew's stable cargo, the rust-toolchain
+      # file pinning nightly is ignored, and dependencies that need
+      # `#![feature(...)]` (e.g. plonky2_field) fail to compile. Prepend
+      # ~/.cargo/bin so the rustup proxy is found first and reads the
+      # workspace rust-toolchain.
+      - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Cache cargo registry and build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+      # Point `testcontainers` at the Colima socket under the runner
+      # user's home; see the `DOCKER_HOST` comment in the job env block
+      # above. Set in a step (not the static `env:` block) so the path
+      # resolves from `$HOME` at runtime instead of being hard-coded.
+      - name: Set DOCKER_HOST for Colima socket
+        run: echo "DOCKER_HOST=unix://$HOME/.colima/default/docker.sock" >> "$GITHUB_ENV"
 
-      # `--test-threads=1` is mandatory: multiple test binaries each load the
-      # SP1 mock prover ELF (~1.5 GB resident) and running them in parallel
-      # on a 7 GB GitHub-hosted runner OOM-kills the job (exit 143). The
-      # account_server::tests group runs the real SP1 prover and is skipped
-      # here — it is only exercised in the coverage job, which is also
-      # single-threaded.
-      - name: Run tests (server + shared, all features, skip slow SP1 prover tests)
-        run: cargo test -p server -p shared --all-features -- --test-threads=1 --skip account_server::tests
+      # `sccache` (compile cache) and `cargo-nextest` (test runner) are
+      # installed once per runner via Homebrew. Re-running on a host
+      # where they already exist is a no-op. Start sccache's server
+      # explicitly so the first compile step has a warm cache daemon
+      # and print stats up-front for visibility in the run log.
+      #
+      # If a server is already running with a different cap than the
+      # requested SCCACHE_CACHE_SIZE (e.g. carried over from a previous
+      # workflow version), stop it so the next --start-server picks up
+      # the new env value. The on-disk cache files survive the restart.
+      - name: Ensure sccache + cargo-nextest are installed
+        run: |
+          command -v sccache >/dev/null || brew install sccache
+          command -v cargo-nextest >/dev/null || brew install cargo-nextest
+          if ! sccache --show-stats 2>/dev/null | grep -qE "Max cache size +50 GiB"; then
+            sccache --stop-server >/dev/null 2>&1 || true
+          fi
+          sccache --start-server >/dev/null 2>&1 || true
+          sccache --show-stats
 
-      - name: Run tests (program lib)
-        run: cargo test -p zkcoins-program --lib -- --test-threads=1
+      # The `db_tests` added in PR-A1 use testcontainers to spin up a
+      # real Postgres 17 per test. The runner host has Docker (via
+      # Colima) available on PATH; fail fast with a readable error
+      # if it ever goes away, instead of letting the test suite die
+      # 5 minutes into the run with a hard-to-read bollard error.
+      - name: Verify Docker is reachable (testcontainers dependency)
+        run: docker info > /dev/null
+
+      # `cargo nextest` replaces `cargo test`: process-per-test isolation
+      # plus smart scheduling (slow tests start first). `--test-threads 1`
+      # is preserved — the repo invariant is that tests run serially to
+      # avoid testcontainers port races and shared-state pollution.
+      # `api_remote` is the live-DEV-server verification integration test
+      # (node/tests/api_remote.rs). It targets `https://dev-api.zkcoins.app`
+      # by default and is meant to run AFTER a deploy, from the `api-e2e`
+      # job in deploy-dev.yaml — not against whatever DEV currently runs
+      # while a PR is still open. Excluding it here keeps `node-tests`
+      # hermetic: only unit + non-remote integration tests run; remote
+      # verification fires post-deploy as the merge-then-deploy gate.
+      - name: Run node + shared tests (release, all features)
+        run: cargo nextest run -p node -p shared --release --all-features --test-threads 1 -E 'not binary(api_remote)'
+
+      - name: sccache stats (post-build)
+        if: always()
+        run: sccache --show-stats
 
   coverage:
-    name: Coverage (MVP scope)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    name: Coverage Gate (100% lines + functions)
+    # Runs in parallel with `node-tests` (not after) — both jobs
+    # exercise the same suite (nextest vs. nextest-under-llvm-cov), so
+    # serializing them only doubled wall-clock on every Release PR.
+    # The `ci:full` label gate is duplicated explicitly here because the
+    # chain through `node-tests` (which carried the guard) is broken.
+    if: contains(github.event.pull_request.labels.*.name, 'ci:full')
+    needs: lint-and-build
+    runs-on: [self-hosted, m3-ultra]
+    timeout-minutes: 90
+    env:
+      ESPLORA_URL: http://127.0.0.1:1/api
+      USERNAME_DOMAIN: test.zkcoins.local
+      # `PUBLISHER_KEY` is required on every network (no default — see
+      # `node/src/lib.rs`); the value mirrors `node-tests` above and is
+      # a syntactically valid 32-byte hex placeholder, NOT a secret.
+      # MUST match `node/src/router_tests.rs` and the `node-tests` env
+      # block — the test mocks derive the wiremock'd publisher address
+      # from this key.
+      PUBLISHER_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
+      # `db_tests` use the `testcontainers` crate; see `node-tests`
+      # above for the rationale. `DOCKER_HOST` is set in a step below
+      # so the Colima socket path resolves from `$HOME` at runtime.
+      # Same sccache wrapper as `node-tests`; reuses the same on-disk
+      # cache populated by the previous job in the same workflow run.
+      RUSTC_WRAPPER: sccache
+      # See `node-tests` env block above for the 50-GiB rationale.
+      SCCACHE_CACHE_SIZE: "50G"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust 1.81.0
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.81.0"
-          components: llvm-tools-preview
+      - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Cache cargo registry and build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-llvm-cov-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-llvm-cov-
+      # See `node-tests` job above for the rationale; resolves the
+      # Colima socket path from `$HOME` at runtime.
+      - name: Set DOCKER_HOST for Colima socket
+        run: echo "DOCKER_HOST=unix://$HOME/.colima/default/docker.sock" >> "$GITHUB_ENV"
 
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-llvm-cov
-
-      # Coverage is measured on the MVP build only: no Cargo features
-      # enabled. Code behind a Cargo feature (address-list / faucet /
-      # usernames / lnurl) is excluded from the binary at compile time
-      # and is therefore not part of the measured surface.
-      #
-      # main.rs (runtime bootstrap) and publisher.rs (Bitcoin commit /
-      # reveal broadcasting that needs a signet/regtest node) are
-      # genuinely not exercisable in unit tests and are excluded at the
-      # file level via --ignore-filename-regex.
-      # Threshold is the current MVP baseline with main.rs (bootstrap)
-      # and publisher.rs (Bitcoin commit/reveal broadcasting that needs a
-      # signet/regtest node) excluded. The goal is 100% on this scope;
-      # each lifting PR ratchets the threshold upward.
-      # All tests must run for the coverage measurement to reflect the
-      # true exercised production surface — account_server tests are slow
-      # under SP1=mock but exercise large parts of the file.
-      - name: Run cargo-llvm-cov (MVP scope, regression guard)
+      # Same install gate as `node-tests`. Idempotent: no-op on a
+      # warm runner where both tools already exist. See `node-tests`
+      # for why we conditionally restart the sccache server.
+      - name: Ensure sccache + cargo-nextest are installed
         run: |
-          cargo llvm-cov -p server --show-missing-lines \
-            --ignore-filename-regex 'main\.rs|publisher\.rs|server_runtime\.rs|scanner_runtime\.rs|_tests\.rs$' \
+          command -v sccache >/dev/null || brew install sccache
+          command -v cargo-nextest >/dev/null || brew install cargo-nextest
+          if ! sccache --show-stats 2>/dev/null | grep -qE "Max cache size +50 GiB"; then
+            sccache --stop-server >/dev/null 2>&1 || true
+          fi
+          sccache --start-server >/dev/null 2>&1 || true
+          sccache --show-stats
+
+      # Coverage runs the same `db_tests` as `node-tests` and so
+      # needs Docker reachable for testcontainers. See the matching
+      # check in the `node-tests` job for the rationale.
+      - name: Verify Docker is reachable (testcontainers dependency)
+        run: docker info > /dev/null
+
+      # `cargo llvm-cov nextest` is the nextest-aware coverage subcommand:
+      # collects llvm-cov data while driving the suite through nextest,
+      # so the 100% line/function gate and the test execution share a
+      # single binary run (same as the old `cargo llvm-cov -- ...` form).
+      #
+      # The `api_remote` integration test (node/tests/api_remote.rs)
+      # is excluded for the same reason as in `node-tests` above: it
+      # targets the live DEV server and belongs in the post-deploy
+      # `api-e2e` job, not the hermetic coverage gate. The MVP coverage
+      # scope is measured by the rest of the suite, which covers the
+      # in-process axum handlers via oneshot().
+      - name: Run llvm-cov (MVP scope, 100% line + function gate)
+        run: |
+          cargo llvm-cov nextest --release -p node --show-missing-lines \
+            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|_tests\.rs$|bin/.*\.rs$' \
             --fail-under-lines 100 \
             --fail-under-functions 100 \
-            -- --test-threads=1
+            --test-threads 1 \
+            -E 'not binary(api_remote)'
+
+      - name: sccache stats (post-build)
+        if: always()
+        run: sccache --show-stats
+
+  # Telegram alert on workflow failure. Modelled as a separate job (not
+  # an inline step) so job-level failures — timeout, OOM, runner crash —
+  # still fire the alert. `if: failure()` evaluates against the whole
+  # `needs:` group: any listed job transitioning to `failure` triggers
+  # it, while skipped jobs (node-tests / coverage on a non-ci:full PR,
+  # or all jobs on a draft PR) and manual cancellation stay silent.
+  notify-failure:
+    name: Telegram alert on failure
+    needs: [lint-and-build, node-tests, coverage]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Telegram alert
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          TEXT=$'❌ <b>'"${{ github.workflow }}"$'</b> failed\n<b>Repo:</b> '"${{ github.repository }}"$'\n<b>Branch:</b> '"${{ github.ref_name }}"$'\n<b>Run:</b> '"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+               --data-urlencode "chat_id=${TG_CHAT}" \
+               --data-urlencode "text=${TEXT}" \
+               -d "parse_mode=HTML" \
+               -d "disable_web_page_preview=true"

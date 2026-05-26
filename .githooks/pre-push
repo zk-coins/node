@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Pre-push gate for zk-coins/node.
+#
+# Activation (one-time per clone):
+#   git config core.hooksPath .githooks
+#
+# This hook catches lint regressions in seconds — there is no point
+# waiting for CI to flag a missing import or a misformatted file.
+#
+# The authoritative test + coverage gate runs in CI on a self-hosted
+# M3 Ultra runner (issue #40, .github/workflows/ci.yaml). The hook
+# does *not* re-run those — locally on a laptop they take 60-90 min,
+# and a developer waiting that long on every push is exactly what
+# issue #40 removed.
+#
+# Wall budgets (warm cache, M3 Ultra) — kept in sync with the matching
+# table in CONTRIBUTING.md § Setup:
+#   - cold cache:                         < 2 min
+#   - warm cache:                         < 30 s
+#
+# Bypass: `git push --no-verify` works. CI is the real gate, so a
+# bypassed lint failure surfaces at the PR check level instead.
+set -euo pipefail
+
+echo "[pre-push] cargo fmt --all --check"
+cargo fmt --all --check
+
+echo "[pre-push] cargo clippy -p node -p shared (MVP feature set)"
+cargo clippy -p node -p shared -- -D warnings
+
+echo "[pre-push] cargo clippy -p node --all-features (self-host opt-in build)"
+cargo clippy -p node --all-features -- -D warnings
+
+echo "[pre-push] cargo clippy -p zkcoins-program-plonky2 -p zkcoins-prover-plonky2 --lib"
+cargo clippy -p zkcoins-program-plonky2 -p zkcoins-prover-plonky2 --lib -- -D warnings
+
+echo "[pre-push] cargo check --workspace --all-features"
+cargo check --workspace --all-features
+
+echo "[pre-push] all checks passed."

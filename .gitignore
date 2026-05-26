@@ -2,7 +2,7 @@ target/
 .env
 *.pem
 *.bin
-!server/minting_secret.bin
+!node/minting_secret.bin
 .DS_Store
 
 # accidentally-tracked tmp file

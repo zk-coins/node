@@ -1,0 +1,99 @@
+[package]
+name = "node"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bitcoin = { workspace = true }
+bitcoin_hashes = { version = "0.16.0", features = ["std"] }
+sha2 = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+hex = "0.4.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "net", "time", "sync"] }
+# Event-driven chain ingestion (issue #84): WebSocket subscription to
+# the Esplora-compatible block-event stream replaces the previous
+# 30-s tip polling loop. `rustls-tls-webpki-roots` keeps the TLS
+# stack self-contained on CI hosts (no system openssl), matching the
+# `reqwest` features used by `api_remote`.
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
+# `StreamExt` / `SinkExt` are used by `scanner_ws` to drive the
+# tungstenite stream inside `tokio::time::timeout(...)` on each
+# `.next()` call and to send the subscribe frame.
+futures-util = "0.3"
+# Promoted from `[dev-dependencies]` to `[dependencies]` so the
+# scanner can parse the `block` / `blocks` JSON frames returned by
+# the Esplora WS endpoint.
+serde_json = "1.0"
+# Optional ZMQ subscriber path (issue #84, dormant in this PR). When
+# `feature = "zmq"` is enabled the operator can plug a Bitcoin Core
+# ZMQ stream into the same channel the WebSocket scanner publishes
+# on — useful for self-hosters running a node directly. The MVP
+# binary keeps this off; no module references the crate yet, so a
+# missing system libzmq does not break the default build. Pinned
+# with `=` (vs. caret) because the feature is dormant — there is no
+# active integration to validate against a SemVer-compatible bump,
+# so any version drift should be a deliberate code change with
+# review, not a silent `cargo update` side-effect.
+bitcoincore-zmq = { version = "=1.5.4", optional = true }
+esplora-client = { git = "https://github.com/BitVM/rust-esplora-client", branch = "master" }
+axum = { version = "0.7.9", features = ["json", "multipart"] }
+anyhow = "1.0"
+zkcoins-prover = { path = "../script-plonky2/", package = "zkcoins-prover-plonky2" }
+zkcoins-program = { path = "../program-plonky2/", package = "zkcoins-program-plonky2" }
+shared = { path = "../shared/" }
+lazy_static = { workspace = true }
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+# Postgres state-layer. PR-A1 wires the module + migrations + tests
+# only; bootstrap integration happens in PR-A2 + PR-A3 (see the
+# `#[allow(dead_code)]` on the module).
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "macros",
+    "migrate",
+] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+# Used by `publisher_tests` for Esplora mocking and by `router_tests`
+# to mock the Esplora HTTP endpoint behind the `/health/ready`
+# readiness probe so the tests never hit the real
+# `https://mutinynet.com/api` from CI.
+wiremock = "0.6"
+# Used by `db_tests` to spin up a real Postgres 17 per test run.
+# The legacy `clients::Cli` of v0.14/0.15 was replaced by a global
+# `runner()` — see `db_tests::setup_pool` for the shape we use.
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+# HTTP client for the `api_remote` integration test, which exercises
+# the deployed DEV server end-to-end. rustls (not native-tls) to keep
+# the test runner self-contained on CI hosts without openssl headers.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Random key + suffix generation for the `api_remote` suite so each
+# run picks a fresh wallet and avoids collisions with concurrent
+# DEV-server consumers.
+rand = "0.8"
+# Auto-cleaning scratch directories for the ProofStore tests in
+# `router_tests`. Replaces the ad-hoc `std::env::temp_dir() + nanos
+# + remove_dir_all().ok()` shape — the `TempDir` Drop impl removes
+# the directory even when the test panics, so no test leaves a
+# leaked /tmp/zkcoins-* tree behind.
+tempfile = "3"
+
+[features]
+# All non-MVP features are off by default. When a feature is not enabled, the
+# corresponding routes, handlers, and supporting modules are excluded from the
+# binary at compile time via `#[cfg(feature = "…")]`, so the disabled code
+# cannot run, crash, or be exploited at runtime.
+default = []
+address-list = []
+lnurl = []
+# Dormant self-host operator opt-in (issue #84). When enabled, a ZMQ
+# subscriber publishes block-hash events into the same channel the
+# WebSocket scanner uses. No module activates the subscriber in this
+# PR; the flag exists so the crate dependency is feature-gated and
+# the MVP binary does not require `libzmq`.
+zmq = ["dep:bitcoincore-zmq"]

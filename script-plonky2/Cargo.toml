@@ -1,0 +1,12 @@
+[package]
+name = "zkcoins-prover-plonky2"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+zkcoins-program-plonky2 = { path = "../program-plonky2" }
+plonky2 = "1.1.0"
+anyhow = "1.0"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }

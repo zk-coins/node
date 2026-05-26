@@ -1,0 +1,28 @@
+-- Drop `minting_meta` entirely (Phase D).
+--
+-- Pre-Phase-D the singleton `minting_meta` row carried a single
+-- `num_pubkeys BIGINT` counter — how many BIP-32 child indices the
+-- faucet had ever spent in a successful mint. The counter survived
+-- process restarts so the next `current_private_key()` derivation
+-- aligned with the last on-chain commitment.
+--
+-- Phase D removes that counter as a separately-stored value. The
+-- count is now derived from the Sparse Merkle Tree on demand:
+-- `derive_num_pubkeys_from_smt(minting_xpriv, smt)` walks `pk_0,
+-- pk_1, …` and stops at the first `sha256(pk_n.serialize())` whose
+-- leaf is absent from the SMT. The SMT is already the canonical
+-- truth (loaded from `smt_state` at boot, mutated by the scanner
+-- on every inscription) and is the source the previous startup
+-- invariant check measured the counter *against* — collapsing the
+-- two into one removes the desync class that issue zk-coins/node#89
+-- documented.
+--
+-- `minting_meta` had no other columns (id + num_pubkeys +
+-- updated_at), so dropping the whole table is the cleanest shape.
+-- The matching `load_minting_num_pubkeys` / `upsert_minting_num_pubkeys`
+-- helpers and the `commit_mint_tx` counter step are removed in
+-- the same commit. After this migration runs, no code reads or
+-- writes the table; the migration is destructive but the value was
+-- the bug we are fixing — the SMT carries the truth.
+
+DROP TABLE IF EXISTS minting_meta;

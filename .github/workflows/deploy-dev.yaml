@@ -11,8 +11,20 @@ on:
         type: boolean
         default: false
 
+# Serialize DEV deploys per branch. Multiple develop pushes in quick
+# succession (e.g. three PRs merged back-to-back) used to fire three
+# parallel deploys that raced on `docker compose recreate` on the
+# host and left the zkcoins-node container half-renamed in
+# `Created` state, blocking the next `up -d` with a name conflict.
+# `cancel-in-progress: true` keeps the newest commit's deploy; the
+# older deploy is irrelevant the moment its commit is no longer the
+# branch tip.
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: true
+
 env:
-  DOCKER_TAGS: zkcoin/server:beta
+  DOCKER_TAGS: zkcoins/node:beta
 
 permissions:
   contents: read
@@ -41,8 +53,18 @@ jobs:
           push: true
           tags: ${{ env.DOCKER_TAGS }}
           platforms: linux/arm64
-          build-args: |
-            FEATURES=address-list,faucet,usernames,lnurl
+          # Registry-backed buildx cache. Same `zkcoins/node:buildcache`
+          # tag is reused by Deploy PRD — DEV and PRD compile the same
+          # Rust workspace so cache hits cross-deploy. `type=registry`
+          # over `type=gha` because GHA cache caps at 10 GB with LRU
+          # eviction; Docker Hub holds the tag indefinitely.
+          # Caveat: DEV's `cancel-in-progress: true` (above) can interrupt
+          # a concurrent DEV deploy mid-push to the cache manifest.
+          # BuildKit's `cache-from` tolerates partial manifests (falls back
+          # to a from-scratch build with a warning) so the race is
+          # self-healing on the next deploy.
+          cache-from: type=registry,ref=zkcoins/node:buildcache
+          cache-to: type=registry,ref=zkcoins/node:buildcache,mode=max
 
       - name: Install cloudflared
         run: |
@@ -56,12 +78,167 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           echo "${{ secrets.DEPLOY_DEV_SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
 
-          DEPLOY_CMD="zkcoins-server"
+          # The deploy host runs a forced-command restricted shell that only
+          # accepts whitelisted command names — arbitrary inline shell is
+          # rejected. Both branches must resolve to a single allowlisted
+          # command; the reset variant is implemented host-side.
+          DEPLOY_CMD="zkcoins-node"
           if [ "${{ inputs.reset_state }}" == "true" ]; then
-            DEPLOY_CMD="cd ~/zkcoins && docker compose stop zkcoins-server && docker compose rm -f zkcoins-server && docker volume rm zkcoins_server-data 2>/dev/null; zkcoins-server"
+            DEPLOY_CMD="reset-zkcoins-node"
           fi
 
+          # ServerAlive* keep the session alive across long-running
+          # `docker compose recreate` steps where the remote command
+          # produces no stdout for >60s. Without keepalive the
+          # cloudflared tunnel (and the OpenSSH client) drop the
+          # session and exit 255 even though the host-side deploy
+          # script keeps running — observed on the PR #111 merge
+          # (run 26419696840). 30s interval × 8 retries = 4 min of
+          # network silence tolerated before the session is killed.
           ssh -i ~/.ssh/deploy_key \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=8 \
             -o ProxyCommand="cloudflared access ssh --hostname ${{ secrets.DEPLOY_DEV_HOST }}" \
             ${{ secrets.DEPLOY_DEV_USER }}@${{ secrets.DEPLOY_DEV_HOST }} \
             "$DEPLOY_CMD"
+
+      # Post-deploy smoke test: hit the public endpoint until /api/info
+      # answers 200 or we give up. A green "Build and deploy to DEV"
+      # without this step was historically misleading — a runtime-bootstrap
+      # panic left the container Up-but-unresponsive while the workflow
+      # reported success. Failing this step blocks the auto-release PR
+      # from collecting a green check and surfaces the regression in CI.
+      - name: Smoke test public endpoint
+        run: |
+          set -euo pipefail
+          URL="https://dev-api.zkcoins.app/api/info"
+          for i in $(seq 1 30); do
+            code=$(curl -sS -o /tmp/info.json -w '%{http_code}' --max-time 10 "$URL" || echo "000")
+            if [ "$code" = "200" ]; then
+              echo "DEV /api/info responded 200 after ${i} attempt(s):"
+              cat /tmp/info.json
+              echo
+              exit 0
+            fi
+            echo "[$i/30] $URL -> ${code} (waiting 10 s)"
+            sleep 10
+          done
+          echo "::error::DEV /api/info never returned 200 within ~5 min after deploy"
+          exit 1
+
+  # Functional verification of the deployed DEV server.
+  #
+  # The smoke test in `build-and-deploy` only proves the HTTP listener
+  # is bound; this job exercises all 15 routes end-to-end (read-only,
+  # negative-path, full mint→send→commit and username-claim roundtrips
+  # against the live server). Runs on the same self-hosted M3 Ultra
+  # runner as `node-tests` / `coverage`, so sccache hits the warm
+  # cache populated by previous runs and the build itself stays
+  # well under a minute on a hot cache.
+  api-e2e:
+    name: API E2E against DEV
+    needs: build-and-deploy
+    runs-on: [self-hosted, m3-ultra]
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+      ZKCOINS_API_URL: https://dev-api.zkcoins.app
+      # The bootstrap `lazy_static`s panic if these are unset; the
+      # integration test only talks to the deployed server but the
+      # lib's panic-on-load behaviour is unconditional. Values are
+      # placeholders — nothing in the test path reads them.
+      USERNAME_DOMAIN: dev.zkcoins.app
+      ESPLORA_URL: http://127.0.0.1:1/api
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Self-hosted runner inherits a minimal PATH that hides rustup;
+      # see the matching step in `node-tests` for the rationale.
+      - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Ensure sccache + cargo-nextest are installed
+        run: |
+          command -v sccache >/dev/null || brew install sccache
+          command -v cargo-nextest >/dev/null || brew install cargo-nextest
+          sccache --start-server >/dev/null 2>&1 || true
+          sccache --show-stats
+
+      # Operational preflight: hit /health/ready and /health/publisher
+      # BEFORE running the API E2E suite, so an empty publisher wallet
+      # or a non-ready DB fails THIS step with a clear "top up the
+      # publisher" / "DB not ready" message instead of cascading
+      # through the test suite as opaque 503s.
+      #
+      # Historically a green E2E run masked an empty publisher wallet
+      # because the suite silently dev_skip!()'d 5xx errors; PR
+      # "test: harden suite" (this PR) removed the masking and added
+      # this preflight as the load-bearing operational gate.
+      #
+      # 50_000 sats is a conservative floor: a single inscription
+      # commit + reveal pair at typical Mutinynet fee rates needs
+      # ~1_500 sats; 50_000 buys ~30 mints before the next top-up.
+      # Adjust upward if the suite grows.
+      - name: Ensure jq is installed (preflight dependency)
+        run: command -v jq >/dev/null || brew install jq
+
+      - name: Preflight — publisher wallet has UTXOs
+        env:
+          DEV_API: https://dev-api.zkcoins.app
+        run: |
+          set -euo pipefail
+          ready=$(curl -sS --max-time 10 "$DEV_API/health/ready")
+          if ! echo "$ready" | jq -e '.ready == true' > /dev/null; then
+            echo "::error::/health/ready not ready: $ready"
+            exit 1
+          fi
+          pub=$(curl -sS --max-time 15 -w '|%{http_code}' "$DEV_API/health/publisher")
+          code="${pub##*|}"
+          body="${pub%|*}"
+          if [ "$code" != "200" ]; then
+            echo "::error::/health/publisher returned $code: $body"
+            exit 1
+          fi
+          utxos=$(echo "$body" | jq -r '.utxo_count')
+          sats=$(echo "$body" | jq -r '.total_sats')
+          if [ "$utxos" -lt 1 ] || [ "$sats" -lt 50000 ]; then
+            echo "::error::publisher wallet too low (utxos=$utxos, sats=$sats) — top up before re-running"
+            exit 1
+          fi
+          echo "publisher OK: utxos=$utxos, sats=$sats"
+
+      - name: Run API E2E suite against DEV
+        env:
+          # DEV image is MVP-only by policy (see Dockerfile FEATURES
+          # arg); the gated address-list/lnurl tests skip cleanly
+          # instead of panicking the CI canary.
+          ZKCOINS_E2E_ALLOW_FEATURE_TRIMMED_SERVER: "true"
+        run: cargo test -p node --release --all-features --test api_remote -- --test-threads=1 --nocapture
+
+      - name: sccache stats (post-build)
+        if: always()
+        run: sccache --show-stats
+
+  # Telegram alert on workflow failure. Separate job (not an inline step)
+  # so job-level failures — timeout, OOM, runner crash — still fire the
+  # alert; runs on the cheapest runner since the curl never needs to touch
+  # the self-hosted M3 Ultra. See ci.yaml > notify-failure for the
+  # firing-matrix rationale.
+  notify-failure:
+    name: Telegram alert on failure
+    needs: [build-and-deploy, api-e2e]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Telegram alert
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          TEXT=$'❌ <b>'"${{ github.workflow }}"$'</b> failed\n<b>Repo:</b> '"${{ github.repository }}"$'\n<b>Branch:</b> '"${{ github.ref_name }}"$'\n<b>Run:</b> '"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+               --data-urlencode "chat_id=${TG_CHAT}" \
+               --data-urlencode "text=${TEXT}" \
+               -d "parse_mode=HTML" \
+               -d "disable_web_page_preview=true"

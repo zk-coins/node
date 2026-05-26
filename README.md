@@ -1,32 +1,57 @@
-# zkCoins Server
+# zkCoins Node
+
+[![Docker Image Version](https://img.shields.io/docker/v/zkcoins/node/latest?logo=docker&label=zkcoins%2Fnode&color=2496ED)](https://hub.docker.com/r/zkcoins/node)
+[![Docker Pulls](https://img.shields.io/docker/pulls/zkcoins/node?logo=docker&color=2496ED)](https://hub.docker.com/r/zkcoins/node)
 
 Rust/Axum backend for [zkcoins.app](https://zkcoins.app) — account management, ZK proof generation, Bitcoin blockchain scanning, and nullifier publishing.
 
+Container images: **[hub.docker.com/r/zkcoins/node](https://hub.docker.com/r/zkcoins/node)**
+
 ## Live
 
-| Environment | URL                                                | Image                  |
-| ----------- | -------------------------------------------------- | ---------------------- |
-| **PRD**     | [api.zkcoins.app](https://api.zkcoins.app)         | `zkcoin/server:latest` |
-| **DEV**     | [dev-api.zkcoins.app](https://dev-api.zkcoins.app) | `zkcoin/server:beta`   |
+| Environment | URL                                                | Image                                                                                |
+| ----------- | -------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| **PRD**     | [api.zkcoins.app](https://api.zkcoins.app)         | [`zkcoins/node:latest`](https://hub.docker.com/r/zkcoins/node/tags?name=latest)      |
+| **DEV**     | [dev-api.zkcoins.app](https://dev-api.zkcoins.app) | [`zkcoins/node:beta`](https://hub.docker.com/r/zkcoins/node/tags?name=beta)          |
 
 ## Stack
 
 | Layer           | Technology           | Why                                                  |
 | --------------- | -------------------- | ---------------------------------------------------- |
-| Language        | Rust 1.81            | Same as ZK circuits, memory safety, performance      |
+| Language        | Rust nightly         | Required for Plonky2 (`feature(specialization)`)     |
 | Web framework   | Axum                 | Built on Tokio, idiomatic async Rust                 |
-| ZK Proofs       | SP1 zkVM             | Write proofs in standard Rust, no DSL                |
-| Data structures | SMT + MMR            | Non-inclusion proofs + append-only history           |
+| ZK Proofs       | Plonky2 + Poseidon-Goldilocks (cyclic recursion) | Server-side, no zkVM, no external prover dependency  |
+| Data structures | SMT + MMR (Poseidon) | Non-inclusion proofs + append-only history           |
 | Bitcoin         | Taproot Inscriptions | 64-byte nullifiers, Esplora API scanning             |
 | Bitcoin index   | electrs (Esplora)    | Esplora REST API via shared Docker network `bitcoin` |
 
 Full rationale: [docs.zkcoins.app/tech-decisions](https://docs.zkcoins.app/tech-decisions)
 
+## Trust Model
+
+Proof generation runs **inside this server process**. `AccountNode::send_coins` (`node/src/account_node.rs`) calls `self.prover.prove_account_update_with_in_and_out_coins_and_sources(...)` (and the `prove_initial_*` variant for first-time accounts) on every send / receive / mint. ZK proving requires the full private witness, so the server sees, in cleartext:
+
+- Sender, recipient, and amount of every coin movement
+- The complete in-coin / out-coin / source-aggregator slot layout per account
+- Account history roots, Merkle proofs, and inclusion-proof witnesses
+- Usernames and their bound coin sets (`UsernameStore`)
+- Postgres rows persisting all of the above (`node/migrations/000{1,2}_*.sql`)
+
+The **on-chain footprint stays private** — Plonky2 ensures that the public outputs (nullifiers, history roots, Taproot inscriptions) carry no readable transaction data. Block explorers and chain analytics see only opaque 64-byte commitments. The trust boundary is therefore the **server operator**, not the chain.
+
+| | Hosted (`api.zkcoins.app`) | Self-hosted |
+| --- | --- | --- |
+| On-chain privacy (vs. block explorers) | ✅ | ✅ |
+| Operator sees plaintext transaction data | ❌ Yes — DFX runs the hosted node | ✅ No |
+| Setup effort | ✅ None | ⚠️ Postgres + electrs + Bitcoin node |
+
+**If you need full transaction privacy, run your own server.** Every release is shipped as `zkcoins/node:latest` (see [Live](#live)), the build recipe is [`Dockerfile`](./Dockerfile), and runtime knobs are documented in [Configuration](#configuration). Point the [zkcoins.app](https://zkcoins.app) client at your self-hosted instance for end-to-end self-custody of transaction data.
+
 ## Contributing
 
-**New PRs may only merge into `develop` if test coverage is 100% on the activated surface.** Code behind a Cargo feature (`address-list`, `faucet`, `usernames`, `lnurl`) is excluded from the MVP measurement — feature-gated routes do not need to be tested as long as the feature stays off in the PRD build. Concretely:
+**New PRs may only merge into `develop` if test coverage is 100% on the activated surface.** Code behind a Cargo feature (`address-list`, `lnurl`) is excluded from the MVP measurement — feature-gated routes do not need to be tested because both DEV and PRD ship the MVP-only binary with every Cargo feature off. (Mint and usernames are part of the MVP and are permanently compiled in — no Cargo feature gate.) Concretely:
 
-- `cargo llvm-cov -p server` (no `--all-features`) must report 100% lines, statements, branches, and functions on the MVP build. CI enforces this with `--fail-under-lines 100`. The current baseline is below 100% — the regression-block threshold is set to the current measured value and the goal is to lift it to 100% via follow-up PRs.
+- `cargo llvm-cov -p node` (no `--all-features`) must report 100% lines + 100% functions on the activated MVP surface. CI enforces this with `--fail-under-lines 100 --fail-under-functions 100` in the `Coverage Gate (100% lines + functions)` job. The current `develop` baseline is at the gate.
 - Defensive code that genuinely cannot be reached in unit tests (e.g. the publisher's Bitcoin-broadcast path that requires a signet/regtest node, the `main.rs` runtime bootstrap) is excluded from the measured scope at the file level rather than tested.
 - The branch is protected on GitHub: a PR cannot be merged while CI is red.
 
@@ -40,47 +65,45 @@ API endpoints, background services, their activation status, and the tests that 
 
 **Triage legend** (MVP testing decision): `mvp` = in MVP scope, must reach full test coverage before launch · `gate` = not in MVP scope; hidden behind a Cargo feature, default off, no test coverage required · `planned` = not in scope for MVP.
 
-**Coverage legend:** unit % refers to `cargo-llvm-cov` line coverage of the module that implements the function (latest run, `SP1_PROVER=mock` with `--all-features`). `—` means no test exists.
+**Coverage legend:** unit % refers to `cargo-llvm-cov` line coverage of the module that implements the function. The MVP-scope per-module summary is in § "Test stack" below; the authoritative live numbers are in the `Coverage Gate` CI job. `—` means no test exists.
 
 | Function                             | Trigger                               | Status                   | Triage  | Tests                         |
 | ------------------------------------ | ------------------------------------- | ------------------------ | ------- | ----------------------------- |
-| Health check                         | `GET /health`                         | always                   | mvp     | 75% (server)                  |
-| Network info                         | `GET /api/info`                       | env¹                     | mvp     | 75% (server)                  |
-| Get balance                          | `GET /api/balance?address=<hex>`      | always                   | mvp     | 75% (server)                  |
-| List all addresses                   | `GET /api/address`                    | feature (`address-list`) | gate    | 75% (server)                  |
-| Mint coins (faucet, single-phase)    | `POST /api/mint`                      | feature (`faucet`)²      | gate    | 91% (account)                 |
-| Send — phase 1 (generate proof)      | `POST /api/send`                      | env²                     | mvp     | 75% (server)                  |
-| Send — phase 2 (commit + broadcast)  | `POST /api/commit`                    | env³                     | mvp     | 75% (server) · 0% (publisher) |
-| Receive coin                         | `POST /api/receive`                   | always                   | mvp     | 91% (account)                 |
-| Download coin proof                  | `GET /api/proof/:id`                  | always                   | mvp     | 75% (server)                  |
-| Claim username                       | `POST /api/username/claim`            | feature (`usernames`)    | gate    | 98% (username)                |
-| Resolve username                     | `GET /api/username/resolve/:username` | feature (`usernames`)    | gate    | 98% (username)                |
-| LNURL-Pay metadata                   | `GET /.well-known/lnurlp/:username`   | feature (`lnurl`)        | gate    | 75% (server)                  |
-| LNURL-Pay callback                   | `GET /lnurl/pay/:username`            | feature (`lnurl`)        | gate    | 75% (server)                  |
-| Bitcoin block scanner (background)   | Loop in `main.rs`, 30 s poll          | env⁴                     | mvp     | 51% (scanner) · 4% (main)     |
-| State persistence (SMT/MMR write)    | Scanner callback on commitment match  | always                   | mvp     | 97% (state)                   |
+| Health check                         | `GET /health`                         | always                   | mvp     | 100% (router)                  |
+| Network info                         | `GET /api/info`                       | env¹                     | mvp     | 100% (router)                  |
+| Get balance                          | `GET /api/balance?address=<hex>`      | always                   | mvp     | 100% (router)                  |
+| List all addresses                   | `GET /api/address`                    | feature (`address-list`) | gate    | 100% (router)                  |
+| Mint coins (single-phase)            | `POST /api/mint`                      | always²                  | mvp     | 100% (account_node)                 |
+| Send — phase 1 (generate proof)      | `POST /api/send`                      | env²                     | mvp     | 100% (router)                  |
+| Send — phase 2 (commit + broadcast)  | `POST /api/commit`                    | env³                     | mvp     | 100% (router) · 0% (publisher) |
+| Receive coin                         | `POST /api/receive`                   | always                   | mvp     | 100% (account_node)                 |
+| Download coin proof                  | `GET /api/proof/:id`                  | always                   | mvp     | 100% (router)                  |
+| Claim username                       | `POST /api/username/claim`            | always                   | mvp     | 100% (username)                |
+| Resolve username                     | `GET /api/username/resolve/:username` | always                   | mvp     | 100% (username)                |
+| LNURL-Pay metadata                   | `GET /.well-known/lnurlp/:username`   | feature (`lnurl`)        | gate    | 100% (router)                  |
+| LNURL-Pay callback                   | `GET /lnurl/pay/:username`            | feature (`lnurl`)        | gate    | 100% (router)                  |
+| Bitcoin block scanner (background)   | WS subscription in `scanner_ws.rs`    | env⁴                     | mvp     | 100% (scanner) · — (main, excluded) |
+| State persistence (SMT/MMR write)    | Scanner callback on commitment match  | always                   | mvp     | 100% (state)                   |
 | Taproot inscription broadcast        | Called by `/api/commit`               | env³                     | mvp     | 0% (publisher)                |
 | Publisher UTXO lookup                | Internal, before broadcast            | env³                     | mvp     | 0% (publisher)                |
 | Explorer endpoints (`/api/stats`, …) | n/a                                   | planned                  | planned | —                             |
 | Light client support                 | n/a                                   | planned                  | planned | —                             |
 
 ¹ `NETWORK_NAME` env var controls the string returned. `IS_MAINNET=true` flips the default to `"Mainnet"`.
-² Proof generation routes through SP1. `SP1_PROVER=mock` skips real proving; `cpu`/`cuda`/`network` perform actual proving (latency and resource cost vary by stage — see [Proving Strategy](#proving-strategy)).
-³ Requires `PUBLISHER_KEY` set to a real funded key and `ESPLORA_URL` reachable. With the default test key the server panics on `IS_MAINNET=true` startup; on testnet it accepts the call but broadcast will fail without funded UTXOs.
-⁴ Scanner depends on `ESPLORA_URL` being reachable; on connection failure it backs off and retries.
+² Proof generation routes through the Plonky2 cyclic-recursion circuit. Single host, single Rust process — no zkVM, no external prover service. Mac Studio M3 Ultra is the production hardware target (96 GB unified memory, no external GPU). See [Proving Strategy](#proving-strategy).
+³ Requires `PUBLISHER_KEY` set to a real funded key and `ESPLORA_URL` reachable. With the default test key the server panics on `IS_MAINNET=true` startup; on testnet it accepts the call but broadcast will fail without funded UTXOs — DEV and PRD both return `503 SERVICE_UNAVAILABLE` to the client on broadcast failure (the historic `DEV_SKIP_BROADCAST_FAILURE` env-gate that silently swallowed these failures was removed once DEV and PRD were unified on the MVP-only binary; the DEV publisher wallet therefore has to be funded for E2E paths).
+⁴ Scanner depends on `ESPLORA_URL` (REST, used for the per-block `get_block_txids` / `get_tx` lookups and for the post-reconnect tip anchor) AND `ESPLORA_WS_URL` (WebSocket, used by `scanner_ws` to receive new-tip events — issue #84). Both default to mutinynet endpoints; on connection failure the WS subscriber reconnects with exponential backoff capped at 30 s.
 
 ### Cargo features
 
-All non-MVP routes are gated by Cargo features so the disabled handler functions, helper structs, and `AppState` fields are excluded from the binary at compile time. With a feature off, the route is never registered and the fallback responds with `404`. There is no runtime path that can reach a disabled handler. Defaults are empty (fail-closed): the PRD image build passes no features, the DEV image build passes all four.
+All non-MVP routes are gated by Cargo features so the disabled handler functions, helper structs, and `AppState` fields are excluded from the binary at compile time. With a feature off, the route is never registered and the fallback responds with `404`. There is no runtime path that can reach a disabled handler. Defaults are empty (fail-closed): **both the DEV and the PRD image builds pass no features**, so the two environments run the identical MVP-only binary. The Cargo flags exist for self-hosters who want to compile a binary with a specific non-MVP subset enabled, and for future per-feature rollouts when an individual feature is deemed ready for production.
 
 | Feature        | Gates                                                                                                                                                 |
 | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `address-list` | `GET /api/address`                                                                                                                                    |
-| `faucet`       | `POST /api/mint`, `MintRequest`, `AppState::minting_account`                                                                                          |
-| `usernames`    | `POST /api/username/claim`, `GET /api/username/resolve/:u`, `ClaimUsernameRequest`, `UsernameStore::{claim,save_to_file}`, `AppState::usernames_path` |
-| `lnurl`        | `GET /.well-known/lnurlp/:u`, `GET /lnurl/pay/:u` (depends on `usernames`)                                                                            |
+| `lnurl`        | `GET /.well-known/lnurlp/:u`, `GET /lnurl/pay/:u`                                                                                                     |
 
-Build the MVP-only binary (PRD): `cargo build --release -p server`. Build with everything enabled (DEV / tests): `cargo build --release -p server --all-features`. The Docker `FEATURES` build arg accepts a comma-separated list and is forwarded to `cargo build --features`.
+Build the MVP-only binary (DEV + PRD ship this): `cargo build --release -p node`. Build with every feature enabled (CI clippy + tests + self-host opt-in): `cargo build --release -p node --all-features`. The Docker `FEATURES` build arg accepts a comma-separated list and is forwarded to `cargo build --features`; both `deploy-dev.yaml` and `deploy-prd.yaml` leave it empty.
 
 ### Triage gaps
 
@@ -96,87 +119,87 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 
 #### Health check
 
-- **Module:** `server.rs::main_app` route handler
+- **Module:** `router.rs::main_app` route handler
 - **Behaviour:** returns the literal string `"ok"` with HTTP 200
-- **Tests:** `server.rs::tests::health_returns_ok`
+- **Tests:** `router.rs::tests::health_returns_ok`
 
 #### Network info
 
-- **Module:** `server.rs::info_handler`
-- **Behaviour:** returns `{ "network": NETWORK_NAME }`. `NETWORK_NAME` defaults to `Mutinynet` when `IS_MAINNET=false`, `Mainnet` when `true`
-- **Tests:** `server.rs::tests::info_returns_network_name`
+- **Module:** `router.rs::info_handler`
+- **Behaviour:** returns `{ network, capabilities: { address_list, faucet, usernames, lnurl }, username_domain }`. `network` defaults to `Mutinynet` when `IS_MAINNET=false`, `Mainnet` when `true`. `capabilities.{address_list,lnurl}` each reflect whether the corresponding Cargo feature was compiled into this binary, letting clients gate UI on a single server-side source of truth instead of parallel build-time env flags. `capabilities.{faucet,usernames}` are hardcoded `true` — mint and usernames are permanent MVP — and are retained only for back-compat with wallet clients that deserialise the shape. `username_domain` is the external hostname this server serves; **required env var** (server panics on startup if unset). PRD sets `USERNAME_DOMAIN=zkcoins.app`, DEV sets `USERNAME_DOMAIN=dev.zkcoins.app` — distinct from `network` because the same chain can be served from two isolated external hostnames, and the client renders `<hex|username>@<domain>` from this field
+- **Tests:** `router.rs::tests::info_returns_network_name_capabilities_and_username_domain`, `router.rs::tests::info_serialization_format_is_stable`
 
 #### Get balance
 
-- **Module:** `server.rs::get_balance_handler` → `account_server.rs::AccountServer::get_account_balance`
-- **Behaviour:** address parsed as hex pubkey, looks up the account. Returns `{ balance, username? }`. The minting address returns `u64::MAX`
-- **Tests:** `server.rs::tests::balance_*` (5 tests covering happy path, unknown address, invalid hex, missing param, wrong length)
+- **Module:** `router.rs::get_balance_handler` → `account_node.rs::AccountNode::get_account_balance`
+- **Behaviour:** address parsed as hex pubkey, looks up the account. Returns `{ balance, username? }`. A well-formed address with no on-chain activity yields `200 OK` with `balance: 0` (canonical zero state, not 404). The minting address returns `u64::MAX`. Malformed input — invalid hex, wrong length, or a missing `address` query parameter — returns `422`
+- **Tests:** `router.rs::tests::balance_*` (6 tests covering happy path, unknown address with and without a claimed username, invalid hex, missing param, wrong length)
 
 #### List all addresses
 
-- **Module:** `server.rs::get_address_handler` → `account_server.rs::AccountServer::get_addresses`
+- **Module:** `router.rs::get_address_handler` → `account_node.rs::AccountNode::get_addresses`
 - **Behaviour:** returns all known addresses as hex strings. Intended for explorer/debug use, not user-facing
-- **Tests:** `server.rs::tests::address_returns_list`
+- **Tests:** `router.rs::tests::address_returns_list`
 
-#### Mint coins (faucet, single-phase)
+#### Mint coins (single-phase)
 
-- **Module:** `server.rs::mint_handler` → `account_server.rs::send_coins` with the server-held minting account
+- **Module:** `router.rs::mint_handler` → `account_node.rs::send_coins` with the server-held minting account
 - **Behaviour:** server signs commitment itself (no client roundtrip) using the minting key
-- **Proof generation:** `zkcoins_prover::Prover::create_account` (or `update_account` for the receiver) under SP1
-- **Tests:** `account_server.rs::tests::test_create_minting_account`, `test_mint_single_invoice`, `test_mint_repro_live_setup`
+- **Proof generation:** `zkcoins_prover::Prover` (the Plonky2 wrapper in [`script-plonky2/`](./script-plonky2/)) — `prove_initial` for new accounts, `prove_account_update` for receivers
+- **Tests:** `account_node.rs::tests::test_create_minting_account`, `test_mint_single_invoice`, `test_mint_repro_live_setup`
 
 #### Send — phase 1 (generate proof)
 
-- **Module:** `server.rs::send_coin_handler` → `verify_send_signature` (Schnorr over `SHA256(account_address || recipient || amount || timestamp)`, ±5 min skew) → `account_server.rs::send_coins`
+- **Module:** `router.rs::send_coin_handler` → `verify_send_signature` (Schnorr over `SHA256(account_address || recipient || amount || timestamp)`, ±5 min skew) → `account_node.rs::send_coins`
 - **Behaviour:** returns `{ proof_id, account_state_hash, output_coins_root }`. Proof is persisted under `data/proofs/<id>.bin` for later commit
-- **Tests:** request-layer tests in `server.rs::tests::send_*` and `send_signature_*` (12 tests covering parser, signature verification, replay). Proof generation itself is not exercised — tests run with `SP1_PROVER=mock`
+- **Tests:** request-layer tests in `router.rs::tests::send_*` and `send_signature_*` (12 tests covering parser, signature verification, replay). Proof generation itself is not exercised — the Plonky2 cyclic-recursion build is too slow for unit tests (~3–15 min per prove at production parameters); positive proofs are exercised in `program-plonky2/` directly
 
 #### Send — phase 2 (commit + broadcast)
 
-- **Module:** `server.rs::commit_handler` → `publisher.rs::create_and_broadcast_inscription`
-- **Behaviour:** verifies the client's Schnorr commitment, builds a Taproot commit+reveal tx pair, mines a txid prefix `4242` (max 400 000 attempts in `publisher.rs::inscription_txs`), broadcasts both txs, then calls `account_server.rs::receive_coin` to deliver the coin to the recipient
-- **Tests:** `server.rs::tests::commit_missing_body_returns_error`, `commit_nonexistent_proof_id_returns_404`. **No happy-path broadcast test** — would require a live Bitcoin signet/regtest
+- **Module:** `router.rs::commit_handler` → `publisher.rs::create_and_broadcast_inscription`
+- **Behaviour:** verifies the client's Schnorr commitment, builds a Taproot commit+reveal tx pair, mines a txid prefix `4242` (max 400 000 attempts in `publisher.rs::inscription_txs`), broadcasts both txs, then calls `account_node.rs::receive_coin` to deliver the coin to the recipient
+- **Tests:** `router.rs::tests::commit_missing_body_returns_error`, `commit_nonexistent_proof_id_returns_404`. **No happy-path broadcast test** — would require a live Bitcoin signet/regtest
 
 #### Receive coin
 
-- **Module:** `server.rs::receive_coin_handler` → `account_server.rs::receive_coin`
+- **Module:** `router.rs::receive_coin_handler` → `account_node.rs::receive_coin`
 - **Behaviour:** replay-protected via per-account `coin_history` SMT
-- **Tests:** `account_server.rs::tests::test_receive_duplicate_coin_rejected`, `test_receive_updates_balance`
+- **Tests:** `account_node.rs::tests::test_receive_duplicate_coin_rejected`, `test_receive_updates_balance`
 
 #### Download coin proof
 
-- **Module:** `server.rs::get_proof_handler` → `ProofStore::get_proof`
+- **Module:** `router.rs::get_proof_handler` → `ProofStore::get_proof`
 - **Behaviour:** streams the binary serialised `CoinProof` (`Vec<u8>` from bincode) with content-type `application/octet-stream`
-- **Tests:** `server.rs::tests::proof_not_found_returns_404`
+- **Tests:** `router.rs::tests::proof_not_found_returns_404`
 
 #### Claim username
 
-- **Module:** `server.rs::claim_username_handler` → `username.rs::UsernameStore::claim`
-- **Behaviour:** verifies Schnorr signature over `SHA256(username || pubkey || timestamp)` (5 min skew); writes to `usernames.bin` (atomic)
-- **Tests:** `server.rs::tests::claim_username_*` (3 tests) + `username.rs::tests::*` (8 tests covering valid charset, duplicates, persistence)
+- **Module:** `router.rs::claim_username_handler` → `username.rs::UsernameStore::claim`
+- **Behaviour:** verifies Schnorr signature over `SHA256(username || pubkey || timestamp)` (5 min skew); persists to the Postgres `usernames` table via `db::claim_username` (`INSERT … ON CONFLICT DO NOTHING`)
+- **Tests:** `router.rs::tests::claim_username_*` (3 tests) + `username.rs::tests::*` (8 tests covering valid charset, duplicates, persistence)
 
 #### Resolve username
 
-- **Module:** `server.rs::resolve_username_handler` → `username.rs::UsernameStore::resolve`
+- **Module:** `router.rs::resolve_username_handler` → `username.rs::UsernameStore::resolve`
 - **Behaviour:** if exact username unknown, falls back to hex prefix matching against known addresses. Case-insensitive
-- **Tests:** `server.rs::tests::resolve_unknown_username_returns_404`, `resolve_minting_address_by_hex_prefix`, `username.rs::tests::resolve_is_case_insensitive`
+- **Tests:** `router.rs::tests::resolve_unknown_username_returns_404`, `resolve_minting_address_by_hex_prefix`, `username.rs::tests::resolve_is_case_insensitive`
 
 #### LNURL-Pay metadata and callback
 
-- **Module:** `server.rs::lnurlp_handler`, `server.rs::lnurl_callback_handler`
+- **Module:** `router.rs::lnurlp_handler`, `router.rs::lnurl_callback_handler`
 - **Behaviour:** thin stub implementation of [LNURL-pay](https://github.com/lnurl/luds/blob/luds/06.md). Metadata returned for known usernames; callback returns a phase-2 error (not wired to a real BOLT-11 invoice generator yet)
-- **Tests:** `server.rs::tests::lnurlp_known_address_returns_pay_request`, `lnurlp_unknown_user_returns_404`, `lnurl_pay_callback_returns_phase2_error`
+- **Tests:** `router.rs::tests::lnurlp_known_address_returns_pay_request`, `lnurlp_unknown_user_returns_404`, `lnurl_pay_callback_returns_phase2_error`
 
 #### Bitcoin block scanner
 
 - **Module:** `scanner.rs::scan_for_inscriptions` / `InscriptionScanner::scan_from_block`. Loop spawned from `main.rs::main`. State saved between runs in `data/latest_block.bin`
-- **Behaviour:** polls Esplora; filters txs by txid prefix `4242`; extracts Taproot inscription content via `extract_inscription_content`; deserialises as `Commitment`; calls callback in `main.rs` which verifies the signature and updates state
+- **Behaviour:** subscribes to the Esplora WebSocket (`scanner_ws.rs`, `ESPLORA_WS_URL`) for new tip events; drains the resulting mpsc channel in `scanner_runtime.rs`, walking forward through `block_status.next_best`; filters txs by txid prefix `4242`; extracts Taproot inscription content via `extract_inscription_content`; deserialises as `Commitment`; calls callback in `main.rs` which verifies the signature and updates state. Polling was removed in [issue #84](https://github.com/zk-coins/node/issues/84); see [CONTRIBUTING.md § "No polling — events only"](./CONTRIBUTING.md#no-polling--events-only) for the CI lint that enforces this
 - **Tests:** `scanner.rs::tests::parse_valid_inscription_into_commitment`, `reject_invalid_inscription_data`, `verify_commitment_signature_after_deserialization`, `parse_multi_chunk_inscription`. **No integration test** with a real Bitcoin block
 
 #### State persistence (SMT/MMR write)
 
-- **Module:** `state.rs::State::update` (atomic writes via `atomic_write` helper)
-- **Behaviour:** on each verified commitment: append SMT root to MMR, persist `smt.bin`, `mmr.bin`, `latest_block.bin`
+- **Module:** `state.rs::State::update` + scanner callback in `main.rs` → `db::persist_state_tx`
+- **Behaviour:** on each verified commitment: append SMT root to MMR, then atomically upsert the SMT bytes, MMR bytes, and last-processed block hash inside a single `BEGIN; UPSERT; UPSERT; UPSERT; COMMIT` against Postgres (issue #11 fix). Replaces the pre-migration `smt.bin` / `mmr.bin` / `latest_block.bin` sibling files
 - **Tests:** `state.rs::tests::*` (9 tests covering single + multiple updates, persistence roundtrip, proof generation/verification, empty MMR edge cases)
 
 #### Taproot inscription broadcast and Publisher UTXO lookup
@@ -187,17 +210,18 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 
 #### Planned
 
-- **Explorer endpoints (`/api/stats`, `/api/nullifiers`)** — to power an `explorer.zkcoins.app` companion app
+- **Explorer endpoints (`/api/stats`, `/api/nullifiers`)** — to power the `zkcoins.space` companion app
 - **Light client support** — let wallets verify nullifier set membership without scanning the chain themselves
 
 ### Configuration
 
 | Variable        | Default                     | Effect                                                                                                                                                        |
 | --------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SP1_PROVER`    | `cpu`                       | `mock` (no real proofs, instant), `cpu`, `cuda`, `network`. Tests run with `mock`.                                                                            |
-| `ESPLORA_URL`   | `https://mutinynet.com/api` | Esplora API endpoint (electrs or public)                                                                                                                      |
+| `ESPLORA_URL`   | `https://mutinynet.com/api` | Esplora REST API endpoint (electrs or public)                                                                                                                  |
+| `ESPLORA_WS_URL` | `wss://mutinynet.com/api/v1/ws` | Esplora WebSocket endpoint consumed by `scanner_ws` (issue #84). Override only when the upstream WS path changes                                       |
 | `IS_MAINNET`    | `false`                     | `true` for Bitcoin Mainnet, `false` for Mutinynet/Signet                                                                                                      |
 | `NETWORK_NAME`  | `Mutinynet` / `Mainnet`     | Human-readable name returned by `/api/info`. Default depends on `IS_MAINNET`                                                                                  |
+| `USERNAME_DOMAIN` | _(required, no default)_  | External hostname returned by `/api/info`. The client renders `<hex\|username>@<domain>` from this. **Server panics on startup if unset.** PRD sets `zkcoins.app`, DEV sets `dev.zkcoins.app` — silent fallback would let a misconfigured stage reproduce the cross-network routing bug (#95) |
 | `PUBLISHER_KEY` | test key                    | 32-byte hex private key for inscription publishing. **Required on mainnet** — server panics on startup if default test key is detected with `IS_MAINNET=true` |
 | `RUST_LOG`      | `info`                      | Log level                                                                                                                                                     |
 
@@ -207,37 +231,39 @@ Runtime config above shapes _behaviour_ of compiled-in routes. _Which_ routes ar
 
 Spawned from `main.rs::main`:
 
-1. **REST server** (`tokio::spawn` of `start_rest_server`) — Axum app bound to `0.0.0.0:4242`
-2. **Block scanner** (driven directly in main, not spawned) — `scan_for_inscriptions` runs an infinite loop polling Esplora every 30 s and writing state on each verified commitment
+1. **REST server** (`tokio::spawn` of `start_rest_node`) — Axum app bound to `0.0.0.0:4242`
+2. **Block scanner** (driven directly in main, not spawned) — `scan_for_inscriptions` consumes new tips from the WS-fed `mpsc<BlockHash>` channel produced by `scanner_ws::run_scanner_ws` (spawned as a tokio task at startup) and writes state on each verified commitment. No fixed-interval polling — see [issue #84](https://github.com/zk-coins/node/issues/84)
 
 ### Tests
 
-| Stack            | Command                                                   | What it covers                                                                                             |
-| ---------------- | --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `cargo test`     | `SP1_PROVER=mock cargo test -p server`                    | 45 tests covering only MVP code paths — what the PRD binary actually contains                              |
-| `cargo test`     | `SP1_PROVER=mock cargo test -p server --all-features`     | 58 tests including the gated `address-list`, `faucet`, `usernames`, and `lnurl` routes                     |
-| `cargo-llvm-cov` | `SP1_PROVER=mock cargo llvm-cov -p server --all-features` | Line coverage (latest run: **69.0% lines · 55.0% regions · 76.4% functions**) — measured with all gates on |
+| Stack            | Command                                       | What it covers                                                                                             |
+| ---------------- | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `cargo test`     | `cargo test -p node`                        | MVP code paths — what the DEV + PRD binary actually contains                                               |
+| `cargo test`     | `cargo test -p node --all-features`         | Including the gated `address-list` and `lnurl` routes                                                      |
+| `cargo-llvm-cov` | `cargo llvm-cov -p node`                    | Coverage gate enforced by CI: 100% lines + functions on the activated MVP surface                          |
 
-Per-module line coverage (latest run, all features):
+Per-module coverage (CI-gated):
 
-| Module              | Tests | Line % |
-| ------------------- | ----- | ------ |
-| `server.rs`         | 37    | 74.55% |
-| `account_server.rs` | 6     | 91.12% |
-| `state.rs`          | 9     | 97.01% |
-| `username.rs`       | 8     | 98.29% |
-| `scanner.rs`        | 4     | 50.99% |
-| `publisher.rs`      | 0     | 0.00%  |
-| `main.rs`           | 0     | 4.33%  |
+| Module              | Line + function % | Notes                                                                              |
+| ------------------- | ----------------- | ---------------------------------------------------------------------------------- |
+| `account_node.rs` | 100%              | send-coins flow, account ledger, scanner integration                               |
+| `scanner.rs`        | 100%              | Bitcoin block / inscription scanner                                                |
+| `router.rs`         | 100%              | REST handlers + request validation                                                 |
+| `state.rs`          | 100%              | Poseidon-based SMT + MMR                                                           |
+| `username.rs`       | 100%              | Username claim / resolve / LNURL                                                   |
+| `publisher.rs`      | excluded          | Bitcoin commit/reveal broadcasting — needs live signet/regtest node                |
+| `main.rs`           | excluded          | Runtime bootstrap                                                                  |
+| `*_runtime.rs`      | excluded          | Background-loop wrappers; covered indirectly via integration tests against handlers |
+| `scanner_ws.rs`     | excluded          | WS subscriber + reconnect loop; pure helpers (`parse_ws_frame`, `frame_signals_tx_seen`) are unit-tested, the I/O loop is covered indirectly via the publisher's `track-tx` round-trip |
 
-`publisher.rs` and `main.rs` are untested by design — they require a live Bitcoin node and a funded publisher key. CI runs both the MVP build (`cargo build/clippy`) and the all-features build, plus `cargo test --all-features`. Coverage is collected ad-hoc, not in CI.
+`publisher.rs`, `main.rs`, the `*_runtime.rs` wrappers, and `scanner_ws.rs` are excluded by design — they require a live Bitcoin node, a funded publisher key, a bound TCP socket, or an upstream WebSocket peer, none of which fit in a unit test. The exclusion list is encoded in the CI gate's `--ignore-filename-regex`; everything else is held at 100% lines + 100% functions. CI runs the MVP build, the all-features build, `cargo nextest run -p node -p shared --release --all-features --test-threads 1 -E 'not binary(api_remote)'` on the self-hosted M3 Ultra runner pool, and the `Coverage Gate (100% lines + functions)` job.
 
 ## Running
 
 Requires access to a Bitcoin node. See [Backend docs](https://docs.zkcoins.app/infrastructure/backend).
 
 ```bash
-SP1_PROVER=mock cargo run -p server
+cargo run -p node
 # Server starts on http://0.0.0.0:4242
 ```
 
@@ -254,59 +280,64 @@ Mint uses a single-phase flow (server holds the minting account key).
 ## Project Structure
 
 ```
-server/                # Axum REST API
+node/                    # Axum REST API
 ├── src/
-│   ├── main.rs        # Entry point, chain scanner, bind 0.0.0.0:4242
-│   ├── server.rs      # REST endpoints + /health
-│   ├── account_server.rs  # Account logic, coin proofs, prover calls
-│   ├── state.rs       # Sparse Merkle Tree + Merkle Mountain Range
-│   ├── scanner.rs     # Bitcoin block scanner (30s polling, prefix 4242)
-│   └── publisher.rs   # Taproot Inscription broadcaster (commit/reveal)
-shared/                # Shared types (Commitment, Invoice, ClientAccount)
-program/               # SP1 zkVM circuit types (AccountState, Coin, ProofData)
-├── src/merkle/        # SMT + MMR implementations
-script/                # Prover (real SP1 zkVM — create_account, update_account)
+│   ├── main.rs          # Entry point, chain scanner, bind 0.0.0.0:4242
+│   ├── router.rs        # REST endpoints + /health
+│   ├── runtime.rs       # Bootstrap: lazy_statics, Postgres pool, REST listener
+│   ├── account_node.rs  # Account logic, coin proofs, prover calls
+│   ├── state.rs         # Sparse Merkle Tree + Merkle Mountain Range
+│   ├── scanner.rs       # Bitcoin block scanner (event-driven via scanner_ws, prefix 4242)
+│   ├── scanner_ws.rs    # Esplora WebSocket subscriber (issue #84, replaces 30 s polling)
+│   └── publisher.rs     # Taproot Inscription broadcaster (commit/reveal)
+shared/                  # Shared types (Commitment, Invoice, ClientAccount)
+program-plonky2/         # Cyclic-recursion state-transition circuit (Plonky2 + Poseidon)
+├── src/
+│   ├── circuit/         # `build_circuit` + per-stage gadgets
+│   ├── hash.rs          # Poseidon-Goldilocks helpers (HashDigest, digest_to_bytes…)
+│   ├── merkle/          # Poseidon-based SMT + MMR
+│   ├── types.rs         # AccountState, Coin, ProofData
+│   └── inputs.rs        # CommitmentMerkleProofs, ProofType
+script-plonky2/          # Host-side prover wrapper (Prover struct)
 ```
+
+The last SP1 zkVM / SHA256 state is preserved at tag `v0.last-sp1` for historical reference. Recover with `git checkout v0.last-sp1 -- program/ script/`.
 
 ## Docker
 
 ```bash
-docker build -t zkcoin/server .
+docker build -t zkcoins/node .
 docker run -p 4242:4242 \
   --network bitcoin \
-  -e SP1_PROVER=mock \
   -e ESPLORA_URL=http://electrs-mainnet:3000 \
-  zkcoin/server
+  zkcoins/node
 ```
 
-The pre-built ELF (`elf/zkcoins-program`) is committed to the repo, so Docker builds do not require the Succinct toolchain — only standard Rust.
+Docker builds use nightly Rust auto-installed via `rust-toolchain` (no external toolchain needed). The Dockerfile lives at the repo root; `.github/workflows/deploy-dev.yaml` builds `zkcoins/node:beta` for `linux/arm64` and deploys to the DEV host on every push to `develop`.
 
 ## CI/CD
 
 | Workflow               | Trigger      | Action                                               |
 | ---------------------- | ------------ | ---------------------------------------------------- |
-| `deploy-dev.yaml`      | Push develop | Docker (ARM64) → `zkcoin/server:beta` → DEV server   |
-| `deploy-prd.yaml`      | Push main    | Docker (ARM64) → `zkcoin/server:latest` → PRD server |
+| `deploy-dev.yaml`      | Push develop | Docker (ARM64) → `zkcoins/node:beta` → DEV server   |
+| `deploy-prd.yaml`      | Push main    | Docker (ARM64) → `zkcoins/node:latest` → PRD server |
 | `auto-release-pr.yaml` | Push develop | Creates Release PR (develop → main)                  |
 
 Build time: ~5 minutes (Rust compilation on ARM64).
 
 ## Proving Strategy
 
-Staged scaling for the SP1 prover:
+zkCoins is **server-heavy**: a single trusted server generates all proofs, the wallet holds only the private key and signs BIP-340 Schnorr over `SHA256(serialize(asth) ‖ serialize(ocr))`. There is no in-browser Poseidon, no wasm-Plonky2 verifier, no in-app ZK gadget. See [`SPEC.md`](./SPEC.md) §13 + the memory `feedback_zkcoins_server_side_compute` for the full rationale.
 
-| Stage                          | When to move                                            | Configuration                                                                                                                                                                                        |
-| ------------------------------ | ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **0. Mock (DEV)**              | Development & testing                                   | `SP1_PROVER=mock` — no real proofs, instant responses. Required on DEV because CPU prover causes OOM (SP1 `update_account` exceeds available memory).                                                |
-| **1. CPU (PRD)**               | Production baseline                                     | `SP1_PROVER=cpu` running on Mac Studio M3 Ultra, 96 GB unified memory. `create_account` works, `update_account` needs memory tuning.                                                                 |
-| **2. Succinct Prover Network** | CPU latency becomes a bottleneck                        | `SP1_PROVER=network` — no hardware commitment, requires PROVE token deposit and accepts token-price exposure. See [docs.succinct.xyz](https://docs.succinct.xyz/docs/sp1/prover-network/quickstart). |
-| **3. Self-hosted CUDA**        | Network volume too costly or PROVE exposure undesirable | `SP1_PROVER=cuda` on x86 Linux with NVIDIA GPU (Compute Capability ≥ 8.6, ≥ 24 GB VRAM — RTX 4090 / 5090 / RTX 6000 Ada). Apple Silicon is not supported.                                            |
+**Hardware target: Mac Studio M3 Ultra** (96 GB unified RAM, single host). All on-box compute is available: Performance + Efficiency cores, the integrated Apple Silicon GPU (via Metal — currently unused because Plonky2 ships CPU + CUDA backends only), Neural Engine, AMX. **Not available**: external GPU accelerators (no NVIDIA, no CUDA), no cloud prover services (no Succinct Prover Network, no AWS GPU). Performance budget is what the M3 Ultra delivers; if a design overshoots, the design changes — we do not add external hardware.
 
-Skip stages only with concrete latency or cost data, not assumptions.
+Current cyclic-recursion proof times at production parameters (`MAX_IN_COINS = MAX_OUT_COINS = 8`, `INNER_PAD_BITS = 14`): 3–15 min wall per `prove_*` call. See [`program-plonky2/SESSION_STATE.md`](./program-plonky2/SESSION_STATE.md) for the detailed test-time table.
 
 ## Open Tasks
 
-- [ ] GPU acceleration (`SP1_PROVER=cuda`) or Succinct Prover Network
+- [ ] Step 9: signet end-to-end roundtrip against `dev.zkcoins.app` (create account → mint → send → receive)
+- [ ] Step 9: R2 performance measurement on the M3 Ultra (warm proof ≤ 5 s target ≤ 1 s; cold ≤ 30 s; peak mem < 64 GB)
+- [ ] Pre-mainnet hardening: D2/D10 (hiding recipient), D7 (reorg safety), D8 (per-coin nullifier-accum) — see `SPEC.md` §15
 - [ ] Explorer endpoints (`/api/stats`, `/api/nullifiers`)
 - [ ] Light client support
 
@@ -317,6 +348,19 @@ Skip stages only with concrete latency or cost data, not assumptions.
 | [zk-coins/app](https://github.com/zk-coins/app)           | Web application (frontend, PWA)                              |
 | [zk-coins/docs](https://github.com/zk-coins/docs)         | Documentation ([docs.zkcoins.app](https://docs.zkcoins.app)) |
 | [zk-coins/research](https://github.com/zk-coins/research) | Protocol research, upstream repos, paper PDF                 |
+
+## Design Documents
+
+| Document                                                | Scope                                                                                                          | Status |
+| ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ------ |
+| [`LIGHTNING_ATOMIC_SWAP.md`](./LIGHTNING_ATOMIC_SWAP.md) | Trustless LN ↔ zkCoins atomic swap design (HTLC on inscription funding tx)                                     | Draft  |
+| [`BITVM_BRIDGE.md`](./BITVM_BRIDGE.md)                  | BTC ↔ zkCoins trustless mint/burn bridge — landscape, BitVM2 / Glock / Mosaic comparison, N=100 federation target | Draft  |
+| [`BRIDGE_MVP.md`](./BRIDGE_MVP.md)                      | Engineering spec for the bridge MVP — 8 phases, file-by-file, 5–7 months effort estimate                       | Draft  |
+
+These documents describe the bridge and swap roadmap. They build on
+the Plonky2 migration that landed via PR [#17](https://github.com/zk-coins/node/pull/17)
+on 2026-05-18 and cross-reference `SPEC.md`, `MIGRATION_RESEARCH.md`,
+and `ROADMAP.md`.
 
 ## Protocol
 
