@@ -659,6 +659,12 @@ async fn test_load_root_indices_rejects_short_prev_root_blob() {
     // surface as `sqlx::Error::Decode` rather than panicking on the
     // `try_into::<[u8; 32]>()`.
     let (pool, _container) = setup_pool().await;
+    // Drop the 0010 length CHECK so the corrupt-row plant succeeds;
+    // subject of this test is the Rust-side defense, not the DB CHECK.
+    sqlx::query("ALTER TABLE mmr_root_index DROP CONSTRAINT mmr_root_index_prev_root_length")
+        .execute(&pool)
+        .await
+        .expect("drop mmr_root_index_prev_root_length");
     sqlx::query(
         "INSERT INTO mmr_root_index (prev_mmr_root, smt_root, leaf_index) \
          VALUES ($1, $2, $3)",
@@ -680,6 +686,12 @@ async fn test_load_root_indices_rejects_short_prev_root_blob() {
 async fn test_load_root_indices_rejects_short_smt_root_blob() {
     // Same defensive branch, for the `smt_root` column.
     let (pool, _container) = setup_pool().await;
+    // Drop the 0010 length CHECK so the corrupt-row plant succeeds;
+    // subject of this test is the Rust-side defense, not the DB CHECK.
+    sqlx::query("ALTER TABLE mmr_root_index DROP CONSTRAINT mmr_root_index_smt_root_length")
+        .execute(&pool)
+        .await
+        .expect("drop mmr_root_index_smt_root_length");
     sqlx::query(
         "INSERT INTO mmr_root_index (prev_mmr_root, smt_root, leaf_index) \
          VALUES ($1, $2, $3)",

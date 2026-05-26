@@ -213,6 +213,13 @@ async fn load_latest_block_rejects_wrong_length() {
     // and assert the loader returns an `sqlx::Error::Decode` rather
     // than panicking or silently truncating.
     let (pool, _container) = setup_pool().await;
+    // Drop the 0010 length CHECK so the corrupt-row plant succeeds;
+    // the subject of this test is the Rust-side defense in
+    // `load_latest_block`, not the DB-level CHECK.
+    sqlx::query("ALTER TABLE latest_block DROP CONSTRAINT latest_block_hash_length")
+        .execute(&pool)
+        .await
+        .expect("drop latest_block_hash_length");
     sqlx::query("INSERT INTO latest_block (id, block_hash) VALUES (1, $1)")
         .bind(vec![0u8; 7])
         .execute(&pool)

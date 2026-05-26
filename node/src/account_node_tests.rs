@@ -559,6 +559,19 @@ async fn test_load_from_pg_rejects_wrong_address_length() {
         .await
         .expect("connect_and_migrate failed");
 
+    // The 0010 CHECK constraint `accounts_address_length` would
+    // otherwise reject the wrong-length row at insert time, masking
+    // the actual subject of this test: the Rust-side
+    // `LoadAccountNodeError::BadAddressLength` defense in
+    // `load_from_pg`. Drop the constraint inside this per-test
+    // container so the corrupt-row plant succeeds; the constraint
+    // is itself covered indirectly by the migration test that runs
+    // `connect_and_migrate` here.
+    sqlx::query("ALTER TABLE accounts DROP CONSTRAINT accounts_address_length")
+        .execute(&pool)
+        .await
+        .expect("drop accounts_address_length");
+
     sqlx::query("INSERT INTO accounts (address, data) VALUES ($1, $2)")
         .bind(vec![0u8; 7]) // wrong length
         .bind(b"anything".to_vec())
