@@ -29,6 +29,15 @@
 //!   the `tokio::time::` reference in event-driven code (documented
 //!   in CONTRIBUTING.md, enforced by the CI lint added in the same
 //!   PR).
+//! - 30 s client-side Ping keepalive (`ping_interval`). A tokio
+//!   `interval` ticker running alongside the reader sends a
+//!   `WsMessage::Ping` to the peer every `ping_interval`. RFC 6455
+//!   §5.5 mandates a Pong response, which arrives on the same
+//!   reader and resets the liveness watchdog. Without this, a quiet
+//!   Mainnet-tier upstream (10-min mean block time) had nothing
+//!   flowing in the watchdog window and reconnected every ~2 min;
+//!   the keepalive turns the watchdog into the half-open detector
+//!   it was always meant to be (no pong + no event = dead).
 //! - On reconnect, fetch the current tip via the existing
 //!   `EsploraClient::get_tip_hash` and push that hash into the
 //!   channel too. This plugs the gap that opened while we were
@@ -75,6 +84,44 @@ pub const DEFAULT_ESPLORA_WS_URL: &str = "wss://mutinynet.com/api/v1/ws";
 /// frame at all (including `pong` / keep-alives) is a strong "the
 /// socket is half-open" signal.
 pub const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Default cadence of the client-side Ping keepalive. The scanner
+/// sends `WsMessage::Ping` to the peer every `DEFAULT_PING_INTERVAL`;
+/// the peer's mandatory Pong reply (RFC 6455 §5.5) arrives on the
+/// same reader and resets the liveness watchdog. Must stay strictly
+/// less than `DEFAULT_LIVENESS_TIMEOUT / 2` so that at least one
+/// ping + pong round-trip fits inside every watchdog window even on
+/// a marginal link (a single dropped pong should not be enough to
+/// trip the watchdog).
+pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Capacity of the bounded `mpsc` channel feeding the dedicated
+/// writer task in `connect_and_drain`. Fixed at `1` on purpose:
+///
+/// - Strict back-pressure. A second ping cannot queue until the
+///   first one has fully flushed onto the wire, so the producer
+///   side (the `select!` loop) observes a stalled writer
+///   immediately rather than absorbing it into a growing queue.
+/// - Latest-ping-wins is acceptable because we never have anything
+///   useful to "catch up" on — a stale ping in the queue would buy
+///   us nothing the next live ping wouldn't.
+/// - No unbounded queue. If the peer accepts TCP but never reads
+///   (a stalled writer), the producer's `out_tx.send(...).await`
+///   is the natural choke-point; combined with the
+///   `liveness_timeout`-bounded `tokio::time::timeout` wrapper
+///   around that send, a wedged writer becomes a reconnect rather
+///   than a deadlocked task.
+const WRITER_QUEUE_CAPACITY: usize = 1;
+
+/// Compile-time assertion that the ping cadence leaves enough margin
+/// inside the watchdog window. Encoded as a `const` evaluation so
+/// any future tweak to either constant trips the build instead of
+/// quietly drifting into a configuration where the watchdog could
+/// fire between pings.
+const _PING_INTERVAL_FITS_LIVENESS: () = assert!(
+    DEFAULT_PING_INTERVAL.as_millis() < DEFAULT_LIVENESS_TIMEOUT.as_millis() / 2,
+    "DEFAULT_PING_INTERVAL must be < DEFAULT_LIVENESS_TIMEOUT / 2"
+);
 
 /// Default initial reconnect delay. Doubled on each consecutive
 /// failure up to `DEFAULT_RECONNECT_MAX`.
@@ -173,6 +220,13 @@ pub struct ScannerWsConfig {
     /// Force-reconnect deadline for `ws.next()`. A silent half-open
     /// socket would otherwise wedge the scanner indefinitely.
     pub liveness_timeout: Duration,
+    /// Cadence of the client-side Ping keepalive. Each tick sends a
+    /// `WsMessage::Ping` frame; the peer's Pong reply (RFC 6455
+    /// §5.5) flows back through `ws.next()` and resets the liveness
+    /// watchdog. Without keepalive a quiet Mainnet upstream produced
+    /// nothing on the reader for minutes at a time and the watchdog
+    /// reconnected every ~2 min unnecessarily.
+    pub ping_interval: Duration,
 }
 
 impl ScannerWsConfig {
@@ -190,6 +244,7 @@ impl ScannerWsConfig {
             reconnect_min: DEFAULT_RECONNECT_MIN,
             reconnect_max: DEFAULT_RECONNECT_MAX,
             liveness_timeout: DEFAULT_LIVENESS_TIMEOUT,
+            ping_interval: DEFAULT_PING_INTERVAL,
         }
     }
 }
@@ -271,65 +326,228 @@ pub async fn run_scanner_ws(config: ScannerWsConfig, tip_tx: mpsc::Sender<BlockH
     }
 }
 
+/// Sentinel payload sent in every outbound Ping frame. The peer is
+/// required by RFC 6455 §5.5 to echo the payload back in its Pong;
+/// the value itself is otherwise irrelevant to the scanner.
+const PING_PAYLOAD: &[u8] = b"zkcoins-scanner-keepalive";
+
 /// Single connect → subscribe → drain cycle. Returns Ok on a clean
 /// close, Err on any failure. Caller schedules the reconnect.
+///
+/// Architecture: the WS stream is split into a reader (`SplitStream`)
+/// and a writer (`SplitSink`). The writer half is moved into a
+/// dedicated `tokio::spawn`ed writer task that drains a 1-slot
+/// `tokio::sync::mpsc::Receiver<WsMessage>` and runs `feed` + `flush`
+/// against the sink. The main loop's `tokio::select!` polls only the
+/// reader, the liveness watchdog, and an mpsc `out_tx.send().await`
+/// driven by the ping ticker.
+///
+/// Why the writer-task split (and not `sink.send(...).await` inline
+/// in the select): `SinkExt::send` is NOT cancel-safe — if the read
+/// arm wins a race against a half-completed send, the send-future is
+/// dropped and the sink can be left in a torn state mid-frame. By
+/// contrast `tokio::sync::mpsc::Sender::send().await` IS cancel-safe,
+/// and the writer task awaits the actual wire-level send to
+/// completion outside any `select!` boundary, so the sink is never
+/// cancelled mid-poll. The `select!`-on-ticker invariant that the
+/// liveness deadline is reset ONLY by inbound frames (never by our
+/// own send activity) is preserved exactly as before.
 async fn connect_and_drain(
     config: &ScannerWsConfig,
     tip_tx: &mpsc::Sender<BlockHash>,
 ) -> Result<(), WsError> {
-    let mut ws = connect_with_timeout(&config.url).await?;
+    let ws = connect_with_timeout(&config.url).await?;
     println!("scanner_ws: connected to {}", config.url);
 
+    let (mut sink, mut stream) = ws.split();
+
     let subscribe = serde_json::json!({ "action": "want", "data": ["blocks"] }).to_string();
-    ws.send(WsMessage::Text(subscribe))
+    sink.send(WsMessage::Text(subscribe))
         .await
         .map_err(|e| WsError::Subscribe(e.to_string()))?;
 
+    // Outbound writer task. Owns `sink` outright and drives every
+    // outbound frame to completion via `feed` + `flush` — the
+    // `feed`/`flush` split keeps the partial-write window the
+    // narrowest the API allows. The writer's body is plain
+    // `loop { rx.recv().await ... }`, with no `select!` around the
+    // send, so the send-future is never cancelled mid-poll and the
+    // sink can never be left in a torn state.
+    //
+    // The main loop talks to this task via `tokio::sync::mpsc::Sender`,
+    // whose `send().await` IS cancel-safe (documented: dropping the
+    // future before completion is sound — the message is never
+    // delivered, but the channel and sender remain consistent). This
+    // is the cancel-safety argument for the ping arm in the `select!`
+    // below: instead of `sink.send(Ping).await` (NOT cancel-safe) we
+    // do `out_tx.send(Ping).await`, and the writer task takes care of
+    // the actual wire-level send outside any `select!` boundary.
+    //
+    // The channel is bounded at `WRITER_QUEUE_CAPACITY` (= 1) so a
+    // stalled writer applies immediate back-pressure to the main loop
+    // (the second ping tick would block) — far preferable to growing
+    // an unbounded queue of pings against a peer that cannot drain
+    // them. The constant lives at the top of the file alongside the
+    // other tunables and carries the full rationale.
+    let (out_tx, mut out_rx) = mpsc::channel::<WsMessage>(WRITER_QUEUE_CAPACITY);
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            // `feed` queues the frame into the sink's internal
+            // buffer; `flush` drives it onto the wire. Splitting (vs.
+            // `send`) bounds the partial-write window and makes the
+            // two halves explicit. On error we surface it to the main
+            // loop by dropping `out_tx` from the writer side (closing
+            // the channel from the producer's perspective is achieved
+            // by the writer task exiting); the main loop's next
+            // `out_tx.send` will then fail and trigger reconnect.
+            sink.feed(msg).await?;
+            sink.flush().await?;
+        }
+        Ok::<(), tokio_tungstenite::tungstenite::Error>(())
+    });
+    // Always abort the writer when this function returns, regardless
+    // of how we exit. Without this, a returning main-loop iteration
+    // could leave the writer task parked in `out_rx.recv().await` and
+    // leak the `sink` (and thus the underlying TCP socket) until the
+    // tokio runtime tears down. `AbortOnDrop` makes that cleanup
+    // deterministic and exception-safe.
+    struct AbortOnDrop(tokio::task::JoinHandle<Result<(), tokio_tungstenite::tungstenite::Error>>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _writer_guard = AbortOnDrop(writer);
+
+    // Client-side Ping keepalive. The ticker's first tick fires
+    // immediately (default tokio behaviour); that's fine — sending an
+    // initial ping right after subscribe gives us the fastest possible
+    // confirmation that the peer is live. `Burst` is the default
+    // missed-tick behaviour; if a tick is missed (e.g. busy reader)
+    // we explicitly opt into `Delay` below so we never send a flurry
+    // of pings to "catch up". The line below carries the required
+    // `scanner-polling-ok:` marker for the CI lint enforcing
+    // CONTRIBUTING.md § "No polling — events only".
+    let mut ping_ticker = tokio::time::interval(config.ping_interval); // scanner-polling-ok: client-side WS Ping keepalive cadence (RFC 6455 §5.5), not a chain-tip poll
+    ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Track the liveness deadline manually rather than wrapping each
+    // `stream.next()` in `tokio::time::timeout`, because `select!`
+    // drops the losing branch's future on every iteration. With a
+    // wrapper-based watchdog the timer would silently reset every
+    // time the ping arm fires, defeating the watchdog. The manual
+    // deadline is reset ONLY when an inbound frame arrives — exactly
+    // the invariant we want.
+    let mut deadline = tokio::time::Instant::now() + config.liveness_timeout;
+
     loop {
-        let next = tokio::time::timeout(config.liveness_timeout, ws.next()).await;
-        let frame = match next {
-            Ok(Some(Ok(m))) => m,
-            Ok(Some(Err(e))) => return Err(WsError::Stream(e.to_string())),
-            Ok(None) => return Ok(()), // clean close
-            Err(_) => {
+        tokio::select! {
+            biased;
+
+            // Liveness watchdog. Fires only if no inbound frame has
+            // arrived for `liveness_timeout`. A live peer answers our
+            // pings, so this should only fire on a genuinely dead
+            // socket.
+            _ = tokio::time::sleep_until(deadline) => { // scanner-polling-ok: liveness watchdog deadline, not a chain-tip poll
                 return Err(WsError::Stream(format!(
                     "no frame in {:?} (liveness watchdog)",
                     config.liveness_timeout
                 )));
             }
-        };
 
-        match frame {
-            WsMessage::Text(text) => {
-                for hash in parse_ws_frame(&text) {
-                    if tip_tx.send(hash).await.is_err() {
-                        // Receiver dropped → scanner_runtime is
-                        // shutting down; drop any remaining hashes in
-                        // this frame (anchor_on_current_tip on the
-                        // next session would replay the latest tip
-                        // anyway). Issue #84 review (round 4) MAJOR 3.
-                        return Err(WsError::Stream("receiver dropped".into()));
+            // Outbound ping. RFC 6455 §5.5 requires the peer to reply
+            // with a Pong carrying the same payload; that Pong arrives
+            // on `stream.next()` and resets the deadline.
+            //
+            // Cancel-safety: `tokio::sync::mpsc::Sender::send().await`
+            // is documented as cancel-safe, so if the read arm wins
+            // this race the half-completed send-future can be dropped
+            // without corrupting the channel or the underlying sink.
+            // The actual wire-level write happens inside the dedicated
+            // writer task above, never inside this `select!`. A send
+            // error here means the writer task has exited (e.g. the
+            // peer closed mid-write) — surface as a stream error so
+            // the reconnect loop kicks in.
+            //
+            // Backpressure-deadlock guard: if the peer accepts TCP but
+            // never reads, the writer task wedges in `sink.flush()`
+            // forever. The 1-slot `out_tx` then fills with the first
+            // unflushed ping, and a subsequent `out_tx.send(...).await`
+            // would block this arm indefinitely — preventing the
+            // `select!` from advancing to the watchdog arm too. We wrap
+            // the send in `tokio::time::timeout(liveness_timeout, ...)`
+            // so a wedged writer surfaces as a reconnect-triggering
+            // error within the same upper bound the watchdog uses for
+            // "this connection is dead", keeping the two failure modes
+            // semantically aligned.
+            _ = ping_ticker.tick() => {
+                let send_fut = out_tx.send(WsMessage::Ping(PING_PAYLOAD.to_vec()));
+                match tokio::time::timeout(config.liveness_timeout, send_fut).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        return Err(WsError::Stream(format!("ping send failed: {}", e)));
+                    }
+                    Err(_) => {
+                        return Err(WsError::Stream(format!(
+                            "ping send stalled for {:?} (writer wedged, peer not reading)",
+                            config.liveness_timeout
+                        )));
                     }
                 }
             }
-            WsMessage::Binary(_) => {
-                // Esplora WS does not send binary frames for the
-                // `blocks` subscription, but tungstenite delivers
-                // protocol frames here too. Ignore quietly.
+
+            // Inbound frame. Any frame — Text, Binary, Ping, Pong,
+            // Close — counts as evidence the socket is alive and
+            // resets the deadline. The frame variant then drives the
+            // per-shape handling below.
+            //
+            // Cancel-safety: `StreamExt::next` is documented as
+            // cancel-safe (futures-util 0.3), so dropping this arm's
+            // future when another arm wins is sound — no frame is
+            // lost.
+            next = stream.next() => {
+                let frame = match next {
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) => return Err(WsError::Stream(e.to_string())),
+                    None => return Ok(()), // clean close
+                };
+                deadline = tokio::time::Instant::now() + config.liveness_timeout;
+
+                match frame {
+                    WsMessage::Text(text) => {
+                        for hash in parse_ws_frame(&text) {
+                            if tip_tx.send(hash).await.is_err() {
+                                // Receiver dropped → scanner_runtime is
+                                // shutting down; drop any remaining hashes in
+                                // this frame (anchor_on_current_tip on the
+                                // next session would replay the latest tip
+                                // anyway). Issue #84 review (round 4) MAJOR 3.
+                                return Err(WsError::Stream("receiver dropped".into()));
+                            }
+                        }
+                    }
+                    WsMessage::Binary(_) => {
+                        // Esplora WS does not send binary frames for the
+                        // `blocks` subscription, but tungstenite delivers
+                        // protocol frames here too. Ignore quietly.
+                    }
+                    WsMessage::Ping(_) | WsMessage::Pong(_) => {
+                        // tungstenite auto-responds to inbound Pings;
+                        // inbound Pongs are the response to OUR outbound
+                        // keepalive pings. Either way, the deadline
+                        // reset above is the whole job — nothing to do.
+                    }
+                    WsMessage::Close(_) => return Ok(()),
+                    // The `Frame` variant of `tungstenite::Message` only
+                    // surfaces under the `frame` cargo feature, which we do
+                    // not enable. Keep the arm here as a defensive catch-all
+                    // so a future tungstenite upgrade that flips the feature
+                    // default does not break the build via a non-exhaustive
+                    // match warning.
+                    #[allow(unreachable_patterns)]
+                    WsMessage::Frame(_) => {}
+                }
             }
-            WsMessage::Ping(_) | WsMessage::Pong(_) => {
-                // tungstenite handles ping/pong internally; nothing
-                // to do.
-            }
-            WsMessage::Close(_) => return Ok(()),
-            // The `Frame` variant of `tungstenite::Message` only
-            // surfaces under the `frame` cargo feature, which we do
-            // not enable. Keep the arm here as a defensive catch-all
-            // so a future tungstenite upgrade that flips the feature
-            // default does not break the build via a non-exhaustive
-            // match warning.
-            #[allow(unreachable_patterns)]
-            WsMessage::Frame(_) => {}
         }
     }
 }
