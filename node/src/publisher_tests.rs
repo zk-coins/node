@@ -132,7 +132,7 @@ fn inscription_txs_produces_taproot_commit_and_reveal_with_marker_prefix() {
     let publisher_address = test_publisher_address(config.network());
     let outpoints = vec![(fake_outpoint(0), 100_000u64)];
 
-    let (commit_tx, reveal_tx) = inscription_txs(
+    let (commit_tx, reveal_tx, _stats) = inscription_txs(
         b"Hello, zkCoins!",
         &publisher_address,
         outpoints,
@@ -173,7 +173,7 @@ fn inscription_txs_embeds_commitment_data_in_reveal_script() {
     let payload = b"Hello, zkCoins!".to_vec();
     let outpoints = vec![(fake_outpoint(0), 100_000u64)];
 
-    let (_commit_tx, reveal_tx) = inscription_txs(
+    let (_commit_tx, reveal_tx, _stats) = inscription_txs(
         &payload,
         &publisher_address,
         outpoints,
@@ -241,7 +241,7 @@ fn inscription_txs_chunks_large_commitment_data() {
     let payload: Vec<u8> = (0..600).map(|i| (i % 255 + 1) as u8).collect();
     let outpoints = vec![(fake_outpoint(0), 200_000u64)];
 
-    let (_commit_tx, reveal_tx) = inscription_txs(
+    let (_commit_tx, reveal_tx, _stats) = inscription_txs(
         &payload,
         &publisher_address,
         outpoints,
@@ -300,7 +300,7 @@ fn inscription_txs_signs_commit_input_with_taproot_keyspend() {
     let publisher_address = test_publisher_address(config.network());
     let outpoints = vec![(fake_outpoint(0), 100_000u64)];
 
-    let (commit_tx, _reveal_tx) = inscription_txs(
+    let (commit_tx, _reveal_tx, _stats) = inscription_txs(
         b"Hello, zkCoins!",
         &publisher_address,
         outpoints,
@@ -443,7 +443,7 @@ async fn broadcast_inscription_txs_returns_both_txids_on_success() {
     // Build a real (commit, reveal) pair — broadcast just serialises and
     // POSTs them, so the txids the function returns are the ones we
     // computed locally.
-    let (commit_tx, reveal_tx) = inscription_txs(
+    let (commit_tx, reveal_tx, _stats) = inscription_txs(
         b"Hello, zkCoins!",
         &publisher_address,
         outpoints,
@@ -483,7 +483,7 @@ async fn broadcast_inscription_txs_errors_when_track_tx_event_never_arrives() {
     let publisher_address = test_publisher_address(config.network());
     let outpoints = vec![(fake_outpoint(0), 100_000u64)];
 
-    let (commit_tx, reveal_tx) = inscription_txs(
+    let (commit_tx, reveal_tx, _stats) = inscription_txs(
         b"Hello, zkCoins!",
         &publisher_address,
         outpoints,
@@ -516,7 +516,7 @@ async fn broadcast_inscription_txs_propagates_esplora_error() {
     let publisher_address = test_publisher_address(config.network());
     let outpoints = vec![(fake_outpoint(0), 100_000u64)];
 
-    let (commit_tx, reveal_tx) = inscription_txs(
+    let (commit_tx, reveal_tx, _stats) = inscription_txs(
         b"Hello, zkCoins!",
         &publisher_address,
         outpoints,
@@ -556,9 +556,14 @@ async fn create_and_broadcast_inscription_fails_when_no_utxos() {
         .mount(&server)
         .await;
 
-    let err = create_and_broadcast_inscription(b"Hello, zkCoins!", &config, None)
-        .await
-        .expect_err("empty wallet must produce an Err");
+    let err = create_and_broadcast_inscription(
+        b"Hello, zkCoins!",
+        db::InscriptionKind::Mint,
+        &config,
+        None,
+    )
+    .await
+    .expect_err("empty wallet must produce an Err");
 
     assert!(
         err.to_string().contains("No UTXOs available"),
@@ -596,10 +601,14 @@ async fn create_and_broadcast_inscription_succeeds_end_to_end_with_mocked_esplor
         .mount(&server)
         .await;
 
-    let (commit_txid, reveal_txid) =
-        create_and_broadcast_inscription(b"Hello, zkCoins!", &config, None)
-            .await
-            .expect("end-to-end inscription should succeed against mocked Esplora");
+    let (commit_txid, reveal_txid) = create_and_broadcast_inscription(
+        b"Hello, zkCoins!",
+        db::InscriptionKind::Mint,
+        &config,
+        None,
+    )
+    .await
+    .expect("end-to-end inscription should succeed against mocked Esplora");
     assert_ne!(
         commit_txid, reveal_txid,
         "commit and reveal must be distinct transactions"
@@ -691,13 +700,14 @@ fn build_test_pair(commitment_data: &[u8]) -> (Transaction, Transaction) {
     };
     let publisher_address = test_publisher_address(config.network());
     let outpoints = vec![(fake_outpoint(0), 100_000u64)];
-    inscription_txs(
+    let (commit_tx, reveal_tx, _stats) = inscription_txs(
         commitment_data,
         &publisher_address,
         outpoints,
         TEST_PUBLISHER_KEY,
         &config,
-    )
+    );
+    (commit_tx, reveal_tx)
 }
 
 /// Insert a row in the supplied state directly via the db helper. Used
@@ -710,12 +720,15 @@ async fn seed_pending_row(
     status: &str,
 ) {
     let commit_txid = commit_tx.compute_txid();
+    let reveal_txid = reveal_tx.compute_txid();
     let commit_tx_bytes = bitcoin::consensus::serialize(commit_tx);
     let reveal_tx_bytes = bitcoin::consensus::serialize(reveal_tx);
     let commit_output_value = commit_tx.output[0].value.to_sat() as i64;
     let inserted = db::insert_pending_inscription(
         pool,
         commit_txid.as_byte_array(),
+        reveal_txid.as_byte_array(),
+        db::InscriptionKind::Mint,
         commitment_data,
         &commit_tx_bytes,
         &reveal_tx_bytes,
@@ -761,9 +774,14 @@ async fn broadcast_persists_constructed_row_before_commit_broadcast() {
         .mount(&server)
         .await;
 
-    let _err = create_and_broadcast_inscription(b"phaseb-1", &config, Some(&pool))
-        .await
-        .expect_err("broadcast must fail (400)");
+    let _err = create_and_broadcast_inscription(
+        b"phaseb-1",
+        db::InscriptionKind::Mint,
+        &config,
+        Some(&pool),
+    )
+    .await
+    .expect_err("broadcast must fail (400)");
 
     // Exactly one row, status = constructed (commit broadcast failed
     // so the advance to `commit_broadcast` never fired).
@@ -817,9 +835,14 @@ async fn broadcast_advances_to_commit_broadcast_after_commit_success() {
         .mount(&server)
         .await;
 
-    let _err = create_and_broadcast_inscription(b"phaseb-2", &config, Some(&pool))
-        .await
-        .expect_err("WS timeout (silent mock + no REST fallback) must surface");
+    let _err = create_and_broadcast_inscription(
+        b"phaseb-2",
+        db::InscriptionKind::Mint,
+        &config,
+        Some(&pool),
+    )
+    .await
+    .expect_err("WS timeout (silent mock + no REST fallback) must surface");
 
     // One row, advanced from `constructed` to `commit_broadcast` by
     // the commit-OK hook but stuck there because the reveal step
@@ -867,9 +890,14 @@ async fn broadcast_advances_to_reveal_broadcast_after_reveal_success() {
         .mount(&server)
         .await;
 
-    let _result = create_and_broadcast_inscription(b"phaseb-3", &config, Some(&pool))
-        .await
-        .expect("happy path must succeed");
+    let _result = create_and_broadcast_inscription(
+        b"phaseb-3",
+        db::InscriptionKind::Mint,
+        &config,
+        Some(&pool),
+    )
+    .await
+    .expect("happy path must succeed");
 
     // Final state is `reveal_broadcast` — see Phase E note above.
     assert_eq!(count_pending_rows(&pool).await, 1);
@@ -1211,10 +1239,14 @@ async fn mint_handler_advances_state_synchronously_with_broadcast() {
         .mount(&server)
         .await;
 
-    let (commit_txid, _reveal_txid) =
-        create_and_broadcast_inscription(b"phase-e-1", &config, Some(&pool))
-            .await
-            .expect("happy path must succeed");
+    let (commit_txid, _reveal_txid) = create_and_broadcast_inscription(
+        b"phase-e-1",
+        db::InscriptionKind::Mint,
+        &config,
+        Some(&pool),
+    )
+    .await
+    .expect("happy path must succeed");
 
     // Publisher leg stopped at `reveal_broadcast` — the `mint_handler`
     // caller is what flips it to `complete` after running
@@ -1248,10 +1280,13 @@ async fn mint_handler_advances_state_synchronously_with_broadcast() {
 async fn scanner_skips_already_integrated_commit_on_replay() {
     let (pool, _container) = setup_phaseb_pool().await;
     let commit_txid = [0x42u8; 32];
+    let reveal_txid = [0x43u8; 32];
 
     db::insert_pending_inscription(
         &pool,
         &commit_txid,
+        &reveal_txid,
+        db::InscriptionKind::Mint,
         b"phase-e-2",
         b"commit-tx-bytes",
         b"reveal-tx-bytes",
@@ -1300,9 +1335,12 @@ async fn scanner_falls_back_to_state_update_for_commits_not_in_pending() {
     // complete — status is still `reveal_broadcast`. The scanner is
     // the recovery path here.
     let crashed_txid = [0x55u8; 32];
+    let crashed_reveal_txid = [0x56u8; 32];
     db::insert_pending_inscription(
         &pool,
         &crashed_txid,
+        &crashed_reveal_txid,
+        db::InscriptionKind::Send,
         b"phase-e-3-crashed",
         b"commit-tx-crashed",
         b"reveal-tx-crashed",

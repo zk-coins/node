@@ -72,7 +72,7 @@ If two keys differ only at the very last bit (bit 255), `combined_len = 256` and
 
 **Where:** `program-plonky2/src/circuit/smt.rs`, ~line 676 (inside `#[cfg(test)] mod tests`).
 
-**Observation:** the helper that mirrors the off-circuit `NonInclusionProof::insert` padding loop and produces the `extension` siblings vector is currently inside the test module. The monolithic circuit (Step 5) and the eventual server prover wiring (Step 7) will need exactly this logic on the host side.
+**Observation:** the helper that mirrors the off-circuit `NonInclusionProof::insert` padding loop and produces the `extension` siblings vector is currently inside the test module. The monolithic circuit (Step 5) and the eventual node prover wiring (Step 7) will need exactly this logic on the host side.
 
 **Why not a bug:** tests pass. The helper is local to the test module by design; nothing depends on it externally yet.
 

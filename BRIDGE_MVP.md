@@ -486,7 +486,7 @@ binary files alongside `smt.bin` / `mmr.bin`. Names:
 - `pending_payouts.bin`
 
 Per `feedback_zkcoins_closed_test_env`, no migration code is needed —
-on first server start with this code, all three files are created
+on first node start with this code, all three files are created
 fresh.
 
 ### 6.5 Test plan (Phase 3)
@@ -519,7 +519,7 @@ A daemon that:
 ### 7.2 Where the code lives
 
 This is **not** in `zk-coins/node` directly — it's a separate
-crate that the server binary depends on. Proposed:
+crate that the node binary depends on. Proposed:
 
 ```
 zk-coins/node/
@@ -535,7 +535,7 @@ zk-coins/node/
 ```
 
 (Alternative: separate repo `zk-coins/bridge-signer`. MVP: keep in
-the server tree to avoid premature repo proliferation. Memory note:
+the node tree to avoid premature repo proliferation. Memory note:
 zkCoins works in `zk-coins/*` org with direct-to-develop pushes
 per `feedback_zkcoins_direct_develop`.)
 
@@ -652,14 +652,14 @@ zk-coins/node/
 ### 8.3 Operator flow
 
 ```
-1. Subscribe to `pending_payouts` events from server (see Phase 6)
+1. Subscribe to `pending_payouts` events from node (see Phase 6)
 2. On PendingAssignment with status changing to Assigned:
    a. Verify the burn-proof landed (zkCoins state confirms)
    b. Verify own BTC balance ≥ amount + fees
    c. Construct the Payout tx (add own input as fee, sign)
    d. Broadcast Payout tx to Bitcoin
    e. Wait for confirmation
-   f. Update server: payout fulfilled (txid)
+   f. Update node: payout fulfilled (txid)
 3. Submit KickOff tx claiming vault reimbursement
 4. Wait for 36-block challenge window
    a. If no challenge: post NoChallenge tx after timelock, retrieve
@@ -702,7 +702,7 @@ Negative (essential to validate the fraud-proof game works):
   operator cannot produce valid Assert → Disprove fires → bond
   slashed.
 - **Operator times out on fronting:** assigned operator does not
-  broadcast Payout within 64 blocks → server reassigns.
+  broadcast Payout within 64 blocks → node reassigns.
 - **Network partition:** simulate Bitcoin node disconnect for an
   operator during KickOff → operator retries on reconnect.
 
@@ -712,7 +712,7 @@ operator + watchtower implementations).
 
 ---
 
-## 9. Phase 6 — Bridge-Aware Server
+## 9. Phase 6 — Bridge-Aware Node
 
 ### 9.1 Goal
 
@@ -723,7 +723,7 @@ Extend `zk-coins/node` HTTP API with peg-in and peg-out endpoints.
 | File | Change |
 | ---- | ------ |
 | `node/src/bridge.rs` | **new** — bridge module |
-| `node/src/server.rs` | Add bridge endpoints to router |
+| `node/src/router.rs` | Add bridge endpoints to router |
 | `node/src/runtime.rs` | Wire bridge state into runtime |
 
 ### 9.3 Endpoints
@@ -736,17 +736,17 @@ GET  /api/bridge/quote
 POST /api/bridge/peg-in/initiate
        Body: { recipient_zkcoins_address, denomination, refund_btc_pubkey }
        Returns: { deposit_taproot_address, refund_timeout_block }
-       Server records the pending peg-in; user makes the Bitcoin deposit.
+       Node records the pending peg-in; user makes the Bitcoin deposit.
 
 POST /api/bridge/peg-in/finalize
        Body: { deposit_txid, deposit_vout, lcp_proof_bytes }
-       Server verifies the LCP, runs the prover to generate
+       Node verifies the LCP, runs the prover to generate
        IssuanceProof, returns ProofId to user; user signs the
        commitment and POSTs it back via the standard /api/commit.
 
 POST /api/bridge/peg-out/burn
        Body: { source_coins[], btc_recipient_address }
-       Server runs the prover to generate BurnProof, returns ProofId
+       Node runs the prover to generate BurnProof, returns ProofId
        and withdrawal_nonce.
 
 GET  /api/bridge/peg-out/status?nonce={nonce}
@@ -758,7 +758,7 @@ POST /api/bridge/peg-out/payout-template
 
 POST /api/bridge/peg-out/fronted
        (Operator-only.) Notify that an operator broadcast a Payout
-       tx; server marks PendingPayout as Fronted.
+       tx; node marks PendingPayout as Fronted.
 ```
 
 ### 9.4 Test plan (Phase 6)
@@ -878,7 +878,7 @@ one fraud-proof challenge.
 - No double-spends, no stuck funds, no unauthorised mints
 - Each scenario covered by automated integration test in the CI
   pipeline
-- Coverage gate maintained on all touched server/bridge code
+- Coverage gate maintained on all touched node/bridge code
 
 Estimated effort: **3–4 weeks** integration + debugging, risk
 **medium-high** (first full-stack run; expect timing and
@@ -897,14 +897,14 @@ state-machine bugs).
 | 3 — State extension | 1 week | Low |
 | 4 — MuSig2 signer | 3–4 weeks | Medium |
 | 5 — Operator + watchtower | 3 weeks | Medium |
-| 6 — Bridge-aware server | 2 weeks | Low |
+| 6 — Bridge-aware node | 2 weeks | Low |
 | 7 — Plonky2 → Groth16 | 3–4 weeks | Medium-high |
 | 8 — Integration on signet | 3–4 weeks | Medium-high |
 | **Total** | **21–28 weeks ≈ 5–7 months** | — |
 
 Assumes Plonky2 migration (PR #17) is complete before Phase 1
 starts. If parallelised carefully, Phases 1–3 can begin while PR #17
-finishes (since they don't depend on the server-side replace step).
+finishes (since they don't depend on the node-side replace step).
 
 ### 12.2 Risk register
 
@@ -943,7 +943,7 @@ finishes (since they don't depend on the server-side replace step).
    testing fast.
 
 4. **Where does `bridge-signer` live?** In-tree under
-   `server/crates/` or separate repo? MVP: in-tree.
+   `node/crates/` or separate repo? MVP: in-tree.
 
 5. **How is the LCP checkpoint advanced?** Manual operator commit
    for MVP. Automation = post-MVP.

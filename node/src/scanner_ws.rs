@@ -9,7 +9,7 @@
 //!
 //! TODO(structured-logging): this module still uses `println!` /
 //! `eprintln!` for runtime logs, consistent with the rest of the
-//! `server` crate's current conventions. Once the crate-wide
+//! `node` crate's current conventions. Once the crate-wide
 //! migration to `tracing` lands (out of scope for issue #84), the
 //! reconnect / liveness lines below are the first candidates for
 //! structured fields (peer URL, attempt count, backoff value) since

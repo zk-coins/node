@@ -1,18 +1,153 @@
-// Bootstrap-level tests for `main.rs`.
-//
-// Today the only thing here is regression coverage for the
-// `block_in_place(block_on(...))` bridge used inside the scanner's
-// synchronous `InscriptionCallback`. Without `block_in_place`, the
-// naive `Handle::current().block_on(persist_state_tx(…))` form panics
-// at runtime on the multi_thread tokio runtime (the default for
-// `#[tokio::main]`) — and "runtime" here means "the first time the
-// scanner sees a real inscription on Mutinynet". CI did not catch the
-// original form because no integration test ever drove the sync
-// callback through a real multi_thread worker; this test does.
+// Bootstrap-level tests for `main.rs` and the lib-root helpers it
+// invokes (`build_network_config_from_env`, the
+// `persist_state_from_sync_context` bridge).
 
 use super::*;
 use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
+
+// --- build_network_config_from_env -------------------------------
+//
+// These tests cover the panic-on-missing rules for the Mainnet path.
+// They use a fake `env` closure rather than `std::env::set_var` so
+// the panic side-effect cannot poison the `NETWORK_CONFIG`
+// lazy_static cell (shared across tests in this binary) and so the
+// tests do not race other test threads via the process-wide
+// environment.
+
+/// Build a closure-shaped env from a slice so the tests read like a
+/// table. Returns the first matching value or `None`.
+fn fake_env(entries: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+    move |k| {
+        entries.iter().find_map(|(name, value)| {
+            if *name == k {
+                Some((*value).to_string())
+            } else {
+                None
+            }
+        })
+    }
+}
+
+#[test]
+fn build_network_config_defaults_to_mutinynet_when_is_mainnet_unset() {
+    let cfg = build_network_config_from_env(fake_env(&[]));
+    assert!(!cfg.is_mainnet);
+    assert_eq!(cfg.url, "https://mutinynet.com/api");
+    assert_eq!(cfg.network_name, "Mutinynet");
+    assert!(cfg.ws_url.is_none());
+}
+
+#[test]
+fn build_network_config_defaults_to_mutinynet_when_is_mainnet_is_not_true() {
+    // Any value other than the literal string "true" is treated as
+    // "not mainnet" — same semantics as the legacy `.map(|v| v == "true")`
+    // pattern. Guards against accidental "TRUE" / "1" / "yes" thinking
+    // it switches the network.
+    let cfg = build_network_config_from_env(fake_env(&[("IS_MAINNET", "1")]));
+    assert!(!cfg.is_mainnet);
+    assert_eq!(cfg.url, "https://mutinynet.com/api");
+    assert!(cfg.ws_url.is_none());
+}
+
+#[test]
+fn build_network_config_respects_explicit_urls_on_mutinynet() {
+    let cfg = build_network_config_from_env(fake_env(&[
+        ("ESPLORA_URL", "http://electrs-mutinynet:3000"),
+        ("ESPLORA_WS_URL", "wss://example.test/ws"),
+        ("NETWORK_NAME", "Custom"),
+    ]));
+    assert!(!cfg.is_mainnet);
+    assert_eq!(cfg.url, "http://electrs-mutinynet:3000");
+    assert_eq!(cfg.ws_url.as_deref(), Some("wss://example.test/ws"));
+    assert_eq!(cfg.network_name, "Custom");
+}
+
+#[test]
+fn build_network_config_full_mainnet() {
+    let cfg = build_network_config_from_env(fake_env(&[
+        ("IS_MAINNET", "true"),
+        ("ESPLORA_URL", "http://electrs-mainnet:3000"),
+        ("ESPLORA_WS_URL", "wss://mempool.space/api/v1/ws"),
+    ]));
+    assert!(cfg.is_mainnet);
+    assert_eq!(cfg.url, "http://electrs-mainnet:3000");
+    assert_eq!(cfg.ws_url.as_deref(), Some("wss://mempool.space/api/v1/ws"));
+    assert_eq!(cfg.network_name, "Mainnet");
+}
+
+#[test]
+fn build_network_config_mainnet_with_explicit_network_name() {
+    // Mainnet path with `NETWORK_NAME` set: the override must win
+    // over the `if is_mainnet { "Mainnet" } else { "Mutinynet" }`
+    // default branch. Documents that operators can rename the chain
+    // label (e.g. "Mainnet-Canary") without changing IS_MAINNET.
+    let cfg = build_network_config_from_env(fake_env(&[
+        ("IS_MAINNET", "true"),
+        ("ESPLORA_URL", "http://electrs-mainnet:3000"),
+        ("ESPLORA_WS_URL", "wss://mempool.space/api/v1/ws"),
+        ("NETWORK_NAME", "Mainnet-Canary"),
+    ]));
+    assert!(cfg.is_mainnet);
+    assert_eq!(cfg.network_name, "Mainnet-Canary");
+}
+
+#[test]
+#[should_panic(expected = "IS_MAINNET=true requires ESPLORA_URL")]
+fn build_network_config_panics_on_mainnet_missing_esplora_url() {
+    let _ = build_network_config_from_env(fake_env(&[
+        ("IS_MAINNET", "true"),
+        ("ESPLORA_WS_URL", "wss://mempool.space/api/v1/ws"),
+    ]));
+}
+
+#[test]
+#[should_panic(expected = "IS_MAINNET=true requires ESPLORA_URL")]
+fn build_network_config_panics_on_mainnet_empty_esplora_url() {
+    // `ESPLORA_URL=` in a compose file resolves to `Some("")`. Without
+    // the empty-string filter in `env_or_unset`, the `expect` would
+    // be bypassed and `EsploraConfig.url` would be left as `""` —
+    // exactly the silent-misconfiguration class the panic is meant
+    // to catch.
+    let _ = build_network_config_from_env(fake_env(&[
+        ("IS_MAINNET", "true"),
+        ("ESPLORA_URL", ""),
+        ("ESPLORA_WS_URL", "wss://mempool.space/api/v1/ws"),
+    ]));
+}
+
+#[test]
+#[should_panic(expected = "IS_MAINNET=true requires ESPLORA_WS_URL")]
+fn build_network_config_panics_on_mainnet_missing_esplora_ws_url() {
+    let _ = build_network_config_from_env(fake_env(&[
+        ("IS_MAINNET", "true"),
+        ("ESPLORA_URL", "http://electrs-mainnet:3000"),
+    ]));
+}
+
+#[test]
+#[should_panic(expected = "IS_MAINNET=true requires ESPLORA_WS_URL")]
+fn build_network_config_panics_on_mainnet_whitespace_esplora_ws_url() {
+    // Whitespace-only values are also rejected — same misconfiguration
+    // class as the empty string, just easier to miss in a diff.
+    let _ = build_network_config_from_env(fake_env(&[
+        ("IS_MAINNET", "true"),
+        ("ESPLORA_URL", "http://electrs-mainnet:3000"),
+        ("ESPLORA_WS_URL", "   "),
+    ]));
+}
+
+// --- persist_state_from_sync_context -----------------------------
+//
+// Regression coverage for the `block_in_place(block_on(...))` bridge
+// used inside the scanner's synchronous `InscriptionCallback`.
+// Without `block_in_place`, the naive
+// `Handle::current().block_on(persist_state_tx(…))` form panics at
+// runtime on the multi_thread tokio runtime (the default for
+// `#[tokio::main]`) — and "runtime" here means "the first time the
+// scanner sees a real inscription on Mutinynet". CI did not catch
+// the original form because no integration test ever drove the sync
+// callback through a real multi_thread worker; this test does.
 
 /// Spin up a fresh `postgres:17` container, run all migrations, and
 /// return the live pool. Mirrors `db_tests::setup_pool` but lives in
