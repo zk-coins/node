@@ -111,7 +111,7 @@ pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(30);
 ///   `liveness_timeout`-bounded `tokio::time::timeout` wrapper
 ///   around that send, a wedged writer becomes a reconnect rather
 ///   than a deadlocked task.
-pub const WRITER_QUEUE_CAPACITY: usize = 1;
+const WRITER_QUEUE_CAPACITY: usize = 1;
 
 /// Compile-time assertion that the ping cadence leaves enough margin
 /// inside the watchdog window. Encoded as a `const` evaluation so

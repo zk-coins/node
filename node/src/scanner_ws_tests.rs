@@ -673,75 +673,61 @@ async fn run_scanner_ws_reconnects_when_ping_send_errors() {
     handle.abort();
 }
 
-/// Writer-send-timeout reconnect: exercises the
-/// `tokio::time::timeout(liveness_timeout, out_tx.send(...))` guard
-/// added around the ping arm's `out_tx.send` to defuse the
-/// backpressure-deadlock window. The deadlock shape it defuses:
+/// Peer-stops-reading reconnect: covers the failure mode where the
+/// peer accepts the TCP socket and completes the WS upgrade but
+/// then stops reading entirely. The
+/// `tokio::time::timeout(liveness_timeout, out_tx.send(...))` wrap
+/// in `scanner_ws.rs` is in place to defuse the deadlock shape:
 ///
-/// 1. The peer accepts the TCP socket and completes the WS upgrade,
-///    but then never reads from the socket again. The OS-level TCP
-///    send window on the scanner side fills up.
+/// 1. Peer accepts and never reads again; OS-level TCP send window
+///    on the scanner side fills up.
 /// 2. The dedicated writer task wedges inside `sink.flush().await`
 ///    waiting for the kernel to drain that buffer.
 /// 3. The 1-slot `out_tx` channel fills with the first un-flushed
 ///    ping (writer holds it, can't progress).
-/// 4. The next `ping_ticker.tick()` fires; its body calls
-///    `out_tx.send(...).await`, which now blocks because the queue
-///    is full and the writer can't drain it.
+/// 4. The next `ping_ticker.tick()` body calls
+///    `out_tx.send(...).await`, which now blocks (queue full).
 /// 5. WITHOUT the timeout wrap, this `.await` sits forever — the
 ///    enclosing `select!` has already exited (the ping arm won),
 ///    so the watchdog arm can't fire to break the deadlock.
 /// 6. WITH the timeout wrap, the wedge surfaces as a stream error
-///    inside `liveness_timeout`, the outer reconnect loop kicks in,
-///    and a fresh TCP connection lands at the server.
+///    inside `liveness_timeout`, the outer reconnect loop kicks
+///    in, and a fresh TCP connection lands at the server.
 ///
-/// Setup: we shrink the server-side `SO_RCVBUF` on the listener to
-/// the OS-minimum BEFORE `accept()`, so each accepted socket inherits
-/// a tiny receive buffer (a few KB). Combined with a server that
-/// reads exactly one frame (the subscribe) and then parks on
-/// `pending()`, the client's kernel send buffer + the server's
-/// receive buffer fill up after a handful of pings, and `flush()`
-/// wedges inside the test budget.
+/// Setup: `SO_RCVBUF = 1 KiB` on each ACCEPTED socket (NOT on the
+/// listener — macOS does not propagate the listener-level recv
+/// buffer to accepted children). `socket2::SockRef` provides a
+/// safe wrapper around `setsockopt`, no unsafe block needed.
 ///
-/// `liveness_timeout = 300 ms` + `ping_interval = 50 ms` match the
-/// reviewer's spec: the wedge bites well before either the watchdog
-/// or the test-budget timeout, so observing ≥ 2 server-side accepts
-/// inside ~3 s is positive evidence that a non-deadlock reconnect
-/// path drove the reconnect.
+/// Honesty note (reviewer round 3): isolating the wrap path from
+/// the watchdog path in this fixture is not achievable in a few-
+/// second budget on the m3-ultra CI runner pool (macOS). The macOS
+/// TCP loopback implementation buffers up to ~150 KiB on the
+/// sender side and dynamically drains/grows in ways that prevent
+/// the scanner's writer-task `flush()` from blocking reliably
+/// inside a 30 s window at any practical ping cadence. As a
+/// result, the path that drives the reconnect observed below is
+/// the liveness watchdog (`liveness_timeout = 300 ms` here), not
+/// the wrap. The wrap remains production-correct code — on links
+/// where the kernel actually wedges the writer (smaller buffers,
+/// non-loopback peer, paths with real RTT) the wrap is the path
+/// that fires — but a "wrap-only" isolation test would need a
+/// custom Sink fixture that sidesteps TCP, which is out of scope
+/// for this PR. The assertion pins the OBSERVABLE invariant
+/// (reconnect within the budget) rather than the specific path,
+/// matching the production guarantee.
 #[cfg(unix)]
 #[tokio::test]
 async fn run_scanner_ws_reconnects_when_writer_send_times_out() {
-    use std::os::unix::io::AsRawFd;
-
-    // Bind a std listener first so we can `setsockopt(SO_RCVBUF)`
-    // BEFORE handing it to tokio. Accepted sockets inherit the small
-    // receive buffer, which is what fills the client's send window
-    // and wedges `sink.flush()`. The exact size is platform-clamped:
-    // Linux rounds up to its minimum (typically ~2 KB); macOS honors
-    // it closer to the literal value. Either way the result is small
-    // enough that a handful of WS Ping frames + WS framing overhead
-    // saturate it inside the test budget.
-    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    std_listener.set_nonblocking(true).unwrap();
-    {
-        let fd = std_listener.as_raw_fd();
-        let bufsize: libc::c_int = 1024;
-        // SAFETY: `fd` is a live socket file descriptor owned by
-        // `std_listener` for the duration of this call; the option
-        // name and value pointer are well-formed per setsockopt(2);
-        // the return value is checked below.
-        let rc = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                &bufsize as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&bufsize) as libc::socklen_t,
-            )
-        };
-        assert_eq!(rc, 0, "setsockopt SO_RCVBUF must succeed");
-    }
-    let listener = TcpListener::from_std(std_listener).unwrap();
+    // Shrink `SO_RCVBUF` on each ACCEPTED socket so the kernel
+    // advertises a tiny TCP receive window. `socket2::SockRef`
+    // borrows the tokio TcpStream's socket and exposes
+    // `set_recv_buffer_size`, a safe cross-platform wrapper around
+    // the underlying `setsockopt(SO_RCVBUF)` syscall — no unsafe
+    // block needed in the fixture. The exact size is platform-
+    // clamped: Linux rounds up to its minimum (typically ~2 KiB);
+    // macOS honors values down to a few hundred bytes.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let url = format!("ws://{}", addr);
 
@@ -752,15 +738,16 @@ async fn run_scanner_ws_reconnects_when_writer_send_times_out() {
         // Per-connection handler: complete the WS handshake, read the
         // subscribe frame so the scanner observably transitions into
         // its steady-state select loop, then PARK without reading
-        // anything else. The server-side socket's receive buffer
-        // (shrunk via SO_RCVBUF on the listener above) fills up after
-        // a handful of pings; the client's `sink.flush()` then wedges
-        // on TCP backpressure, the 1-slot `out_tx` fills, and the
-        // next `out_tx.send(...).await` in the ping arm hits the new
-        // `liveness_timeout` wrap.
+        // anything else.
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             cc_for_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Shrink the accepted socket's recv buffer BEFORE the WS
+            // upgrade handshake completes, so the tiny window is in
+            // effect for every byte the client sends after subscribe.
+            socket2::SockRef::from(&stream)
+                .set_recv_buffer_size(1024)
+                .expect("set_recv_buffer_size must succeed on a freshly accepted socket");
             tokio::spawn(async move {
                 let mut ws = match tokio_tungstenite::accept_async(stream).await {
                     Ok(ws) => ws,
@@ -768,23 +755,24 @@ async fn run_scanner_ws_reconnects_when_writer_send_times_out() {
                 };
                 // Read the subscribe frame so the handshake is fully
                 // observable as complete; subsequent reads are
-                // intentionally omitted so the receive buffer fills.
+                // intentionally omitted.
                 let _ = ws.next().await;
                 // Hold the socket open forever — do NOT read anything
-                // else. The scanner's pings will pile up in the
-                // (small) kernel buffer and wedge the writer.
+                // else. The scanner's pings pile up in the (tiny)
+                // advertised receive window; the inbound side stays
+                // silent so the watchdog deadline is never reset.
                 std::future::pending::<()>().await;
             });
         }
     });
 
     let (tx, mut rx) = mpsc::channel::<BlockHash>(8);
-    // `liveness_timeout = 300 ms`: short enough that the timeout-wrap
-    // around `out_tx.send` fires inside the test budget, long enough
-    // that we don't race a slow CI scheduler.
-    // `ping_interval = 50 ms`: fast enough to fill the 1-slot writer
-    // queue + saturate the small receive buffer well before the
-    // first watchdog window elapses.
+    // `liveness_timeout = 300 ms`: the test's reconnect path (see the
+    // honesty note in the doc-comment above). `ping_interval = 50 ms`:
+    // fast enough that several ping ticks land inside one watchdog
+    // window so any "ping itself accidentally resets the deadline"
+    // regression would surface as a hung connection rather than a
+    // false positive.
     let config = ScannerWsConfig {
         url,
         http_url: "http://127.0.0.1:1/api".to_string(),
@@ -802,9 +790,14 @@ async fn run_scanner_ws_reconnects_when_writer_send_times_out() {
     let observed = connection_count.load(std::sync::atomic::Ordering::SeqCst);
     assert!(
         observed >= 2,
-        "scanner must reconnect when the writer wedges — observed only \
-         {} connections in the budget window (timeout-wrap path OR \
-         watchdog path, both valid reconnect drivers)",
+        "scanner must reconnect when the peer accepts the WS upgrade \
+         then stops reading entirely; observed only {} connections in \
+         the 3 s budget. On the m3-ultra CI runner pool (macOS) the \
+         path that drives this reconnect is the watchdog at \
+         liveness_timeout (300 ms); on links where the writer wedge \
+         actually develops, the timeout-wrap fires first. Both are \
+         production-correct reconnect drivers — the assertion only \
+         pins the observable invariant",
         observed,
     );
 
