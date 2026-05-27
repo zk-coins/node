@@ -27,20 +27,45 @@ use crate::publisher::EsploraConfig;
 use crate::username::UsernameStore;
 use crate::{NETWORK_CONFIG, USERNAME_DOMAIN};
 
-/// Verify a Schnorr signature over send request fields.
-/// Message = SHA256(account_address || recipient || amount || timestamp)
-fn verify_send_signature(request: &SendCoinRequest) -> Result<(), &'static str> {
-    let signature_hex = request.signature.as_deref().ok_or("Missing signature")?;
-    let timestamp = request.timestamp.ok_or("Missing timestamp")?;
+/// Maximum allowed clock skew between the wallet's signed timestamp
+/// and the server's wall clock. Matches the legacy in-helper window
+/// extracted into [`check_timestamp_window`] so the existing app
+/// behaviour is unchanged.
+pub(crate) const MAX_TIMESTAMP_SKEW_SECS: u64 = 300;
 
-    // Reject requests older than 5 minutes
+/// Validate that `timestamp` is within [`MAX_TIMESTAMP_SKEW_SECS`] of
+/// the server's wall clock. Extracted so signed handlers can run the
+/// timestamp gate explicitly BEFORE `verify_send_signature` — emitting
+/// the distinct `"Request timestamp too old or in the future"` string
+/// the app's `KNOWN_SERVER_ERRORS` table maps. Folding it back into the
+/// signature path would collapse both branches to
+/// `"Signature verification failed"`, hiding a clock-skew misconfiguration
+/// behind a generic crypto failure.
+pub(crate) fn check_timestamp_window(timestamp: u64) -> Result<(), &'static str> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    if now.abs_diff(timestamp) > 300 {
+    if now.abs_diff(timestamp) > MAX_TIMESTAMP_SKEW_SECS {
         return Err("Request timestamp too old or in the future");
     }
+    Ok(())
+}
+
+/// Verify a Schnorr signature over send request fields.
+/// Message = SHA256(account_address || recipient || amount || timestamp)
+///
+/// Callers MUST run [`check_timestamp_window`] first — this helper no
+/// longer enforces the freshness window so the handler can surface
+/// `"Request timestamp too old or in the future"` as its own status,
+/// rather than collapsing it into `"Signature verification failed"`.
+/// `request.signature` and `request.timestamp` are also required by the
+/// time this helper runs (the handler returns 401 with
+/// `"Missing signature"` / `"Missing timestamp"` upstream); the
+/// `Option`-shaped `?` arms below stay as defence-in-depth.
+fn verify_send_signature(request: &SendCoinRequest) -> Result<(), &'static str> {
+    let signature_hex = request.signature.as_deref().ok_or("Missing signature")?;
+    let timestamp = request.timestamp.ok_or("Missing timestamp")?;
 
     // Build the message: SHA256(account_address || recipient || amount || timestamp)
     let mut hasher = Sha256::new();
@@ -624,15 +649,37 @@ async fn send_coin_handler(
 ) -> impl IntoResponse {
     println!("Received send post request...");
 
-    // Verify sender signature if provided (graceful: skip if not present for backwards compat)
-    if request.signature.is_some() {
-        if let Err(e) = verify_send_signature(&request) {
-            eprintln!("Signature verification failed: {}", e);
-            return handler_error_response(
-                StatusCode::UNAUTHORIZED,
-                "Signature verification failed",
-            );
-        }
+    // The pre-PR back-compat shape silently skipped signature
+    // verification when `request.signature` was absent. That left
+    // `/api/send` reachable by an unsigned attacker as long as the
+    // sender address was known to the server — a hard-to-spot
+    // security regression. Make signature + timestamp mandatory and
+    // surface the distinct app-known strings so the client's error
+    // mapping ladders correctly (`"Missing signature"` →
+    // `"Anfrage ist nicht signiert."`, etc.).
+    //
+    // Run the timestamp gate BEFORE the signature crypto so a stale
+    // request reports `"Request timestamp too old or in the future"`
+    // rather than collapsing to a generic
+    // `"Signature verification failed"`.
+    // signature + timestamp are both load-bearing — the signature is
+    // computed over the timestamp. Absent timestamp is a malformed
+    // signed-payload; surface the same `"Missing signature"` string
+    // since neither half is independently useful and the app only
+    // maps one error code for this branch.
+    if request.signature.is_none() || request.timestamp.is_none() {
+        return handler_error_response(StatusCode::UNAUTHORIZED, "Missing signature");
+    }
+    let timestamp = request
+        .timestamp
+        .expect("timestamp presence checked immediately above");
+    if let Err(e) = check_timestamp_window(timestamp) {
+        eprintln!("Timestamp window check failed: {}", e);
+        return handler_error_response(StatusCode::UNAUTHORIZED, e);
+    }
+    if let Err(e) = verify_send_signature(&request) {
+        eprintln!("Signature verification failed: {}", e);
+        return handler_error_response(StatusCode::UNAUTHORIZED, "Signature verification failed");
     }
 
     // Create converted addresses (from_address and to_address)
@@ -1238,20 +1285,38 @@ async fn mint_handler(
     // `mint_handler` passes a single-element `vec![Invoice::new(...)]`
     // to `prepare_mint`; `send_coins_inner` builds `coin_proofs` with
     // `out_coins.len() == coin_templates.len() == invoices.len() == 1`,
-    // so the Ok-arm Vec has length exactly 1 — `pop()` is total.
-    let proof_id = state.proof_store.add_proof(
-        coin_proofs
-            .pop()
-            .expect("send_coins returns exactly one coin_proof for single-invoice mint"),
-    );
+    // so the Ok-arm Vec has length exactly 1.
+    //
+    // Surface the prover's post-mint hash pair on the response. Today
+    // the wallet client needs `prev_commitment_pubkey` for the next
+    // send, which it derives from the proof file fetched via
+    // `GET /api/proof/:id` — but the matching account_state_hash and
+    // output_coins_root are the same pair the send response carries
+    // for an ordinary user transition, so emitting them here lets the
+    // client advance its local snapshot atomically with the mint
+    // response (one round-trip instead of two). Source: the prover's
+    // public inputs on the freshly-built coin proof — identical
+    // derivation to the one `send_coin_handler` performs.
+    let final_coin_proof = coin_proofs
+        .pop()
+        .expect("send_coins returns exactly one coin_proof for single-invoice mint");
+    let pis: [zkcoins_program::F; zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] =
+        final_coin_proof.proof.public_inputs
+            [..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
+            .try_into()
+            .expect("Plonky2 Proof emits N_PROOF_DATA_PUBLIC_INPUTS field elements");
+    let proof_data = ProofData::from_field_elements(&pis);
+    let ash_hex = Some(hex::encode(digest_to_bytes(&proof_data.account_state_hash)));
+    let ocr_hex = Some(hex::encode(digest_to_bytes(&proof_data.output_coins_root)));
+    let proof_id = state.proof_store.add_proof(final_coin_proof);
     (
         StatusCode::OK,
         Json(SendCoinResponse {
             success: true,
             error: None,
             proof_id: Some(proof_id),
-            account_state_hash: None,
-            output_coins_root: None,
+            account_state_hash: ash_hex,
+            output_coins_root: ocr_hex,
         }),
     )
 }
@@ -1658,17 +1723,15 @@ async fn claim_username_handler(
             .into_response();
     }
 
-    // Verify timestamp freshness (5 min window)
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if now.abs_diff(request.timestamp) > 300 {
+    // Verify timestamp freshness (shared 5 min window with
+    // `send_coin_handler`). Uses the same string the send path emits so
+    // the app's `KNOWN_SERVER_ERRORS` mapping ladders identically.
+    if let Err(e) = check_timestamp_window(request.timestamp) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(LnurlErrorResponse {
                 status: "ERROR".into(),
-                reason: "Timestamp too old or in the future".into(),
+                reason: e.into(),
             }),
         )
             .into_response();

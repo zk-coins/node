@@ -728,29 +728,30 @@ fn send_signature_rejects_missing_timestamp() {
 }
 
 #[test]
-fn send_signature_rejects_expired_timestamp() {
+fn check_timestamp_window_rejects_expired_timestamp() {
+    // `verify_send_signature` no longer enforces the timestamp window
+    // — that gate lives in `check_timestamp_window` and is run by the
+    // handler explicitly so the distinct app-known string surfaces.
     let old_timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
         - 600; // 10 minutes ago
-    let request = SendCoinRequest {
-        account_address: "0x".to_string() + &hex::encode([1u8; 32]),
-        recipient: "0x".to_string() + &hex::encode([2u8; 32]),
-        amount: 100,
-        public_key: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
-            .parse()
-            .unwrap(),
-        next_public_key: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
-            .parse()
-            .unwrap(),
-        prev_commitment_pubkey: None,
-        signature: Some("ab".repeat(64)),
-        timestamp: Some(old_timestamp),
-    };
-    let result = verify_send_signature(&request);
+    let result = crate::router::check_timestamp_window(old_timestamp);
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("timestamp"));
+    assert_eq!(
+        result.unwrap_err(),
+        "Request timestamp too old or in the future"
+    );
+}
+
+#[test]
+fn check_timestamp_window_accepts_fresh_timestamp() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(crate::router::check_timestamp_window(now).is_ok());
 }
 
 #[test]
@@ -2931,7 +2932,7 @@ async fn receive_coin_duplicate_returns_success_false() {
 }
 
 #[tokio::test]
-async fn send_without_signature_skips_verification_and_proceeds() {
+async fn send_without_signature_returns_401_missing_signature() {
     use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
     use bitcoin::secp256k1::PublicKey;
     let secret_bytes = include_bytes!("../minting_secret.bin");
@@ -2946,8 +2947,12 @@ async fn send_without_signature_skips_verification_and_proceeds() {
         .unwrap()
         .public_key;
 
-    // signature field omitted entirely -> request.signature is None ->
-    // the verify_send_signature block is skipped (legacy/back-compat path).
+    // signature field omitted entirely -> request.signature is None.
+    // Before the require-signature fix, the handler silently skipped
+    // signature verification and proceeded with the send — a security
+    // gap that let an unauthenticated caller spend any known account.
+    // The handler now rejects with 401 + the app-known
+    // `"Missing signature"` string.
     let body = serde_json::json!({
         "account_address": "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS)),
         "recipient": "0x".to_string() + &hex::encode([1u8; 32]),
@@ -2959,10 +2964,91 @@ async fn send_without_signature_skips_verification_and_proceeds() {
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
-    let (status, _) = send_request(req).await;
-    // Without signature, the handler proceeds to send_coins on the
-    // minting account (seeded with 1_000_000 in test_state) and returns OK.
-    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
+    assert_eq!(v["success"], false);
+    assert_eq!(v["error"], "Missing signature");
+}
+
+#[tokio::test]
+async fn send_without_timestamp_returns_401_missing_signature() {
+    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
+    use bitcoin::secp256k1::PublicKey;
+    let secret_bytes = include_bytes!("../minting_secret.bin");
+    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
+    let secp = secp::Secp256k1::new();
+    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .public_key;
+    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
+        .unwrap()
+        .public_key;
+
+    // signature present but timestamp omitted: the signed payload is
+    // incomplete (the signature commits to the timestamp). Collapsed
+    // into the same `"Missing signature"` response since neither half
+    // is independently useful and the app maps only one error code.
+    let body = serde_json::json!({
+        "account_address": "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS)),
+        "recipient": "0x".to_string() + &hex::encode([1u8; 32]),
+        "amount": 1,
+        "public_key": hex::encode(pk_0.serialize()),
+        "next_public_key": hex::encode(pk_1.serialize()),
+        "signature": "ab".repeat(64),
+    });
+    let req = Request::post("/api/send")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
+    assert_eq!(v["error"], "Missing signature");
+}
+
+#[tokio::test]
+async fn send_with_stale_timestamp_returns_401_request_timestamp() {
+    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
+    use bitcoin::secp256k1::PublicKey;
+    let secret_bytes = include_bytes!("../minting_secret.bin");
+    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
+    let secp = secp::Secp256k1::new();
+    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .public_key;
+    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
+        .unwrap()
+        .public_key;
+
+    // Stale timestamp: well outside MAX_TIMESTAMP_SKEW_SECS. Signature
+    // present so the upstream Missing-signature gate passes — the
+    // request reaches `check_timestamp_window` and trips its dedicated
+    // 401 branch (router.rs:674-677). Distinct from the "Signature
+    // verification failed" string that the signature-verify path would
+    // emit otherwise.
+    let stale_timestamp: u64 = 1u64; // 1970, definitely > 300s in the past
+    let body = serde_json::json!({
+        "account_address": "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS)),
+        "recipient": "0x".to_string() + &hex::encode([1u8; 32]),
+        "amount": 1,
+        "public_key": hex::encode(pk_0.serialize()),
+        "next_public_key": hex::encode(pk_1.serialize()),
+        "signature": "ab".repeat(64),
+        "timestamp": stale_timestamp,
+    });
+    let req = Request::post("/api/send")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
+    assert_eq!(v["error"], "Request timestamp too old or in the future");
 }
 
 #[test]
@@ -3871,11 +3957,24 @@ async fn mint_happy_path_broadcasts_and_returns_proof_id() {
         proof_id > 0,
         "fresh-state mint must emit a non-zero proof_id"
     );
-    // Per the mint_handler contract, the mint response intentionally
-    // omits `account_state_hash` and `output_coins_root` (those are
-    // returned by /api/send instead).
-    assert!(v["account_state_hash"].is_null());
-    assert!(v["output_coins_root"].is_null());
+    // The mint response now carries the prover's post-mint
+    // `(account_state_hash, output_coins_root)` pair so the wallet
+    // can advance its local snapshot atomically with the mint
+    // response — same shape as the send response. Both fields are
+    // 32-byte hex strings extracted from `coin_proofs[0].proof
+    // .public_inputs` via `ProofData::from_field_elements`. See the
+    // `mint_response_carries_state_hash_and_coins_root` integration
+    // test in `node/tests/api_remote.rs` for the contract.
+    let ash_hex = v["account_state_hash"]
+        .as_str()
+        .expect("account_state_hash present on mint response");
+    let ash_bytes = hex::decode(ash_hex).expect("account_state_hash is hex");
+    assert_eq!(ash_bytes.len(), 32, "account_state_hash must be 32 bytes");
+    let ocr_hex = v["output_coins_root"]
+        .as_str()
+        .expect("output_coins_root present on mint response");
+    let ocr_bytes = hex::decode(ocr_hex).expect("output_coins_root is hex");
+    assert_eq!(ocr_bytes.len(), 32, "output_coins_root must be 32 bytes");
 
     // 4. Verify the persistence side-effects of the Ok arm: the
     //    accounts row for the MINTING address was upserted by
