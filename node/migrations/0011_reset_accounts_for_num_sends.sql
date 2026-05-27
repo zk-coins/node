@@ -1,0 +1,31 @@
+-- Reset the accounts table to absorb a non-backwards-compatible
+-- change to the bincode `Account` shape: PR adds the `num_sends: u32`
+-- field as the authoritative BIP-32 child-index counter the wallet
+-- needs after a seed restore (see `BalanceResponse::num_sends` doc on
+-- the router side).
+--
+-- bincode encodings of structs are positional + length-prefixed and
+-- there is no in-band "missing field" marker. A pre-PR account blob
+-- ends after the `balance: u64`; a post-PR `bincode::deserialize`
+-- call on that blob reads "unexpected end of input" when it tries
+-- to consume the next 4 bytes for `num_sends`. The fast and
+-- operationally cheap fix is to wipe the table: every persisted
+-- account is reconstructable from the on-chain commitment SMT plus
+-- the chain-history MMR via the scanner-replay path (`runtime.rs`
+-- bootstrap reads the SMT/MMR back; received coins re-land via
+-- `receive_coin` on the next mint/send to the address). The DEV +
+-- PRD environments are closed test envs per
+-- `feedback_zkcoins_closed_test_env.md` — the precedent for
+-- "wipe-and-replay accepts the dataloss" is set by 0010 (which
+-- explicitly notes "data is throw-away, closed test env" and wipes
+-- legacy esplora_log rows whose `triggered_by` value doesn't match
+-- the new vocabulary).
+--
+-- The dependent log/history tables (`account_history`,
+-- `coin_proof_store`) are NOT wiped — their rows are historical
+-- evidence of past sends/mints and don't reference the wiped
+-- account blob's bincode shape. The trigger `accounts_history_capture`
+-- that backfills `account_history` on every UPDATE will simply not
+-- fire until the next `/api/send` re-populates the accounts row.
+
+DELETE FROM accounts;

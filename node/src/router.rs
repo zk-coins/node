@@ -163,6 +163,31 @@ pub struct BalanceResponse {
     balance: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     username: Option<String>,
+    /// Authoritative BIP-32 child-index counter for the queried account.
+    ///
+    /// Equals the number of times this account has executed a
+    /// `/api/send` (`account.num_sends`). The wallet uses this value
+    /// in two places:
+    ///   1. As `numPubkeys` for the next signing/derivation: the
+    ///      pubkey for the next send is at index `num_sends`.
+    ///   2. To derive `prev_commitment_pubkey`: the pubkey committed
+    ///      by the previous send is at index `num_sends - 1` (or
+    ///      `None` when `num_sends == 0`, i.e. the wallet has never
+    ///      sent before).
+    ///
+    /// A freshly seed-restored wallet has no local memory of past
+    /// sends. Without this field the wallet would default to
+    /// `numPubkeys = 0` and either (a) collide on a second send
+    /// against the same SMT key, or (b) omit `prev_commitment_pubkey`
+    /// and receive `"prev_commitment_pubkey required for account
+    /// update"` from `send_coin_handler`. Both failure modes were
+    /// observed in the E2E `07-send.spec.ts::send-success` test.
+    ///
+    /// Always emitted (no `skip_serializing_if`) so the wallet can
+    /// rely on its presence — `0` is the canonical value for an
+    /// account that has never sent (matches `Account::new()`).
+    #[serde(default)]
+    num_sends: u32,
 }
 
 #[cfg(any(feature = "address-list", feature = "lnurl"))]
@@ -535,6 +560,7 @@ async fn get_balance_handler(
                     Json(BalanceResponse {
                         balance: 0,
                         username: None,
+                        num_sends: 0,
                     }),
                 )
             }
@@ -550,6 +576,7 @@ async fn get_balance_handler(
                 Json(BalanceResponse {
                     balance: 0,
                     username: None,
+                    num_sends: 0,
                 }),
             );
         }
@@ -560,14 +587,30 @@ async fn get_balance_handler(
             let username_store = lock_or_recover(&state.username_store);
             username_store.get_username(&address).map(String::from)
         };
+        // Read the per-account send counter so the wallet can hydrate
+        // its `numPubkeys` from the server (the authoritative source —
+        // see `BalanceResponse::num_sends` doc). Defaults to `0` for
+        // an unobserved address, matching `Account::new()`.
+        let num_sends = account_node
+            .get_account(&address)
+            .map(|a| a.num_sends)
+            .unwrap_or(0);
         match account_node.get_account_balance(&address) {
-            Ok(balance) => (StatusCode::OK, Json(BalanceResponse { balance, username })),
+            Ok(balance) => (
+                StatusCode::OK,
+                Json(BalanceResponse {
+                    balance,
+                    username,
+                    num_sends,
+                }),
+            ),
             // Unobserved address: canonical zero-balance state, not a not-found condition.
             Err(_) => (
                 StatusCode::OK,
                 Json(BalanceResponse {
                     balance: 0,
                     username,
+                    num_sends,
                 }),
             ),
         }
@@ -580,6 +623,7 @@ async fn get_balance_handler(
             Json(BalanceResponse {
                 balance: 0,
                 username: None,
+                num_sends: 0,
             }),
         )
     }
