@@ -1,9 +1,9 @@
--- Initial Postgres schema for the zkCoins node state-layer.
+-- Initial Postgres schema for the zkCoins server state-layer.
 --
 -- This migration is part of PR-A1 in the 3-PR Postgres migration
 -- series (file-based bincode -> Postgres). The schema is installed
 -- by `db::connect_and_migrate`; nothing here is wired into the
--- node bootstrap yet — that happens in PR-A2 (state + latest block)
+-- server bootstrap yet — that happens in PR-A2 (state + latest block)
 -- and PR-A3 (accounts + usernames).
 --
 -- Design notes:
