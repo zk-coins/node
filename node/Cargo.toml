@@ -68,14 +68,15 @@ sqlx = { version = "0.8", default-features = false, features = [
 # heuristic Alloy / Loki uses to derive `detected_level`. The trigger
 # was the post-deploy API E2E negative-path tests producing a burst of
 # false `error`-level lines on every `Deploy PRD` run — see PR for the
-# call-site survey.
-tracing = "0.1"
+# call-site survey. Version pinned at workspace root so any future crate
+# adopting the partial-migration path picks up the same version.
+tracing = { workspace = true }
 # `fmt` subscriber for the production binary; `env-filter` lets
 # operators tune verbosity via `RUST_LOG` without rebuilding. Kept
 # minimal — no JSON output, no telemetry exporter — because the
 # operator-facing aggregator (Alloy → Loki) parses the default
 # fmt-layer output today.
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

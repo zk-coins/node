@@ -393,10 +393,15 @@ pub(crate) fn map_send_coins_error(err: &str) -> (StatusCode, &'static str) {
     }
 }
 
-/// Build a `SendCoinResponse` for a failed `send_coins` call, paired
-/// with the appropriate HTTP status code.
-pub(crate) fn send_coins_error_response(err: &str) -> (StatusCode, Json<SendCoinResponse>) {
-    let (status, body) = map_send_coins_error(err);
+/// Build a `SendCoinResponse` for a failed `send_coins` call from a
+/// pre-mapped `(status, body)` tuple. Callers that need the status
+/// code separately (e.g. to route the log level off `is_server_error`)
+/// call `map_send_coins_error` once and thread the result through
+/// here, avoiding a redundant second mapping call.
+pub(crate) fn send_coins_error_response(
+    mapped: (StatusCode, &'static str),
+) -> (StatusCode, Json<SendCoinResponse>) {
+    let (status, body) = mapped;
     (
         status,
         Json(SendCoinResponse {
@@ -847,14 +852,16 @@ async fn send_coin_handler(
             // is caller-fixable input and logs at `info`; a 5xx-class
             // mapping (prover failure, unmapped string) stays at
             // `error` so the operator's existing alert rules still
-            // fire on a genuine prove failure.
-            let (status, _body) = map_send_coins_error(e);
-            if status.is_server_error() {
+            // fire on a genuine prove failure. Map once and thread the
+            // tuple into the response builder — `map_send_coins_error`
+            // is pure but the duplicate call was needless work.
+            let mapped = map_send_coins_error(e);
+            if mapped.0.is_server_error() {
                 tracing::error!("send_coins error: {}", e);
             } else {
-                tracing::info!("send_coins error: {} (status={})", e, status);
+                tracing::info!("send_coins error: {} (status={})", e, mapped.0);
             }
-            send_coins_error_response(e)
+            send_coins_error_response(mapped)
         }
     }
 }
@@ -1023,13 +1030,14 @@ async fn mint_handler(
             // the prover-failure / unmapped-string tail surfaces as
             // 5xx. Route the log level accordingly so the CI E2E
             // negative-path mints stop generating false error lines.
-            let (status, _body) = map_send_coins_error(e);
-            if status.is_server_error() {
+            // Map once and thread the tuple into the response builder.
+            let mapped = map_send_coins_error(e);
+            if mapped.0.is_server_error() {
                 tracing::error!("Mint prepare: err — {}", e);
             } else {
-                tracing::info!("Mint prepare: err — {} (status={})", e, status);
+                tracing::info!("Mint prepare: err — {} (status={})", e, mapped.0);
             }
-            return send_coins_error_response(e);
+            return send_coins_error_response(mapped);
         }
     };
 

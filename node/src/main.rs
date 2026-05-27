@@ -68,6 +68,13 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // `try_init` (not `init`) so a test binary that already installed
     // its own subscriber — or a second main invocation in a test
     // harness — does not panic the bootstrap.
+    //
+    // Partial-migration subscriber: routes `tracing::*` calls through fmt+EnvFilter.
+    // Many call sites in this crate still use `println!`/`eprintln!` (see TODO in
+    // scanner_ws.rs:11). Those continue to write directly to stdout/stderr and are
+    // not affected by RUST_LOG. The 4xx-validation paths in router.rs and
+    // account_node.rs are the first wave of the migration; see #(PR opening from
+    // this branch).
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
