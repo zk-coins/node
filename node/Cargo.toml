@@ -90,6 +90,15 @@ rand = "0.8"
 # the directory even when the test panics, so no test leaves a
 # leaked /tmp/zkcoins-* tree behind.
 tempfile = "3"
+# Used by `scanner_ws_tests` to shrink the OS TCP receive buffer on
+# the test server socket so a kernel-level backpressure wedge fires
+# inside a millisecond-scale test budget instead of needing minutes
+# of pings to fill a default-size buffer. `socket2::SockRef`
+# provides a safe, cross-platform wrapper around the underlying
+# `setsockopt(SO_RCVBUF)` syscall — no unsafe block needed in the
+# test fixture. Already a transitive dep via tokio/h2/reqwest, but
+# must be declared here to be reachable from test code.
+socket2 = "0.5"
 
 [features]
 # All non-MVP features are off by default. When a feature is not enabled, the
