@@ -8,7 +8,7 @@ use crate::account_node::{Account, AccountNode};
 use crate::state::State;
 
 /// Build a `PgPool` that points at nowhere — every query against it
-/// fails fast with a connect error. Used by the server-handler test
+/// fails fast with a connect error. Used by the node-handler test
 /// suite below so the handlers' persistence-side `.await` lines run
 /// the error branch (which mirrors the legacy file-IO best-effort
 /// semantics: log + continue, never fail the response). The matching
@@ -728,29 +728,30 @@ fn send_signature_rejects_missing_timestamp() {
 }
 
 #[test]
-fn send_signature_rejects_expired_timestamp() {
+fn check_timestamp_window_rejects_expired_timestamp() {
+    // `verify_send_signature` no longer enforces the timestamp window
+    // — that gate lives in `check_timestamp_window` and is run by the
+    // handler explicitly so the distinct app-known string surfaces.
     let old_timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
         - 600; // 10 minutes ago
-    let request = SendCoinRequest {
-        account_address: "0x".to_string() + &hex::encode([1u8; 32]),
-        recipient: "0x".to_string() + &hex::encode([2u8; 32]),
-        amount: 100,
-        public_key: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
-            .parse()
-            .unwrap(),
-        next_public_key: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
-            .parse()
-            .unwrap(),
-        prev_commitment_pubkey: None,
-        signature: Some("ab".repeat(64)),
-        timestamp: Some(old_timestamp),
-    };
-    let result = verify_send_signature(&request);
+    let result = crate::router::check_timestamp_window(old_timestamp);
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("timestamp"));
+    assert_eq!(
+        result.unwrap_err(),
+        "Request timestamp too old or in the future"
+    );
+}
+
+#[test]
+fn check_timestamp_window_accepts_fresh_timestamp() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(crate::router::check_timestamp_window(now).is_ok());
 }
 
 #[test]
@@ -975,7 +976,7 @@ async fn claim_username_mixed_case_input_normalised_before_hashing() {
         );
     }
 
-    // Send the mixed-case form. The server normalises, hashes over
+    // Send the mixed-case form. The node normalises, hashes over
     // the lowercase form, and the signature verifies.
     let body = serde_json::json!({
         "username": user_input,
@@ -1003,9 +1004,9 @@ async fn claim_username_mixed_case_input_normalised_before_hashing() {
 
 /// Counterpart to the test above: a wallet that signs over the RAW
 /// mixed-case input (legacy/buggy behaviour) must be rejected by the
-/// server, because the server hashes the normalised form. Without
+/// node, because the node hashes the normalised form. Without
 /// this, the case-mismatch squat is reachable: attacker signs `"Bob"`,
-/// server persists `"bob"`, the legitimate `bob` owner is locked out.
+/// node persists `"bob"`, the legitimate `bob` owner is locked out.
 #[tokio::test]
 async fn claim_username_raw_case_signature_rejected() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -1058,7 +1059,7 @@ async fn claim_username_raw_case_signature_rejected() {
     assert_eq!(
         status,
         StatusCode::UNAUTHORIZED,
-        "raw-case signature must fail; server hashes normalised form"
+        "raw-case signature must fail; node hashes normalised form"
     );
 }
 
@@ -1417,7 +1418,7 @@ async fn claim_username_invalid_signature_format_returns_422() {
     assert_eq!(resp.reason, "Invalid signature format");
 }
 
-/// Pool with no reachable server: `db::claim_username` returns an error
+/// Pool with no reachable Postgres: `db::claim_username` returns an error
 /// after the in-memory `precheck` passes. The handler must map that
 /// onto a 503. Mirrors `claim_propagates_db_error_when_pool_is_dead`
 /// from `username_tests.rs`, but exercises the handler's error arm.
@@ -2931,7 +2932,7 @@ async fn receive_coin_duplicate_returns_success_false() {
 }
 
 #[tokio::test]
-async fn send_without_signature_skips_verification_and_proceeds() {
+async fn send_without_signature_returns_401_missing_signature() {
     use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
     use bitcoin::secp256k1::PublicKey;
     let secret_bytes = include_bytes!("../minting_secret.bin");
@@ -2946,8 +2947,12 @@ async fn send_without_signature_skips_verification_and_proceeds() {
         .unwrap()
         .public_key;
 
-    // signature field omitted entirely -> request.signature is None ->
-    // the verify_send_signature block is skipped (legacy/back-compat path).
+    // signature field omitted entirely -> request.signature is None.
+    // Before the require-signature fix, the handler silently skipped
+    // signature verification and proceeded with the send — a security
+    // gap that let an unauthenticated caller spend any known account.
+    // The handler now rejects with 401 + the app-known
+    // `"Missing signature"` string.
     let body = serde_json::json!({
         "account_address": "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS)),
         "recipient": "0x".to_string() + &hex::encode([1u8; 32]),
@@ -2959,10 +2964,91 @@ async fn send_without_signature_skips_verification_and_proceeds() {
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
-    let (status, _) = send_request(req).await;
-    // Without signature, the handler proceeds to send_coins on the
-    // minting account (seeded with 1_000_000 in test_state) and returns OK.
-    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
+    assert_eq!(v["success"], false);
+    assert_eq!(v["error"], "Missing signature");
+}
+
+#[tokio::test]
+async fn send_without_timestamp_returns_401_missing_signature() {
+    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
+    use bitcoin::secp256k1::PublicKey;
+    let secret_bytes = include_bytes!("../minting_secret.bin");
+    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
+    let secp = secp::Secp256k1::new();
+    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .public_key;
+    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
+        .unwrap()
+        .public_key;
+
+    // signature present but timestamp omitted: the signed payload is
+    // incomplete (the signature commits to the timestamp). Collapsed
+    // into the same `"Missing signature"` response since neither half
+    // is independently useful and the app maps only one error code.
+    let body = serde_json::json!({
+        "account_address": "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS)),
+        "recipient": "0x".to_string() + &hex::encode([1u8; 32]),
+        "amount": 1,
+        "public_key": hex::encode(pk_0.serialize()),
+        "next_public_key": hex::encode(pk_1.serialize()),
+        "signature": "ab".repeat(64),
+    });
+    let req = Request::post("/api/send")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
+    assert_eq!(v["error"], "Missing signature");
+}
+
+#[tokio::test]
+async fn send_with_stale_timestamp_returns_401_request_timestamp() {
+    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
+    use bitcoin::secp256k1::PublicKey;
+    let secret_bytes = include_bytes!("../minting_secret.bin");
+    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
+    let secp = secp::Secp256k1::new();
+    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .public_key;
+    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
+        .unwrap()
+        .public_key;
+
+    // Stale timestamp: well outside MAX_TIMESTAMP_SKEW_SECS. Signature
+    // present so the upstream Missing-signature gate passes — the
+    // request reaches `check_timestamp_window` and trips its dedicated
+    // 401 branch (router.rs:674-677). Distinct from the "Signature
+    // verification failed" string that the signature-verify path would
+    // emit otherwise.
+    let stale_timestamp: u64 = 1u64; // 1970, definitely > 300s in the past
+    let body = serde_json::json!({
+        "account_address": "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS)),
+        "recipient": "0x".to_string() + &hex::encode([1u8; 32]),
+        "amount": 1,
+        "public_key": hex::encode(pk_0.serialize()),
+        "next_public_key": hex::encode(pk_1.serialize()),
+        "signature": "ab".repeat(64),
+        "timestamp": stale_timestamp,
+    });
+    let req = Request::post("/api/send")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
+    assert_eq!(v["error"], "Request timestamp too old or in the future");
 }
 
 #[test]
@@ -2971,10 +3057,10 @@ fn lock_or_recover_account_node_poisoned() {
     // copy of lock_or_recover's poison-recovery closure.
     let state_arc = Arc::new(Mutex::new(State::new()));
     let node = Arc::new(Mutex::new(AccountNode::new(Arc::clone(&state_arc))));
-    let server_clone = Arc::clone(&node);
+    let node_clone = Arc::clone(&node);
 
     let _ = std::thread::spawn(move || {
-        let _guard = server_clone.lock().unwrap();
+        let _guard = node_clone.lock().unwrap();
         panic!("intentional poison");
     })
     .join();
@@ -3046,7 +3132,7 @@ fn map_send_coins_error_unable_to_get_merkle_proofs_is_422() {
 #[test]
 fn map_send_coins_error_unable_to_get_mmr_inclusion_proof_is_422() {
     // Reachable from send_coins via get_merkle_proofs (account_node::236).
-    // Caller's previous_proof references a history root the server's MMR
+    // Caller's previous_proof references a history root the node's MMR
     // hasn't observed yet — stale snapshot, caller-fixable.
     let (status, body) = crate::router::map_send_coins_error(
         "Unable to get mmr inclusion proof for the previous root",
@@ -3062,7 +3148,7 @@ fn map_send_coins_error_unable_to_get_mmr_inclusion_proof_is_422() {
 fn map_send_coins_error_proof_public_inputs_too_short_is_500() {
     // Reachable from send_coins via get_merkle_proofs (account_node::232).
     // The proof bytes stored against the account are too short to
-    // decode N_PROOF_DATA_PUBLIC_INPUTS field elements — server-side
+    // decode N_PROOF_DATA_PUBLIC_INPUTS field elements — node-side
     // corruption or version mismatch, not caller-fixable.
     let (status, body) = crate::router::map_send_coins_error("Proof public_inputs too short");
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -3156,7 +3242,7 @@ fn map_send_coins_error_unknown_string_is_500_internal_error() {
     // A new `send_coins` error string we haven't mapped yet must NOT
     // accidentally surface as 200 OK / 4xx. The default arm is 500 with
     // a generic "internal error" body so the wallet treats it as a
-    // server problem and the operator finds the unmapped string in the
+    // node problem and the operator finds the unmapped string in the
     // `eprintln!` log.
     let (status, body) = crate::router::map_send_coins_error("a string we never added");
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -3188,7 +3274,7 @@ async fn send_with_unknown_account_returns_404_with_error_string() {
         .private_key;
 
     // An address that is well-formed (hex, 32 bytes) but never claimed
-    // an account on the server.
+    // an account on the node.
     let account_address = "0x".to_string() + &hex::encode([0xAAu8; 32]);
     let recipient = "0x".to_string() + &hex::encode([1u8; 32]);
     let amount: u64 = 50;
@@ -3549,8 +3635,8 @@ fn mint_test_state_without_minting_account() -> AppState {
     let state = mint_test_state();
     {
         let mut node = state.account_node.lock().unwrap();
-        // Reset to a brand-new server with no accounts at all. The
-        // `Arc<Mutex<State>>` inside `server` is replaced too, but the
+        // Reset to a brand-new node with no accounts at all. The
+        // `Arc<Mutex<State>>` inside `node` is replaced too, but the
         // shared `state_inner` is dropped on overwrite which is fine
         // — nothing else holds it after `mint_test_state` returns.
         *node = AccountNode::new(Arc::new(Mutex::new(State::new())));
@@ -3660,7 +3746,7 @@ async fn mint_insufficient_funds_returns_422() {
 /// no-state-advance contract that the prepare-then-commit refactor
 /// introduced: after a broadcast failure the in-memory
 /// `minting_account.num_pubkeys` MUST still be 0, the minting
-/// `Account` in the server's map MUST still have an empty
+/// `Account` in the node's map MUST still have an empty
 /// `coin_queue`, `proof = None`, and the unchanged seed balance, and
 /// the recipient account MUST NOT exist yet. Before this PR the
 /// handler had already bumped the counter + mutated the minting
@@ -3678,8 +3764,8 @@ async fn mint_broadcast_failure_returns_503() {
     let minting_coin_queue_len_before: usize;
     let minting_proof_some_before: bool;
     {
-        let server_guard = state.account_node.lock().unwrap();
-        let acct = server_guard
+        let account_node_guard = state.account_node.lock().unwrap();
+        let acct = account_node_guard
             .get_account(&zkcoins_program::types::MINTING_ADDRESS)
             .expect("minting account seeded by mint_test_state");
         minting_balance_before = acct.balance;
@@ -3721,8 +3807,8 @@ async fn mint_broadcast_failure_returns_503() {
         "in-memory minting_account.num_pubkeys must NOT advance on broadcast failure (zk-coins/node#89)"
     );
     {
-        let server_guard = state.account_node.lock().unwrap();
-        let acct_after = server_guard
+        let account_node_guard = state.account_node.lock().unwrap();
+        let acct_after = account_node_guard
             .get_account(&zkcoins_program::types::MINTING_ADDRESS)
             .expect("minting account still present after failed mint");
         assert_eq!(
@@ -3740,7 +3826,7 @@ async fn mint_broadcast_failure_returns_503() {
             "minting Account proof must NOT be set by a failed-broadcast mint"
         );
         assert!(
-            server_guard.get_account(&recipient_addr).is_none(),
+            account_node_guard.get_account(&recipient_addr).is_none(),
             "recipient account must NOT be created when broadcast fails"
         );
     }
@@ -3871,11 +3957,24 @@ async fn mint_happy_path_broadcasts_and_returns_proof_id() {
         proof_id > 0,
         "fresh-state mint must emit a non-zero proof_id"
     );
-    // Per the mint_handler contract, the mint response intentionally
-    // omits `account_state_hash` and `output_coins_root` (those are
-    // returned by /api/send instead).
-    assert!(v["account_state_hash"].is_null());
-    assert!(v["output_coins_root"].is_null());
+    // The mint response now carries the prover's post-mint
+    // `(account_state_hash, output_coins_root)` pair so the wallet
+    // can advance its local snapshot atomically with the mint
+    // response — same shape as the send response. Both fields are
+    // 32-byte hex strings extracted from `coin_proofs[0].proof
+    // .public_inputs` via `ProofData::from_field_elements`. See the
+    // `mint_response_carries_state_hash_and_coins_root` integration
+    // test in `node/tests/api_remote.rs` for the contract.
+    let ash_hex = v["account_state_hash"]
+        .as_str()
+        .expect("account_state_hash present on mint response");
+    let ash_bytes = hex::decode(ash_hex).expect("account_state_hash is hex");
+    assert_eq!(ash_bytes.len(), 32, "account_state_hash must be 32 bytes");
+    let ocr_hex = v["output_coins_root"]
+        .as_str()
+        .expect("output_coins_root present on mint response");
+    let ocr_bytes = hex::decode(ocr_hex).expect("output_coins_root is hex");
+    assert_eq!(ocr_bytes.len(), 32, "output_coins_root must be 32 bytes");
 
     // 4. Verify the persistence side-effects of the Ok arm: the
     //    accounts row for the MINTING address was upserted by
@@ -5271,4 +5370,286 @@ async fn mint_handler_two_sequential_mints_with_different_recipients_advance_cle
         2,
         "on-disk mmr_root_index must have 2 entries after two successful atomic txs"
     );
+}
+
+// =======================================================================
+// Coverage tests for GET /api/inscriptions/:txid (added in #113).
+// =======================================================================
+
+mod inscriptions_endpoint_tests {
+    use super::*;
+    use crate::db::{connect_and_migrate, insert_pending_inscription, InscriptionKind};
+    use crate::router::create_router;
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    async fn live_pool_router() -> (
+        Router,
+        Arc<sqlx::PgPool>,
+        testcontainers::ContainerAsync<Postgres>,
+    ) {
+        let container = Postgres::default()
+            .with_tag("17")
+            .start()
+            .await
+            .expect("postgres container");
+        let host = container.get_host().await.unwrap();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+        let pool = Arc::new(connect_and_migrate(&url).await.expect("migrate"));
+        let state = live_test_state(pool.clone());
+        let app = create_router(state);
+        (app, pool, container)
+    }
+
+    #[tokio::test]
+    async fn get_inscription_bad_hex_returns_422() {
+        let (app, _pool, _c) = live_pool_router().await;
+        let req = Request::get("/api/inscriptions/zzzz")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn get_inscription_wrong_length_returns_422() {
+        let (app, _pool, _c) = live_pool_router().await;
+        let req = Request::get("/api/inscriptions/abcd")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn get_inscription_unknown_txid_returns_404() {
+        let (app, _pool, _c) = live_pool_router().await;
+        let unknown = "f".repeat(64);
+        let req = Request::get(format!("/api/inscriptions/{}", unknown))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_inscription_known_txid_returns_200_with_summary() {
+        let (app, pool, _c) = live_pool_router().await;
+        // Plant a row directly via the DB helper. The endpoint accepts
+        // the display-order (big-endian) hex; we reverse the stored
+        // little-endian bytes to construct the URL.
+        let stored_commit: [u8; 32] = [0x42; 32];
+        let stored_reveal: [u8; 32] = [0x43; 32];
+        insert_pending_inscription(
+            &pool,
+            &stored_commit,
+            &stored_reveal,
+            InscriptionKind::Mint,
+            b"c",
+            b"ctx",
+            b"rtx",
+            777,
+        )
+        .await
+        .unwrap();
+        let mut display = stored_commit.to_vec();
+        display.reverse();
+        let display_hex = hex::encode(display);
+
+        let req = Request::get(format!("/api/inscriptions/{}", display_hex))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["kind"], "mint");
+        assert_eq!(v["status"], "constructed");
+        assert_eq!(v["commit_output_value"], 777);
+    }
+
+    #[tokio::test]
+    async fn get_inscription_db_error_returns_500() {
+        let (app, pool, _c) = live_pool_router().await;
+        // DROP the table out from under the handler so the SELECT fails.
+        // CASCADE because tx_mining_log / coin_proof_store have FKs to it.
+        sqlx::query("DROP TABLE pending_inscriptions CASCADE")
+            .execute(pool.as_ref())
+            .await
+            .unwrap();
+        let txid = "0".repeat(64);
+        let req = Request::get(format!("/api/inscriptions/{}", txid))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}
+
+// =======================================================================
+// Coverage test for the username_claim_log fire-and-forget spawn body.
+// The existing `claim_username_with_valid_signature` test exercises the
+// spawn call site but doesn't wait long enough for the task to complete
+// — this test specifically drives the spawn-body code path (line 1766)
+// and asserts the row landed.
+// =======================================================================
+
+#[tokio::test]
+async fn claim_username_precheck_reject_persists_log_row() {
+    use crate::db::connect_and_migrate;
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("postgres container");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(connect_and_migrate(&url).await.expect("migrate"));
+    let state = live_test_state(pool.clone());
+
+    // Pre-populate the in-memory UsernameStore with a conflicting name
+    // so the handler's `precheck` rejects the claim → log_claim(false,
+    // Some(reason)) → tokio::spawn(insert_username_claim_log).
+    {
+        let mut store = state.username_store.lock().unwrap();
+        let other_addr = zkcoins_program::hash::digest_from_bytes(&[0x11; 32]);
+        store.commit_after_db("alice".into(), other_addr);
+    }
+
+    let secp = secp::Secp256k1::new();
+    let secret = bitcoin::secp256k1::SecretKey::from_slice(&[0x33; 32]).unwrap();
+    let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+    let address: [u8; 32] = Sha256::digest(public_key.serialize()).into();
+    let address_hex = hex::encode(address);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut hasher = Sha256::new();
+    hasher.update(b"zkcoins:claim_username");
+    hasher.update(address_hex.as_bytes());
+    hasher.update(b"alice");
+    hasher.update(now.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    let msg = Message::from_digest(hash);
+    let kp = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &secret);
+    let sig = secp.sign_schnorr(&msg, &kp);
+
+    let body = serde_json::json!({
+        "username": "alice",
+        "address": address_hex,
+        "public_key": public_key.to_string(),
+        "signature": hex::encode(sig.serialize()),
+        "timestamp": now,
+    });
+    let req = Request::post("/api/username/claim")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let app = create_router(state);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // Wait for the fire-and-forget tokio::spawn to land the
+    // username_claim_log row.
+    for _ in 0..40 {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM username_claim_log")
+            .fetch_one(pool.as_ref())
+            .await
+            .unwrap();
+        if count >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let (success, reject_reason): (bool, Option<String>) =
+        sqlx::query_as("SELECT success, reject_reason FROM username_claim_log")
+            .fetch_one(pool.as_ref())
+            .await
+            .unwrap();
+    assert!(!success);
+    assert!(reject_reason.is_some());
+}
+
+/// Cover the `eprintln!("Failed to persist username_claim_log: …")`
+/// arm at router.rs line 1767. The fire-and-forget spawn calls
+/// `insert_username_claim_log` — we DROP the table out from under it
+/// so the insert fails and the eprintln line runs.
+#[tokio::test]
+async fn claim_username_log_spawn_handles_insert_error() {
+    use crate::db::connect_and_migrate;
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("postgres container");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(connect_and_migrate(&url).await.expect("migrate"));
+    let state = live_test_state(pool.clone());
+
+    // Pre-stake a conflicting username so the handler hits the
+    // precheck-reject path and invokes log_claim(false, …) → spawn.
+    {
+        let mut store = state.username_store.lock().unwrap();
+        let other_addr = zkcoins_program::hash::digest_from_bytes(&[0x55; 32]);
+        store.commit_after_db("bob".into(), other_addr);
+    }
+
+    // Drop the username_claim_log table so the spawned insert errs.
+    sqlx::query("DROP TABLE username_claim_log CASCADE")
+        .execute(pool.as_ref())
+        .await
+        .expect("drop username_claim_log");
+
+    let secp = secp::Secp256k1::new();
+    let secret = bitcoin::secp256k1::SecretKey::from_slice(&[0x44; 32]).unwrap();
+    let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+    let address: [u8; 32] = Sha256::digest(public_key.serialize()).into();
+    let address_hex = hex::encode(address);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut hasher = Sha256::new();
+    hasher.update(b"zkcoins:claim_username");
+    hasher.update(address_hex.as_bytes());
+    hasher.update(b"bob");
+    hasher.update(now.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    let msg = Message::from_digest(hash);
+    let kp = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &secret);
+    let sig = secp.sign_schnorr(&msg, &kp);
+
+    let body = serde_json::json!({
+        "username": "bob",
+        "address": address_hex,
+        "public_key": public_key.to_string(),
+        "signature": hex::encode(sig.serialize()),
+        "timestamp": now,
+    });
+    let req = Request::post("/api/username/claim")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let app = create_router(state);
+    let resp = app.oneshot(req).await.unwrap();
+    // 409 from precheck — the response path doesn't depend on the
+    // (failed) audit insert.
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // Give the fire-and-forget spawn time to hit the eprintln path.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 }

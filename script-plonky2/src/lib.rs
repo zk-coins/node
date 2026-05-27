@@ -4,7 +4,7 @@
 //! ## Architecture
 //!
 //! - [`Prover`] owns the heavy `StateTransitionCircuit` build (one
-//!   per process — typically created at server startup).
+//!   per process — typically created at node startup).
 //! - [`Prover::prove_initial`] / [`Prover::prove_account_update`] are
 //!   thin convenience wrappers over the low-level
 //!   [`zkcoins_program_plonky2::circuit::main`] APIs that thread
@@ -20,7 +20,7 @@
 //! This crate inherits its nightly toolchain from
 //! [`program-plonky2/rust-toolchain.toml`](../program-plonky2/rust-toolchain.toml)
 //! via a symlink — Plonky2 requires `feature(specialization)`.
-//! Callers from stable-toolchain crates (e.g. the SP1-era `server/`
+//! Callers from stable-toolchain crates (e.g. the SP1-era `node/`
 //! crate) must invoke this via a subprocess boundary (a `[[bin]]`
 //! target ships in a future iteration).
 
@@ -42,7 +42,7 @@ use zkcoins_program_plonky2::merkle::sparse_merkle_tree::NonInclusionProof;
 use zkcoins_program_plonky2::types::{AccountState, Coin, PublicKey};
 use zkcoins_program_plonky2::{C, D, F};
 
-// Re-export so server callers don't have to depend on
+// Re-export so node callers don't have to depend on
 // `zkcoins-program-plonky2` directly for the source-witness type.
 pub use zkcoins_program_plonky2::circuit::main::InCoinSourceWitness;
 
@@ -56,7 +56,7 @@ pub type Proof = ProofWithPublicInputs<F, C, D>;
 ///
 /// The circuit is cyclic — its `verifier_data.circuit_digest` is
 /// pinned in every proof's public inputs, enforcing that all proofs
-/// the server emits are verifiable by the SAME circuit instance.
+/// the node emits are verifiable by the SAME circuit instance.
 pub struct Prover {
     pub circuit: StateTransitionCircuit,
 }

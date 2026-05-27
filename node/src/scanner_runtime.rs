@@ -69,14 +69,19 @@ struct InscriptionScanner<S = DefaultSleeper> {
     client: AsyncClient<S>,
     processed_blocks: HashSet<BlockHash>,
     current_block_hash: Option<BlockHash>,
+    /// Optional Postgres pool for the per-block `block_log` audit row.
+    /// `None` short-circuits the persistence (used by unit tests that
+    /// run without a DB).
+    pool: Option<sqlx::PgPool>,
 }
 
 impl<S: Sleeper> InscriptionScanner<S> {
-    fn new(client: AsyncClient<S>) -> Self {
+    fn new(client: AsyncClient<S>, pool: Option<sqlx::PgPool>) -> Self {
         Self {
             client,
             processed_blocks: HashSet::new(),
             current_block_hash: None,
+            pool,
         }
     }
 
@@ -120,6 +125,8 @@ impl<S: Sleeper> InscriptionScanner<S> {
             }
 
             println!("Processing block: {}", current_hash);
+            let block_start = std::time::Instant::now();
+            let mut inscription_count: i32 = 0;
 
             let txids = match self.client.get_block_txids(current_hash).await {
                 Ok(txids) => txids,
@@ -150,6 +157,7 @@ impl<S: Sleeper> InscriptionScanner<S> {
                 match self.client.get_tx(&txid).await {
                     Ok(Some(tx)) => {
                         self.process_transaction(&tx, callback).await?;
+                        inscription_count += 1;
                     }
                     Ok(None) => {
                         println!("Transaction {} not found", txid);
@@ -163,6 +171,27 @@ impl<S: Sleeper> InscriptionScanner<S> {
             self.processed_blocks.insert(current_hash);
 
             let block_status = self.client.get_block_status(&current_hash).await?;
+
+            // Persist a block_log row for this block: hash, height,
+            // inscription count, and processing duration. Fire-and-
+            // forget — a block_log insert failure must not break the
+            // scanner loop (the scanner is the only path to chain-tip
+            // catch-up and we never want to wedge it on a DB blip).
+            if let Some(pool) = &self.pool {
+                let block_entry = crate::db::BlockLogEntry {
+                    block_hash: <bitcoin::BlockHash as AsRef<[u8]>>::as_ref(&current_hash).to_vec(),
+                    block_height: block_status.height.map(i64::from),
+                    inscription_count,
+                    processing_duration_us: i64::try_from(block_start.elapsed().as_micros()).ok(),
+                };
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::db::insert_block_log(&pool, &block_entry).await {
+                        eprintln!("Failed to persist block_log: {}", e);
+                    }
+                });
+            }
+
             match block_status.next_best {
                 Some(next_hash) => current_hash = next_hash,
                 None => {
@@ -215,12 +244,13 @@ impl<S: Sleeper> InscriptionScanner<S> {
 pub async fn scan_for_inscriptions(
     config: &EsploraConfig,
     start_block_hash: BlockHash,
+    pool: Option<sqlx::PgPool>,
     callback: &InscriptionCallback,
     mut tip_rx: mpsc::Receiver<BlockHash>,
 ) -> Result<(), Box<dyn StdError>> {
     let builder = Builder::new(&config.url);
     let client = AsyncClient::<DefaultSleeper>::from_builder(builder)?;
-    let mut scanner = InscriptionScanner::new(client);
+    let mut scanner = InscriptionScanner::new(client, pool);
 
     scanner
         .scan_from_block(start_block_hash, callback, &mut tip_rx)

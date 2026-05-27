@@ -27,20 +27,45 @@ use crate::publisher::EsploraConfig;
 use crate::username::UsernameStore;
 use crate::{NETWORK_CONFIG, USERNAME_DOMAIN};
 
-/// Verify a Schnorr signature over send request fields.
-/// Message = SHA256(account_address || recipient || amount || timestamp)
-fn verify_send_signature(request: &SendCoinRequest) -> Result<(), &'static str> {
-    let signature_hex = request.signature.as_deref().ok_or("Missing signature")?;
-    let timestamp = request.timestamp.ok_or("Missing timestamp")?;
+/// Maximum allowed clock skew between the wallet's signed timestamp
+/// and the server's wall clock. Matches the legacy in-helper window
+/// extracted into [`check_timestamp_window`] so the existing app
+/// behaviour is unchanged.
+pub(crate) const MAX_TIMESTAMP_SKEW_SECS: u64 = 300;
 
-    // Reject requests older than 5 minutes
+/// Validate that `timestamp` is within [`MAX_TIMESTAMP_SKEW_SECS`] of
+/// the server's wall clock. Extracted so signed handlers can run the
+/// timestamp gate explicitly BEFORE `verify_send_signature` — emitting
+/// the distinct `"Request timestamp too old or in the future"` string
+/// the app's `KNOWN_SERVER_ERRORS` table maps. Folding it back into the
+/// signature path would collapse both branches to
+/// `"Signature verification failed"`, hiding a clock-skew misconfiguration
+/// behind a generic crypto failure.
+pub(crate) fn check_timestamp_window(timestamp: u64) -> Result<(), &'static str> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    if now.abs_diff(timestamp) > 300 {
+    if now.abs_diff(timestamp) > MAX_TIMESTAMP_SKEW_SECS {
         return Err("Request timestamp too old or in the future");
     }
+    Ok(())
+}
+
+/// Verify a Schnorr signature over send request fields.
+/// Message = SHA256(account_address || recipient || amount || timestamp)
+///
+/// Callers MUST run [`check_timestamp_window`] first — this helper no
+/// longer enforces the freshness window so the handler can surface
+/// `"Request timestamp too old or in the future"` as its own status,
+/// rather than collapsing it into `"Signature verification failed"`.
+/// `request.signature` and `request.timestamp` are also required by the
+/// time this helper runs (the handler returns 401 with
+/// `"Missing signature"` / `"Missing timestamp"` upstream); the
+/// `Option`-shaped `?` arms below stay as defence-in-depth.
+fn verify_send_signature(request: &SendCoinRequest) -> Result<(), &'static str> {
+    let signature_hex = request.signature.as_deref().ok_or("Missing signature")?;
+    let timestamp = request.timestamp.ok_or("Missing timestamp")?;
 
     // Build the message: SHA256(account_address || recipient || amount || timestamp)
     let mut hasher = Sha256::new();
@@ -174,7 +199,7 @@ pub struct ReceiveCoinRequest {
     coin_proof: Proof,
 }
 
-/// Persistent proof store — survives server restarts.
+/// Persistent proof store — survives node restarts.
 /// Each proof is stored as an individual file: /data/proofs/{id}.bin
 pub(crate) struct ProofStore {
     dir: String,
@@ -209,7 +234,7 @@ impl ProofStore {
     }
 
     /// Build a safe file path for a proof ID within the store directory.
-    /// The ID is always a server-generated u64 and the suffix is the
+    /// The ID is always a node-generated u64 and the suffix is the
     /// literal ".bin", so `base.join(...)` cannot escape `base` — no
     /// extra starts_with check is needed.
     fn proof_path(&self, id: u64) -> Option<std::path::PathBuf> {
@@ -296,7 +321,7 @@ pub struct SendCoinResponse {
 ///   the minute-scale prove cost is paid; surfacing the specific
 ///   string lets clients distinguish "fix your inclusion proof" from
 ///   "fix your account selection".
-/// - **404 NOT_FOUND** — sender address is not known to the server.
+/// - **404 NOT_FOUND** — sender address is not known to the node.
 /// - **400 BAD_REQUEST** — request structure violates the API contract
 ///   (e.g. AccountUpdate transition without `prev_commitment_pubkey`).
 /// - **500 INTERNAL_SERVER_ERROR** — the prover failed. Body collapses
@@ -314,7 +339,7 @@ pub(crate) fn map_send_coins_error(err: &str) -> (StatusCode, &'static str) {
         // `get_merkle_proofs` failures — reachable from `send_coins`
         // via the `prev_commitment_pubkey` path. The client supplied
         // the wrong public key, or the previous proof references a
-        // history root the server hasn't seen yet (stale snapshot).
+        // history root the node hasn't seen yet (stale snapshot).
         // Both are caller-fixable, hence 422 rather than 500.
         "Unable to get merkle proofs for provided public key" => (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -433,16 +458,16 @@ pub struct CommitRequest {
 pub struct InfoResponse {
     network: String,
     capabilities: Capabilities,
-    /// External hostname this server serves, used by the client to render
+    /// External hostname this node serves, used by the client to render
     /// `<hex|username>@<domain>`. DEV and PRD share the chain identifier
     /// but live behind different external hostnames, so the client cannot
-    /// derive this from `network` alone — the server reports it directly.
+    /// derive this from `network` alone — the node reports it directly.
     username_domain: String,
 }
 
-/// Server-side feature gates exposed to clients so the app can render
+/// Node-side feature gates exposed to clients so the app can render
 /// capability-driven UI without a parallel build-time env-flag set.
-/// Each bool reflects a compile-time Cargo feature on the server binary,
+/// Each bool reflects a compile-time Cargo feature on the node binary,
 /// except `faucet`: mint is part of the MVP and is always available, so
 /// the field is hardcoded `true`. It is kept on the struct for API
 /// back-compat with wallet clients that introspect `/api/info`.
@@ -604,7 +629,9 @@ async fn receive_coin_handler(
     match snapshot {
         Some(bytes) => {
             let addr_bytes = digest_to_bytes(&recipient);
-            if let Err(e) = db::upsert_account(&state.pool, &addr_bytes, &bytes).await {
+            if let Err(e) =
+                db::upsert_account_with_source(&state.pool, &addr_bytes, &bytes, "receive").await
+            {
                 eprintln!("Failed to upsert recipient account after receive: {}", e);
             }
             Json(SendCoinResponse {
@@ -622,15 +649,37 @@ async fn send_coin_handler(
 ) -> impl IntoResponse {
     println!("Received send post request...");
 
-    // Verify sender signature if provided (graceful: skip if not present for backwards compat)
-    if request.signature.is_some() {
-        if let Err(e) = verify_send_signature(&request) {
-            eprintln!("Signature verification failed: {}", e);
-            return handler_error_response(
-                StatusCode::UNAUTHORIZED,
-                "Signature verification failed",
-            );
-        }
+    // The pre-PR back-compat shape silently skipped signature
+    // verification when `request.signature` was absent. That left
+    // `/api/send` reachable by an unsigned attacker as long as the
+    // sender address was known to the server — a hard-to-spot
+    // security regression. Make signature + timestamp mandatory and
+    // surface the distinct app-known strings so the client's error
+    // mapping ladders correctly (`"Missing signature"` →
+    // `"Anfrage ist nicht signiert."`, etc.).
+    //
+    // Run the timestamp gate BEFORE the signature crypto so a stale
+    // request reports `"Request timestamp too old or in the future"`
+    // rather than collapsing to a generic
+    // `"Signature verification failed"`.
+    // signature + timestamp are both load-bearing — the signature is
+    // computed over the timestamp. Absent timestamp is a malformed
+    // signed-payload; surface the same `"Missing signature"` string
+    // since neither half is independently useful and the app only
+    // maps one error code for this branch.
+    if request.signature.is_none() || request.timestamp.is_none() {
+        return handler_error_response(StatusCode::UNAUTHORIZED, "Missing signature");
+    }
+    let timestamp = request
+        .timestamp
+        .expect("timestamp presence checked immediately above");
+    if let Err(e) = check_timestamp_window(timestamp) {
+        eprintln!("Timestamp window check failed: {}", e);
+        return handler_error_response(StatusCode::UNAUTHORIZED, e);
+    }
+    if let Err(e) = verify_send_signature(&request) {
+        eprintln!("Signature verification failed: {}", e);
+        return handler_error_response(StatusCode::UNAUTHORIZED, "Signature verification failed");
     }
 
     // Create converted addresses (from_address and to_address)
@@ -751,8 +800,13 @@ async fn send_coin_handler(
             // We log and continue rather than failing the request,
             // which mirrors the pre-Postgres `save_to_file` semantics.
             let addr_bytes = digest_to_bytes(&from_address);
-            if let Err(e) =
-                db::upsert_account(&state.pool, &addr_bytes, &updated_account_bytes).await
+            if let Err(e) = db::upsert_account_with_source(
+                &state.pool,
+                &addr_bytes,
+                &updated_account_bytes,
+                "send",
+            )
+            .await
             {
                 eprintln!("Failed to upsert sender account after send: {}", e);
             }
@@ -1016,6 +1070,7 @@ async fn mint_handler(
     // next scanner sweep. No in-handler retry.
     let broadcast_outcome = create_and_broadcast_inscription(
         &commitment_data,
+        crate::db::InscriptionKind::Mint,
         &state.esplora_config,
         Some(&state.pool),
     )
@@ -1230,20 +1285,38 @@ async fn mint_handler(
     // `mint_handler` passes a single-element `vec![Invoice::new(...)]`
     // to `prepare_mint`; `send_coins_inner` builds `coin_proofs` with
     // `out_coins.len() == coin_templates.len() == invoices.len() == 1`,
-    // so the Ok-arm Vec has length exactly 1 — `pop()` is total.
-    let proof_id = state.proof_store.add_proof(
-        coin_proofs
-            .pop()
-            .expect("send_coins returns exactly one coin_proof for single-invoice mint"),
-    );
+    // so the Ok-arm Vec has length exactly 1.
+    //
+    // Surface the prover's post-mint hash pair on the response. Today
+    // the wallet client needs `prev_commitment_pubkey` for the next
+    // send, which it derives from the proof file fetched via
+    // `GET /api/proof/:id` — but the matching account_state_hash and
+    // output_coins_root are the same pair the send response carries
+    // for an ordinary user transition, so emitting them here lets the
+    // client advance its local snapshot atomically with the mint
+    // response (one round-trip instead of two). Source: the prover's
+    // public inputs on the freshly-built coin proof — identical
+    // derivation to the one `send_coin_handler` performs.
+    let final_coin_proof = coin_proofs
+        .pop()
+        .expect("send_coins returns exactly one coin_proof for single-invoice mint");
+    let pis: [zkcoins_program::F; zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] =
+        final_coin_proof.proof.public_inputs
+            [..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
+            .try_into()
+            .expect("Plonky2 Proof emits N_PROOF_DATA_PUBLIC_INPUTS field elements");
+    let proof_data = ProofData::from_field_elements(&pis);
+    let ash_hex = Some(hex::encode(digest_to_bytes(&proof_data.account_state_hash)));
+    let ocr_hex = Some(hex::encode(digest_to_bytes(&proof_data.output_coins_root)));
+    let proof_id = state.proof_store.add_proof(final_coin_proof);
     (
         StatusCode::OK,
         Json(SendCoinResponse {
             success: true,
             error: None,
             proof_id: Some(proof_id),
-            account_state_hash: None,
-            output_coins_root: None,
+            account_state_hash: ash_hex,
+            output_coins_root: ocr_hex,
         }),
     )
 }
@@ -1284,7 +1357,7 @@ async fn get_proof_handler(
 ///
 /// **Broadcast-then-deliver invariant (zk-coins/node#89).** Unlike
 /// the mint flow, the `/api/commit` endpoint receives a *proof_id* the
-/// server already generated (in an earlier `/api/send` call), looks up
+/// node already generated (in an earlier `/api/send` call), looks up
 /// the persisted `CoinProof`, broadcasts its commitment, and only then
 /// hands the proof to `receive_coin` for the recipient mutation. The
 /// in-memory mutation lives in [`broadcast_commit_and_deliver`] in
@@ -1350,8 +1423,62 @@ async fn commit_handler(
         .await
 }
 
+/// `GET /api/inscriptions/:txid` — operator/forensics lookup of a single
+/// inscription by its commit txid. Surfaces the columns that answer
+/// "what kind of operation was this, and where is it in the publish
+/// pipeline" without exposing the raw commit/reveal/commitment blobs
+/// (those are crash-recovery state, not user-facing).
+///
+/// Returns 404 when no row exists — the inscription either never went
+/// through this node (e.g. external recovery via `recover_inscription`
+/// CLI) or the txid is unknown.
+async fn get_inscription_handler(
+    State(state): State<AppState>,
+    Path(txid_hex): Path<String>,
+) -> axum::response::Response {
+    // Bitcoin convention: display txids are big-endian, but the
+    // `pending_inscriptions.commit_txid` column stores raw little-endian
+    // bytes (matching `bitcoin::Txid::as_byte_array()` semantics — see
+    // `publisher.rs` write site). Reverse on parse so a caller can pass
+    // the same hex an explorer shows.
+    let mut bytes = match hex::decode(txid_hex.trim()) {
+        Ok(b) if b.len() == 32 => b,
+        Ok(_) => {
+            return handler_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "txid must be 32 bytes (64 hex chars)",
+            )
+            .into_response();
+        }
+        Err(_) => {
+            return handler_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "txid is not valid hex",
+            )
+            .into_response();
+        }
+    };
+    bytes.reverse();
+
+    match crate::db::get_inscription_summary_by_commit_txid(&state.pool, &bytes).await {
+        Ok(Some(summary)) => (StatusCode::OK, Json(summary)).into_response(),
+        Ok(None) => {
+            handler_error_response(StatusCode::NOT_FOUND, "No inscription found for this txid")
+                .into_response()
+        }
+        Err(e) => {
+            eprintln!("get_inscription_handler: db error: {}", e);
+            handler_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error while looking up inscription",
+            )
+            .into_response()
+        }
+    }
+}
+
 /// JSON body returned by `GET /health/ready`. `failures` is empty on a
-/// fully ready server; each failing dependency contributes one stable
+/// fully ready node; each failing dependency contributes one stable
 /// short tag (`"db"`, `"esplora"`) so a Kuma monitor parses the cause
 /// without having to scrape the status code in isolation.
 #[derive(Serialize)]
@@ -1502,6 +1629,7 @@ struct RootEndpoints {
     receive: &'static str,
     commit: &'static str,
     proof: &'static str,
+    inscription: &'static str,
     health: &'static str,
 }
 
@@ -1522,6 +1650,7 @@ async fn root_handler() -> impl IntoResponse {
             receive: "POST /api/receive",
             commit: "POST /api/commit",
             proof: "GET  /api/proof/{id}",
+            inscription: "GET  /api/inscriptions/{txid}",
             health: "GET  /health",
         },
         docs: "https://docs.zkcoins.app",
@@ -1594,17 +1723,15 @@ async fn claim_username_handler(
             .into_response();
     }
 
-    // Verify timestamp freshness (5 min window)
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if now.abs_diff(request.timestamp) > 300 {
+    // Verify timestamp freshness (shared 5 min window with
+    // `send_coin_handler`). Uses the same string the send path emits so
+    // the app's `KNOWN_SERVER_ERRORS` mapping ladders identically.
+    if let Err(e) = check_timestamp_window(request.timestamp) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(LnurlErrorResponse {
                 status: "ERROR".into(),
-                reason: "Timestamp too old or in the future".into(),
+                reason: e.into(),
             }),
         )
             .into_response();
@@ -1613,7 +1740,7 @@ async fn claim_username_handler(
     // Verify Schnorr signature over sha256("zkcoins:claim_username" || address_hex || normalised_username || timestamp_le).
     // The wallet MUST sign over the lowercase form (same normalisation
     // as `UsernameStore::validate`) — otherwise the same input that the
-    // server persists is not what the signature commits to, opening
+    // node persists is not what the signature commits to, opening
     // the case-mismatch squat described above.
     let mut hasher = Sha256::new();
     hasher.update(b"zkcoins:claim_username");
@@ -1678,9 +1805,37 @@ async fn claim_username_handler(
     // before; the second writer hits `rows_affected == 0` and the
     // handler maps that to a 409. The post-commit insert is idempotent
     // — re-inserting the same `(normalized, address)` is a no-op.
+    // Decode signature bytes once so the claim-log row carries the
+    // exact signature bytes the caller submitted, regardless of the
+    // outcome below.
+    let signature_bytes = hex::decode(&request.signature).unwrap_or_default();
+
+    // username_claim_log helper: fire-and-forget, captures every
+    // outcome that reaches the in-memory / SQL layer (precheck reject,
+    // SQL race-loser, success). Pure-validation rejects above are
+    // already captured via request_log on the audit path.
+    let log_claim = |success: bool, reject_reason: Option<&str>| {
+        let entry = crate::db::UsernameClaimLogEntry {
+            requested_username: request.username.clone(),
+            normalized_username: normalized_username.clone(),
+            address: address_bytes.to_vec(),
+            signature: signature_bytes.clone(),
+            success,
+            reject_reason: reject_reason.map(|s| s.to_string()),
+            request_log_id: None,
+        };
+        let pool = state.pool.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::db::insert_username_claim_log(&pool, &entry).await {
+                eprintln!("Failed to persist username_claim_log: {}", e);
+            }
+        });
+    };
+
     if let Err(reason) =
         lock_or_recover(&state.username_store).precheck(&normalized_username, &address)
     {
+        log_claim(false, Some(reason));
         // `precheck` returns the static collision strings the wallet
         // surfaces verbatim. The status is `409 CONFLICT` for either
         // collision variant — same shape as the SQL-layer race below.
@@ -1700,6 +1855,7 @@ async fn claim_username_handler(
             Ok(b) => b,
             Err(db_err) => {
                 eprintln!("Failed to persist username claim: {}", db_err);
+                log_claim(false, Some(&format!("db error: {}", db_err)));
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(LnurlErrorResponse {
@@ -1711,6 +1867,7 @@ async fn claim_username_handler(
             }
         };
     if !inserted {
+        log_claim(false, Some("race lost on ON CONFLICT"));
         // Concurrent claimer won the `ON CONFLICT` race for the same
         // name. Surface as the same 409 a precheck collision would.
         return (
@@ -1724,6 +1881,8 @@ async fn claim_username_handler(
     }
 
     lock_or_recover(&state.username_store).commit_after_db(normalized_username.clone(), address);
+
+    log_claim(true, None);
 
     (
         StatusCode::OK,
@@ -1862,6 +2021,7 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/api/proof/:id", get(get_proof_handler))
         .route("/api/commit", post(commit_handler))
         .route("/api/mint", post(mint_handler))
+        .route("/api/inscriptions/:txid", get(get_inscription_handler))
         .route("/api/username/claim", post(claim_username_handler))
         .route(
             "/api/username/resolve/:username",
@@ -1880,9 +2040,19 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/.well-known/lnurlp/:username", get(lnurlp_handler))
         .route("/lnurl/pay/:username", get(lnurl_callback_handler));
 
-    app.with_state(state)
+    // Audit middleware sits OUTSIDE `with_state` because it carries its
+    // own `State<AppState>` extractor. Layered after CORS so the audit
+    // log records the final, CORS-decorated response — `Access-Control-*`
+    // headers and all. The `from_fn_with_state` adapter clones the
+    // state for every request (state itself is `Arc`-backed, so the
+    // clone is cheap).
+    app.with_state(state.clone())
         .fallback(|| async { StatusCode::NOT_FOUND })
         .layer(cors)
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            crate::audit::audit_log_middleware,
+        ))
 }
 
 #[cfg(test)]

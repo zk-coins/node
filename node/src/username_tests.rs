@@ -195,6 +195,13 @@ async fn load_from_pg_rejects_wrong_address_length() {
     // surface the mismatch as a typed error rather than panic on the
     // try_into.
     let (pool, _container) = setup_pool().await;
+    // Drop the 0010 length CHECK so the corrupt-row plant succeeds;
+    // the subject of this test is the Rust-side defense in
+    // `UsernameStore::load_from_pg`, not the DB-level CHECK.
+    sqlx::query("ALTER TABLE usernames DROP CONSTRAINT usernames_address_length")
+        .execute(&pool)
+        .await
+        .expect("drop usernames_address_length");
     sqlx::query("INSERT INTO usernames (name, address) VALUES ($1, $2)")
         .bind("alice")
         .bind(vec![0u8; 7])

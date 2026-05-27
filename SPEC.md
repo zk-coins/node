@@ -335,7 +335,7 @@ fn main(inputs: ProgramInputs):
 
 ### Note on the minting account
 
-`MINTING_ADDRESS` is a `HashDigest` constant. In the Plonky2/Poseidon build it is a domain-separated placeholder baked into `program-plonky2/src/types.rs::MINTING_ADDRESS` and **overridden at runtime** in `runtime.rs::start_rest_node`: after constructing the minting `ClientAccount` from `minting_secret.bin`, the code sets `minting_client.address = *MINTING_ADDRESS` so the prover circuit and the server state share the same value. This runtime override was added in PR [#36](https://github.com/zk-coins/node/pull/36) to fix a panic-in-tokio-spawn regression (see [`MIGRATION_RESEARCH.md` §7.23](./MIGRATION_RESEARCH.md#723-minting_address-panic-in-tokiospawn-ed-task-swallows-server-bootstrap--medium-codified)). The closed test environment means we are not bound to the historical SP1 minting key.
+`MINTING_ADDRESS` is a `HashDigest` constant. In the Plonky2/Poseidon build it is a domain-separated placeholder baked into `program-plonky2/src/types.rs::MINTING_ADDRESS` and **overridden at runtime** in `runtime.rs::start_rest_node`: after constructing the minting `ClientAccount` from `minting_secret.bin`, the code sets `minting_client.address = *MINTING_ADDRESS` so the prover circuit and the node state share the same value. This runtime override was added in PR [#36](https://github.com/zk-coins/node/pull/36) to fix a panic-in-tokio-spawn regression (see [`MIGRATION_RESEARCH.md` §7.23](./MIGRATION_RESEARCH.md#723-minting_address-panic-in-tokiospawn-ed-task-swallows-node-bootstrap--medium-codified)). The closed test environment means we are not bound to the historical SP1 minting key.
 
 ---
 
@@ -385,10 +385,10 @@ For the **initial proof** there is no prior account proof to verify. The circuit
 
 ### 11.2 Client (`shared::ClientAccount::create_commitment`)
 
-Given a fresh server response `(proof_id, account_state_hash, output_coins_root)`:
+Given a fresh node response `(proof_id, account_state_hash, output_coins_root)`:
 
 1. Sign `H(account_state_hash || output_coins_root)` with the **current** commitment private key (BIP-32 derivation index = `num_pubkeys - 1` in the reference).
-2. POST `(proof_id, commitment)` to `/api/commit`. The server attaches this commitment to the proof, builds a Taproot commit+reveal tx pair whose commit-tx txid begins with `4242`, and broadcasts.
+2. POST `(proof_id, commitment)` to `/api/commit`. The node attaches this commitment to the proof, builds a Taproot commit+reveal tx pair whose commit-tx txid begins with `4242`, and broadcasts.
 
 ### 11.3 Scanner (`node::scanner`)
 
@@ -409,7 +409,7 @@ This list captures the non-trivial decisions a port must make. None of them are 
 
 1. **Pick `H`.** Recommended: Poseidon over Goldilocks (`F = GF(2^64 - 2^32 + 1)`), width 12, full+partial rounds per the standard parameter set. `HashDigest` becomes 4 field elements (≡ 256-bit security with appropriate rate).
 
-2. **Re-derive `MINTING_ADDRESS`.** Plonky2 port has it as a domain-separated placeholder (`program-plonky2/src/types.rs::MINTING_ADDRESS`). At server runtime, `runtime.rs::start_rest_node` overrides it by setting `minting_client.address = *MINTING_ADDRESS` on the freshly-constructed `ClientAccount` so the prover circuit and runtime state agree on the value (see `MIGRATION_RESEARCH.md` §7.23). Closed test environment means no requirement to match the historical SP1 minting key.
+2. **Re-derive `MINTING_ADDRESS`.** Plonky2 port has it as a domain-separated placeholder (`program-plonky2/src/types.rs::MINTING_ADDRESS`). At node runtime, `runtime.rs::start_rest_node` overrides it by setting `minting_client.address = *MINTING_ADDRESS` on the freshly-constructed `ClientAccount` so the prover circuit and runtime state agree on the value (see `MIGRATION_RESEARCH.md` §7.23). Closed test environment means no requirement to match the historical SP1 minting key.
 
 3. **`AccountState` hashing.** Drop `bincode + SHA256`. Define a canonical field-element layout (e.g. `[owner_limbs(4), balance_lo, balance_hi, pubkey_x_limbs(4), pubkey_parity]`) and hash with Poseidon. Both circuit and host MUST agree.
 

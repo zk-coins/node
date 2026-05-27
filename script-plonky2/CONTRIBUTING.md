@@ -3,7 +3,7 @@
 Companion crate to `program-plonky2/` providing a high-level
 [`Prover`] struct around the low-level
 `zkcoins_program_plonky2::circuit::main::prove_*` API. Mirrors the
-shape of the SP1-era `script/` crate so server-side integration
+shape of the SP1-era `script/` crate so node-side integration
 follows the same pattern.
 
 ## Why a separate crate?
@@ -14,20 +14,20 @@ Two reasons:
    (`feature(specialization)`). Both `program-plonky2/` and
    `script-plonky2/` use a shared nightly toolchain via the
    `rust-toolchain.toml` symlink. The parent stable workspace
-   (server, SP1-era crates) cannot directly depend on either.
+   (node, SP1-era crates) cannot directly depend on either.
 2. **Separation of concerns.** `program-plonky2/` builds the cyclic
    state-transition circuit and exposes the raw `prove_*` /
    `verify` APIs. `script-plonky2/` wraps them in a `Prover` that
    owns the built circuit, so successive proofs amortise the build
-   cost. Server code wires against the `Prover` API.
+   cost. Node code wires against the `Prover` API.
 
 ## How to call this from the stable workspace
 
-Two options for the upcoming step-7 server replacement:
+Two options for the upcoming step-7 node replacement:
 
 - **Option A: subprocess boundary.** Add a `[[bin]]` target to
   `script-plonky2/` that takes JSON input on stdin and emits proof
-  bytes on stdout. The stable-workspace `server/` crate spawns it via
+  bytes on stdout. The stable-workspace `node/` crate spawns it via
   `tokio::process`. Keeps toolchain isolation but pays IPC overhead
   per proof (~10–100 ms serialisation, negligible against ~5–15 min
   proof time).
@@ -62,7 +62,7 @@ underlying APIs end-to-end. The hard correctness coverage lives in
 - The `ProgramInputs` builder that the SP1-era `script/` crate uses.
   Plonky2's cyclic recursion threads its inputs slot-by-slot
   (`InCoinSlotTargets` / `OutCoinSlotTargets` per-slot witnesses)
-  instead of the SP1-era batched `ProgramInputs`. The server can
+  instead of the SP1-era batched `ProgramInputs`. The node can
   construct slot tuples directly without an intermediate builder.
 - CLI / RPC plumbing for Option A above. Add a `[[bin]]` target if
   the step-7 ROADMAP entry picks subprocess boundary.

@@ -68,7 +68,7 @@ jobs:
           # produces no stdout for >60s. Mirrors deploy-dev.yaml; see
           # the comment there for the failure mode that motivated this
           # (PR #111 merge run 26419696840 — SSH dropped mid-recreate,
-          # exit 255, container actually came up server-side).
+          # exit 255, container actually came up node-side).
           ssh -i ~/.ssh/deploy_key \
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=8 \
@@ -100,7 +100,7 @@ jobs:
           echo "::error::PRD /api/info never returned 200 within ~5 min after deploy"
           exit 1
 
-  # Functional verification of the deployed PRD server. Mirrors the
+  # Functional verification of the deployed PRD node. Mirrors the
   # Deploy DEV api-e2e job, but excludes the three roundtrip tests —
   # they would consume real publisher UTXOs and write coins into the
   # production SMT/MMR. `--skip _roundtrip_` is a substring match; the
@@ -115,7 +115,7 @@ jobs:
       RUSTC_WRAPPER: sccache
       ZKCOINS_API_URL: https://api.zkcoins.app
       # The bootstrap `lazy_static`s panic if these are unset; the
-      # integration test only talks to the deployed server but the
+      # integration test only talks to the deployed node but the
       # lib's panic-on-load behaviour is unconditional. Values are
       # placeholders — nothing in the read-only test path reads them.
       USERNAME_DOMAIN: zkcoins.app
@@ -135,6 +135,13 @@ jobs:
           sccache --show-stats
 
       - name: Run API E2E suite against PRD (skip roundtrips)
+        env:
+          # PRD image is MVP-only by policy (see Dockerfile FEATURES
+          # arg — "both DEV and PRD images ship the MVP-only feature
+          # set so the two environments run the identical binary").
+          # The gated address-list/lnurl tests skip cleanly instead of
+          # panicking the CI canary. Mirrors deploy-dev.yaml.
+          ZKCOINS_E2E_ALLOW_FEATURE_TRIMMED_SERVER: "true"
         run: cargo test -p node --release --all-features --test api_remote -- --test-threads=1 --nocapture --skip _roundtrip_
 
       - name: sccache stats (post-build)

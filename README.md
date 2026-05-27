@@ -20,7 +20,7 @@ Container images: **[hub.docker.com/r/zkcoins/node](https://hub.docker.com/r/zkc
 | --------------- | -------------------- | ---------------------------------------------------- |
 | Language        | Rust nightly         | Required for Plonky2 (`feature(specialization)`)     |
 | Web framework   | Axum                 | Built on Tokio, idiomatic async Rust                 |
-| ZK Proofs       | Plonky2 + Poseidon-Goldilocks (cyclic recursion) | Server-side, no zkVM, no external prover dependency  |
+| ZK Proofs       | Plonky2 + Poseidon-Goldilocks (cyclic recursion) | Node-side, no zkVM, no external prover dependency    |
 | Data structures | SMT + MMR (Poseidon) | Non-inclusion proofs + append-only history           |
 | Bitcoin         | Taproot Inscriptions | 64-byte nullifiers, Esplora API scanning             |
 | Bitcoin index   | electrs (Esplora)    | Esplora REST API via shared Docker network `bitcoin` |
@@ -29,7 +29,7 @@ Full rationale: [docs.zkcoins.app/tech-decisions](https://docs.zkcoins.app/tech-
 
 ## Trust Model
 
-Proof generation runs **inside this server process**. `AccountNode::send_coins` (`node/src/account_node.rs`) calls `self.prover.prove_account_update_with_in_and_out_coins_and_sources(...)` (and the `prove_initial_*` variant for first-time accounts) on every send / receive / mint. ZK proving requires the full private witness, so the server sees, in cleartext:
+Proof generation runs **inside this node process**. `AccountNode::send_coins` (`node/src/account_node.rs`) calls `self.prover.prove_account_update_with_in_and_out_coins_and_sources(...)` (and the `prove_initial_*` variant for first-time accounts) on every send / receive / mint. ZK proving requires the full private witness, so the node sees, in cleartext:
 
 - Sender, recipient, and amount of every coin movement
 - The complete in-coin / out-coin / source-aggregator slot layout per account
@@ -37,7 +37,7 @@ Proof generation runs **inside this server process**. `AccountNode::send_coins` 
 - Usernames and their bound coin sets (`UsernameStore`)
 - Postgres rows persisting all of the above (`node/migrations/000{1,2}_*.sql`)
 
-The **on-chain footprint stays private** — Plonky2 ensures that the public outputs (nullifiers, history roots, Taproot inscriptions) carry no readable transaction data. Block explorers and chain analytics see only opaque 64-byte commitments. The trust boundary is therefore the **server operator**, not the chain.
+The **on-chain footprint stays private** — Plonky2 ensures that the public outputs (nullifiers, history roots, Taproot inscriptions) carry no readable transaction data. Block explorers and chain analytics see only opaque 64-byte commitments. The trust boundary is therefore the **node operator**, not the chain.
 
 | | Hosted (`api.zkcoins.app`) | Self-hosted |
 | --- | --- | --- |
@@ -45,7 +45,7 @@ The **on-chain footprint stays private** — Plonky2 ensures that the public out
 | Operator sees plaintext transaction data | ❌ Yes — DFX runs the hosted node | ✅ No |
 | Setup effort | ✅ None | ⚠️ Postgres + electrs + Bitcoin node |
 
-**If you need full transaction privacy, run your own server.** Every release is shipped as `zkcoins/node:latest` (see [Live](#live)), the build recipe is [`Dockerfile`](./Dockerfile), and runtime knobs are documented in [Configuration](#configuration). Point the [zkcoins.app](https://zkcoins.app) client at your self-hosted instance for end-to-end self-custody of transaction data.
+**If you need full transaction privacy, run your own node.** Every release is shipped as `zkcoins/node:latest` (see [Live](#live)), the build recipe is [`Dockerfile`](./Dockerfile), and runtime knobs are documented in [Configuration](#configuration). Point the [zkcoins.app](https://zkcoins.app) client at your self-hosted instance for end-to-end self-custody of transaction data.
 
 ## Contributing
 
@@ -91,7 +91,7 @@ API endpoints, background services, their activation status, and the tests that 
 
 ¹ `NETWORK_NAME` env var controls the string returned. `IS_MAINNET=true` flips the default to `"Mainnet"`.
 ² Proof generation routes through the Plonky2 cyclic-recursion circuit. Single host, single Rust process — no zkVM, no external prover service. Mac Studio M3 Ultra is the production hardware target (96 GB unified memory, no external GPU). See [Proving Strategy](#proving-strategy).
-³ Requires `PUBLISHER_KEY` set to a real funded key and `ESPLORA_URL` reachable. With the default test key the server panics on `IS_MAINNET=true` startup; on testnet it accepts the call but broadcast will fail without funded UTXOs — DEV and PRD both return `503 SERVICE_UNAVAILABLE` to the client on broadcast failure (the historic `DEV_SKIP_BROADCAST_FAILURE` env-gate that silently swallowed these failures was removed once DEV and PRD were unified on the MVP-only binary; the DEV publisher wallet therefore has to be funded for E2E paths).
+³ Requires `PUBLISHER_KEY` set to a real funded key and `ESPLORA_URL` reachable. With the default test key the node panics on `IS_MAINNET=true` startup; on testnet it accepts the call but broadcast will fail without funded UTXOs — DEV and PRD both return `503 SERVICE_UNAVAILABLE` to the client on broadcast failure (the historic `DEV_SKIP_BROADCAST_FAILURE` env-gate that silently swallowed these failures was removed once DEV and PRD were unified on the MVP-only binary; the DEV publisher wallet therefore has to be funded for E2E paths).
 ⁴ Scanner depends on `ESPLORA_URL` (REST, used for the per-block `get_block_txids` / `get_tx` lookups and for the post-reconnect tip anchor) AND `ESPLORA_WS_URL` (WebSocket, used by `scanner_ws` to receive new-tip events — issue #84). Both default to mutinynet endpoints; on connection failure the WS subscriber reconnects with exponential backoff capped at 30 s.
 
 ### Cargo features
@@ -126,7 +126,7 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 #### Network info
 
 - **Module:** `router.rs::info_handler`
-- **Behaviour:** returns `{ network, capabilities: { address_list, faucet, usernames, lnurl }, username_domain }`. `network` defaults to `Mutinynet` when `IS_MAINNET=false`, `Mainnet` when `true`. `capabilities.{address_list,lnurl}` each reflect whether the corresponding Cargo feature was compiled into this binary, letting clients gate UI on a single server-side source of truth instead of parallel build-time env flags. `capabilities.{faucet,usernames}` are hardcoded `true` — mint and usernames are permanent MVP — and are retained only for back-compat with wallet clients that deserialise the shape. `username_domain` is the external hostname this server serves; **required env var** (server panics on startup if unset). PRD sets `USERNAME_DOMAIN=zkcoins.app`, DEV sets `USERNAME_DOMAIN=dev.zkcoins.app` — distinct from `network` because the same chain can be served from two isolated external hostnames, and the client renders `<hex|username>@<domain>` from this field
+- **Behaviour:** returns `{ network, capabilities: { address_list, faucet, usernames, lnurl }, username_domain }`. `network` defaults to `Mutinynet` when `IS_MAINNET=false`, `Mainnet` when `true`. `capabilities.{address_list,lnurl}` each reflect whether the corresponding Cargo feature was compiled into this binary, letting clients gate UI on a single node-side source of truth instead of parallel build-time env flags. `capabilities.{faucet,usernames}` are hardcoded `true` — mint and usernames are permanent MVP — and are retained only for back-compat with wallet clients that deserialise the shape. `username_domain` is the external hostname this node serves; **required env var** (node panics on startup if unset). PRD sets `USERNAME_DOMAIN=zkcoins.app`, DEV sets `USERNAME_DOMAIN=dev.zkcoins.app` — distinct from `network` because the same chain can be served from two isolated external hostnames, and the client renders `<hex|username>@<domain>` from this field
 - **Tests:** `router.rs::tests::info_returns_network_name_capabilities_and_username_domain`, `router.rs::tests::info_serialization_format_is_stable`
 
 #### Get balance
@@ -143,8 +143,8 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 
 #### Mint coins (single-phase)
 
-- **Module:** `router.rs::mint_handler` → `account_node.rs::send_coins` with the server-held minting account
-- **Behaviour:** server signs commitment itself (no client roundtrip) using the minting key
+- **Module:** `router.rs::mint_handler` → `account_node.rs::send_coins` with the node-held minting account
+- **Behaviour:** node signs commitment itself (no client roundtrip) using the minting key
 - **Proof generation:** `zkcoins_prover::Prover` (the Plonky2 wrapper in [`script-plonky2/`](./script-plonky2/)) — `prove_initial` for new accounts, `prove_account_update` for receivers
 - **Tests:** `account_node.rs::tests::test_create_minting_account`, `test_mint_single_invoice`, `test_mint_repro_live_setup`
 
@@ -221,8 +221,8 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 | `ESPLORA_WS_URL` | `wss://mutinynet.com/api/v1/ws` | Esplora WebSocket endpoint consumed by `scanner_ws` (issue #84). Override only when the upstream WS path changes                                       |
 | `IS_MAINNET`    | `false`                     | `true` for Bitcoin Mainnet, `false` for Mutinynet/Signet                                                                                                      |
 | `NETWORK_NAME`  | `Mutinynet` / `Mainnet`     | Human-readable name returned by `/api/info`. Default depends on `IS_MAINNET`                                                                                  |
-| `USERNAME_DOMAIN` | _(required, no default)_  | External hostname returned by `/api/info`. The client renders `<hex\|username>@<domain>` from this. **Server panics on startup if unset.** PRD sets `zkcoins.app`, DEV sets `dev.zkcoins.app` — silent fallback would let a misconfigured stage reproduce the cross-network routing bug (#95) |
-| `PUBLISHER_KEY` | test key                    | 32-byte hex private key for inscription publishing. **Required on mainnet** — server panics on startup if default test key is detected with `IS_MAINNET=true` |
+| `USERNAME_DOMAIN` | _(required, no default)_  | External hostname returned by `/api/info`. The client renders `<hex\|username>@<domain>` from this. **Node panics on startup if unset.** PRD sets `zkcoins.app`, DEV sets `dev.zkcoins.app` — silent fallback would let a misconfigured stage reproduce the cross-network routing bug (#95) |
+| `PUBLISHER_KEY` | test key                    | 32-byte hex private key for inscription publishing. **Required on mainnet** — node panics on startup if default test key is detected with `IS_MAINNET=true` |
 | `RUST_LOG`      | `info`                      | Log level                                                                                                                                                     |
 
 Runtime config above shapes _behaviour_ of compiled-in routes. _Which_ routes are compiled in is decided at build time by Cargo features — see [Cargo features](#cargo-features).
@@ -231,7 +231,7 @@ Runtime config above shapes _behaviour_ of compiled-in routes. _Which_ routes ar
 
 Spawned from `main.rs::main`:
 
-1. **REST server** (`tokio::spawn` of `start_rest_node`) — Axum app bound to `0.0.0.0:4242`
+1. **REST API** (`tokio::spawn` of `start_rest_node`) — Axum app bound to `0.0.0.0:4242`
 2. **Block scanner** (driven directly in main, not spawned) — `scan_for_inscriptions` consumes new tips from the WS-fed `mpsc<BlockHash>` channel produced by `scanner_ws::run_scanner_ws` (spawned as a tokio task at startup) and writes state on each verified commitment. No fixed-interval polling — see [issue #84](https://github.com/zk-coins/node/issues/84)
 
 ### Tests
@@ -264,18 +264,18 @@ Requires access to a Bitcoin node. See [Backend docs](https://docs.zkcoins.app/i
 
 ```bash
 cargo run -p node
-# Server starts on http://0.0.0.0:4242
+# Node starts on http://0.0.0.0:4242
 ```
 
 ## Two-Phase Send Flow
 
-User sends require a two-phase flow because the server doesn't hold sender private keys:
+User sends require a two-phase flow because the node doesn't hold sender private keys:
 
-1. **`POST /api/send`** — server generates ZK proof, returns `proof_id` + `account_state_hash` + `output_coins_root`
+1. **`POST /api/send`** — node generates ZK proof, returns `proof_id` + `account_state_hash` + `output_coins_root`
 2. **Client signs commitment** — `Schnorr(hash_concat(account_state_hash, output_coins_root))` with BIP-32 key at `numPubkeys`
-3. **`POST /api/commit`** — server verifies commitment, broadcasts Taproot inscription, delivers coin to recipient via `receive_coin`
+3. **`POST /api/commit`** — node verifies commitment, broadcasts Taproot inscription, delivers coin to recipient via `receive_coin`
 
-Mint uses a single-phase flow (server holds the minting account key).
+Mint uses a single-phase flow (node holds the minting account key).
 
 ## Project Structure
 
@@ -319,15 +319,15 @@ Docker builds use nightly Rust auto-installed via `rust-toolchain` (no external 
 
 | Workflow               | Trigger      | Action                                               |
 | ---------------------- | ------------ | ---------------------------------------------------- |
-| `deploy-dev.yaml`      | Push develop | Docker (ARM64) → `zkcoins/node:beta` → DEV server   |
-| `deploy-prd.yaml`      | Push main    | Docker (ARM64) → `zkcoins/node:latest` → PRD server |
+| `deploy-dev.yaml`      | Push develop | Docker (ARM64) → `zkcoins/node:beta` → DEV node     |
+| `deploy-prd.yaml`      | Push main    | Docker (ARM64) → `zkcoins/node:latest` → PRD node   |
 | `auto-release-pr.yaml` | Push develop | Creates Release PR (develop → main)                  |
 
 Build time: ~5 minutes (Rust compilation on ARM64).
 
 ## Proving Strategy
 
-zkCoins is **server-heavy**: a single trusted server generates all proofs, the wallet holds only the private key and signs BIP-340 Schnorr over `SHA256(serialize(asth) ‖ serialize(ocr))`. There is no in-browser Poseidon, no wasm-Plonky2 verifier, no in-app ZK gadget. See [`SPEC.md`](./SPEC.md) §13 + the memory `feedback_zkcoins_server_side_compute` for the full rationale.
+zkCoins is **node-heavy**: a single trusted node generates all proofs, the wallet holds only the private key and signs BIP-340 Schnorr over `SHA256(serialize(asth) ‖ serialize(ocr))`. There is no in-browser Poseidon, no wasm-Plonky2 verifier, no in-app ZK gadget. See [`SPEC.md`](./SPEC.md) §13 + the memory `feedback_zkcoins_server_side_compute` for the full rationale.
 
 **Hardware target: Mac Studio M3 Ultra** (96 GB unified RAM, single host). All on-box compute is available: Performance + Efficiency cores, the integrated Apple Silicon GPU (via Metal — currently unused because Plonky2 ships CPU + CUDA backends only), Neural Engine, AMX. **Not available**: external GPU accelerators (no NVIDIA, no CUDA), no cloud prover services (no Succinct Prover Network, no AWS GPU). Performance budget is what the M3 Ultra delivers; if a design overshoots, the design changes — we do not add external hardware.
 
@@ -364,7 +364,7 @@ and `ROADMAP.md`.
 
 ## Protocol
 
-Based on [Shielded CSV](https://eprint.iacr.org/2025/068) by Jonas Nick (Blockstream), Liam Eagen (Alpen Labs), Robin Linus (ZeroSync). Server code derived from [ZeroSync/ZKCoins](https://github.com/ZeroSync/ZKCoins).
+Based on [Shielded CSV](https://eprint.iacr.org/2025/068) by Jonas Nick (Blockstream), Liam Eagen (Alpen Labs), Robin Linus (ZeroSync). Node code derived from [ZeroSync/ZKCoins](https://github.com/ZeroSync/ZKCoins).
 
 ## License
 

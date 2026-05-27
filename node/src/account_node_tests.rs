@@ -392,7 +392,7 @@ fn test_receive_updates_balance() {
     );
 }
 
-/// Reproduces the exact configuration of /api/mint on the live DEV server:
+/// Reproduces the exact configuration of /api/mint on the live DEV node:
 /// recipient = raw [1u8; 32] bytes, amount = 1.
 #[test]
 fn test_mint_repro_live_setup() {
@@ -558,6 +558,25 @@ async fn test_load_from_pg_rejects_wrong_address_length() {
     let pool = crate::db::connect_and_migrate(&url)
         .await
         .expect("connect_and_migrate failed");
+
+    // The 0010 CHECK constraint `accounts_address_length` would
+    // otherwise reject the wrong-length row at insert time, masking
+    // the actual subject of this test: the Rust-side
+    // `LoadAccountNodeError::BadAddressLength` defense in
+    // `load_from_pg`. Drop the constraint inside this per-test
+    // container so the corrupt-row plant succeeds. The 0008
+    // `accounts_history_trigger` would also fail on the matching
+    // `account_history_address_length` CHECK if it fired against
+    // the 7-byte address, so disable the trigger for this test —
+    // we are not exercising the history path here.
+    sqlx::query("ALTER TABLE accounts DISABLE TRIGGER accounts_history_trigger")
+        .execute(&pool)
+        .await
+        .expect("disable accounts_history_trigger");
+    sqlx::query("ALTER TABLE accounts DROP CONSTRAINT accounts_address_length")
+        .execute(&pool)
+        .await
+        .expect("drop accounts_address_length");
 
     sqlx::query("INSERT INTO accounts (address, data) VALUES ($1, $2)")
         .bind(vec![0u8; 7]) // wrong length
@@ -756,7 +775,7 @@ fn test_receive_coin_rejects_replay_via_coin_history() {
 /// Construction: do a real mint → recipient receive flow so that
 /// the recipient's `account.coin_queue[0]` carries an HONEST
 /// `inclusion_proof` produced by `out_coins_tree.generate_inclusion_proof`.
-/// Then reach into the server's internal `accounts` map and flip
+/// Then reach into the node's internal `accounts` map and flip
 /// one sibling on the queued entry's `inclusion_proof`. The next
 /// `send_coins` call from that recipient must surface the
 /// "In-coin not present in source's output_coins_root" error.
@@ -802,7 +821,7 @@ fn test_send_coins_rejects_tampered_source_proof_inclusion() {
         .expect("recipient receive_coin");
 
     // Tamper the queued `inclusion_proof.siblings[0]` directly on the
-    // server's internal `accounts` map. The honest off-circuit
+    // node's internal `accounts` map. The honest off-circuit
     // `source_inclusion.verify` walks the path siblings; flipping
     // the topmost sibling produces a recomputed root that doesn't
     // match the source's committed `output_coins_root`.

@@ -136,7 +136,7 @@ any of them is a design-level rethink, not a tweak.
 | **A2** | **No protocol changes to zkCoins or Arkade for A1.** The atomic-swap construction uses primitives both papers already specify: Shielded CSV §5.1 (shared accounts), §A.1.1 (time-locked nullifiers), §A.1.2 (atomic swap); Arkade Script HTLC template (`arkade-os/compiler`, `docs.arkadeos.com/learn/smart-contracts/hash-time-locked-contract`). | No 12th divergence to track in [`SPEC.md`](./SPEC.md) §15. No deviation from the Ark whitepaper. The integration adds wiring, not protocol changes. |
 | **A3** | **Arkade operator and zkCoins federation remain independent trust domains.** A user holding a VTXO trusts the Arkade operator's rationality (Ark §5 Table 1). A user holding a zkCoins coin pegged to BTC trusts the zkCoins bridge (Phase 1 federation or Phase 2 BitVM2 setup). The two assumptions do not collapse into one; an atomic-swap counterparty may simultaneously occupy both roles, but the trust analyses stay separate. | Operating both an Arkade `arkd` instance and a zkCoins bridge node in the same datacentre is permitted; the security argument tracks each role independently. §8 is the canonical reference for which assumption applies where. |
 | **A4** | **No confidential-VTXO work in the integration roadmap.** Bringing ZK privacy to Arkade VTXOs (§6.5) is genuine open research — Pedersen commitments + range proofs + redesigned forfeit mechanism + a PCD-style ZK validity proof per Arkade batch. Estimated 1–2 year paper-stage work; no existing protocol or implementation. | This document records confidential VTXOs as a research direction worth tracking but explicitly out-of-scope for any near-term zkCoins effort. If Arkade ships such a feature upstream, this section becomes a re-evaluation gate. |
-| **A5** | **Pipeline use (§6.3) is layered on top of A1, not a separate primitive.** "BTC → Arkade → zkCoins → Arkade → BTC" decomposes into: Arkade boarding (Ark §4.5), an HTLC swap into zkCoins (A1), zkCoins-internal transfers, an HTLC swap back out, Arkade exit. Each step is independently specified and the pipeline composes them. | No new design work for the pipeline as long as A1 lands. The wallet-side UX of routing a user through the pipeline is `zk-coins/app` work, not a server-side primitive. |
+| **A5** | **Pipeline use (§6.3) is layered on top of A1, not a separate primitive.** "BTC → Arkade → zkCoins → Arkade → BTC" decomposes into: Arkade boarding (Ark §4.5), an HTLC swap into zkCoins (A1), zkCoins-internal transfers, an HTLC swap back out, Arkade exit. Each step is independently specified and the pipeline composes them. | No new design work for the pipeline as long as A1 lands. The wallet-side UX of routing a user through the pipeline is `zk-coins/app` work, not a node-side primitive. |
 | **A6** | **Cross-asset DEX (§6.6) is a v2 follow-up to A1.** A swap between an Arkade Asset (Arkade Labs' native-asset proposal) and a zkCoins asset is structurally identical to A1 with two field substitutions on each side. It does not require new crypto, but it does require the zkCoins multi-asset shared-account semantics from [`MULTI_ASSET.md`](./MULTI_ASSET.md) to be live, and Arkade Assets to be in production beyond beta. | Tracked as a v2 milestone; not in the initial A1 implementation scope. The first integration ships before chasing this. |
 
 These mirror the lockedness pattern of [`MULTI_ASSET.md`](./MULTI_ASSET.md) §2
@@ -267,7 +267,7 @@ maturity.
 ### 6.1 Layer 0 — independent systems
 
 A user holds an Arkade wallet pointing at some Arkade instance and a
-zkCoins wallet pointing at a zkCoins server. The wallets do not
+zkCoins wallet pointing at a zkCoins node. The wallets do not
 interoperate. The user manually converts between BTC and zkCoins via
 the bridge ([`BRIDGE_MVP.md`](./BRIDGE_MVP.md) or
 [`BITVM_BRIDGE.md`](./BITVM_BRIDGE.md)) and between BTC and Arkade VTXOs
@@ -386,7 +386,7 @@ the initial boarding):
   (no custody handoff possible without preimage reveal), bounded by
   `T_e` on the Arkade side and the publisher's nullifier-publication
   cadence on the zkCoins side.
-- zkCoins-internal transfers: per [`SPEC.md`](./SPEC.md) — server-side
+- zkCoins-internal transfers: per [`SPEC.md`](./SPEC.md) — node-side
   compute correctness + Schnorr signature security.
 
 §8 has the full trust-stacking analysis.
@@ -539,12 +539,12 @@ flow, failure modes, trust argument.
 ### 7.1 Parties and pre-conditions
 
 - **User (Alice):** Arkade wallet pointing at some Arkade instance,
-  zkCoins wallet pointing at a zkCoins server, an existing zkCoins
+  zkCoins wallet pointing at a zkCoins node, an existing zkCoins
   account.
 - **Counterparty (Bob, "swap provider"):** Arkade wallet with VTXO
-  inventory, zkCoins server with sufficient inventory in some operator
+  inventory, zkCoins node with sufficient inventory in some operator
   account. May be the same operator that runs the Arkade instance and
-  the zkCoins server, or a third party; the protocol does not require
+  the zkCoins node, or a third party; the protocol does not require
   it.
 - **Pre-agreed parameters:** swap amount `A`, provider fee `F`, the
   on-Arkade HTLC timeout `T_htlc`, the zkCoins-side recovery timeout
@@ -785,7 +785,7 @@ reasoning about real-world security.
 | Arkade operator (rational) | Operator follows protocol | Operator loses their own funds, not users'; users still exit (Ark §5 Table 1) |
 | Arkade operator (malicious) | Operator deviates | NL, FL still hold; NS, AS, FS violations cost the operator, not users |
 | Arkade MuSig2 covenant emulation | 1-of-n VTXO holders + operator follow signing protocol | VTXT well-formed (Ark §3.2, §4 Remark 4.5) |
-| zkCoins server-side compute | Server runs the published Plonky2 circuit honestly | Per [`CONTRIBUTING.md`](./CONTRIBUTING.md) invariant 1 + invariant 2; closed test environment today, in-circuit verification long-term |
+| zkCoins node-side compute | Node runs the published Plonky2 circuit honestly | Per [`CONTRIBUTING.md`](./CONTRIBUTING.md) invariant 1 + invariant 2; closed test environment today, in-circuit verification long-term |
 | zkCoins Schnorr signatures | BIP-340 / secp256k1 secure | Standard Bitcoin cryptographic assumption |
 | zkCoins publisher liveness | Some publisher willing to inscribe | Permissionless — alternative publishers can take the nullifier |
 | zkCoins bridge Phase 1 (federation) | M-of-N federation honesty ([`BRIDGE_MVP.md`](./BRIDGE_MVP.md)) | M+ colluders can steal BTC reserves; zkCoins-side internal transfers unaffected |
@@ -800,7 +800,7 @@ The HTLC atomic swap of §7 requires:
   fallback if violated).
 - Bitcoin L1 (for confirmation of the inscriptions and any unilateral
   Arkade exit).
-- zkCoins server-side compute (so the publisher accepts and processes
+- zkCoins node-side compute (so the publisher accepts and processes
   the nullifier).
 - BIP-340 Schnorr security (for both sides' signatures).
 
@@ -817,7 +817,7 @@ The pipeline composes:
 
 - Arkade onboarding → Arkade rational operator + Bitcoin L1
 - §7 HTLC swap into zkCoins → as in §8.2
-- zkCoins-internal transfers → zkCoins server-side compute + Schnorr
+- zkCoins-internal transfers → zkCoins node-side compute + Schnorr
 - §7 HTLC swap out of zkCoins → as in §8.2
 - Arkade exit → Arkade rational operator (cooperative) or pure Bitcoin
   L1 (unilateral)
@@ -971,7 +971,7 @@ between systems.
   successfully on the other side? Auto-nullify the recovery to free
   the shared account?
 - **Recommendation:** track as `zk-coins/app` wallet UX issue once
-  A1 lands; not a server-side concern.
+  A1 lands; not a node-side concern.
 
 ### 10.6 Multi-asset semantics in A1 (vs. A6)
 
