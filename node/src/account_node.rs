@@ -225,19 +225,11 @@ impl AccountNode {
             return Err("Coin inclusion proof verification failed");
         }
 
-        // Log coin receipt without exposing full address (privacy).
-        // Runs on the SUCCESS path (after the inclusion proof verifies),
-        // so the log is informational — was previously `eprintln!`
-        // which Loki classified as `detected_level=error` even though
-        // the request returns 200. Downgraded to `tracing::info!` for
-        // the same Deploy-PRD log-cleanliness reason as the 4xx
-        // request-path logs in `router.rs`.
-        let addr_bytes = zkcoins_program::hash::digest_to_bytes(&coin_proof.coin.recipient);
-        tracing::info!(
-            "Receiving coin for address: {:02x}{:02x}…",
-            addr_bytes[0],
-            addr_bytes[1]
-        );
+        // Coin-receipt breadcrumb intentionally omitted: the success
+        // path is already covered by the structured
+        // `tracing::info!("Persisted state. New MMR root: …")` line
+        // emitted downstream when the receive is committed, so an
+        // additional address-fragment hint here is pure duplication.
 
         // Reject duplicate coins (replay protection)
         let coin_id = coin_proof.coin.identifier;

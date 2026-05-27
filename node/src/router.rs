@@ -773,15 +773,10 @@ async fn send_coin_handler(
         send_result = res;
     }
 
-    // Diagnostic breadcrumb. The Err branch is followed immediately by
-    // a more specific `send_coins error: {detail}` log below; logging
-    // this redundant marker at `info` keeps the operator's mental
-    // model intact without contributing to the `detected_level=error`
-    // burst the CI E2E suite used to generate on every Deploy PRD run.
-    tracing::info!(
-        "Send result: {}",
-        if send_result.is_ok() { "ok" } else { "err" }
-    );
+    // Outcome breadcrumb intentionally omitted: both arms below
+    // already emit a specific log line (success state-hash on Ok,
+    // mapped status + detail string on Err), so a generic
+    // "Send result: ok|err" marker between them is pure duplication.
 
     match send_result {
         Ok(mut coin_proofs) => {
@@ -846,21 +841,21 @@ async fn send_coin_handler(
             )
         }
         Err(e) => {
-            // Route the log level off the mapped HTTP status: a 4xx-class
-            // mapping (most of `map_send_coins_error`'s arms — unknown
-            // account, insufficient funds, malformed merkle proofs, …)
-            // is caller-fixable input and logs at `info`; a 5xx-class
-            // mapping (prover failure, unmapped string) stays at
-            // `error` so the operator's existing alert rules still
-            // fire on a genuine prove failure. Map once and thread the
-            // tuple into the response builder — `map_send_coins_error`
-            // is pure but the duplicate call was needless work.
+            // Single `warn` covers every error path. Rationale: a
+            // 5xx-class mapping (prover failure, unmapped string)
+            // originates from a deeper layer that already emits its
+            // own `tracing::error!` / `eprintln!` at the source, so
+            // this outer line is a request-level summary — `warn` is
+            // the correct level (request failed, no new service-side
+            // signal). A 4xx-class mapping is caller-fixable input
+            // and `warn` is also correct there. Loki's
+            // `FieldDetector.extractLogLevel` classifies `warn` as
+            // non-error, which matches what we want for both arms.
+            // Map once and thread the tuple into the response
+            // builder — `map_send_coins_error` is pure but the
+            // duplicate call was needless work.
             let mapped = map_send_coins_error(e);
-            if mapped.0.is_server_error() {
-                tracing::error!("send_coins error: {}", e);
-            } else {
-                tracing::info!("send_coins error: {} (status={})", e, mapped.0);
-            }
+            tracing::warn!("send_coins error: {} (status={})", e, mapped.0);
             send_coins_error_response(mapped)
         }
     }
@@ -1024,19 +1019,16 @@ async fn mint_handler(
             p
         }
         Err(e) => {
-            // Same conditional split as the send_coins error arm: most
-            // `prepare_mint` failure strings map to 4xx (insufficient
-            // funds in the minting account, malformed proofs, …), only
-            // the prover-failure / unmapped-string tail surfaces as
-            // 5xx. Route the log level accordingly so the CI E2E
-            // negative-path mints stop generating false error lines.
-            // Map once and thread the tuple into the response builder.
+            // Single `warn` for the same reason as the send_coins
+            // error arm: 5xx-class mappings (prover failure,
+            // unmapped string) are already logged at `error` by the
+            // deeper layer, and 4xx-class mappings (insufficient
+            // funds, malformed proofs, …) are caller-fixable input.
+            // `warn` is the correct request-level summary level for
+            // both. Map once and thread the tuple into the response
+            // builder.
             let mapped = map_send_coins_error(e);
-            if mapped.0.is_server_error() {
-                tracing::error!("Mint prepare: err — {}", e);
-            } else {
-                tracing::info!("Mint prepare: err — {} (status={})", e, mapped.0);
-            }
+            tracing::warn!("Mint prepare: err — {} (status={})", e, mapped.0);
             return send_coins_error_response(mapped);
         }
     };
