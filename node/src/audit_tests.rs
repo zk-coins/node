@@ -72,6 +72,34 @@ fn headers_to_json_collapses_repeated_keys_into_array() {
     assert_eq!(values, vec!["a=1", "b=2"]);
 }
 
+/// Three+ repeats exercise the `Some(Value::Array(mut arr)) => arr.push`
+/// branch — the second collapse takes the array-grow path, not the
+/// `String → Array` promotion path covered above.
+#[test]
+fn headers_to_json_third_repeat_pushes_into_existing_array() {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.append(
+        HeaderName::from_static("set-cookie"),
+        HeaderValue::from_static("a=1"),
+    );
+    headers.append(
+        HeaderName::from_static("set-cookie"),
+        HeaderValue::from_static("b=2"),
+    );
+    headers.append(
+        HeaderName::from_static("set-cookie"),
+        HeaderValue::from_static("c=3"),
+    );
+    let value = headers_to_json(&headers);
+    let arr = value
+        .as_object()
+        .and_then(|o| o.get("set-cookie"))
+        .and_then(|v| v.as_array())
+        .expect("repeated key rendered as array");
+    let values: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(values, vec!["a=1", "b=2", "c=3"]);
+}
+
 /// `buffer_body` MUST never panic — it returns an empty `Bytes` on
 /// any underlying error. We synthesize a body that fails to collect
 /// to exercise the `Err(_) => eprintln + empty` arm.

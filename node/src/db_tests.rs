@@ -1157,3 +1157,77 @@ async fn get_inscription_summary_returns_full_row() {
     assert!(summary.created_at.ends_with('Z'));
     assert!(summary.updated_at.ends_with('Z'));
 }
+
+#[tokio::test]
+async fn load_pending_in_progress_rejects_invalid_kind_in_row() {
+    // The Rust-side `InscriptionKind::from_db_str` defence in
+    // `load_pending_in_progress` only fires when the DB row contains
+    // a `kind` value outside the CHECK enum. Drop the CHECK first
+    // so we can plant a corrupt row, then assert the loader surfaces
+    // `sqlx::Error::Decode`.
+    let (pool, _container) = setup_pool().await;
+    sqlx::query(
+        "ALTER TABLE pending_inscriptions DROP CONSTRAINT pending_inscriptions_status_check",
+    )
+    .execute(&pool)
+    .await
+    .expect("drop status check");
+    sqlx::query("ALTER TABLE pending_inscriptions DROP CONSTRAINT pending_inscriptions_kind_check")
+        .execute(&pool)
+        .await
+        .expect("drop kind check");
+    sqlx::query(
+        "INSERT INTO pending_inscriptions \
+         (commit_txid, reveal_txid, status, kind, commitment, commit_tx, reveal_tx, commit_output_value) \
+         VALUES ($1, $2, 'constructed', 'bogus', $3, $4, $5, 0)",
+    )
+    .bind(&[0x10u8; 32][..])
+    .bind(&[0x11u8; 32][..])
+    .bind(b"c".to_vec())
+    .bind(b"ctx".to_vec())
+    .bind(b"rtx".to_vec())
+    .execute(&pool)
+    .await
+    .expect("plant row");
+
+    let err = load_pending_in_progress(&pool)
+        .await
+        .expect_err("loader must reject bogus kind");
+    assert!(matches!(err, sqlx::Error::Decode(_)));
+}
+
+#[tokio::test]
+async fn get_inscription_summary_rejects_invalid_kind_in_row() {
+    // Same defensive branch but inside the single-row lookup used by
+    // the `GET /api/inscriptions/:txid` handler.
+    let (pool, _container) = setup_pool().await;
+    sqlx::query(
+        "ALTER TABLE pending_inscriptions DROP CONSTRAINT pending_inscriptions_status_check",
+    )
+    .execute(&pool)
+    .await
+    .expect("drop status check");
+    sqlx::query("ALTER TABLE pending_inscriptions DROP CONSTRAINT pending_inscriptions_kind_check")
+        .execute(&pool)
+        .await
+        .expect("drop kind check");
+    let commit_txid = [0x20u8; 32];
+    sqlx::query(
+        "INSERT INTO pending_inscriptions \
+         (commit_txid, reveal_txid, status, kind, commitment, commit_tx, reveal_tx, commit_output_value) \
+         VALUES ($1, $2, 'constructed', 'bogus', $3, $4, $5, 0)",
+    )
+    .bind(&commit_txid[..])
+    .bind(&[0x21u8; 32][..])
+    .bind(b"c".to_vec())
+    .bind(b"ctx".to_vec())
+    .bind(b"rtx".to_vec())
+    .execute(&pool)
+    .await
+    .expect("plant row");
+
+    let err = get_inscription_summary_by_commit_txid(&pool, &commit_txid)
+        .await
+        .expect_err("summary must reject bogus kind");
+    assert!(matches!(err, sqlx::Error::Decode(_)));
+}

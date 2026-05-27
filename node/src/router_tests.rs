@@ -5479,3 +5479,78 @@ async fn claim_username_precheck_reject_persists_log_row() {
     assert!(!success);
     assert!(reject_reason.is_some());
 }
+
+/// Cover the `eprintln!("Failed to persist username_claim_log: …")`
+/// arm at router.rs line 1767. The fire-and-forget spawn calls
+/// `insert_username_claim_log` — we DROP the table out from under it
+/// so the insert fails and the eprintln line runs.
+#[tokio::test]
+async fn claim_username_log_spawn_handles_insert_error() {
+    use crate::db::connect_and_migrate;
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("postgres container");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(connect_and_migrate(&url).await.expect("migrate"));
+    let state = live_test_state(pool.clone());
+
+    // Pre-stake a conflicting username so the handler hits the
+    // precheck-reject path and invokes log_claim(false, …) → spawn.
+    {
+        let mut store = state.username_store.lock().unwrap();
+        let other_addr = zkcoins_program::hash::digest_from_bytes(&[0x55; 32]);
+        store.commit_after_db("bob".into(), other_addr);
+    }
+
+    // Drop the username_claim_log table so the spawned insert errs.
+    sqlx::query("DROP TABLE username_claim_log CASCADE")
+        .execute(pool.as_ref())
+        .await
+        .expect("drop username_claim_log");
+
+    let secp = secp::Secp256k1::new();
+    let secret = bitcoin::secp256k1::SecretKey::from_slice(&[0x44; 32]).unwrap();
+    let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+    let address: [u8; 32] = Sha256::digest(public_key.serialize()).into();
+    let address_hex = hex::encode(address);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut hasher = Sha256::new();
+    hasher.update(b"zkcoins:claim_username");
+    hasher.update(address_hex.as_bytes());
+    hasher.update(b"bob");
+    hasher.update(now.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    let msg = Message::from_digest(hash);
+    let kp = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &secret);
+    let sig = secp.sign_schnorr(&msg, &kp);
+
+    let body = serde_json::json!({
+        "username": "bob",
+        "address": address_hex,
+        "public_key": public_key.to_string(),
+        "signature": hex::encode(sig.serialize()),
+        "timestamp": now,
+    });
+    let req = Request::post("/api/username/claim")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let app = create_router(state);
+    let resp = app.oneshot(req).await.unwrap();
+    // 409 from precheck — the response path doesn't depend on the
+    // (failed) audit insert.
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // Give the fire-and-forget spawn time to hit the eprintln path.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+}
