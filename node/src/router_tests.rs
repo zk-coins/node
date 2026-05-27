@@ -3009,6 +3009,48 @@ async fn send_without_timestamp_returns_401_missing_signature() {
     assert_eq!(v["error"], "Missing signature");
 }
 
+#[tokio::test]
+async fn send_with_stale_timestamp_returns_401_request_timestamp() {
+    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
+    use bitcoin::secp256k1::PublicKey;
+    let secret_bytes = include_bytes!("../minting_secret.bin");
+    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
+    let secp = secp::Secp256k1::new();
+    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .public_key;
+    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
+        .unwrap()
+        .public_key;
+
+    // Stale timestamp: well outside MAX_TIMESTAMP_SKEW_SECS. Signature
+    // present so the upstream Missing-signature gate passes — the
+    // request reaches `check_timestamp_window` and trips its dedicated
+    // 401 branch (router.rs:674-677). Distinct from the "Signature
+    // verification failed" string that the signature-verify path would
+    // emit otherwise.
+    let stale_timestamp: u64 = 1u64; // 1970, definitely > 300s in the past
+    let body = serde_json::json!({
+        "account_address": "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS)),
+        "recipient": "0x".to_string() + &hex::encode([1u8; 32]),
+        "amount": 1,
+        "public_key": hex::encode(pk_0.serialize()),
+        "next_public_key": hex::encode(pk_1.serialize()),
+        "signature": "ab".repeat(64),
+        "timestamp": stale_timestamp,
+    });
+    let req = Request::post("/api/send")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
+    assert_eq!(v["error"], "Request timestamp too old or in the future");
+}
+
 #[test]
 fn lock_or_recover_account_node_poisoned() {
     // Generic instantiation: cover the AccountNode-specific monomorphic
