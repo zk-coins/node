@@ -609,7 +609,13 @@ async fn receive_coin_handler(
     let coin_proof = match bincode::deserialize::<CoinProof>(&body) {
         Ok(cp) => cp,
         Err(e) => {
-            eprintln!("Failed to deserialize proof with commitment: {}", e);
+            // Caller submitted a malformed binary body. The handler
+            // returns a default `SendCoinResponse { success: false }`
+            // (currently a 200 with `success=false`, behaviourally a
+            // client-input rejection); log at `info` so the CI E2E
+            // negative-path tests hitting `/api/receive` with bad
+            // bytes do not surface as `detected_level=error` lines.
+            tracing::info!("Failed to deserialize proof with commitment: {}", e);
             return Json(SendCoinResponse::default());
         }
     };
@@ -674,11 +680,18 @@ async fn send_coin_handler(
         .timestamp
         .expect("timestamp presence checked immediately above");
     if let Err(e) = check_timestamp_window(timestamp) {
-        eprintln!("Timestamp window check failed: {}", e);
+        // 401 — caller's signed timestamp is outside the freshness
+        // window. Client-input class, logged at `info` so the post-deploy
+        // API E2E negative-path tests (`send_stale_timestamp_returns_401`
+        // and friends) do not surface as `detected_level=error` lines
+        // in Loki on every CI run.
+        tracing::info!("Timestamp window check failed: {}", e);
         return handler_error_response(StatusCode::UNAUTHORIZED, e);
     }
     if let Err(e) = verify_send_signature(&request) {
-        eprintln!("Signature verification failed: {}", e);
+        // 401 — client-supplied signature does not validate. Same
+        // log-level rationale as the timestamp window check above.
+        tracing::info!("Signature verification failed: {}", e);
         return handler_error_response(StatusCode::UNAUTHORIZED, "Signature verification failed");
     }
 
@@ -755,7 +768,12 @@ async fn send_coin_handler(
         send_result = res;
     }
 
-    eprintln!(
+    // Diagnostic breadcrumb. The Err branch is followed immediately by
+    // a more specific `send_coins error: {detail}` log below; logging
+    // this redundant marker at `info` keeps the operator's mental
+    // model intact without contributing to the `detected_level=error`
+    // burst the CI E2E suite used to generate on every Deploy PRD run.
+    tracing::info!(
         "Send result: {}",
         if send_result.is_ok() { "ok" } else { "err" }
     );
@@ -823,7 +841,19 @@ async fn send_coin_handler(
             )
         }
         Err(e) => {
-            eprintln!("send_coins error: {}", e);
+            // Route the log level off the mapped HTTP status: a 4xx-class
+            // mapping (most of `map_send_coins_error`'s arms — unknown
+            // account, insufficient funds, malformed merkle proofs, …)
+            // is caller-fixable input and logs at `info`; a 5xx-class
+            // mapping (prover failure, unmapped string) stays at
+            // `error` so the operator's existing alert rules still
+            // fire on a genuine prove failure.
+            let (status, _body) = map_send_coins_error(e);
+            if status.is_server_error() {
+                tracing::error!("send_coins error: {}", e);
+            } else {
+                tracing::info!("send_coins error: {} (status={})", e, status);
+            }
             send_coins_error_response(e)
         }
     }
@@ -979,11 +1009,26 @@ async fn mint_handler(
     };
     let mut prepared = match prepared {
         Ok(p) => {
-            eprintln!("Mint prepare: ok");
+            // Success-path breadcrumb. `info` rather than `eprintln!`
+            // (which used to land on stderr → Loki classified as
+            // `detected_level=error`) — there is no failure to log
+            // here.
+            tracing::info!("Mint prepare: ok");
             p
         }
         Err(e) => {
-            eprintln!("Mint prepare: err — {}", e);
+            // Same conditional split as the send_coins error arm: most
+            // `prepare_mint` failure strings map to 4xx (insufficient
+            // funds in the minting account, malformed proofs, …), only
+            // the prover-failure / unmapped-string tail surfaces as
+            // 5xx. Route the log level accordingly so the CI E2E
+            // negative-path mints stop generating false error lines.
+            let (status, _body) = map_send_coins_error(e);
+            if status.is_server_error() {
+                tracing::error!("Mint prepare: err — {}", e);
+            } else {
+                tracing::info!("Mint prepare: err — {} (status={})", e, status);
+            }
             return send_coins_error_response(e);
         }
     };

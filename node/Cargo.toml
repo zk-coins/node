@@ -62,6 +62,20 @@ sqlx = { version = "0.8", default-features = false, features = [
     # a manual `Encode` shim.
     "json",
 ] }
+# Structured logging facade. Replaces the legacy `println!` / `eprintln!`
+# calls on the API request path so log lines carry an explicit level
+# (`info` / `warn` / `error`) instead of relying on the stdout-vs-stderr
+# heuristic Alloy / Loki uses to derive `detected_level`. The trigger
+# was the post-deploy API E2E negative-path tests producing a burst of
+# false `error`-level lines on every `Deploy PRD` run — see PR for the
+# call-site survey.
+tracing = "0.1"
+# `fmt` subscriber for the production binary; `env-filter` lets
+# operators tune verbosity via `RUST_LOG` without rebuilding. Kept
+# minimal — no JSON output, no telemetry exporter — because the
+# operator-facing aggregator (Alloy → Loki) parses the default
+# fmt-layer output today.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
