@@ -396,13 +396,13 @@ Step 4. User (or their wallet, or any helper service) generates a
         Bitcoin Light Client Proof showing MovetoVault is in the
         canonical chain at depth ≥ 6.
 
-Step 5. User submits to a zkCoins server an IssuanceProof request:
+Step 5. User submits to a zkCoins node an IssuanceProof request:
           - Their account state (initial, balance = 0)
           - The Bitcoin LCP for MovetoVault
           - The peg-in UTXO outpoint
           - The non-inclusion proof against peg_in_consumed_smt
 
-Step 6. zkCoins server (or the user's own prover, in a more
+Step 6. zkCoins node (or the user's own prover, in a more
         decentralised future) generates the IssuanceProof:
           - Verifies the Bitcoin LCP
           - Verifies the deposit amount equals the requested mint
@@ -436,13 +436,13 @@ needed.
 | Vault sweeps multiple deposits without proper mint authorisation | Pre-signing prevents this (vault can only spend via pre-signed paths) |
 | User's LCP is forged or stale | Circuit re-verifies LCP from headers; forgery requires breaking PoW |
 | Bitcoin reorg removes MovetoVault | LCP becomes invalid; user retries after deeper confirmation |
-| zkCoins server malicious — refuses to generate IssuanceProof | User goes to another zkCoins server (server-side compute is replicable; any party with the protocol can mint). This requires multiple zkCoins servers to exist; currently single-server. |
+| zkCoins node malicious — refuses to generate IssuanceProof | User goes to another zkCoins node (node-side compute is replicable; any party with the protocol can mint). This requires multiple zkCoins nodes to exist; currently single-node. |
 
 ### 5.5 The "user pays an operator to mint" alternative
 
 The above puts proof generation on the user side (or their chosen
-zkCoins server). A simpler MVP variant: the federation includes
-zkCoins-server operators who automatically generate the IssuanceProof
+zkCoins node). A simpler MVP variant: the federation includes
+zkCoins-node operators who automatically generate the IssuanceProof
 when they see a confirmed MovetoVault. This is more centralised but
 operationally simpler. Trade-off documented as open question §10.
 
@@ -540,7 +540,7 @@ A realistic implementation sequence:
 | 3 | Bitcoin Light Client gadget in circuit | 2–3 weeks | Phase 0 |
 | 4 | `IssuanceProof` circuit branch | 2 weeks | Phase 0, Phase 3 |
 | 5 | `BurnProof` circuit branch | 1–2 weeks | Phase 0 |
-| 6 | Bridge server-side state (peg_in_consumed_smt, burned_coins_smt, pending_payouts) | 1 week | Phase 4, Phase 5 |
+| 6 | Bridge node-side state (peg_in_consumed_smt, burned_coins_smt, pending_payouts) | 1 week | Phase 4, Phase 5 |
 | 7 | Federation node software (signer + operator + watchtower roles) | 4–6 weeks | Phase 2a, Phase 6 |
 | 8 | Integration testing with all federation members on signet | 2–4 weeks | Phase 7 |
 | 9 | Mainnet launch | TBD | Phase 8 |
@@ -669,9 +669,9 @@ Zcash's t/z address model.
 
 ## 10. Open Questions
 
-1. **Who pays for proof generation in Phase 4–5?** Server-side
+1. **Who pays for proof generation in Phase 4–5?** Node-side
    (zkCoins operator) is operationally simpler; user-side
-   (decentralised) is more trustless. Default: server-side for v1
+   (decentralised) is more trustless. Default: node-side for v1
    with a clear migration path to user-side later.
 
 2. **Federation size and composition.** Minimum credible: 5

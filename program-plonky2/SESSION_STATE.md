@@ -34,9 +34,9 @@ Tests, Analyze rust, Analyze actions, CodeQL, Coverage MVP scope).
   end-state documented in
   [`MIGRATION_RESEARCH.md` §7.22](../MIGRATION_RESEARCH.md#722-stage-5d-next-5-source-side-verification-via-aggregator-pattern--codified-resolves-721).
 - Step 6 (script-plonky2 prover host wrapper): ✅ done (`d96bb62`)
-- Step 7 (server replacement): ✅ done. Workspace toolchain unified
+- Step 7 (node replacement): ✅ done. Workspace toolchain unified
   to nightly. `program/` + `script/` deleted (recoverable via
-  `git checkout v0.last-sp1 -- ...`). shared + server fully
+  `git checkout v0.last-sp1 -- ...`). shared + node fully
   migrated to Plonky2-era modules with the HashDigest type-shift
   handled at all boundaries. `account_node::send_coins` wired to
   the Plonky2 `Prover` wrapper (`c71c9fc`); the **in-circuit
@@ -44,7 +44,7 @@ Tests, Analyze rust, Analyze actions, CodeQL, Coverage MVP scope).
   through (Step 7 follow-up, addresses #25), with the off-circuit
   pre-check loop retained as **defense-in-depth fast-fail** before
   the minute-scale prove. Dockerfile re-introduced (`dac0179`). 138
-  server tests pass with `--all-features` (32 baseline + 10 inline
+  node tests pass with `--all-features` (32 baseline + 10 inline
   error-path in `d6a3cb9` + 64 ported SP1-era fixtures re-enabled
   via `account_node_tests.rs` + `router_tests.rs` + 13
   feature-gated + 1 new Stage 5d-next-5 Phase 2b negative + 17
@@ -59,7 +59,7 @@ Tests, Analyze rust, Analyze actions, CodeQL, Coverage MVP scope).
 
 `cargo run --release -p node` boots cleanly:
 - `Prover::new()` builds the cyclic state-transition circuit
-- REST server binds `0.0.0.0:4242`
+- REST API binds `0.0.0.0:4242`
 - `GET /health` → `ok`
 - `GET /api/info` → `{"network":"Mutinynet"}`
 - Block scanner connects to Esplora + processes Mutinynet tip
@@ -157,7 +157,7 @@ At Stage 5d-next-5 / Phase 2b production parameters
   exercise off-circuit gadgets (Poseidon / SMT / MMR / types /
   inputs). `cargo test --release --lib -- --test-threads=2` wall
   ~42 min on M3. Single-threaded ~80–120 min on `ubuntu-latest`.
-- `server` crate: 120 tests with `--all-features` (32 baseline + 10
+- `node` crate: 120 tests with `--all-features` (32 baseline + 10
   inline error-path + 64 ported SP1-era fixtures + 13 feature-gated
   + 1 Stage 5d-next-5 Phase 2b negative). `cargo test -p node
   --release --all-features -- --test-threads=1` wall ~36 min on M3.
@@ -220,7 +220,7 @@ likely to be touched next" above.
 - Pre-mainnet protocol redesigns (D2/D10 / D7 / D8 — see
   ROADMAP "Pre-mainnet blockers").
 
-Step 6 (`script-plonky2/` prover host) and Step 7 (server-side
+Step 6 (`script-plonky2/` prover host) and Step 7 (node-side
 replacement + in-circuit `send_coins` follow-up) have BOTH landed
 on this branch.
 
@@ -240,7 +240,7 @@ Kept for the wall-time reference points; the current branch is at
 **Current branch (Stage 5d-next-5 / Phase 2b landed; PR #31
 housekeeping merged).** Full `program-plonky2` lib sweep ~42 min
 wall on M3 with `--test-threads=2`, 115 cyclic-recursion tests
-green; full server sweep `cargo test -p node --release
+green; full node sweep `cargo test -p node --release
 --all-features -- --test-threads=1` ~36 min wall, 138 tests green
 (including the Phase 2b negative
 `test_send_coins_rejects_tampered_source_proof_inclusion` + the

@@ -325,7 +325,7 @@ impl SparseMerkleTree {
 
 /// Persist a `SparseMerkleTree` to `path` via bincode. Matches the
 /// SP1-era `zkcoins_program::merkle::sparse_merkle_tree::save_merkle_tree`
-/// shape — used by the server's `State::save_to_files` cutover.
+/// shape — used by the node's `State::save_to_files` cutover.
 pub fn save_merkle_tree(tree: &SparseMerkleTree, path: &str) -> std::io::Result<()> {
     use std::io::Write;
     let file = std::fs::File::create(path)?;

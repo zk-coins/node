@@ -22,7 +22,7 @@ pub type MerklePath = Vec<HashDigest>;
 /// [`MerkleMountainRange::root_extended`] and [`MMRProof::extend_to`]
 /// before being consumed in-circuit.
 ///
-/// Picked so a single zkCoins server can run for many years of state
+/// Picked so a single zkCoins node can run for many years of state
 /// transitions without exhausting the MMR; the closed test env makes
 /// this a free parameter (no on-chain commitment to a specific depth).
 pub const MMR_MAX_DEPTH: usize = 32;
@@ -221,7 +221,7 @@ impl MerkleMountainRange {
 
 /// Persist a `MerkleMountainRange` to `path` via bincode. Matches
 /// the SP1-era `zkcoins_program::merkle::merkle_mountain_range`
-/// helper shape — used by the server's `State::save_to_files` cutover.
+/// helper shape — used by the node's `State::save_to_files` cutover.
 pub fn save_mmr(mmr: &MerkleMountainRange, path: &str) -> std::io::Result<()> {
     use std::io::Write;
     let file = std::fs::File::create(path)?;

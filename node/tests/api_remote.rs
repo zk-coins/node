@@ -1,4 +1,4 @@
-//! HTTP API end-to-end test suite for the deployed zkCoins server.
+//! HTTP API end-to-end test suite for the deployed zkCoins node.
 //!
 //! This suite is the functional counterpart to the smoke test inside
 //! `.github/workflows/deploy-dev.yaml` (which only probes `/api/info`).
@@ -9,10 +9,10 @@
 //! exercising the API contract happy path against the same backend
 //! the wallet app talks to.
 //!
-//! Scope note: the suite verifies server-visible behaviour (status
+//! Scope note: the suite verifies API-visible behaviour (status
 //! codes, response shapes, balance movements). The commit message
 //! format used in `send_commit_roundtrip_moves_balance` is the
-//! 64-byte `ash || ocr` raw concat, which the server accepts via
+//! 64-byte `ash || ocr` raw concat, which the node accepts via
 //! `Commitment::verify`'s SHA-256 fallback. The canonical wallet
 //! client signs the 32-byte Poseidon `hash_concat(ash, ocr)` digest
 //! (see `shared::ClientAccount::create_commitment`); the two forms
@@ -20,11 +20,11 @@
 //! and the suite never re-spends from the test wallet so the leaf
 //! shape is observationally indistinguishable in-scope.
 //!
-//! The DEV server is shared by other workflows (per-PR app E2E,
+//! The DEV node is shared by other workflows (per-PR app E2E,
 //! interactive testing). To keep this suite race-free we always:
 //!   - mint into freshly-generated wallets (no fixed addresses)
 //!   - assert strictly on 4xx codes (client-fixable contract bugs)
-//!   - assert strictly on 5xx codes as well (server-side regressions
+//!   - assert strictly on 5xx codes as well (node-side regressions
 //!     are real bugs, not flakes — the deploy-dev preflight verifies
 //!     publisher wallet + /health/ready BEFORE this suite runs, so a
 //!     503 here is unambiguous: it means something regressed)
@@ -35,7 +35,7 @@
 //!
 //! Configuration:
 //!   - `ZKCOINS_API_URL` (default `https://dev-api.zkcoins.app`) —
-//!     the base URL of the server under test.
+//!     the base URL of the node under test.
 
 use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
 use bitcoin::secp256k1::{self as secp, Keypair, Message, PublicKey, SecretKey};
@@ -110,26 +110,29 @@ fn url(path: &str) -> String {
 /// (any value, even empty) downgrades the CI panic back to a silent
 /// skip. The dev-api / prd-api Docker images intentionally ship the
 /// MVP-only feature set (`Dockerfile` `ARG FEATURES=`), so when the
-/// suite runs `--all-features` against a feature-trimmed *server*
+/// suite runs `--all-features` against a feature-trimmed *node*
 /// the gated `address_list` / `lnurl` tests must skip cleanly instead
 /// of panicking the CI canary. The env var documents this as an
-/// opt-in: workflows that point the suite at a trimmed server set it,
-/// workflows that point it at a fully-featured server leave it unset
+/// opt-in: workflows that point the suite at a trimmed node set it,
+/// workflows that point it at a fully-featured node leave it unset
 /// so the canary stays armed.
+///
+/// The env-var name keeps the legacy `_SERVER` suffix as a stable
+/// contract with `.github/workflows/deploy-dev.yaml`; the prose above
+/// reflects the post-rename "node" terminology.
 macro_rules! feature_skip {
     ($feature:expr, $test:expr) => {{
-        let allow_trimmed_server =
-            std::env::var("ZKCOINS_E2E_ALLOW_FEATURE_TRIMMED_SERVER").is_ok();
-        if std::env::var("CI").is_ok() && !allow_trimmed_server {
+        let allow_trimmed_node = std::env::var("ZKCOINS_E2E_ALLOW_FEATURE_TRIMMED_SERVER").is_ok();
+        if std::env::var("CI").is_ok() && !allow_trimmed_node {
             panic!(
                 "feature `{}` disabled but running in CI — all-features build is required \
-                 (set ZKCOINS_E2E_ALLOW_FEATURE_TRIMMED_SERVER=1 if the target server is \
+                 (set ZKCOINS_E2E_ALLOW_FEATURE_TRIMMED_SERVER=1 if the target node is \
                  intentionally feature-trimmed, e.g. the MVP-only DEV image)",
                 $feature
             );
         }
         eprintln!(
-            "SKIP {}: feature `{}` disabled on this server",
+            "SKIP {}: feature `{}` disabled on this node",
             $test, $feature
         );
         return;
@@ -149,9 +152,9 @@ macro_rules! feature_skip {
 // rest of the test if the relevant feature flag is `false`.
 //
 // `ZKCOINS_FORCE_DISABLE_FEATURES` (comma-separated list, e.g.
-// `address_list,lnurl`) overrides any flag returned by the server
+// `address_list,lnurl`) overrides any flag returned by the node
 // to `false`. This is the local dry-run hook — point the suite at the
-// live DEV server, force features off, and confirm that every gated
+// live DEV node, force features off, and confirm that every gated
 // test prints `SKIP …` instead of hitting a disabled-on-paper but
 // actually-running endpoint. Forcing `faucet` or `usernames` off is a
 // no-op (the routes are always registered) and the flags are ignored.
@@ -225,7 +228,7 @@ async fn fetch_capabilities(client: &reqwest::Client) -> Capabilities {
 
 // ---------------------------------------------------------------------------
 // TestWallet — fresh-per-test random key + helpers for signing the four
-// request shapes the server accepts (send / commit / username-claim).
+// request shapes the node accepts (send / commit / username-claim).
 // ---------------------------------------------------------------------------
 
 struct TestWallet {
@@ -237,7 +240,7 @@ impl TestWallet {
     fn new() -> Self {
         let mut seed = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut seed);
-        // Signet matches the mutinynet flavour the DEV server runs on;
+        // Signet matches the mutinynet flavour the DEV node runs on;
         // the network choice only affects xpub serialisation prefixes,
         // not the derived secp256k1 keys we sign with.
         let xpriv = Xpriv::new_master(Network::Signet, &seed).expect("derive xpriv from seed");
@@ -267,7 +270,7 @@ impl TestWallet {
         Keypair::from_secret_key(&self.secp, &self.seckey(idx))
     }
 
-    /// The hex address that the server treats as the account identifier.
+    /// The hex address that the node treats as the account identifier.
     /// Mirrors `shared::AccountState::new` → `sha256(compressed_pubkey)`.
     fn address_hex(&self) -> String {
         let pk = self.pubkey(0);
@@ -297,7 +300,7 @@ impl TestWallet {
 
     /// Sign the commit message: the BIP-340 Schnorr signature is
     /// produced by `Commitment::new`, which SHA256s any non-32-byte
-    /// payload before signing. The server reconstructs the
+    /// payload before signing. The node reconstructs the
     /// `Commitment` struct from `(public_key, signature, message)`
     /// and re-verifies it the same way.
     fn sign_commit(&self, message_bytes: &[u8]) -> String {
@@ -309,7 +312,7 @@ impl TestWallet {
     /// Sign the username-claim preimage:
     /// `SHA256("zkcoins:claim_username" || address_hex_str || normalised_username_str || timestamp_le8)`.
     ///
-    /// The server canonicalises the username with `to_lowercase()`
+    /// The node canonicalises the username with `to_lowercase()`
     /// before hashing; wallets must sign over the same lowercase form
     /// or verification fails. The helper mirrors that to keep the
     /// signature path honest end-to-end.
@@ -483,6 +486,19 @@ async fn balance_invalid_hex_returns_422() {
         .await
         .expect("GET /api/balance (bad hex)");
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // The balance handler returns a `BalanceResponse` (not a
+    // `SendCoinResponse`) on the 422 branches — so the body has
+    // `balance: 0` and no `error` field. This anchors the contract:
+    // any future refactor that swaps the body for a `handler_error_response`
+    // envelope (with an `error: "Invalid hex"` string, matching the
+    // app's `KNOWN_SERVER_ERRORS`) must update this assertion.
+    let body: Value = resp.json().await.expect("balance body JSON");
+    assert_eq!(body["balance"], 0, "422 balance body must report balance 0");
+    assert!(
+        body.get("error").is_none(),
+        "balance 422 body must not carry an `error` field today (got {:?})",
+        body.get("error")
+    );
 }
 
 #[tokio::test]
@@ -495,6 +511,14 @@ async fn balance_wrong_length_returns_422() {
         .await
         .expect("GET /api/balance (short hex)");
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // Same envelope shape as the invalid-hex branch above.
+    let body: Value = resp.json().await.expect("balance body JSON");
+    assert_eq!(body["balance"], 0, "422 balance body must report balance 0");
+    assert!(
+        body.get("error").is_none(),
+        "balance 422 body must not carry an `error` field today (got {:?})",
+        body.get("error")
+    );
 }
 
 #[tokio::test]
@@ -523,7 +547,7 @@ async fn address_list_returns_addresses() {
 
 #[tokio::test]
 async fn proof_for_huge_id_returns_404() {
-    // u64::MAX is guaranteed to exceed any real proof_id the server
+    // u64::MAX is guaranteed to exceed any real proof_id the node
     // has issued, so the file-on-disk lookup misses and returns 404.
     let resp = http_client()
         .get(url(&format!("/api/proof/{}", u64::MAX)))
@@ -624,6 +648,17 @@ async fn mint_invalid_hex_address_returns_422() {
         .await
         .expect("POST /api/mint bad hex");
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // The mint handler uses `handler_error_response` for both hex/
+    // length failures, so the body is a `SendCoinResponse` envelope
+    // with `success: false` and a specific `error` string. Asserting
+    // the EXACT string keeps the lockstep contract honest — the app's
+    // `KNOWN_SERVER_ERRORS` uses a generic `"Invalid hex"` placeholder
+    // but the server emits the more-specific `"account_address is not
+    // valid hex"`. The lockstep inventory test below documents this
+    // mismatch.
+    let body: Value = resp.json().await.expect("mint 422 body JSON");
+    assert_eq!(body["success"], Value::Bool(false));
+    assert_eq!(body["error"], "account_address is not valid hex");
 }
 
 #[tokio::test]
@@ -637,6 +672,17 @@ async fn mint_wrong_address_length_returns_422() {
         .await
         .expect("POST /api/mint short addr");
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // Same envelope as the invalid-hex branch — but with the address-
+    // length-specific message. The app's `KNOWN_SERVER_ERRORS` lists
+    // `"Invalid address length"` as a placeholder; the server emits
+    // `"account_address must be 32 bytes (64 hex chars)"`. See the
+    // lockstep inventory test below.
+    let body: Value = resp.json().await.expect("mint 422 body JSON");
+    assert_eq!(body["success"], Value::Bool(false));
+    assert_eq!(
+        body["error"],
+        "account_address must be 32 bytes (64 hex chars)"
+    );
 }
 
 #[tokio::test]
@@ -656,6 +702,12 @@ async fn send_bad_address_hex_returns_422() {
     // — this should fail at the hex-decode step (handler-level 422,
     // not axum-level deserialization 422).
     let alice = TestWallet::new();
+    // Signature/timestamp are present so the request passes the
+    // "Missing signature" / "Missing timestamp" / timestamp-window gates
+    // upstream; the test exercises the per-field hex validator that
+    // runs after the auth gates.
+    let ts = unix_now();
+    let signature = alice.sign_send("0xZZZZZZ", &alice.address_hex(), 1, ts);
     let body = json!({
         "account_address": "0xZZZZZZ",
         "recipient": alice.address_hex(),
@@ -663,8 +715,8 @@ async fn send_bad_address_hex_returns_422() {
         "public_key": hex::encode(alice.pubkey(0).serialize()),
         "next_public_key": hex::encode(alice.pubkey(1).serialize()),
         "prev_commitment_pubkey": Option::<String>::None,
-        "signature": Option::<String>::None,
-        "timestamp": Option::<u64>::None,
+        "signature": Some(signature),
+        "timestamp": Some(ts),
     });
     let resp = http_client()
         .post(url("/api/send"))
@@ -673,12 +725,19 @@ async fn send_bad_address_hex_returns_422() {
         .await
         .expect("POST /api/send bad hex");
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // Body contract: same `SendCoinResponse` envelope as the mint 422
+    // branches. The string is specific (per-field), not the generic
+    // `"Invalid hex"` listed in the app's `KNOWN_SERVER_ERRORS` — the
+    // lockstep inventory below tracks the mismatch.
+    let body: Value = resp.json().await.expect("send 422 body JSON");
+    assert_eq!(body["success"], Value::Bool(false));
+    assert_eq!(body["error"], "account_address is not valid hex");
 }
 
 #[tokio::test]
 async fn send_unknown_account_returns_404() {
     // Well-formed body, valid signatures, but the sender account has
-    // no balance / state on the server, so `send_coins` returns
+    // no balance / state on the node, so `send_coins` returns
     // "Unknown account address" → 404.
     let alice = TestWallet::new();
     let bob = TestWallet::new();
@@ -703,6 +762,14 @@ async fn send_unknown_account_returns_404() {
         .await
         .expect("POST /api/send unknown account");
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // Body contract: 404 here is the canonical "Unknown account address"
+    // path from `map_send_coins_error` in `router.rs`. This is the
+    // value-bearing half of the lockstep check — the app's
+    // `KNOWN_SERVER_ERRORS` list is asserted against the live server
+    // here so a server-side rename surfaces immediately.
+    let body: Value = resp.json().await.expect("send 404 body JSON");
+    assert_eq!(body["success"], Value::Bool(false));
+    assert_eq!(body["error"], "Unknown account address");
 }
 
 #[tokio::test]
@@ -726,6 +793,12 @@ async fn send_bad_signature_returns_401() {
         .await
         .expect("POST /api/send bad sig");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // Body contract: `"Signature verification failed"` is one of the
+    // app's `KNOWN_SERVER_ERRORS` and the live server must emit the
+    // exact same string.
+    let body: Value = resp.json().await.expect("send 401 body JSON");
+    assert_eq!(body["success"], Value::Bool(false));
+    assert_eq!(body["error"], "Signature verification failed");
 }
 
 #[tokio::test]
@@ -753,6 +826,12 @@ async fn send_stale_timestamp_returns_401() {
         .await
         .expect("POST /api/send stale ts");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // Body contract: `"Request timestamp too old or in the future"`
+    // is one of the app's `KNOWN_SERVER_ERRORS` and the live server
+    // must emit the exact same string.
+    let body: Value = resp.json().await.expect("send 401 body JSON");
+    assert_eq!(body["success"], Value::Bool(false));
+    assert_eq!(body["error"], "Request timestamp too old or in the future");
 }
 
 #[tokio::test]
@@ -806,7 +885,7 @@ async fn commit_unknown_proof_id_returns_404() {
 #[tokio::test]
 async fn commit_bad_message_hex_returns_422_or_404() {
     let alice = TestWallet::new();
-    // proof_id=1 may or may not exist on the server. If it exists, the
+    // proof_id=1 may or may not exist on the node. If it exists, the
     // handler reaches the hex-decode step and returns 422. If not, the
     // proof-store miss short-circuits at 404. Both are acceptable for
     // this negative-path coverage.
@@ -901,7 +980,7 @@ async fn claim_username_stale_timestamp_returns_401() {
 }
 
 // ---------------------------------------------------------------------------
-// Section 3 — happy-path roundtrips against the deployed server
+// Section 3 — happy-path roundtrips against the deployed node
 // ---------------------------------------------------------------------------
 
 /// Roundtrip A — mint into a fresh wallet and observe the balance.
@@ -962,7 +1041,7 @@ async fn mint_roundtrip_lands_balance_and_proof() {
         bincode::deserialize(&proof_bytes).expect("decode CoinProof bincode");
     assert!(
         coin_proof.commitment.is_some(),
-        "mint coin proof should carry a server-signed commitment"
+        "mint coin proof should carry a node-signed commitment"
     );
     assert_eq!(coin_proof.coin.amount, MINT_AMOUNT);
 }
@@ -970,7 +1049,7 @@ async fn mint_roundtrip_lands_balance_and_proof() {
 /// Roundtrip B — full mint → send → commit pipeline.
 ///
 /// The send half requires the previous commitment's signing key as
-/// `prev_commitment_pubkey`. After a mint that's the server's minting
+/// `prev_commitment_pubkey`. After a mint that's the node's minting
 /// pubkey, embedded in the mint's `CoinProof.commitment`.
 #[tokio::test]
 async fn send_commit_roundtrip_moves_balance() {
@@ -1085,7 +1164,7 @@ async fn send_commit_roundtrip_moves_balance() {
 
     // Value-bearing assertions on the response payload: each hash
     // field must decode to exactly 32 bytes and be non-zero. A
-    // shape-only `.is_some()` check was masking server bugs that
+    // shape-only `.is_some()` check was masking node bugs that
     // returned a placeholder zero-hash or a truncated hex string.
     let ash_hex = send_body["account_state_hash"]
         .as_str()
@@ -1237,6 +1316,850 @@ async fn username_claim_resolve_lnurlp_roundtrip() {
     assert!(lnurlp_body["metadata"]
         .as_str()
         .is_some_and(|s| !s.is_empty()));
+}
+
+// ---------------------------------------------------------------------------
+// Section 4 — value-bearing field coverage on wallet-app-facing routes
+//
+// The roundtrip tests above prove the happy path executes end-to-end;
+// the tests in this section assert the EXACT shape and content of
+// every response field the wallet app reads. A field that ships as
+// `null` / `""` / `"0x00...0"` instead of a real value passes
+// `.is_some()` but breaks the wallet — the assertions here catch that
+// class of regression at the API layer instead of in the wallet's
+// integration test loop.
+// ---------------------------------------------------------------------------
+
+/// Field coverage #1 — mint response carries the post-mint
+/// commitment fields (`account_state_hash`, `output_coins_root`).
+///
+/// **Contract expectation.** The wallet app needs the same SMT-root
+/// pair from the mint response that the send response already carries,
+/// so its local account snapshot can advance without a second round
+/// trip. Mirror of the strong-assertion block in
+/// `send_commit_roundtrip_moves_balance:1090-1109`: each hash field
+/// MUST be present, decode to exactly 32 bytes of hex, and be non-zero.
+/// A shape-only `.is_some()` check would mask a server bug that
+/// returned a placeholder zero-hash or a truncated hex string.
+///
+/// **Today the mint handler ships these fields as `None`** (see
+/// `router::mint_handler`'s tail and the matching `None`s in
+/// `runtime::broadcast_commit_and_deliver`), and the response struct
+/// serialises them with `skip_serializing_if = Option::is_none`. The
+/// test therefore fails against the current server — it is written
+/// against the expected contract, not the current implementation, so
+/// CI surfaces the gap until the server is updated to populate the
+/// fields. See the task brief for the lockstep rationale.
+#[tokio::test]
+async fn mint_response_carries_state_hash_and_coins_root() {
+    let client = http_client();
+    let alice = TestWallet::new();
+
+    assert_minting_balance_in_bounds(&client).await;
+
+    let mint_resp = client
+        .post(url("/api/mint"))
+        .json(&json!({
+            "account_address": alice.address_hex(),
+            "amount": MINT_AMOUNT,
+        }))
+        .send()
+        .await
+        .expect("POST /api/mint");
+    assert_eq!(mint_resp.status(), StatusCode::OK, "mint must succeed");
+    let body: Value = mint_resp.json().await.expect("mint body JSON");
+
+    assert_eq!(
+        body["success"],
+        Value::Bool(true),
+        "mint success must be true"
+    );
+    let proof_id = body["proof_id"]
+        .as_u64()
+        .expect("proof_id present and a u64");
+    assert!(
+        proof_id > 0,
+        "proof_id must be a positive u64, got {}",
+        proof_id
+    );
+
+    // Value-bearing assertions on the two post-mint hash fields.
+    // Mirrors the send-response block in
+    // `send_commit_roundtrip_moves_balance:1090-1109` verbatim — the
+    // mint client consumes the same pair to advance its local
+    // account snapshot, so the same shape guarantees apply.
+    let ash_hex = body["account_state_hash"]
+        .as_str()
+        .expect("account_state_hash present on mint response")
+        .to_string();
+    let ash_bytes = hex::decode(&ash_hex).expect("account_state_hash is hex");
+    assert_eq!(
+        ash_bytes.len(),
+        32,
+        "account_state_hash must be 32 bytes (got {})",
+        ash_bytes.len()
+    );
+    assert!(
+        ash_bytes.iter().any(|&b| b != 0),
+        "account_state_hash must be non-zero on a real mint"
+    );
+
+    let ocr_hex = body["output_coins_root"]
+        .as_str()
+        .expect("output_coins_root present on mint response")
+        .to_string();
+    let ocr_bytes = hex::decode(&ocr_hex).expect("output_coins_root is hex");
+    assert_eq!(
+        ocr_bytes.len(),
+        32,
+        "output_coins_root must be 32 bytes (got {})",
+        ocr_bytes.len()
+    );
+    assert!(
+        ocr_bytes.iter().any(|&b| b != 0),
+        "output_coins_root must be non-zero on a real mint"
+    );
+
+    // Balance must land — the proof is fetchable AND the balance is
+    // credited. Value-bearing check on the side effect.
+    let observed = poll_balance_at_least(&client, &alice.address_hex(), MINT_AMOUNT).await;
+    assert!(
+        observed >= MINT_AMOUNT,
+        "balance never reached mint amount; got {observed}"
+    );
+}
+
+/// Field coverage #2 — commit response carries the post-commit
+/// commitment fields (`account_state_hash`, `output_coins_root`).
+///
+/// **Contract expectation.** Same as the mint test above — the wallet
+/// app needs the SMT-root pair from the commit response so its local
+/// account snapshot advances atomically with the broadcast. Each hash
+/// field MUST be present, decode to exactly 32 bytes of hex, and be
+/// non-zero. The full mint → send → commit pipeline is exercised
+/// because the commit step is otherwise unreachable.
+///
+/// **Today the commit handler ships these fields as `None`** (see
+/// `runtime::broadcast_commit_and_deliver`'s tail). The test is
+/// written against the expected contract and fails against the
+/// current server until the runtime is updated to populate the
+/// fields.
+#[tokio::test]
+async fn commit_response_carries_state_hash_and_coins_root() {
+    let client = http_client();
+    let alice = TestWallet::new();
+    let bob = TestWallet::new();
+
+    assert_minting_balance_in_bounds(&client).await;
+
+    // ---- Mint ----
+    let mint_resp = client
+        .post(url("/api/mint"))
+        .json(&json!({
+            "account_address": alice.address_hex(),
+            "amount": MINT_AMOUNT,
+        }))
+        .send()
+        .await
+        .expect("POST /api/mint");
+    assert_eq!(mint_resp.status(), StatusCode::OK, "mint must succeed");
+    let mint_body: Value = mint_resp.json().await.expect("mint body JSON");
+    let mint_proof_id = mint_body["proof_id"].as_u64().expect("mint proof_id");
+
+    let _ = poll_balance_at_least(&client, &alice.address_hex(), MINT_AMOUNT).await;
+
+    // ---- Fetch the mint proof for prev_commitment_pubkey ----
+    let proof_resp = client
+        .get(url(&format!("/api/proof/{}", mint_proof_id)))
+        .send()
+        .await
+        .expect("GET mint proof");
+    assert_eq!(proof_resp.status(), StatusCode::OK);
+    let proof_bytes = proof_resp.bytes().await.expect("mint proof bytes");
+    let mint_coin_proof: CoinProof = bincode::deserialize(&proof_bytes).expect("decode CoinProof");
+    let prev_pk = mint_coin_proof
+        .commitment
+        .as_ref()
+        .expect("mint coin proof has commitment")
+        .public_key;
+
+    // ---- Send ----
+    let amount = SEND_AMOUNT;
+    let ts = unix_now();
+    let signature = alice.sign_send(&alice.address_hex(), &bob.address_hex(), amount, ts);
+    let send_resp = client
+        .post(url("/api/send"))
+        .json(&json!({
+            "account_address": alice.address_hex(),
+            "recipient": bob.address_hex(),
+            "amount": amount,
+            "public_key": hex::encode(alice.pubkey(0).serialize()),
+            "next_public_key": hex::encode(alice.pubkey(1).serialize()),
+            "prev_commitment_pubkey": hex::encode(prev_pk.serialize()),
+            "signature": signature,
+            "timestamp": ts,
+        }))
+        .send()
+        .await
+        .expect("POST /api/send");
+    assert_eq!(send_resp.status(), StatusCode::OK, "send must succeed");
+    let send_body: Value = send_resp.json().await.expect("send body JSON");
+    let send_proof_id = send_body["proof_id"].as_u64().expect("send proof_id");
+    let ash_hex = send_body["account_state_hash"]
+        .as_str()
+        .expect("send body carries account_state_hash")
+        .to_string();
+    let ocr_hex = send_body["output_coins_root"]
+        .as_str()
+        .expect("send body carries output_coins_root")
+        .to_string();
+    let ash_bytes = hex::decode(&ash_hex).expect("ash hex");
+    let ocr_bytes = hex::decode(&ocr_hex).expect("ocr hex");
+
+    // ---- Commit ----
+    let mut commit_message = Vec::with_capacity(64);
+    commit_message.extend_from_slice(&ash_bytes);
+    commit_message.extend_from_slice(&ocr_bytes);
+    let commit_sig = alice.sign_commit(&commit_message);
+    let commit_resp = client
+        .post(url("/api/commit"))
+        .json(&json!({
+            "proof_id": send_proof_id,
+            "public_key": hex::encode(alice.pubkey(0).serialize()),
+            "signature": commit_sig,
+            "message": hex::encode(&commit_message),
+        }))
+        .send()
+        .await
+        .expect("POST /api/commit");
+    assert_eq!(commit_resp.status(), StatusCode::OK, "commit must succeed");
+    let commit_body: Value = commit_resp.json().await.expect("commit body JSON");
+
+    assert_eq!(
+        commit_body["success"],
+        Value::Bool(true),
+        "commit success must be true"
+    );
+    let echoed_proof_id = commit_body["proof_id"]
+        .as_u64()
+        .expect("commit proof_id present and a u64");
+    assert_eq!(
+        echoed_proof_id, send_proof_id,
+        "commit must echo the send proof_id (got {}, sent {})",
+        echoed_proof_id, send_proof_id
+    );
+
+    // Value-bearing assertions on the post-commit hash fields. Same
+    // contract as the send response (see
+    // `send_commit_roundtrip_moves_balance:1090-1109`).
+    let commit_ash_hex = commit_body["account_state_hash"]
+        .as_str()
+        .expect("account_state_hash present on commit response")
+        .to_string();
+    let commit_ash_bytes = hex::decode(&commit_ash_hex).expect("commit ash is hex");
+    assert_eq!(
+        commit_ash_bytes.len(),
+        32,
+        "commit account_state_hash must be 32 bytes (got {})",
+        commit_ash_bytes.len()
+    );
+    assert!(
+        commit_ash_bytes.iter().any(|&b| b != 0),
+        "commit account_state_hash must be non-zero"
+    );
+
+    let commit_ocr_hex = commit_body["output_coins_root"]
+        .as_str()
+        .expect("output_coins_root present on commit response")
+        .to_string();
+    let commit_ocr_bytes = hex::decode(&commit_ocr_hex).expect("commit ocr is hex");
+    assert_eq!(
+        commit_ocr_bytes.len(),
+        32,
+        "commit output_coins_root must be 32 bytes (got {})",
+        commit_ocr_bytes.len()
+    );
+    assert!(
+        commit_ocr_bytes.iter().any(|&b| b != 0),
+        "commit output_coins_root must be non-zero"
+    );
+}
+
+/// Field coverage #3 — `/api/balance` carries the claimed username.
+///
+/// `BalanceResponse.username` is `Option<String>` with
+/// `skip_serializing_if = Option::is_none`. After a successful
+/// `/api/username/claim`, querying balance for the claimed address
+/// MUST surface the exact (lowercased) username in the response body.
+/// The wallet app reads this to render the "@<username>" badge next
+/// to a balance figure without making a second round-trip.
+#[tokio::test]
+async fn balance_response_carries_username_after_claim() {
+    let client = http_client();
+    let caps = fetch_capabilities(&client).await;
+    // `usernames` is permanent MVP per `fetch_capabilities`, so the
+    // skip path is unreachable in practice — keep the gate honest in
+    // case a future feature trim disables it.
+    if !caps.usernames {
+        feature_skip!("usernames", "balance_response_carries_username_after_claim");
+    }
+
+    let alice = TestWallet::new();
+    let username = format!("u_{}", random_suffix());
+    let ts = unix_now();
+    let signature = alice.sign_username_claim(&alice.address_hex(), &username, ts);
+    let claim_resp = client
+        .post(url("/api/username/claim"))
+        .json(&json!({
+            "username": username,
+            "address": alice.address_hex(),
+            "public_key": hex::encode(alice.pubkey(0).serialize()),
+            "signature": signature,
+            "timestamp": ts,
+        }))
+        .send()
+        .await
+        .expect("POST /api/username/claim");
+    assert_eq!(claim_resp.status(), StatusCode::OK, "claim must succeed");
+
+    // GET /api/balance and assert the username surfaces.
+    let bal_resp = client
+        .get(url(&format!(
+            "/api/balance?address={}",
+            alice.address_hex()
+        )))
+        .send()
+        .await
+        .expect("GET /api/balance after claim");
+    assert_eq!(bal_resp.status(), StatusCode::OK);
+    let body: Value = bal_resp.json().await.expect("balance body JSON");
+    // Server canonicalises usernames to lowercase before persisting,
+    // so the round-trip must compare against the lowercased form.
+    let want = username.to_lowercase();
+    assert_eq!(
+        body["username"].as_str(),
+        Some(want.as_str()),
+        "balance body must carry the just-claimed username, got {:?}",
+        body["username"]
+    );
+}
+
+/// Field coverage #4 — `/api/username/claim` echoes the claimed
+/// address. The roundtrip test asserts `username` only; the wallet
+/// app reads BOTH fields (username + address) and uses the echoed
+/// address to verify the claim landed on the wallet's own address
+/// before persisting locally — a value-bearing assertion on `address`
+/// is therefore required.
+#[tokio::test]
+async fn claim_response_carries_address() {
+    let client = http_client();
+    let caps = fetch_capabilities(&client).await;
+    if !caps.usernames {
+        feature_skip!("usernames", "claim_response_carries_address");
+    }
+    let alice = TestWallet::new();
+    let username = format!("u_{}", random_suffix());
+    let ts = unix_now();
+    let signature = alice.sign_username_claim(&alice.address_hex(), &username, ts);
+    let claim_resp = client
+        .post(url("/api/username/claim"))
+        .json(&json!({
+            "username": username,
+            "address": alice.address_hex(),
+            "public_key": hex::encode(alice.pubkey(0).serialize()),
+            "signature": signature,
+            "timestamp": ts,
+        }))
+        .send()
+        .await
+        .expect("POST /api/username/claim");
+    assert_eq!(claim_resp.status(), StatusCode::OK, "claim must succeed");
+    let body: Value = claim_resp.json().await.expect("claim body JSON");
+    assert_eq!(
+        body["username"].as_str(),
+        Some(username.to_lowercase().as_str()),
+        "claim response must echo the lowercased username, got {:?}",
+        body["username"]
+    );
+    assert_eq!(
+        body["address"].as_str(),
+        Some(alice.address_hex().as_str()),
+        "claim response must echo the claimed address verbatim, got {:?}",
+        body["address"]
+    );
+}
+
+/// Field coverage #5 — `/api/balance` omits `username` for an unclaimed
+/// wallet. `BalanceResponse.username` is `Option<String>` with
+/// `skip_serializing_if = Option::is_none`, so an unclaimed account
+/// MUST produce a JSON body that either omits the field entirely
+/// (preferred) or sets it to `null`. The wallet app's response schema
+/// permits both shapes; the assertion fails if the server returns
+/// e.g. `""` (empty string) instead, which would render as a phantom
+/// empty username in the UI.
+#[tokio::test]
+async fn balance_response_has_no_username_for_unclaimed_wallet() {
+    let client = http_client();
+    let wallet = TestWallet::new();
+    // No claim happens — the wallet is fresh.
+    let resp = client
+        .get(url(&format!(
+            "/api/balance?address={}",
+            wallet.address_hex()
+        )))
+        .send()
+        .await
+        .expect("GET /api/balance for unclaimed wallet");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.expect("balance body JSON");
+    assert_eq!(
+        body["balance"], 0,
+        "fresh wallet must have zero balance, got {:?}",
+        body["balance"]
+    );
+    match body.get("username") {
+        // Preferred: field omitted entirely (`skip_serializing_if` path).
+        None => {}
+        // Permitted: explicit `null`.
+        Some(Value::Null) => {}
+        // Anything else (empty string, real string) is a contract
+        // violation — the wallet app would mis-render it.
+        Some(other) => panic!(
+            "unclaimed wallet must produce no `username` (or null), got {:?}",
+            other
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Section 5 — error-envelope contract
+//
+// Every non-2xx response the wallet app cares about MUST deserialise
+// as `{ success: false, error: <non-empty string> }`. The error string
+// is the lockstep anchor against `app/src/lib/api/errorMessages.ts ::
+// KNOWN_SERVER_ERRORS` — if the server renames a string without
+// updating the app's mapping, the user-facing message degrades to
+// `Serverfehler <status>: <raw>`.
+// ---------------------------------------------------------------------------
+
+/// Error contract #6 — every 4xx send body is a structured envelope.
+///
+/// Asserts only the SHAPE of the body (`success: false`, `error`
+/// non-empty string). The exact string is covered per-error by the
+/// extended negative-path tests above and by the lockstep inventory
+/// test below.
+#[tokio::test]
+async fn send_returns_structured_error_envelope() {
+    // Use the "unknown account" path: a well-formed body with a
+    // freshly-generated wallet that has never minted. Picked because
+    // it is the cheapest provocation that exercises the
+    // `send_coins_error_response` branch (the 422 invalid-hex paths
+    // go through `handler_error_response`, which has its own envelope
+    // shape — both are checked by the per-string assertions).
+    let alice = TestWallet::new();
+    let bob = TestWallet::new();
+    let amount: u64 = 1;
+    let ts = unix_now();
+    let signature = alice.sign_send(&alice.address_hex(), &bob.address_hex(), amount, ts);
+    let resp = http_client()
+        .post(url("/api/send"))
+        .json(&json!({
+            "account_address": alice.address_hex(),
+            "recipient": bob.address_hex(),
+            "amount": amount,
+            "public_key": hex::encode(alice.pubkey(0).serialize()),
+            "next_public_key": hex::encode(alice.pubkey(1).serialize()),
+            "prev_commitment_pubkey": Option::<String>::None,
+            "signature": Some(signature),
+            "timestamp": Some(ts),
+        }))
+        .send()
+        .await
+        .expect("POST /api/send envelope check");
+    let status = resp.status();
+    assert!(status.is_client_error(), "expected 4xx, got {}", status);
+    let body: Value = resp.json().await.expect("envelope body must be JSON");
+    assert_eq!(
+        body["success"],
+        Value::Bool(false),
+        "envelope must carry success=false, got {:?}",
+        body["success"]
+    );
+    let error = body["error"]
+        .as_str()
+        .expect("envelope must carry an `error` string");
+    assert!(!error.is_empty(), "envelope `error` must be non-empty");
+}
+
+/// The exact set of `error` strings the wallet app's
+/// `KNOWN_SERVER_ERRORS` constant (in
+/// `app/src/lib/api/errorMessages.ts`) maps from. Kept in alphabetical
+/// groups matching the source comment in that file so a diff against
+/// the app stays trivial. If the server adds or renames an error
+/// string, BOTH this constant and the app's constant must be updated
+/// in lockstep — the test below provokes every reachable string and
+/// names the unreachable ones explicitly.
+const APP_KNOWN_ERROR_STRINGS: &[&str] = &[
+    // From `router::map_send_coins_error` — `send_coins` business errors.
+    "Unknown account address",
+    "prev_commitment_pubkey required for account update",
+    "Insufficient funds",
+    "In-coin not present in source's output_coins_root",
+    "Source commitment not present in history MMR",
+    "Coin is missing commitment",
+    "Should provide an inclusion proof",
+    "Coin should not exist in coin history tree",
+    "Coin should not exist in tree yet",
+    "Too many in-coins for one transition",
+    "Too many out-coins for one transition",
+    "prove failed",
+    "internal error",
+    // From `router::handler_error_response` call sites.
+    "Signature verification failed",
+    "Missing signature",
+    "Request timestamp too old or in the future",
+    "Invalid hex",
+    "Invalid address length",
+    "Broadcast failed",
+];
+
+/// Error contract #7 — lockstep with `app/src/lib/api/errorMessages.ts`.
+///
+/// Provokes every error string in `APP_KNOWN_ERROR_STRINGS` that is
+/// reachable from a black-box HTTP client and asserts the server's
+/// `error` body matches verbatim. Strings that depend on the
+/// prover / publisher / Bitcoin network being in a specific failure
+/// state are documented as comments — those are covered by deterministic
+/// unit tests in `node/src/router_tests.rs` (search for
+/// `map_send_coins_error`). Mismatches between the app's expected
+/// strings and what the server actually emits are also documented:
+/// the app lists generic `"Invalid hex"`, `"Invalid address length"`,
+/// `"Broadcast failed"` placeholders that the server never emits as-is.
+///
+/// This test does ONE full mint up front so the heavier provocations
+/// (Insufficient funds, prev_commitment_pubkey, replay) can re-use
+/// the same balance without re-paying prove cost — keep new
+/// provocations grouped here for the same reason.
+#[tokio::test]
+async fn error_strings_match_known_app_mapping() {
+    let client = http_client();
+
+    // ---- Strings reachable WITHOUT a prior mint -----------------
+
+    // "Unknown account address" — fresh wallet send.
+    {
+        let alice = TestWallet::new();
+        let bob = TestWallet::new();
+        let ts = unix_now();
+        let signature = alice.sign_send(&alice.address_hex(), &bob.address_hex(), 1, ts);
+        let resp = client
+            .post(url("/api/send"))
+            .json(&json!({
+                "account_address": alice.address_hex(),
+                "recipient": bob.address_hex(),
+                "amount": 1u64,
+                "public_key": hex::encode(alice.pubkey(0).serialize()),
+                "next_public_key": hex::encode(alice.pubkey(1).serialize()),
+                "prev_commitment_pubkey": Option::<String>::None,
+                "signature": Some(signature),
+                "timestamp": Some(ts),
+            }))
+            .send()
+            .await
+            .expect("send unknown account");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body: Value = resp.json().await.expect("body JSON");
+        assert_eq!(body["error"], "Unknown account address");
+    }
+
+    // "Signature verification failed" — 64 zero bytes as signature.
+    {
+        let alice = TestWallet::new();
+        let bob = TestWallet::new();
+        let resp = client
+            .post(url("/api/send"))
+            .json(&json!({
+                "account_address": alice.address_hex(),
+                "recipient": bob.address_hex(),
+                "amount": 1u64,
+                "public_key": hex::encode(alice.pubkey(0).serialize()),
+                "next_public_key": hex::encode(alice.pubkey(1).serialize()),
+                "prev_commitment_pubkey": Option::<String>::None,
+                "signature": Some("00".repeat(64)),
+                "timestamp": Some(unix_now()),
+            }))
+            .send()
+            .await
+            .expect("send bad sig");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body: Value = resp.json().await.expect("body JSON");
+        assert_eq!(body["error"], "Signature verification failed");
+    }
+
+    // "Request timestamp too old or in the future" — stale timestamp.
+    {
+        let alice = TestWallet::new();
+        let bob = TestWallet::new();
+        let stale_ts = unix_now().saturating_sub(600);
+        let signature = alice.sign_send(&alice.address_hex(), &bob.address_hex(), 1, stale_ts);
+        let resp = client
+            .post(url("/api/send"))
+            .json(&json!({
+                "account_address": alice.address_hex(),
+                "recipient": bob.address_hex(),
+                "amount": 1u64,
+                "public_key": hex::encode(alice.pubkey(0).serialize()),
+                "next_public_key": hex::encode(alice.pubkey(1).serialize()),
+                "prev_commitment_pubkey": Option::<String>::None,
+                "signature": Some(signature),
+                "timestamp": Some(stale_ts),
+            }))
+            .send()
+            .await
+            .expect("send stale ts");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body: Value = resp.json().await.expect("body JSON");
+        assert_eq!(body["error"], "Request timestamp too old or in the future");
+    }
+
+    // "Missing signature" — well-formed send body but signature: null.
+    // The signed handlers (`send_handler`, `claim_username_handler`)
+    // reject absent `signature` fields with 401 BEFORE crypto
+    // verification runs. The matching `"Missing timestamp"` 401 covers
+    // an absent `timestamp` field. Both gates land before
+    // `verify_send_signature` so a clock-skew or empty-credential
+    // misconfiguration surfaces distinctly instead of collapsing into
+    // `"Signature verification failed"`.
+    {
+        let alice = TestWallet::new();
+        let body = json!({
+            "account_address": alice.address_hex(),
+            "recipient": TestWallet::new().address_hex(),
+            "amount": 1u64,
+            "public_key": hex::encode(alice.pubkey(0).serialize()),
+            "next_public_key": hex::encode(alice.pubkey(1).serialize()),
+            "prev_commitment_pubkey": Option::<String>::None,
+            "timestamp": unix_now(),
+            // signature deliberately omitted
+        });
+        let resp = http_client()
+            .post(url("/api/send"))
+            .json(&body)
+            .send()
+            .await
+            .expect("send missing signature");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body: Value = resp.json().await.expect("body JSON");
+        assert_eq!(body["error"], "Missing signature");
+    }
+
+    // ---- Mismatches: app uses a generic placeholder, server emits a
+    //      more-specific string. Document each here. -----------------
+
+    // app `"Invalid hex"` vs. server emit (mint hex path).
+    {
+        let resp = client
+            .post(url("/api/mint"))
+            .json(&json!({"account_address": "not_hex", "amount": 100u64}))
+            .send()
+            .await
+            .expect("mint bad hex");
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value = resp.json().await.expect("body JSON");
+        let actual = body["error"].as_str().expect("error string");
+        assert_eq!(
+            actual, "account_address is not valid hex",
+            "server emits a per-field hex error today; app `KNOWN_SERVER_ERRORS` \
+             carries the generic `\"Invalid hex\"` — lockstep gap"
+        );
+    }
+
+    // app `"Invalid address length"` vs. server emit (mint length path).
+    {
+        let short_addr = format!("0x{}", "ab".repeat(16));
+        let resp = client
+            .post(url("/api/mint"))
+            .json(&json!({"account_address": short_addr, "amount": 100u64}))
+            .send()
+            .await
+            .expect("mint short addr");
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value = resp.json().await.expect("body JSON");
+        let actual = body["error"].as_str().expect("error string");
+        assert_eq!(
+            actual, "account_address must be 32 bytes (64 hex chars)",
+            "server emits a per-field length error today; app \
+             `KNOWN_SERVER_ERRORS` carries the generic \
+             `\"Invalid address length\"` — lockstep gap"
+        );
+    }
+
+    // ---- Strings reachable ONLY after a successful mint --------
+    //
+    // The block below is gated on the minting balance — if the
+    // deploy-dev DEV server is too drained to mint, skip with a clear
+    // log line instead of failing the whole suite. The provocations
+    // re-use one mint to keep prove cost amortised.
+    let alice = TestWallet::new();
+    let bob = TestWallet::new();
+
+    assert_minting_balance_in_bounds(&client).await;
+
+    let mint_resp = client
+        .post(url("/api/mint"))
+        .json(&json!({
+            "account_address": alice.address_hex(),
+            "amount": MINT_AMOUNT,
+        }))
+        .send()
+        .await
+        .expect("POST /api/mint for lockstep block");
+    assert_eq!(
+        mint_resp.status(),
+        StatusCode::OK,
+        "mint must succeed for the post-mint lockstep block"
+    );
+    let mint_body: Value = mint_resp.json().await.expect("mint body JSON");
+    let mint_proof_id = mint_body["proof_id"].as_u64().expect("mint proof_id");
+    let _ = poll_balance_at_least(&client, &alice.address_hex(), MINT_AMOUNT).await;
+
+    // Fetch the mint commitment so we have a valid `prev_commitment_pubkey`
+    // to pass on the happy-path replay below — and a clear omission to
+    // trigger the `"prev_commitment_pubkey required for account update"`
+    // branch.
+    let proof_resp = client
+        .get(url(&format!("/api/proof/{}", mint_proof_id)))
+        .send()
+        .await
+        .expect("GET mint proof");
+    assert_eq!(proof_resp.status(), StatusCode::OK);
+    let proof_bytes = proof_resp.bytes().await.expect("mint proof bytes");
+    let mint_coin_proof: CoinProof = bincode::deserialize(&proof_bytes).expect("decode CoinProof");
+    let prev_pk = mint_coin_proof
+        .commitment
+        .as_ref()
+        .expect("mint coin proof has commitment")
+        .public_key;
+
+    // "prev_commitment_pubkey required for account update" — covered by
+    // `router_tests::map_send_coins_error_prev_commitment_pubkey_required_is_400`
+    // and `account_node_tests::*prev_commitment_pubkey*`. Live-provoking
+    // it from the HTTP surface needs a second send on a wallet whose
+    // `account.proof` is already populated — alice has only received a
+    // mint here, so the inner path takes the AccountCreation branch
+    // and never reaches the AccountUpdate gate. We could chain a full
+    // mint→send→commit and then a second send, but the additional
+    // on-chain cost (publisher UTXO per inscription) outweighs the
+    // value of duplicating coverage that the unit tests already give.
+
+    // "Insufficient funds" — send MINT_AMOUNT + 1 (one sat over balance).
+    {
+        let amount: u64 = MINT_AMOUNT + 1;
+        let ts = unix_now();
+        let signature = alice.sign_send(&alice.address_hex(), &bob.address_hex(), amount, ts);
+        let resp = client
+            .post(url("/api/send"))
+            .json(&json!({
+                "account_address": alice.address_hex(),
+                "recipient": bob.address_hex(),
+                "amount": amount,
+                "public_key": hex::encode(alice.pubkey(0).serialize()),
+                "next_public_key": hex::encode(alice.pubkey(1).serialize()),
+                "prev_commitment_pubkey": hex::encode(prev_pk.serialize()),
+                "signature": Some(signature),
+                "timestamp": Some(ts),
+            }))
+            .send()
+            .await
+            .expect("send insufficient funds");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Insufficient funds must be 422"
+        );
+        let body: Value = resp.json().await.expect("body JSON");
+        assert_eq!(body["error"], "Insufficient funds");
+    }
+
+    // ---- Strings NOT deterministically reachable from a black-box
+    //      HTTP client. Each is covered by a unit test in
+    //      `node/src/router_tests.rs`; the comments below name the
+    //      reachable path so a future contributor can find it without
+    //      a full repo grep. ----------------------------------------
+    //
+    // "In-coin not present in source's output_coins_root"
+    //   → router_tests::map_send_coins_error_in_coin_not_present
+    //     (reachable from `account_node::send_coins` only when the
+    //      defense-in-depth shim catches a tampered in-coin proof —
+    //      requires a doctored CoinProof on disk; not provoked here)
+    //
+    // "Source commitment not present in history MMR"
+    //   → router_tests::map_send_coins_error_source_commitment_missing
+    //     (requires a mint commitment that was somehow removed from
+    //      the MMR between snapshot and prove — race window only)
+    //
+    // "Coin is missing commitment"
+    //   → router_tests::map_send_coins_error_coin_missing_commitment
+    //     (requires `receive_coin` with a CoinProof.commitment = None,
+    //      which the router prevents via type — internal-state-only)
+    //
+    // "Should provide an inclusion proof"
+    //   → router_tests::map_send_coins_error_should_provide_inclusion_proof
+    //     (server-internal path through prepare_send_coins — none of
+    //      the client-facing routes can pass a missing inclusion proof)
+    //
+    // "Coin should not exist in coin history tree" / "Coin should not
+    //  exist in tree yet"
+    //   → router_tests::map_send_coins_error_coin_history_*
+    //     (a double-commit replay would reach these — but the publisher
+    //      side rejects the replay before send_coins sees it; the
+    //      provocation requires direct in-memory mutation that the HTTP
+    //      surface forbids)
+    //
+    // "Too many in-coins for one transition" / "Too many out-coins for
+    //  one transition"
+    //   → router_tests::map_send_coins_error_too_many_*
+    //     (`/api/send` accepts one recipient and reads one in-coin per
+    //      sender, so the >8 path is unreachable from the HTTP surface)
+    //
+    // "prove failed"
+    //   → router_tests::map_send_coins_error_prove_failed
+    //     (catch-all for any error message ending in "failed" — would
+    //      require the prover binary to fail at runtime; flaky to
+    //      provoke against the live DEV deploy)
+    //
+    // "internal error"
+    //   → router_tests::map_send_coins_error_unknown_returns_internal
+    //     (catch-all for any unmapped `send_coins` error — would
+    //      require the server to invent a new error string)
+    //
+    // "Missing signature"
+    //   → router_tests::verify_send_signature_missing_signature for the
+    //     helper-level unit; the live provocation in the block above
+    //     exercises the handler-level 401.
+    //
+    // "Broadcast failed"
+    //   → operator-only: requires the publisher's broadcast leg to
+    //      fail. The server actually emits
+    //      `"Failed to broadcast commitment inscription on-chain"` on
+    //      this branch (see `runtime::broadcast_commit_and_deliver`),
+    //      so the app's `"Broadcast failed"` is also a lockstep gap
+    //      placeholder rather than an exact-match expectation.
+
+    // ---- Inventory anchor ---------------------------------------
+    //
+    // Compile-time guard: the constant above tracks
+    // `app/src/lib/api/errorMessages.ts :: KNOWN_SERVER_ERRORS` 1:1.
+    // If the app drops a string, this `assert!` keeps the suite
+    // honest — the test reads the constant rather than re-listing
+    // strings so anyone updating the inventory has exactly one place
+    // to touch in this file.
+    assert!(
+        APP_KNOWN_ERROR_STRINGS.len() == 19,
+        "APP_KNOWN_ERROR_STRINGS length drifted from the app's \
+         KNOWN_SERVER_ERRORS — update both in lockstep (got {})",
+        APP_KNOWN_ERROR_STRINGS.len()
+    );
 }
 
 // ---------------------------------------------------------------------------

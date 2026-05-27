@@ -24,6 +24,8 @@ use crate::db;
 use crate::publisher::{create_and_broadcast_inscription, resume_pending_inscriptions};
 use crate::router::{lock_or_recover, SendCoinResponse};
 use crate::NETWORK_CONFIG;
+use shared::ProofData;
+use zkcoins_program::hash::digest_to_bytes;
 
 use bitcoin::bip32::Xpriv;
 use shared::ClientAccount;
@@ -79,7 +81,7 @@ pub async fn start_rest_node(
         // child pubkey for ordinary wallets; for the minting wallet that
         // derivation is meaningless — only the wallet's commitment-signing
         // side is used. Force the address to the canonical constant so
-        // the rest of the server (which reads minting_account.address as
+        // the rest of the node (which reads minting_account.address as
         // the on-chain identity of the minting wallet) is internally
         // consistent. The test harness already constructs the minting
         // account this way (see
@@ -114,7 +116,7 @@ pub async fn start_rest_node(
     let bootstrap_snapshot: Option<(zkcoins_program::hash::HashDigest, Vec<u8>)> = {
         let mut account_node_guard = state.account_node.lock().unwrap();
         if account_node_guard.get_minting_account_address().is_err() {
-            let mut minting_server_account = crate::account_node::Account::new();
+            let mut minting_node_account = crate::account_node::Account::new();
             // The Plonky2 state-transition circuit packs the running
             // balance as a Goldilocks field element via
             // `balance_hi * 2^32 + balance_lo`. Values >= p (the
@@ -123,10 +125,10 @@ pub async fn start_rest_node(
             // which trips a "wire set twice" partition error. Stay
             // safely below 2^48 so the circuit-vs-witness sides agree
             // even after many mint operations.
-            minting_server_account.balance = 1u64 << 48;
+            minting_node_account.balance = 1u64 << 48;
             account_node_guard.import_account(
                 *zkcoins_program::types::MINTING_ADDRESS,
-                minting_server_account,
+                minting_node_account,
             );
             account_node_guard
                 .get_account(&zkcoins_program::types::MINTING_ADDRESS)
@@ -185,9 +187,46 @@ pub async fn start_rest_node(
 
     let app = create_router(state);
 
-    println!("REST server started at {}", socket_addr);
+    // boot_log: announce the startup event with the connected network,
+    // node version, listen address, and process pid. Best-effort —
+    // a failed boot_log insert must NOT prevent the node from
+    // starting (the operator would lose access to a real recovery
+    // path on a transient DB blip).
+    {
+        let boot_entry = crate::db::BootLogEntry {
+            event_type: "startup".to_string(),
+            message: format!(
+                "zkcoins-node {} starting on {} (network={})",
+                env!("CARGO_PKG_VERSION"),
+                socket_addr,
+                NETWORK_CONFIG.network_name,
+            ),
+            metadata: Some(serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "network": NETWORK_CONFIG.network_name,
+                "socket_addr": socket_addr.to_string(),
+                "pid": std::process::id(),
+                "is_mainnet": NETWORK_CONFIG.is_mainnet,
+            })),
+        };
+        if let Err(e) = crate::db::insert_boot_log(&pool, &boot_entry).await {
+            eprintln!("Failed to persist boot_log startup event: {}", e);
+        }
+    }
+
+    println!("REST API started at {}", socket_addr);
     let listener = TcpListener::bind(socket_addr).await?;
-    axum::serve(listener, app).await?;
+    // `into_make_service_with_connect_info::<SocketAddr>()` exposes the
+    // peer's TCP socket to extractors — the audit middleware reads it
+    // through `ConnectInfo<SocketAddr>` and writes it to
+    // `request_log.remote_addr`. Without this the audit row's
+    // `remote_addr` column is always NULL (the default `into_make_service`
+    // never inserts a `ConnectInfo` extension).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
@@ -217,8 +256,13 @@ pub(crate) async fn broadcast_commit_and_deliver(
         "Broadcasting user commitment ({} bytes)",
         commitment_data.len()
     );
-    if let Err(err) =
-        create_and_broadcast_inscription(&commitment_data, &NETWORK_CONFIG, Some(&state.pool)).await
+    if let Err(err) = create_and_broadcast_inscription(
+        &commitment_data,
+        crate::db::InscriptionKind::Send,
+        &NETWORK_CONFIG,
+        Some(&state.pool),
+    )
+    .await
     {
         eprintln!("Error broadcasting commit inscription: {}", err);
         return crate::router::handler_error_response(
@@ -229,6 +273,22 @@ pub(crate) async fn broadcast_commit_and_deliver(
 
     let mut updated_proof = coin_proof;
     updated_proof.commitment = Some(commitment);
+    // Extract the prover's post-state hash pair from the stored
+    // CoinProof's public_inputs so the response carries the same
+    // (account_state_hash, output_coins_root) the wallet client used
+    // to build the commitment in the first place. Lets the client
+    // confirm the server's post-commit snapshot matches what it just
+    // signed without a second `/api/proof/:id` round-trip. Derivation
+    // is identical to the one in `mint_handler` and `send_coin_handler`.
+    let pis: [zkcoins_program::F; zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] =
+        updated_proof.proof.public_inputs
+            [..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
+            .try_into()
+            .expect("Plonky2 Proof emits N_PROOF_DATA_PUBLIC_INPUTS field elements");
+    let proof_data = ProofData::from_field_elements(&pis);
+    let ash_hex = Some(hex::encode(digest_to_bytes(&proof_data.account_state_hash)));
+    let ocr_hex = Some(hex::encode(digest_to_bytes(&proof_data.output_coins_root)));
+
     let recipient = updated_proof.coin.recipient;
     let snapshot: Option<Vec<u8>> = {
         let mut account_node_guard = lock_or_recover(&state.account_node);
@@ -240,8 +300,10 @@ pub(crate) async fn broadcast_commit_and_deliver(
             .map(AccountNode::serialize_account)
     };
     if let Some(bytes) = snapshot {
-        let addr_bytes = zkcoins_program::hash::digest_to_bytes(&recipient);
-        if let Err(e) = db::upsert_account(&state.pool, &addr_bytes, &bytes).await {
+        let addr_bytes = digest_to_bytes(&recipient);
+        if let Err(e) =
+            db::upsert_account_with_source(&state.pool, &addr_bytes, &bytes, "receive").await
+        {
             eprintln!("Failed to upsert account after commit: {}", e);
         }
     }
@@ -252,8 +314,8 @@ pub(crate) async fn broadcast_commit_and_deliver(
             success: true,
             error: None,
             proof_id: Some(proof_id),
-            account_state_hash: None,
-            output_coins_root: None,
+            account_state_hash: ash_hex,
+            output_coins_root: ocr_hex,
         }),
     )
 }

@@ -87,7 +87,7 @@ any point during the swap. Equivalently:
 Symmetrically for the swap provider.
 
 The "single counterparty" referred to is a swap provider (a liquidity
-operator who runs both a zkCoins server and a Lightning node), analogous
+operator who runs both a zkCoins node and a Lightning node), analogous
 to Boltz's role in BTC ↔ LN submarine swaps.
 
 ---
@@ -121,14 +121,14 @@ revealing preimage `x` such that `H(x) = H`".
 
 Per `SPEC.md` §5 and §11:
 
-1. The sender's server generates a state-transition proof (`ProofData`)
+1. The sender's node generates a state-transition proof (`ProofData`)
    covering balance update, output coin creation, and history extension.
 2. The sender's wallet signs `SHA256(serialize(asth) ‖ serialize(ocr))`
    with BIP-340 Schnorr. Here `asth` is the account state hash and
    `ocr` is the output coins root (the Merkle root of the SMT
    containing the send's output coin identifiers); both abbreviations
    match `SPEC.md`'s glossary.
-3. The server (or any party with the signed `Commitment`) constructs a
+3. The node (or any party with the signed `Commitment`) constructs a
    Taproot commit-reveal pair where the commit tx's txid hex begins
    with `4242`, and the reveal tx's witness contains the inscription
    payload (signed `Commitment`).
@@ -148,23 +148,23 @@ the reveal-tx getting sufficient Bitcoin confirmations and (b) the
 scanner running. Until then, the send has not happened from the
 recipient's perspective.
 
-### 4.3 What the wallet knows vs. what the server knows
+### 4.3 What the wallet knows vs. what the node knows
 
 - **Wallet:** holds the account commitment private key; signs the
   Schnorr commitment over `SHA256(asth ‖ ocr)`. Holds no Poseidon
   state, no SMT/MMR data.
-- **Server:** holds the entire state (SMT + MMR), generates proofs,
+- **Node:** holds the entire state (SMT + MMR), generates proofs,
   holds the inscription-publishing Bitcoin wallet, runs the scanner.
 
-This split is locked by the server-side-compute architecture decision
+This split is locked by the node-side-compute architecture decision
 (`MIGRATION_RESEARCH.md` §5; `feedback_zkcoins_server_side_compute`).
 
 For swap design this matters because:
 
 - Anything that requires "the wallet signs after seeing something" is
   cheap (one round-trip to wallet).
-- Anything that requires "the server constructs and signs a Bitcoin tx
-  that publishes the inscription" can be replaced with "the server
+- Anything that requires "the node constructs and signs a Bitcoin tx
+  that publishes the inscription" can be replaced with "the node
   constructs the inscription payload and lets a different party
   publish".
 
@@ -332,7 +332,7 @@ the on-chain side.
   account (so `recipient = H(initial_pubkey)` is known to them and the
   provider).
 - **Provider:** Lightning node with inbound liquidity from the user,
-  zkCoins server with sufficient inventory in some operator account,
+  zkCoins node with sufficient inventory in some operator account,
   Bitcoin wallet for funding UTXO.
 - **Pre-agreed:** swap amount `A` (in sats), provider fee `F`, swap
   timeout parameters (`T_lock` for on-chain CLTV, `T_ln` for
@@ -348,7 +348,7 @@ Step 1. User generates preimage x ←$ {0,1}^256. Computes H = SHA256(x).
           - amount A
           - user_btc_refund_pubkey for the funding UTXO
 
-Step 2. Provider's zkCoins server prepares the send:
+Step 2. Provider's zkCoins node prepares the send:
           - Loads the operator account state
           - Builds out_coins with one entry: { identifier, recipient =
             user_zkcoins_recipient_address, amount = A }
@@ -444,7 +444,7 @@ Step 11. Provider settles the LN HTLC, capturing A + F. Swap complete.
 | User aborts at Step 5 | Provider has funded U_lock; nothing else moved | Provider refunds U_lock at T_lock (Step 3 ELSE branch). Cost: on-chain fee for U_lock creation. |
 | User pays LN (Step 6) but never broadcasts commit (Step 7) | Provider has incoming LN HTLC, U_lock still locked | LN HTLC times out at T_ln, user gets LN funds back. Provider refunds U_lock at T_lock. Both whole. |
 | User broadcasts commit but it doesn't confirm before T_lock | User has paid LN, U_lock is being refunded by provider; user's tx might or might not eventually confirm | This is the race condition T_lock is designed to prevent. See §12. With margin, this should not happen; if it does, provider claims U_lock refund and user claims LN refund. Provider has zkCoins still in inventory (no send actually happened since inscription never landed). |
-| Provider's server crashes between Step 2 and Step 4 | User has H, has not paid anything | User aborts, no loss. |
+| Provider's node crashes between Step 2 and Step 4 | User has H, has not paid anything | User aborts, no loss. |
 | Provider's Bitcoin wallet runs out of funds for U_lock | Pre-condition failure | Provider rejects swap initiation. No loss. |
 | Provider refuses to settle LN at Step 11 despite preimage visible | Provider has zkCoins inventory still committed, user has zkCoins (Step 9 succeeded), preimage on-chain | LN HTLC will time out and refund to user. User keeps zkCoins **and** gets LN funds back. **Net: provider loses A+F to itself.** This is asymmetric — provider has no incentive to do this. Documented as provider-side discipline. |
 
@@ -499,7 +499,7 @@ Step 1. Provider generates preimage x ←$ {0,1}^256. Computes
           - amount A
           - provider's LN invoice for amount A − F (standard, not hold)
 
-Step 2. User's zkCoins server prepares the send proof to
+Step 2. User's zkCoins node prepares the send proof to
         provider_zkcoins_recipient_address with amount A. User signs
         Schnorr σ over H(asth ‖ ocr) with their commitment pubkey.
 
@@ -554,9 +554,9 @@ Step 10. Swap complete.
 
 The last failure mode of the table is worth flagging in code: if the
 inscription never lands, the zkCoins state never updates. The user's
-server-side state shows the send as "prepared" but not "committed",
+node-side state shows the send as "prepared" but not "committed",
 because the corresponding `Commitment` was never broadcast. The
-swap-aware server must release the prepared state if it observes that
+swap-aware node must release the prepared state if it observes that
 the corresponding U_lock' has been refunded, so the user can re-use
 those coins for another swap or send.
 
@@ -756,7 +756,7 @@ the *inscription publication*, not U_lock.
 
 ### 12.5 The proof-time question
 
-Provider's send proof generation (zkCoins server side):
+Provider's send proof generation (zkCoins node side):
 
 - SP1 today: tens of seconds to a few minutes warm.
 - Plonky2 post-cutover target: ≤1 second warm.
@@ -837,7 +837,7 @@ Typical Boltz total fees: 0.1–0.5% of swap amount + ~250 sat on-chain.
 Between Step 2 (provider prepares send) and Step 9 (inscription
 confirms), the provider's zkCoins inventory is committed but
 not-yet-published. The provider must not initiate another swap that
-would also commit the same balance — server-side concurrency control
+would also commit the same balance — node-side concurrency control
 required.
 
 Concretely, the operator account's "soft balance" must reflect:
@@ -846,7 +846,7 @@ includes all amounts for prepared-but-not-confirmed sends.
 
 This is the "stuck inventory" problem of any submarine swap provider;
 Boltz solves it with parallel HTLC tracking. zkCoins-side it requires
-the swap-aware server to track prepared swaps until inscription
+the swap-aware node to track prepared swaps until inscription
 confirms (or refund completes).
 
 ### 14.4 Watching the chain
@@ -1033,7 +1033,7 @@ implementation. Specifically:
   inscription payload, exactly the signature the scanner verifies.
 
 Implementation can therefore run in parallel to PR #17 without
-contention. The swap code touches `server/` (new endpoints) and adds a
+contention. The swap code touches `node/` (new endpoints) and adds a
 new operational component (Bitcoin script construction, LN node
 integration). Neither touches `program-plonky2/` or `program/`.
 
@@ -1157,8 +1157,8 @@ A draft sequence; not a commitment.
 
 3. **Where does the operator account's privkey live?** The Schnorr
    signature on H(asth ‖ ocr) (Step 2 of Flow A) needs to happen
-   server-side, because the operator is the sender. This means the
-   operator account's commitment key is server-resident. Same
+   node-side, because the operator is the sender. This means the
+   operator account's commitment key is node-resident. Same
    architectural assumption as for any operator-issued zkCoins coin;
    should be documented in ops runbook.
 
