@@ -838,6 +838,136 @@ fn test_send_coins_second_send_succeeds_without_prev_commitment_pubkey() {
     assert_eq!(acct.commitment_public_key, Some(current_pk));
 }
 
+/// Regression pinning the exact in-process state-machine shape the
+/// failing api_remote test
+/// `second_send_succeeds_without_prev_commitment_pubkey_field` /
+/// app E2E `07-send-success` exercise: mint → recipient sends →
+/// commit → mint AGAIN to the SAME recipient → recipient sends again.
+///
+/// The differentiator from
+/// `test_send_coins_twice_from_same_account_uses_update_account` is
+/// the SECOND mint into the sender's account between her first and
+/// second send. That changes the second send's witness shape because
+/// the sender now has both `account.proof = Some(send_1.proof)` AND a
+/// freshly-received in-coin in her queue whose source proof
+/// references a MORE-RECENT MMR root than `account.proof` does.
+///
+/// This unit test passes locally (the off-circuit witness assembly
+/// produces a Plonky2-valid input) — the failing api_remote / E2E
+/// tests must therefore be hitting a path that differs only in
+/// effects this unit test cannot reach: scanner timing, MMR state
+/// after dozens of other tests' commits, or a deeper in-circuit
+/// constraint that activates only at a larger MMR depth. The
+/// regression here documents that as long as the local state machine
+/// is the only thing under test, the AccountUpdate branch with a
+/// mint-2-sourced in-coin proves successfully — so any future change
+/// that breaks that shape lands as a test failure here rather than
+/// as a silent live-server regression.
+#[test]
+fn test_send_after_mint_receive_into_account_with_existing_proof() {
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    let mut node = AccountNode::new(Arc::clone(&state_arc));
+
+    let mut minting = TestAccountData::new_minting_account();
+    node.import_account(
+        minting.address,
+        Account {
+            proof: None,
+            coin_queue: vec![],
+            coin_history: SparseMerkleTree::new(),
+            balance: 10_000,
+            num_sends: 0,
+            commitment_public_key: None,
+        },
+    );
+
+    let mut alice = TestAccountData::new_generic(&[7u8; 32], Network::Signet);
+    let bob: Address = digest_from_bytes(&[8u8; 32]);
+
+    // ---- Mint #1: minting -> alice (100). Alice receives.
+    let mint1 = minting
+        .execute_send_coins(&mut node, vec![Invoice::new(100, alice.address)])
+        .expect("mint #1 should succeed");
+    state_arc
+        .lock()
+        .unwrap()
+        .update(
+            &mint1
+                .iter()
+                .map(|cp| cp.commitment.clone().unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    for cp in mint1 {
+        node.receive_coin(cp).expect("alice receives mint #1");
+    }
+
+    // ---- Alice's first send: alice -> bob (40). prove_initial branch.
+    let send1 = alice
+        .execute_send_coins(&mut node, vec![Invoice::new(40, bob)])
+        .expect("alice send #1 should succeed");
+    state_arc
+        .lock()
+        .unwrap()
+        .update(
+            &send1
+                .iter()
+                .map(|cp| cp.commitment.clone().unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+    // Sanity: alice has proof=Some + cpk=Some + num_sends=1 now.
+    {
+        let a = node
+            .get_account(&alice.address)
+            .expect("alice account in map");
+        assert!(a.proof.is_some(), "alice.proof must be Some after send #1");
+        assert_eq!(a.num_sends, 1);
+        assert!(a.commitment_public_key.is_some());
+    }
+
+    // ---- Mint #2: minting -> alice (100). Alice receives ON TOP of
+    // her existing proof. This is the differentiator from the
+    // currently-passing `_twice_from_same_account_uses_update_account`
+    // test, and matches the api_remote / app `07-send-success`
+    // sequence exactly.
+    let mint2 = minting
+        .execute_send_coins(&mut node, vec![Invoice::new(100, alice.address)])
+        .expect("mint #2 should succeed");
+    state_arc
+        .lock()
+        .unwrap()
+        .update(
+            &mint2
+                .iter()
+                .map(|cp| cp.commitment.clone().unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    for cp in mint2 {
+        node.receive_coin(cp).expect("alice receives mint #2");
+    }
+
+    // ---- Alice's second send: prove_account_update branch with a
+    // freshly-received in-coin from mint #2. This is the path the
+    // live server takes on /api/send #2 and is the one that 500's
+    // with "prove failed" against DEV.
+    let send2 = alice
+        .execute_send_coins(&mut node, vec![Invoice::new(30, bob)])
+        .expect("alice send #2 must succeed (prove_account_update with new in-coin from mint #2)");
+    assert_eq!(send2.len(), 1);
+
+    // Post-conditions: all three coupled fields advanced together.
+    let a = node
+        .get_account(&alice.address)
+        .expect("alice still in map");
+    assert!(a.proof.is_some());
+    assert_eq!(a.num_sends, 2);
+    let expected_cpk = generate_test_public_key(&alice.xpriv, alice.num_pubkeys.saturating_sub(1));
+    assert_eq!(a.commitment_public_key, Some(expected_cpk));
+}
+
 #[test]
 fn test_receive_coin_rejects_replay_via_coin_history() {
     let state_arc = Arc::new(Mutex::new(State::new()));
