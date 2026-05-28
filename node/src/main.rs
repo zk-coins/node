@@ -56,6 +56,31 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         std::process::exit(1);
     }));
 
+    // Install a `tracing` subscriber so the API handlers' structured
+    // `tracing::info!` / `tracing::error!` calls actually emit. Without
+    // a subscriber every `tracing::*` macro is a silent no-op, which
+    // would drop the request-path logs entirely after the migration
+    // away from `eprintln!`. The `fmt` layer writes to stdout and the
+    // `env-filter` layer honours `RUST_LOG` (default `info`, matching
+    // the previous documented baseline in `CONTRIBUTING.md`). Both
+    // crates are direct deps in `node/Cargo.toml`.
+    //
+    // `try_init` (not `init`) so a test binary that already installed
+    // its own subscriber — or a second main invocation in a test
+    // harness — does not panic the bootstrap.
+    //
+    // Partial-migration subscriber: routes `tracing::*` calls through fmt+EnvFilter.
+    // Many call sites in this crate still use `println!`/`eprintln!` (see TODO in
+    // scanner_ws.rs:11). Those continue to write directly to stdout/stderr and are
+    // not affected by RUST_LOG. The 4xx-validation paths in router.rs and
+    // account_node.rs are the first wave of the migration.
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(false)
+        .try_init();
+
     // Open the Postgres pool and run pending migrations BEFORE any
     // state load — `connect_and_migrate` is idempotent (sqlx tracks
     // applied migrations in `_sqlx_migrations`) and so safe to call on

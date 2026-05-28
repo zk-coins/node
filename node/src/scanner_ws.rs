@@ -9,11 +9,11 @@
 //!
 //! TODO(structured-logging): this module still uses `println!` /
 //! `eprintln!` for runtime logs, consistent with the rest of the
-//! `node` crate's current conventions. Once the crate-wide
-//! migration to `tracing` lands (out of scope for issue #84), the
-//! reconnect / liveness lines below are the first candidates for
-//! structured fields (peer URL, attempt count, backoff value) since
-//! they sit on a hot path that operators need to grep cleanly.
+//! `node` crate's current conventions.
+//! Partial structured-logging migration began in router.rs + account_node.rs.
+//! This file is still on the old `println!`/`eprintln!` path; switching the
+//! reconnect/liveness lines below to `tracing::info!`/`warn!` is the next
+//! incremental step.
 //!
 //! ### Design points
 //!

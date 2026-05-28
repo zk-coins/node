@@ -393,10 +393,15 @@ pub(crate) fn map_send_coins_error(err: &str) -> (StatusCode, &'static str) {
     }
 }
 
-/// Build a `SendCoinResponse` for a failed `send_coins` call, paired
-/// with the appropriate HTTP status code.
-pub(crate) fn send_coins_error_response(err: &str) -> (StatusCode, Json<SendCoinResponse>) {
-    let (status, body) = map_send_coins_error(err);
+/// Build a `SendCoinResponse` for a failed `send_coins` call from a
+/// pre-mapped `(status, body)` tuple. Callers that need the status
+/// code separately (e.g. to route the log level off `is_server_error`)
+/// call `map_send_coins_error` once and thread the result through
+/// here, avoiding a redundant second mapping call.
+pub(crate) fn send_coins_error_response(
+    mapped: (StatusCode, &'static str),
+) -> (StatusCode, Json<SendCoinResponse>) {
+    let (status, body) = mapped;
     (
         status,
         Json(SendCoinResponse {
@@ -609,7 +614,13 @@ async fn receive_coin_handler(
     let coin_proof = match bincode::deserialize::<CoinProof>(&body) {
         Ok(cp) => cp,
         Err(e) => {
-            eprintln!("Failed to deserialize proof with commitment: {}", e);
+            // Caller submitted a malformed binary body. The handler
+            // returns a default `SendCoinResponse { success: false }`
+            // (currently a 200 with `success=false`, behaviourally a
+            // client-input rejection); log at `info` so the CI E2E
+            // negative-path tests hitting `/api/receive` with bad
+            // bytes do not surface as `detected_level=error` lines.
+            tracing::info!("Failed to deserialize proof with commitment: {}", e);
             return Json(SendCoinResponse::default());
         }
     };
@@ -674,11 +685,18 @@ async fn send_coin_handler(
         .timestamp
         .expect("timestamp presence checked immediately above");
     if let Err(e) = check_timestamp_window(timestamp) {
-        eprintln!("Timestamp window check failed: {}", e);
+        // 401 — caller's signed timestamp is outside the freshness
+        // window. Client-input class, logged at `info` so the post-deploy
+        // API E2E negative-path tests (`send_stale_timestamp_returns_401`
+        // and friends) do not surface as `detected_level=error` lines
+        // in Loki on every CI run.
+        tracing::info!("Timestamp window check failed: {}", e);
         return handler_error_response(StatusCode::UNAUTHORIZED, e);
     }
     if let Err(e) = verify_send_signature(&request) {
-        eprintln!("Signature verification failed: {}", e);
+        // 401 — client-supplied signature does not validate. Same
+        // log-level rationale as the timestamp window check above.
+        tracing::info!("Signature verification failed: {}", e);
         return handler_error_response(StatusCode::UNAUTHORIZED, "Signature verification failed");
     }
 
@@ -755,10 +773,10 @@ async fn send_coin_handler(
         send_result = res;
     }
 
-    eprintln!(
-        "Send result: {}",
-        if send_result.is_ok() { "ok" } else { "err" }
-    );
+    // Outcome breadcrumb intentionally omitted: both arms below
+    // already emit a specific log line (success state-hash on Ok,
+    // mapped status + detail string on Err), so a generic
+    // "Send result: ok|err" marker between them is pure duplication.
 
     match send_result {
         Ok(mut coin_proofs) => {
@@ -823,8 +841,22 @@ async fn send_coin_handler(
             )
         }
         Err(e) => {
-            eprintln!("send_coins error: {}", e);
-            send_coins_error_response(e)
+            // Single `warn` covers every error path. Rationale: a
+            // 5xx-class mapping (prover failure, unmapped string)
+            // originates from a deeper layer that already emits its
+            // own `tracing::error!` / `eprintln!` at the source, so
+            // this outer line is a request-level summary — `warn` is
+            // the correct level (request failed, no new service-side
+            // signal). A 4xx-class mapping is caller-fixable input
+            // and `warn` is also correct there. Loki's
+            // `FieldDetector.extractLogLevel` classifies `warn` as
+            // non-error, which matches what we want for both arms.
+            // Map once and thread the tuple into the response
+            // builder — `map_send_coins_error` is pure but the
+            // duplicate call was needless work.
+            let mapped = map_send_coins_error(e);
+            tracing::warn!("send_coins error: {} (status={})", e, mapped.0);
+            send_coins_error_response(mapped)
         }
     }
 }
@@ -979,12 +1011,25 @@ async fn mint_handler(
     };
     let mut prepared = match prepared {
         Ok(p) => {
-            eprintln!("Mint prepare: ok");
+            // Success-path breadcrumb. `info` rather than `eprintln!`
+            // (which used to land on stderr → Loki classified as
+            // `detected_level=error`) — there is no failure to log
+            // here.
+            tracing::info!("Mint prepare: ok");
             p
         }
         Err(e) => {
-            eprintln!("Mint prepare: err — {}", e);
-            return send_coins_error_response(e);
+            // Single `warn` for the same reason as the send_coins
+            // error arm: 5xx-class mappings (prover failure,
+            // unmapped string) are already logged at `error` by the
+            // deeper layer, and 4xx-class mappings (insufficient
+            // funds, malformed proofs, …) are caller-fixable input.
+            // `warn` is the correct request-level summary level for
+            // both. Map once and thread the tuple into the response
+            // builder.
+            let mapped = map_send_coins_error(e);
+            tracing::warn!("Mint prepare: err — {} (status={})", e, mapped.0);
+            return send_coins_error_response(mapped);
         }
     };
 

@@ -15,6 +15,11 @@ rand = "0.8"
 blake3 = "1.6.1"
 lazy_static = "1.5.0"
 bitcoin = { version = "0.32.5", features = ["rand", "rand-std", "serde"] }
+# Structured logging facade + `fmt` subscriber. Workspace-level so any
+# future crate adopting the partial-migration path (shared,
+# script-plonky2) picks up the same version automatically.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.dev]
 opt-level = 3
