@@ -14,8 +14,12 @@ bitcoin_hashes = { version = "0.16.0", features = ["std"] }
 # `#[global_allocator]`; tests, integration tests, and the
 # `program-plonky2` / `script-plonky2` library crates keep using the
 # system allocator (no behavioural change at the prover circuit
-# level). Default features off so we get the small portable build
-# (no secure-mode overhead, no debug rings).
+# level). `default-features = false` is defensive — upstream
+# (`purpleprotocol/mimalloc_rust`) currently ships `default = []`, so
+# this disables nothing today. It pins the opt-in posture for the
+# future: if upstream ever turns on `secure`, `debug`, `extended`, or
+# a v2 flip via default features, the node binary stays on the small
+# portable build until someone opts in deliberately.
 mimalloc = { version = "0.1", default-features = false }
 sha2 = { workspace = true }
 serde = { workspace = true }
