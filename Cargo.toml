@@ -24,6 +24,46 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [profile.dev]
 opt-level = 3
 
+# Release profile is what the Dockerfile builds (`cargo build --release -p
+# node`). Defaults from Cargo are intentionally lax (codegen-units = 16,
+# lto = false, incremental = false), tuned for build-time and developer
+# laptops — not for a prover hot-path that runs for minutes per call.
+#
+# Three knobs are turned on here. Each is documented in
+# https://doc.rust-lang.org/cargo/reference/profiles.html.
+#
+# `lto = "thin"` enables cross-crate Link-Time Optimization on a
+# per-codegen-unit basis. Plonky2's hot path (`plonky2_field::goldilocks`
+# `Mul`, `reduce128`, the FFT inner loops) is heavily `#[inline]`d
+# intra-crate, but the `node` / `script-plonky2` boundary calls *into*
+# those generics through a trait surface. `thin` lets LLVM inline
+# across that boundary. `fat` was tried upstream and reverted (see
+# `0xPolygonZero/plonky2/Cargo.toml` — `#lto = "fat"` commented out);
+# `thin` keeps almost the full speedup with a far smaller link-time
+# regression.
+#
+# `codegen-units = 1` forces the whole crate into a single LLVM
+# compilation unit. Trades ~30-60% link-time on the node binary for
+# the most aggressive intra-crate optimization. Justified because the
+# binary's wall-clock is dominated by Plonky2 prove calls (3-15 min at
+# `MAX_IN_COINS=8`), not by `cargo build` time.
+#
+# `incremental = false` is the default for release; restating it
+# explicitly so a future `CARGO_INCREMENTAL=1` env var on a build host
+# (or a global `~/.cargo/config.toml` override) cannot silently
+# fragment the codegen unit and undo the line above. Plonky2 upstream
+# left `incremental = true` in their release profile — that is
+# explicitly counter to what we want here.
+#
+# `panic = "abort"` is *not* set: `node/src/main.rs` installs a global
+# panic hook (PR #36, MINTING_ADDRESS bootstrap fix) and the account
+# / state layers use `RwLock` poison recovery to fail a single request
+# without taking the process down. `panic = "abort"` would defeat both.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+incremental = false
+
 [workspace.package]
 version = "1.1.0"
 edition = "2021"

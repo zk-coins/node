@@ -6,6 +6,17 @@ edition.workspace = true
 [dependencies]
 bitcoin = { workspace = true }
 bitcoin_hashes = { version = "0.16.0", features = ["std"] }
+# Drop-in allocator. Plonky2's prove path allocates many polynomial
+# and witness buffers across the rayon worker pool; glibc-malloc on
+# the Debian-bookworm-slim runtime image is not tuned for that
+# pattern. mimalloc consistently outperforms glibc malloc on
+# multi-thread alloc-heavy ARM64 workloads. Wired in `main.rs` via
+# `#[global_allocator]`; tests, integration tests, and the
+# `program-plonky2` / `script-plonky2` library crates keep using the
+# system allocator (no behavioural change at the prover circuit
+# level). Default features off so we get the small portable build
+# (no secure-mode overhead, no debug rings).
+mimalloc = { version = "0.1", default-features = false }
 sha2 = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
