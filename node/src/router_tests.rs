@@ -186,6 +186,11 @@ async fn balance_unknown_address_returns_ok_with_zero() {
     let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
     assert_eq!(resp.balance, 0);
     assert!(resp.username.is_none());
+    // num_sends MUST be 0 for an unobserved address — this is the
+    // canonical "fresh wallet" state the seed-restore flow assumes.
+    // A non-zero default would silently desync the wallet's BIP-32
+    // counter (see `BalanceResponse::num_sends` doc).
+    assert_eq!(resp.num_sends, 0);
 }
 
 #[tokio::test]
@@ -209,6 +214,7 @@ async fn balance_unknown_address_with_claimed_username_returns_username() {
     let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
     assert_eq!(resp.balance, 0);
     assert_eq!(resp.username, Some("alice".to_string()));
+    assert_eq!(resp.num_sends, 0);
 }
 
 #[tokio::test]
@@ -224,6 +230,11 @@ async fn balance_minting_address_returns_max() {
 
     let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
     assert_eq!(resp.balance, 1_000_000u64);
+    // The bootstrap-seeded minting account has not produced any send
+    // yet via the test fixture, so num_sends is 0 here. (The api_remote
+    // suite exercises the post-mint num_sends > 0 path against the
+    // live DEV server — see `balance_response_num_sends_*`.)
+    assert_eq!(resp.num_sends, 0);
 }
 
 #[tokio::test]
@@ -236,6 +247,7 @@ async fn balance_missing_address_param_returns_unprocessable() {
     let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
     assert_eq!(resp.balance, 0);
     assert!(resp.username.is_none());
+    assert_eq!(resp.num_sends, 0);
 }
 
 #[tokio::test]
@@ -546,6 +558,60 @@ async fn balance_includes_username_when_claimed() {
     let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
     assert_eq!(resp.balance, 1_000_000u64);
     assert_eq!(resp.username, Some("satoshi".to_string()));
+}
+
+// --- num_sends emission ---
+
+/// `BalanceResponse::num_sends` must reflect the queried account's
+/// per-account send counter (`Account::num_sends`).
+///
+/// Regression for the seed-restore desync that surfaced as
+/// `07-send.spec.ts::send-success` failing with
+/// `"prev_commitment_pubkey required for account update"` (400).
+/// The wallet derives both its current pubkey and
+/// `prev_commitment_pubkey` from this counter; a stale `0` from the
+/// balance endpoint sends the wallet into the wrong SMT slot or
+/// omits the `prev` parameter when the server side expects it.
+///
+/// Driven via the in-memory `AccountNode` knob rather than a full
+/// `/api/send` round-trip: prover initialisation alone costs ~50 s
+/// of CI time and is exercised by the `api_remote` suite against
+/// the live DEV server. The handler-level guarantee tested here is
+/// "whatever `Account::num_sends` says, the JSON emits".
+#[tokio::test]
+async fn balance_response_emits_num_sends_from_account() {
+    let state = test_state();
+    let address_bytes = [0x77u8; 32];
+    let address = zkcoins_program::hash::digest_from_bytes(&address_bytes);
+
+    // Inject an account whose `proof` is None but `num_sends` is
+    // non-zero — an impossible production state (the invariant says
+    // `num_sends > 0 iff proof.is_some()`), but the handler does not
+    // re-check the invariant on read; it emits whatever the field
+    // holds. Setting `num_sends` directly is the smallest possible
+    // signal that the handler reads the right field. (The invariant
+    // itself is covered by the `account_node_tests` unit test
+    // `test_send_coins_twice_from_same_account_uses_update_account`,
+    // which exercises the real bump path through `send_coins_inner`.)
+    {
+        let mut node = state.account_node.lock().unwrap();
+        let mut acct = crate::account_node::Account::new();
+        acct.balance = 42_000;
+        acct.num_sends = 3;
+        node.import_account(address, acct);
+    }
+
+    let uri = format!("/api/balance?address={}", hex::encode(address_bytes));
+    let req = Request::get(&uri).body(Body::empty()).unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(resp.balance, 42_000);
+    assert_eq!(
+        resp.num_sends, 3,
+        "balance handler must emit the per-account num_sends counter"
+    );
 }
 
 // --- Concurrent balance reads ---

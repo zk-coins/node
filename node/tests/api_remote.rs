@@ -1731,6 +1731,194 @@ async fn balance_response_has_no_username_for_unclaimed_wallet() {
     }
 }
 
+/// Field coverage #6 — `/api/balance.num_sends` is the wallet's
+/// authoritative BIP-32 child-index counter.
+///
+/// Regression for the seed-restore desync that surfaced as
+/// `app/e2e/07-send.spec.ts::send-success` failing with
+/// `Interner Fehler: Vorheriger Public Key fehlt.` (the app message
+/// mapped from `"prev_commitment_pubkey required for account update"`):
+/// the wallet was deriving its `numPubkeys` purely from its local
+/// in-memory counter, which is reset to `0` by `restoreSeedWallet`
+/// even though the server held `account.proof = Some(...)` from a
+/// previous test's send. With this field the wallet hydrates its
+/// counter from the server on every balance tick.
+///
+/// Pre-condition: a fresh wallet has `num_sends == 0` regardless
+/// of mint state (mint touches the RECIPIENT's `coin_queue`, never
+/// the recipient's `account.proof` — see `account_node.rs::receive_coin`).
+/// Post-`/api/send` + `/api/commit` round-trip: `num_sends == 1`.
+#[tokio::test]
+async fn balance_response_num_sends_starts_zero_and_bumps_on_send() {
+    let client = http_client();
+    let alice = TestWallet::new();
+    let bob = TestWallet::new();
+
+    // Fresh wallet (never minted, never sent): num_sends MUST be 0.
+    let pre_mint = client
+        .get(url(&format!(
+            "/api/balance?address={}",
+            alice.address_hex()
+        )))
+        .send()
+        .await
+        .expect("GET /api/balance pre-mint");
+    assert_eq!(pre_mint.status(), StatusCode::OK);
+    let pre_mint_body: Value = pre_mint.json().await.expect("balance body JSON");
+    assert_eq!(
+        pre_mint_body["num_sends"].as_u64(),
+        Some(0),
+        "fresh wallet must report num_sends=0, got {:?}",
+        pre_mint_body["num_sends"]
+    );
+
+    // Mint into Alice. The mint flow writes into Alice's `coin_queue`
+    // via `receive_coin`; it does NOT touch `account.proof`. So
+    // `num_sends` must still be 0 after the mint settles.
+    assert_minting_balance_in_bounds(&client).await;
+    let mint_resp = client
+        .post(url("/api/mint"))
+        .json(&json!({
+            "account_address": alice.address_hex(),
+            "amount": MINT_AMOUNT,
+        }))
+        .send()
+        .await
+        .expect("POST /api/mint");
+    assert_eq!(mint_resp.status(), StatusCode::OK, "mint must succeed");
+    let mint_body: Value = mint_resp.json().await.expect("mint body JSON");
+    let mint_proof_id = mint_body["proof_id"].as_u64().expect("proof_id");
+    let _ = poll_balance_at_least(&client, &alice.address_hex(), MINT_AMOUNT).await;
+
+    let post_mint = client
+        .get(url(&format!(
+            "/api/balance?address={}",
+            alice.address_hex()
+        )))
+        .send()
+        .await
+        .expect("GET /api/balance post-mint");
+    assert_eq!(post_mint.status(), StatusCode::OK);
+    let post_mint_body: Value = post_mint.json().await.expect("balance body JSON");
+    assert_eq!(
+        post_mint_body["num_sends"].as_u64(),
+        Some(0),
+        "minted-into wallet must still report num_sends=0 (mint touches \
+         coin_queue, not account.proof), got {:?}",
+        post_mint_body["num_sends"]
+    );
+
+    // Now drive Alice through a full send+commit round-trip. The
+    // shape mirrors `send_commit_roundtrip_moves_balance` — fetch
+    // the mint's coin proof for the prev pubkey, sign, send, commit.
+    let proof_resp = client
+        .get(url(&format!("/api/proof/{}", mint_proof_id)))
+        .send()
+        .await
+        .expect("GET mint proof");
+    assert_eq!(proof_resp.status(), StatusCode::OK);
+    let proof_bytes = proof_resp.bytes().await.expect("mint proof bytes");
+    let mint_coin_proof: CoinProof = bincode::deserialize(&proof_bytes).expect("decode CoinProof");
+    let prev_pk = mint_coin_proof
+        .commitment
+        .as_ref()
+        .expect("mint coin proof has commitment")
+        .public_key;
+
+    let amount = SEND_AMOUNT;
+    let ts = unix_now();
+    let signature = alice.sign_send(&alice.address_hex(), &bob.address_hex(), amount, ts);
+    let send_resp = client
+        .post(url("/api/send"))
+        .json(&json!({
+            "account_address": alice.address_hex(),
+            "recipient": bob.address_hex(),
+            "amount": amount,
+            "public_key": hex::encode(alice.pubkey(0).serialize()),
+            "next_public_key": hex::encode(alice.pubkey(1).serialize()),
+            "prev_commitment_pubkey": hex::encode(prev_pk.serialize()),
+            "signature": signature,
+            "timestamp": ts,
+        }))
+        .send()
+        .await
+        .expect("POST /api/send");
+    assert_eq!(send_resp.status(), StatusCode::OK, "send must succeed");
+    let send_body: Value = send_resp.json().await.expect("send body JSON");
+    let send_proof_id = send_body["proof_id"].as_u64().expect("send proof_id");
+    let ash_hex = send_body["account_state_hash"]
+        .as_str()
+        .expect("account_state_hash present")
+        .to_string();
+    let ocr_hex = send_body["output_coins_root"]
+        .as_str()
+        .expect("output_coins_root present")
+        .to_string();
+    let ash_bytes = hex::decode(&ash_hex).expect("ash is hex");
+    let ocr_bytes = hex::decode(&ocr_hex).expect("ocr is hex");
+
+    // After `/api/send` Ok the server has already bumped
+    // `account.num_sends` (atomically with `account.proof = Some(...)`
+    // inside `send_coins_inner`), so the very next balance read MUST
+    // report `1` — independent of whether the user later succeeds in
+    // the commit phase. (The commit only advances the SMT; the
+    // per-account counter advances on the proof itself.)
+    let post_send = client
+        .get(url(&format!(
+            "/api/balance?address={}",
+            alice.address_hex()
+        )))
+        .send()
+        .await
+        .expect("GET /api/balance post-send");
+    assert_eq!(post_send.status(), StatusCode::OK);
+    let post_send_body: Value = post_send.json().await.expect("balance body JSON");
+    assert_eq!(
+        post_send_body["num_sends"].as_u64(),
+        Some(1),
+        "post-send wallet must report num_sends=1, got {:?}",
+        post_send_body["num_sends"]
+    );
+
+    // Close the loop: drive the commit so the test doesn't leave a
+    // proof_id orphaned in the proof_store (every other api_remote
+    // commit-round-trip cleans up the same way).
+    let mut commit_message = Vec::with_capacity(64);
+    commit_message.extend_from_slice(&ash_bytes);
+    commit_message.extend_from_slice(&ocr_bytes);
+    let commit_sig = alice.sign_commit(&commit_message);
+    let commit_resp = client
+        .post(url("/api/commit"))
+        .json(&json!({
+            "proof_id": send_proof_id,
+            "public_key": hex::encode(alice.pubkey(0).serialize()),
+            "signature": commit_sig,
+            "message": hex::encode(&commit_message),
+        }))
+        .send()
+        .await
+        .expect("POST /api/commit");
+    assert_eq!(commit_resp.status(), StatusCode::OK, "commit must succeed");
+
+    // num_sends survives the commit (commit doesn't mutate the
+    // counter — it only advances the SMT and Bob's coin_queue).
+    let post_commit = client
+        .get(url(&format!(
+            "/api/balance?address={}",
+            alice.address_hex()
+        )))
+        .send()
+        .await
+        .expect("GET /api/balance post-commit");
+    let post_commit_body: Value = post_commit.json().await.expect("balance body JSON");
+    assert_eq!(
+        post_commit_body["num_sends"].as_u64(),
+        Some(1),
+        "post-commit num_sends must still be 1, got {:?}",
+        post_commit_body["num_sends"]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Section 5 — error-envelope contract
 //

@@ -128,6 +128,7 @@ fn test_wallet_operations() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
+            num_sends: 0,
         },
     );
     assert_eq!(
@@ -256,6 +257,7 @@ fn test_create_minting_account() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
+            num_sends: 0,
         },
     );
     assert_eq!(
@@ -279,6 +281,7 @@ fn test_mint_single_invoice() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
+            num_sends: 0,
         },
     );
 
@@ -305,6 +308,7 @@ fn test_receive_duplicate_coin_rejected() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
+            num_sends: 0,
         },
     );
 
@@ -351,6 +355,7 @@ fn test_receive_updates_balance() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
+            num_sends: 0,
         },
     );
 
@@ -407,6 +412,7 @@ fn test_mint_repro_live_setup() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 1_000_000,
+            num_sends: 0,
         },
     );
 
@@ -657,6 +663,7 @@ fn test_receive_coin_rejects_invalid_inclusion_proof() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
+            num_sends: 0,
         },
     );
 
@@ -692,6 +699,7 @@ fn test_send_coins_twice_from_same_account_uses_update_account() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
+            num_sends: 0,
         },
     );
 
@@ -734,6 +742,7 @@ fn test_receive_coin_rejects_replay_via_coin_history() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
+            num_sends: 0,
         },
     );
     let recipient: Address = digest_from_bytes(&[9u8; 32]);
@@ -792,6 +801,7 @@ fn test_send_coins_rejects_tampered_source_proof_inclusion() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
+            num_sends: 0,
         },
     );
 
@@ -873,6 +883,7 @@ fn test_send_coins_rejects_too_many_invoices() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 1_000_000,
+            num_sends: 0,
         },
     );
 
@@ -905,6 +916,7 @@ fn test_send_coins_rejects_too_many_coins_in_queue() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
+            num_sends: 0,
         },
     );
     let recipient_data = TestAccountData::new_generic(&[20u8; 32], Network::Signet);
@@ -978,6 +990,7 @@ fn test_send_coins_errors_when_state_lacks_commitment_for_in_coin() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
+            num_sends: 0,
         },
     );
     let recipient_data = TestAccountData::new_generic(&[21u8; 32], Network::Signet);
@@ -1027,6 +1040,7 @@ fn test_send_coins_errors_when_state_lacks_commitment_for_prev_account_proof() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
+            num_sends: 0,
         },
     );
     let recipient_data = TestAccountData::new_generic(&[22u8; 32], Network::Signet);
@@ -1063,6 +1077,12 @@ fn test_send_coins_errors_when_state_lacks_commitment_for_prev_account_proof() {
             .get_mut(&recipient_addr)
             .expect("recipient account present after receive_coin");
         recipient_account.proof = proof;
+        // Maintain the `num_sends > 0 iff proof.is_some()` invariant
+        // documented on the `Account` struct. The forge above only
+        // moves `proof`; without bumping `num_sends` the recipient
+        // would carry an inconsistent (proof=Some, num_sends=0)
+        // shape that the balance handler would mis-emit.
+        recipient_account.num_sends = 1;
     }
 
     // Pass a `prev_commitment_pubkey` that the state's commitment
@@ -1104,6 +1124,7 @@ fn test_send_coins_rejects_coin_queue_entry_without_commitment() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
+            num_sends: 0,
         },
     );
     let recipient: Address = digest_from_bytes(&[10u8; 32]);
@@ -1171,6 +1192,7 @@ fn test_send_coins_rejects_source_commitment_missing_from_history_mmr() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
+            num_sends: 0,
         },
     );
 
