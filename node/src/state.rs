@@ -7,7 +7,7 @@ use shared::SECP256K1;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use zkcoins_program::circuit::main::MMR_PROOF_PATH_LEN;
-use zkcoins_program::hash::{hash_concat, HashDigest, ZERO_HASH};
+use zkcoins_program::hash::{digest_from_bytes, hash_concat, HashDigest, ZERO_HASH};
 use zkcoins_program::merkle::merkle_mountain_range::{MMRProof, MerkleMountainRange};
 use zkcoins_program::merkle::sparse_merkle_tree::{InclusionProof, SparseMerkleTree};
 
@@ -178,14 +178,65 @@ impl State {
             let key_bytes = commitment.public_key.serialize();
             let key: [u8; 32] = bitcoin::hashes::sha256::Hash::hash(&key_bytes).to_byte_array();
 
-            // Store the BIP-340 message digest (32 raw bytes) reinterpreted
-            // as a Poseidon `HashOut<F>` — `digest_from_bytes` is the
-            // canonical inverse of `digest_to_bytes` (round-trip safe).
-            let message_bytes = commitment.get_account_state_hash();
-            let message_data = zkcoins_program::hash::digest_from_bytes(&message_bytes);
+            // The SMT value is the canonical Poseidon combiner of the
+            // commitment's two halves:
+            //
+            //     smt_value = hash_concat(asth, ocr)
+            //
+            // That is exactly what the in-circuit gadget reconstructs in
+            // `CommitmentMerkleProofs::commitment()`
+            // (`program-plonky2/src/inputs.rs`) and feeds back into the
+            // SMT inclusion check. Any other value here surfaces as the
+            // server-side `prove_account_update_*` failing on the second
+            // send from an account (the first end-to-end test that
+            // exercises a non-initial proof is
+            // `second_send_succeeds_without_prev_commitment_pubkey_field`,
+            // added in PR #132).
+            //
+            // The protocol ships two on-the-wire shapes for
+            // `Commitment.message`, and both must produce the canonical
+            // SMT value:
+            //
+            //   * 64 bytes — wallet wire format
+            //     (`zk-coins/app/rust/client/src/lib.rs::create_commitment`,
+            //     mirrored by `TestWallet::sign_commit` in
+            //     `node/tests/api_remote.rs`): raw concatenation
+            //     `asth_bytes || ocr_bytes`. The Schnorr signature is
+            //     over `sha256(message)` (see `Commitment::verify` in
+            //     `shared/src/commitment.rs`), but the SMT value MUST
+            //     ignore that signature digest and reconstruct the
+            //     canonical Poseidon combiner over the two halves.
+            //   * 32 bytes — mint flow (`ClientAccount::create_commitment`
+            //     in `shared/src/lib.rs`): the already-canonical
+            //     `digest_to_bytes(hash_concat(asth, ocr))`. Round-trips
+            //     through `digest_from_bytes` and recovers the same
+            //     canonical `hash_concat(asth, ocr)` digest the 64-byte
+            //     path produces — so the two forms agree on the SMT
+            //     entry, by construction.
+            //
+            // Any other length is a test-only fixture (existing
+            // `state_tests.rs` uses arbitrary byte slices to exercise
+            // the surrounding state machinery); production callers
+            // never produce that shape, so we preserve the legacy
+            // sha256-fallback path via `get_account_state_hash` rather
+            // than forcing a tests-only refactor. The SMT value on
+            // that path is opaque but consistent — fine for the test
+            // surface, never reached by deployed code.
+            let smt_value = if commitment.message.len() == 64 {
+                let mut ash_bytes = [0u8; 32];
+                let mut ocr_bytes = [0u8; 32];
+                ash_bytes.copy_from_slice(&commitment.message[..32]);
+                ocr_bytes.copy_from_slice(&commitment.message[32..]);
+                let ash = digest_from_bytes(&ash_bytes);
+                let ocr = digest_from_bytes(&ocr_bytes);
+                hash_concat(&ash, &ocr)
+            } else {
+                let message_bytes = commitment.get_account_state_hash();
+                digest_from_bytes(&message_bytes)
+            };
 
-            // Update the SMT with just the message
-            self.smt.insert(key, message_data)?;
+            // Update the SMT with the canonical commitment value.
+            self.smt.insert(key, smt_value)?;
         }
 
         // 2. Get the current SMT root
