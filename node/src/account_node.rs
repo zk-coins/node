@@ -37,6 +37,21 @@ pub struct Account {
     pub coin_queue: Vec<CoinProof>,
     pub coin_history: SparseMerkleTree,
     pub balance: u64,
+    /// Number of own sends this account has committed (i.e. how often
+    /// `account.proof` has been advanced via `send_coins_inner`).
+    ///
+    /// Authoritative source of truth for the wallet's BIP-32 child
+    /// index counter. After a seed restore the wallet has no local
+    /// memory of past sends; the server returns this count on the
+    /// balance endpoint so the wallet can derive the correct current
+    /// pubkey and the correct `prev_commitment_pubkey` (= pubkey at
+    /// `num_sends - 1`) without local bookkeeping.
+    ///
+    /// Invariant: `num_sends > 0` iff `proof.is_some()`. Both fields
+    /// are mutated atomically inside `send_coins_inner` once prove
+    /// succeeded; no public mutator exists outside that path.
+    #[serde(default)]
+    pub num_sends: u32,
 }
 
 impl Account {
@@ -80,6 +95,7 @@ impl Account {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 0,
+            num_sends: 0,
         }
     }
     /// Uses the coin_template and next_public_key to create the next account_state and generates a
@@ -225,12 +241,11 @@ impl AccountNode {
             return Err("Coin inclusion proof verification failed");
         }
 
-        // Log coin receipt without exposing full address (privacy).
-        let addr_bytes = zkcoins_program::hash::digest_to_bytes(&coin_proof.coin.recipient);
-        eprintln!(
-            "Receiving coin for address: {:02x}{:02x}…",
-            addr_bytes[0], addr_bytes[1]
-        );
+        // Coin-receipt breadcrumb intentionally omitted: the success
+        // path is already covered by the structured
+        // `tracing::info!("Persisted state. New MMR root: …")` line
+        // emitted downstream when the receive is committed, so an
+        // additional address-fragment hint here is pure duplication.
 
         // Reject duplicate coins (replay protection)
         let coin_id = coin_proof.coin.identifier;
@@ -604,6 +619,14 @@ impl AccountNode {
         account.coin_queue.clear();
         account.balance = balance - invoiced_amount;
         account.proof = Some(proof.clone());
+        // Bump the per-account send counter atomically with `proof`.
+        // `num_sends > 0 iff proof.is_some()` is the invariant the
+        // balance endpoint relies on to emit the wallet's authoritative
+        // BIP-32 child-index counter — see the field doc on `Account`.
+        // saturating_add guards against the theoretical u32 overflow
+        // at 2^32 sends (4 billion); the prover would melt long before
+        // that, but we don't want a panic on the hot path.
+        account.num_sends = account.num_sends.saturating_add(1);
 
         // Build CoinProof entries for distribution to recipients.
         //
