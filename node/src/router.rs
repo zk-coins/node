@@ -167,21 +167,19 @@ pub struct BalanceResponse {
     ///
     /// Equals the number of times this account has executed a
     /// `/api/send` (`account.num_sends`). The wallet uses this value
-    /// in two places:
-    ///   1. As `numPubkeys` for the next signing/derivation: the
-    ///      pubkey for the next send is at index `num_sends`.
-    ///   2. To derive `prev_commitment_pubkey`: the pubkey committed
-    ///      by the previous send is at index `num_sends - 1` (or
-    ///      `None` when `num_sends == 0`, i.e. the wallet has never
-    ///      sent before).
+    /// as `numPubkeys` for the next signing/derivation: the pubkey
+    /// for the next send is at index `num_sends`.
     ///
-    /// A freshly seed-restored wallet has no local memory of past
-    /// sends. Without this field the wallet would default to
-    /// `numPubkeys = 0` and either (a) collide on a second send
-    /// against the same SMT key, or (b) omit `prev_commitment_pubkey`
-    /// and receive `"prev_commitment_pubkey required for account
-    /// update"` from `send_coin_handler`. Both failure modes were
-    /// observed in the E2E `07-send.spec.ts::send-success` test.
+    /// The wallet does NOT use it to derive `prev_commitment_pubkey`
+    /// anymore — the server reads that one from its own state
+    /// (`Account::commitment_public_key`) and the legacy
+    /// `prev_commitment_pubkey` field on `SendCoinRequest` is
+    /// ignored. See the field doc on `Account::commitment_public_key`
+    /// for the bug class this eliminated (seed restore +
+    /// stale-deploy + TOCTOU drift between local counter and server
+    /// state, all surfacing as 400
+    /// `"prev_commitment_pubkey required for account update"` in
+    /// `07-send.spec.ts::send-success`).
     ///
     /// Always emitted (no `skip_serializing_if`) so the wallet can
     /// rely on its presence — `0` is the canonical value for an
@@ -203,6 +201,15 @@ pub struct SendCoinRequest {
     amount: u64,
     public_key: bitcoin::secp256k1::PublicKey,
     next_public_key: bitcoin::secp256k1::PublicKey,
+    /// Legacy field — IGNORED by `send_coin_handler` as of the
+    /// [`crate::account_node::Account::commitment_public_key`]
+    /// refactor. The server reads the previous commitment pubkey
+    /// from its own state instead. Kept on the wire so deployed
+    /// wallets (and the in-tree `app` PR #125) that still emit it
+    /// continue to parse against the post-refactor server with no
+    /// 4xx for an unknown field. Drop entirely once every published
+    /// wallet has cycled off this contract.
+    #[serde(default)]
     prev_commitment_pubkey: Option<bitcoin::secp256k1::PublicKey>,
     signature: Option<String>,
     timestamp: Option<u64>,
@@ -347,19 +354,19 @@ pub struct SendCoinResponse {
 ///   string lets clients distinguish "fix your inclusion proof" from
 ///   "fix your account selection".
 /// - **404 NOT_FOUND** — sender address is not known to the node.
-/// - **400 BAD_REQUEST** — request structure violates the API contract
-///   (e.g. AccountUpdate transition without `prev_commitment_pubkey`).
 /// - **500 INTERNAL_SERVER_ERROR** — the prover failed. Body collapses
 ///   to a generic `"prove failed"` to avoid leaking prover-internal
 ///   state to the caller. The full error string is logged via
 ///   `eprintln!` in the handler.
+///
+/// The historical 400 `"prev_commitment_pubkey required for account
+/// update"` is unreachable as of the
+/// [`Account::commitment_public_key`] refactor: the server reads the
+/// previous commitment pubkey from its own state instead of trusting
+/// the caller. The match arm is therefore gone.
 pub(crate) fn map_send_coins_error(err: &str) -> (StatusCode, &'static str) {
     match err {
         "Unknown account address" => (StatusCode::NOT_FOUND, "Unknown account address"),
-        "prev_commitment_pubkey required for account update" => (
-            StatusCode::BAD_REQUEST,
-            "prev_commitment_pubkey required for account update",
-        ),
         "Insufficient funds" => (StatusCode::UNPROCESSABLE_ENTITY, "Insufficient funds"),
         // `get_merkle_proofs` failures — reachable from `send_coins`
         // via the `prev_commitment_pubkey` path. The client supplied

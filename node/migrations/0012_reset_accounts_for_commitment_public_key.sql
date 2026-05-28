@@ -1,0 +1,40 @@
+-- Reset the accounts table to absorb a non-backwards-compatible
+-- change to the bincode `Account` shape: the
+-- `Account::commitment_public_key: Option<PublicKey>` field is the
+-- server-authoritative source for the previous-commitment-pubkey
+-- lookup that the `send_coins_inner` AccountUpdate branch used to
+-- read from the caller-supplied `prev_commitment_pubkey` parameter.
+-- The caller-supplied field is now ignored, the new field lives on
+-- the persisted account struct, and the invariant the rest of the
+-- module relies on becomes
+-- `proof.is_some() iff num_sends > 0 iff commitment_public_key.is_some()`.
+--
+-- bincode encodings of structs are positional + length-prefixed and
+-- there is no in-band "missing field" marker. A pre-PR account blob
+-- ends after `num_sends: u32`; a post-PR `bincode::deserialize` call
+-- on that blob reads "unexpected end of input" when it tries to
+-- consume the next bytes for `commitment_public_key`. As with
+-- migration 0011 the fast and operationally cheap fix is to wipe
+-- the table: every persisted account is reconstructable from the
+-- next mint/send round-trip the user makes against the address.
+-- The DEV + PRD environments are closed test envs per
+-- `feedback_zkcoins_closed_test_env.md`, so the "wipe-and-rebuild
+-- accepts the dataloss" trade-off is the same one 0010 / 0011 set.
+--
+-- A SECOND consequence of the refactor is that any account whose
+-- bincode blob was persisted with `proof = Some(...)` (i.e.
+-- `num_sends > 0`) but without a `commitment_public_key` would
+-- panic the AccountUpdate branch at the `expect(...)` documenting
+-- the invariant. Migration 0011 left us in exactly this state for
+-- every account that had successfully sent post-deploy. Wiping
+-- here covers BOTH the bincode-shape change AND that invariant gap
+-- in one go.
+--
+-- The dependent log/history tables (`account_history`,
+-- `coin_proof_store`) are NOT wiped — their rows are historical
+-- evidence of past sends/mints and don't reference the wiped
+-- account blob's bincode shape. The trigger `accounts_history_capture`
+-- that backfills `account_history` on every UPDATE will simply not
+-- fire until the next `/api/send` re-populates the accounts row.
+
+DELETE FROM accounts;

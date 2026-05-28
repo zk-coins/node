@@ -287,6 +287,20 @@ impl TestWallet {
         amount: u64,
         timestamp: u64,
     ) -> String {
+        self.sign_send_at(account_address, recipient, amount, timestamp, 0)
+    }
+
+    /// Same as [`Self::sign_send`] but at an arbitrary BIP-32 child
+    /// index. Needed for the multi-send regression test that drives
+    /// `account.num_sends >= 2` against the live server.
+    fn sign_send_at(
+        &self,
+        account_address: &str,
+        recipient: &str,
+        amount: u64,
+        timestamp: u64,
+        idx: u32,
+    ) -> String {
         let mut hasher = Sha256::new();
         hasher.update(account_address.as_bytes());
         hasher.update(recipient.as_bytes());
@@ -294,7 +308,7 @@ impl TestWallet {
         hasher.update(timestamp.to_le_bytes());
         let hash: [u8; 32] = hasher.finalize().into();
         let msg = Message::from_digest(hash);
-        let sig = self.secp.sign_schnorr_no_aux_rand(&msg, &self.keypair(0));
+        let sig = self.secp.sign_schnorr_no_aux_rand(&msg, &self.keypair(idx));
         hex::encode(sig.as_ref())
     }
 
@@ -1916,6 +1930,228 @@ async fn balance_response_num_sends_starts_zero_and_bumps_on_send() {
         Some(1),
         "post-commit num_sends must still be 1, got {:?}",
         post_commit_body["num_sends"]
+    );
+}
+
+/// Regression: the second `/api/send` for an account whose
+/// `account.proof = Some(...)` MUST succeed even when the client
+/// omits `prev_commitment_pubkey` from the request body.
+///
+/// Pre-`Account::commitment_public_key`-refactor this surfaced as a
+/// 400 `prev_commitment_pubkey required for account update` —
+/// observed live as `07-send.spec.ts::send-success` failing with
+/// `Interner Fehler: Vorheriger Public Key fehlt.` against DEV every
+/// time the wallet's local BIP-32 child-index counter drifted from
+/// the server's (seed restore + stale-app deploy + TOCTOU between
+/// balance fetch and signing). Post-refactor the server reads the
+/// previous commitment pubkey from `account.commitment_public_key`
+/// (set atomically with `proof` inside `send_coins_inner`), so the
+/// caller-supplied field is purely advisory and a missing one is
+/// fully recoverable.
+///
+/// Flow: mint → send #1 (first send, `account.proof = None` → prove
+/// initial → server stamps `commitment_public_key = pubkey_0`) →
+/// send #2 with `prev_commitment_pubkey` deliberately omitted →
+/// MUST succeed (AccountUpdate branch reads its own stored value).
+#[tokio::test]
+async fn second_send_succeeds_without_prev_commitment_pubkey_field() {
+    let client = http_client();
+    let alice = TestWallet::new();
+    let bob = TestWallet::new();
+
+    assert_minting_balance_in_bounds(&client).await;
+
+    // ---- Mint ----
+    let mint_resp = client
+        .post(url("/api/mint"))
+        .json(&json!({
+            "account_address": alice.address_hex(),
+            "amount": MINT_AMOUNT,
+        }))
+        .send()
+        .await
+        .expect("POST /api/mint");
+    assert_eq!(mint_resp.status(), StatusCode::OK, "mint must succeed");
+    let mint_body: Value = mint_resp.json().await.expect("mint body JSON");
+    let mint_proof_id = mint_body["proof_id"].as_u64().expect("mint proof_id");
+
+    let _ = poll_balance_at_least(&client, &alice.address_hex(), MINT_AMOUNT).await;
+
+    // ---- Fetch the mint proof; capture the minting pubkey for the
+    // FIRST send's `prev_commitment_pubkey`. (The first send hits the
+    // `prove_initial` branch and ignores the field, but we pass it
+    // anyway to mirror the "what an old wallet would send" shape.)
+    let proof_resp = client
+        .get(url(&format!("/api/proof/{}", mint_proof_id)))
+        .send()
+        .await
+        .expect("GET mint proof");
+    let proof_bytes = proof_resp.bytes().await.expect("mint proof bytes");
+    let mint_coin_proof: CoinProof = bincode::deserialize(&proof_bytes).expect("decode CoinProof");
+    let prev_pk_minting = mint_coin_proof
+        .commitment
+        .as_ref()
+        .expect("mint coin proof has commitment")
+        .public_key;
+
+    // ---- First send (proves initial, sets account.proof = Some + commitment_public_key = pubkey_0) ----
+    let ts1 = unix_now();
+    let sig1 = alice.sign_send(&alice.address_hex(), &bob.address_hex(), SEND_AMOUNT, ts1);
+    let send1_resp = client
+        .post(url("/api/send"))
+        .json(&json!({
+            "account_address": alice.address_hex(),
+            "recipient": bob.address_hex(),
+            "amount": SEND_AMOUNT,
+            "public_key": hex::encode(alice.pubkey(0).serialize()),
+            "next_public_key": hex::encode(alice.pubkey(1).serialize()),
+            "prev_commitment_pubkey": hex::encode(prev_pk_minting.serialize()),
+            "signature": sig1,
+            "timestamp": ts1,
+        }))
+        .send()
+        .await
+        .expect("POST /api/send #1");
+    assert_eq!(
+        send1_resp.status(),
+        StatusCode::OK,
+        "first send must succeed"
+    );
+    let send1_body: Value = send1_resp.json().await.expect("send #1 body JSON");
+    let send1_proof_id = send1_body["proof_id"].as_u64().expect("send #1 proof_id");
+    let ash1_hex = send1_body["account_state_hash"]
+        .as_str()
+        .expect("send #1 account_state_hash")
+        .to_string();
+    let ocr1_hex = send1_body["output_coins_root"]
+        .as_str()
+        .expect("send #1 output_coins_root")
+        .to_string();
+
+    // Commit the first send so its commitment lands in the SMT —
+    // the second send's prev-commitment lookup needs it indexed.
+    let mut commit1_msg = Vec::with_capacity(64);
+    commit1_msg.extend_from_slice(&hex::decode(&ash1_hex).expect("ash1 hex"));
+    commit1_msg.extend_from_slice(&hex::decode(&ocr1_hex).expect("ocr1 hex"));
+    let commit1_sig = alice.sign_commit(&commit1_msg);
+    let commit1_resp = client
+        .post(url("/api/commit"))
+        .json(&json!({
+            "proof_id": send1_proof_id,
+            "public_key": hex::encode(alice.pubkey(0).serialize()),
+            "signature": commit1_sig,
+            "message": hex::encode(&commit1_msg),
+        }))
+        .send()
+        .await
+        .expect("POST /api/commit #1");
+    assert_eq!(
+        commit1_resp.status(),
+        StatusCode::OK,
+        "commit #1 must succeed"
+    );
+
+    // Verify the server bumped `num_sends` to 1 (the wallet would
+    // sync this on its next balance tick to choose `pubkey(1)` as
+    // its next signing key).
+    let post_send1 = client
+        .get(url(&format!(
+            "/api/balance?address={}",
+            alice.address_hex()
+        )))
+        .send()
+        .await
+        .expect("GET /api/balance post-send-1");
+    let post_send1_body: Value = post_send1.json().await.expect("balance body JSON");
+    assert_eq!(
+        post_send1_body["num_sends"].as_u64(),
+        Some(1),
+        "post-send-1 num_sends must report 1"
+    );
+
+    // Mint a second time into Alice so she has balance for send #2
+    // (after send #1, alice's balance is `MINT_AMOUNT - SEND_AMOUNT`,
+    // which is still enough for another SEND_AMOUNT — but minting
+    // again keeps the test symmetric with `send_commit_roundtrip`).
+    let _ = client
+        .post(url("/api/mint"))
+        .json(&json!({
+            "account_address": alice.address_hex(),
+            "amount": MINT_AMOUNT,
+        }))
+        .send()
+        .await
+        .expect("POST /api/mint #2");
+    let _ = poll_balance_at_least(
+        &client,
+        &alice.address_hex(),
+        MINT_AMOUNT - SEND_AMOUNT + MINT_AMOUNT,
+    )
+    .await;
+
+    // ---- Second send WITHOUT `prev_commitment_pubkey`. ----
+    //
+    // The whole point of the refactor: the AccountUpdate branch reads
+    // `account.commitment_public_key` from its own state (set
+    // atomically with `proof` by send #1 above), so the caller can
+    // omit the field entirely and the prove still succeeds. Pre-
+    // refactor this returned 400
+    // `"prev_commitment_pubkey required for account update"`.
+    //
+    // The wallet's signing key for this send is `pubkey(1)` because
+    // `num_sends == 1` (the server's authoritative counter); the
+    // `public_key` field on the request reflects that.
+    let ts2 = unix_now();
+    let sig2 = alice.sign_send_at(
+        &alice.address_hex(),
+        &bob.address_hex(),
+        SEND_AMOUNT,
+        ts2,
+        1,
+    );
+    let send2_body = json!({
+        "account_address": alice.address_hex(),
+        "recipient": bob.address_hex(),
+        "amount": SEND_AMOUNT,
+        "public_key": hex::encode(alice.pubkey(1).serialize()),
+        "next_public_key": hex::encode(alice.pubkey(2).serialize()),
+        // NOTE: `prev_commitment_pubkey` deliberately omitted from
+        // the payload. With the refactor this must NOT 400.
+        "signature": sig2,
+        "timestamp": ts2,
+    });
+    let send2_resp = client
+        .post(url("/api/send"))
+        .json(&send2_body)
+        .send()
+        .await
+        .expect("POST /api/send #2 (no prev_commitment_pubkey)");
+    let send2_status = send2_resp.status();
+    let send2_body_text = send2_resp.text().await.unwrap_or_default();
+    assert_eq!(
+        send2_status,
+        StatusCode::OK,
+        "second send WITHOUT prev_commitment_pubkey must succeed \
+         (refactor: server reads its own stored commitment_public_key); \
+         got {} body={}",
+        send2_status,
+        send2_body_text
+    );
+
+    // Server-side counter advanced.
+    let post_send2 = client
+        .get(url(&format!(
+            "/api/balance?address={}",
+            alice.address_hex()
+        )))
+        .send()
+        .await
+        .expect("GET /api/balance post-send-2");
+    let post_send2_body: Value = post_send2.json().await.expect("balance body JSON");
+    assert_eq!(
+        post_send2_body["num_sends"].as_u64(),
+        Some(2),
+        "post-send-2 num_sends must report 2"
     );
 }
 

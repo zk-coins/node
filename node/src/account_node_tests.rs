@@ -129,6 +129,7 @@ fn test_wallet_operations() {
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
             num_sends: 0,
+            commitment_public_key: None,
         },
     );
     assert_eq!(
@@ -258,6 +259,7 @@ fn test_create_minting_account() {
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
             num_sends: 0,
+            commitment_public_key: None,
         },
     );
     assert_eq!(
@@ -282,6 +284,7 @@ fn test_mint_single_invoice() {
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
             num_sends: 0,
+            commitment_public_key: None,
         },
     );
 
@@ -309,6 +312,7 @@ fn test_receive_duplicate_coin_rejected() {
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
             num_sends: 0,
+            commitment_public_key: None,
         },
     );
 
@@ -356,6 +360,7 @@ fn test_receive_updates_balance() {
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
             num_sends: 0,
+            commitment_public_key: None,
         },
     );
 
@@ -413,6 +418,7 @@ fn test_mint_repro_live_setup() {
             coin_history: SparseMerkleTree::new(),
             balance: 1_000_000,
             num_sends: 0,
+            commitment_public_key: None,
         },
     );
 
@@ -664,6 +670,7 @@ fn test_receive_coin_rejects_invalid_inclusion_proof() {
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
             num_sends: 0,
+            commitment_public_key: None,
         },
     );
 
@@ -700,6 +707,7 @@ fn test_send_coins_twice_from_same_account_uses_update_account() {
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
             num_sends: 0,
+            commitment_public_key: None,
         },
     );
 
@@ -727,6 +735,107 @@ fn test_send_coins_twice_from_same_account_uses_update_account() {
         .execute_send_coins(&mut node, vec![Invoice::new(50, recipient)])
         .expect("second send should succeed (update_account path)");
     assert_eq!(coin_proofs_2.len(), 1);
+
+    // Invariant check: after two sends the three coupled fields are
+    // all "updated" — `proof = Some`, `num_sends = 2`, and
+    // `commitment_public_key = Some(pubkey_used_in_send_2)`. The
+    // AccountUpdate branch reads this last value (not a caller
+    // parameter) on the NEXT send, so its presence here is the
+    // load-bearing post-condition.
+    let acct = node
+        .get_account(&minting.address)
+        .expect("minting account still in map after send");
+    assert!(
+        acct.proof.is_some(),
+        "account.proof must be Some after send"
+    );
+    assert_eq!(
+        acct.num_sends, 2,
+        "num_sends bumps once per successful send_coins_inner"
+    );
+    let expected_cpk =
+        generate_test_public_key(&minting.xpriv, minting.num_pubkeys.saturating_sub(1));
+    assert_eq!(
+        acct.commitment_public_key,
+        Some(expected_cpk),
+        "commitment_public_key holds the pubkey used in the most recent send"
+    );
+}
+
+/// Regression: a second `send_coins` from an account whose
+/// `account.proof = Some(...)` MUST succeed when the caller passes
+/// `None` for `prev_commitment_pubkey` — the AccountUpdate branch
+/// reads `account.commitment_public_key` from its own state instead
+/// of consulting the caller-supplied parameter. Pre-refactor this
+/// returned the 400-mapped error
+/// `"prev_commitment_pubkey required for account update"`.
+///
+/// Live-server analogue is the api_remote test
+/// `second_send_succeeds_without_prev_commitment_pubkey_field` —
+/// this one drives the same code path through `account_node` directly
+/// (no prover, no HTTP) so the contract is pinned even when the
+/// `api_remote` suite is skipped (slim CI).
+#[test]
+fn test_send_coins_second_send_succeeds_without_prev_commitment_pubkey() {
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    let mut node = AccountNode::new(Arc::clone(&state_arc));
+
+    let mut minting = TestAccountData::new_minting_account();
+    node.import_account(
+        minting.address,
+        Account {
+            proof: None,
+            coin_queue: vec![],
+            coin_history: SparseMerkleTree::new(),
+            balance: 10_000,
+            num_sends: 0,
+            commitment_public_key: None,
+        },
+    );
+
+    let recipient: Address = digest_from_bytes(&[43u8; 32]);
+
+    // First send: account.proof is None -> prove_initial branch.
+    // The caller-supplied prev_commitment_pubkey is ignored on this
+    // branch (it's only consulted on the AccountUpdate branch, and
+    // post-refactor not even there); pass None to make that explicit.
+    let coin_proofs_1 = minting
+        .execute_send_coins(&mut node, vec![Invoice::new(100, recipient)])
+        .expect("first send should succeed");
+    state_arc
+        .lock()
+        .unwrap()
+        .update(
+            &coin_proofs_1
+                .iter()
+                .map(|cp| cp.commitment.clone().unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+    // Second send WITHOUT prev_commitment_pubkey. Pre-refactor this
+    // returned `"prev_commitment_pubkey required for account update"`
+    // and was mapped to 400 by `map_send_coins_error`. Post-refactor
+    // the AccountUpdate branch reads `account.commitment_public_key`
+    // (set atomically in the first send) and the prove succeeds.
+    let current_pk = generate_test_public_key(&minting.xpriv, minting.num_pubkeys);
+    let next_pk = generate_test_public_key(&minting.xpriv, minting.num_pubkeys + 1);
+    let coin_proofs_2 = node
+        .send_coins(
+            vec![Invoice::new(50, recipient)],
+            minting.address,
+            current_pk,
+            next_pk,
+            None, // <-- the contract under test: prev_commitment_pubkey omitted
+        )
+        .expect("second send must succeed without prev_commitment_pubkey");
+    assert_eq!(coin_proofs_2.len(), 1);
+
+    let acct = node
+        .get_account(&minting.address)
+        .expect("minting account still in map after send");
+    assert_eq!(acct.num_sends, 2);
+    assert_eq!(acct.commitment_public_key, Some(current_pk));
 }
 
 #[test]
@@ -743,6 +852,7 @@ fn test_receive_coin_rejects_replay_via_coin_history() {
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
             num_sends: 0,
+            commitment_public_key: None,
         },
     );
     let recipient: Address = digest_from_bytes(&[9u8; 32]);
@@ -802,6 +912,7 @@ fn test_send_coins_rejects_tampered_source_proof_inclusion() {
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
             num_sends: 0,
+            commitment_public_key: None,
         },
     );
 
@@ -884,6 +995,7 @@ fn test_send_coins_rejects_too_many_invoices() {
             coin_history: SparseMerkleTree::new(),
             balance: 1_000_000,
             num_sends: 0,
+            commitment_public_key: None,
         },
     );
 
@@ -917,6 +1029,7 @@ fn test_send_coins_rejects_too_many_coins_in_queue() {
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
             num_sends: 0,
+            commitment_public_key: None,
         },
     );
     let recipient_data = TestAccountData::new_generic(&[20u8; 32], Network::Signet);
@@ -991,6 +1104,7 @@ fn test_send_coins_errors_when_state_lacks_commitment_for_in_coin() {
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
             num_sends: 0,
+            commitment_public_key: None,
         },
     );
     let recipient_data = TestAccountData::new_generic(&[21u8; 32], Network::Signet);
@@ -1021,12 +1135,18 @@ fn test_send_coins_errors_when_state_lacks_commitment_for_in_coin() {
 }
 
 /// AccountUpdate branch: when `account.proof = Some(...)` and the
-/// caller passes a `prev_commitment_pubkey` that the state's
-/// commitment-proof index does not contain, the second call to
-/// `get_merkle_proofs` (inside the AccountUpdate-prove preparation)
-/// surfaces "Unable to get merkle proofs..." just like the in-coin
-/// loop's call. Set up via one honest mint + receive + state.update;
-/// then pass a fresh, never-indexed `prev_commitment_pubkey`.
+/// account's stored `commitment_public_key` is for a commitment that
+/// the state's commitment-proof index does not contain, the second
+/// call to `get_merkle_proofs` (inside the AccountUpdate-prove
+/// preparation) surfaces "Unable to get merkle proofs..." just like
+/// the in-coin loop's call. Set up via one honest mint + receive +
+/// state.update; then forge an `account.proof = Some(...)` plus a
+/// `commitment_public_key` that is fresh and not indexed in the SMT.
+///
+/// As of the `Account::commitment_public_key` refactor the
+/// AccountUpdate branch reads the previous commitment pubkey from the
+/// account itself (not from a caller-supplied parameter), so the test
+/// drives the failure through that field.
 #[test]
 fn test_send_coins_errors_when_state_lacks_commitment_for_prev_account_proof() {
     let state_arc = Arc::new(Mutex::new(State::new()));
@@ -1041,6 +1161,7 @@ fn test_send_coins_errors_when_state_lacks_commitment_for_prev_account_proof() {
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
             num_sends: 0,
+            commitment_public_key: None,
         },
     );
     let recipient_data = TestAccountData::new_generic(&[22u8; 32], Network::Signet);
@@ -1065,7 +1186,15 @@ fn test_send_coins_errors_when_state_lacks_commitment_for_prev_account_proof() {
     // Forge an `account.proof = Some(...)` on the recipient by reusing
     // the minting account's proof we just produced (signature
     // verification doesn't happen on this path — `get_merkle_proofs`
-    // only consults state for the prev_commitment_pubkey lookup).
+    // only consults state for the commitment-pubkey lookup).
+    //
+    // To drive the "Unable to get merkle proofs..." error path we
+    // also set the recipient's `commitment_public_key` to a fresh,
+    // never-indexed pubkey. Post-refactor the AccountUpdate branch
+    // reads THIS field (not a caller parameter) for the lookup, so
+    // the unknown pubkey lives on the account itself.
+    let stranger_seed = Xpriv::new_master(Network::Signet, &[99u8; 32]).expect("stranger xpriv");
+    let unknown_commitment_pk = generate_test_public_key(&stranger_seed, 0);
     {
         let mint_account = node
             .accounts
@@ -1077,20 +1206,23 @@ fn test_send_coins_errors_when_state_lacks_commitment_for_prev_account_proof() {
             .get_mut(&recipient_addr)
             .expect("recipient account present after receive_coin");
         recipient_account.proof = proof;
-        // Maintain the `num_sends > 0 iff proof.is_some()` invariant
-        // documented on the `Account` struct. The forge above only
-        // moves `proof`; without bumping `num_sends` the recipient
-        // would carry an inconsistent (proof=Some, num_sends=0)
-        // shape that the balance handler would mis-emit.
+        // Maintain the invariant documented on `Account`:
+        // `proof.is_some() iff num_sends > 0 iff
+        // commitment_public_key.is_some()`. Forging only `proof`
+        // would leave an inconsistent shape that the balance handler
+        // would mis-emit AND that the AccountUpdate branch would
+        // panic on (the field's `expect` guards the invariant).
         recipient_account.num_sends = 1;
+        recipient_account.commitment_public_key = Some(unknown_commitment_pk);
     }
 
-    // Pass a `prev_commitment_pubkey` that the state's commitment
-    // index has never seen — the lookup fails inside
-    // get_merkle_proofs and propagates "Unable to get merkle proofs...".
-    let stranger_seed = Xpriv::new_master(Network::Signet, &[99u8; 32]).expect("stranger xpriv");
-    let unknown_prev_pk = generate_test_public_key(&stranger_seed, 0);
-
+    // Caller-supplied `prev_commitment_pubkey` is ignored by the
+    // post-refactor server — pass `None` here to make that explicit.
+    // The AccountUpdate branch reads the recipient's stored
+    // `commitment_public_key` (the stranger pubkey installed above),
+    // hits the SMT lookup miss, and surfaces "Unable to get merkle
+    // proofs...". The HTTP mapping in `map_send_coins_error`
+    // translates this to 422 (caller-fixable).
     let current_pk = generate_test_public_key(&recipient_data.xpriv, 0);
     let next_pk = generate_test_public_key(&recipient_data.xpriv, 1);
     let result = node.send_coins(
@@ -1098,13 +1230,8 @@ fn test_send_coins_errors_when_state_lacks_commitment_for_prev_account_proof() {
         recipient_addr,
         current_pk,
         next_pk,
-        Some(unknown_prev_pk),
+        None,
     );
-    // The AccountUpdate-branch get_merkle_proofs call uses
-    // `prev_commitment_pubkey`, which is not in state, so the lookup
-    // fails. The error string is identical to the in-coin loop's,
-    // which is fine — both signal the same caller-fixable malformed
-    // witness, and Item 1's HTTP mapping translates both to 422.
     assert_eq!(
         result.unwrap_err(),
         "Unable to get merkle proofs for provided public key"
@@ -1125,6 +1252,7 @@ fn test_send_coins_rejects_coin_queue_entry_without_commitment() {
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
             num_sends: 0,
+            commitment_public_key: None,
         },
     );
     let recipient: Address = digest_from_bytes(&[10u8; 32]);
@@ -1193,6 +1321,7 @@ fn test_send_coins_rejects_source_commitment_missing_from_history_mmr() {
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
             num_sends: 0,
+            commitment_public_key: None,
         },
     );
 

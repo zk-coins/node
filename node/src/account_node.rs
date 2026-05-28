@@ -41,17 +41,48 @@ pub struct Account {
     /// `account.proof` has been advanced via `send_coins_inner`).
     ///
     /// Authoritative source of truth for the wallet's BIP-32 child
-    /// index counter. After a seed restore the wallet has no local
-    /// memory of past sends; the server returns this count on the
-    /// balance endpoint so the wallet can derive the correct current
-    /// pubkey and the correct `prev_commitment_pubkey` (= pubkey at
-    /// `num_sends - 1`) without local bookkeeping.
+    /// index counter on the SIGNING side (which key to sign the
+    /// outgoing send with). After a seed restore the wallet has no
+    /// local memory of past sends; the server returns this count on
+    /// the balance endpoint so the wallet can derive the correct
+    /// current signing pubkey without local bookkeeping.
     ///
-    /// Invariant: `num_sends > 0` iff `proof.is_some()`. Both fields
-    /// are mutated atomically inside `send_coins_inner` once prove
-    /// succeeded; no public mutator exists outside that path.
+    /// The wallet no longer derives `prev_commitment_pubkey` from
+    /// this counter — that one is supplied authoritatively by the
+    /// server via [`Self::commitment_public_key`] and the
+    /// `send_coins_inner` AccountUpdate branch reads it directly
+    /// from this struct instead of trusting a caller-supplied value.
+    /// See the field doc on `commitment_public_key` for the rationale.
+    ///
+    /// Invariant: `num_sends > 0` iff `proof.is_some()` iff
+    /// `commitment_public_key.is_some()`. All three fields are mutated
+    /// atomically inside `send_coins_inner` once prove succeeded; no
+    /// public mutator exists outside that path.
     #[serde(default)]
     pub num_sends: u32,
+    /// Pubkey of the COMMITMENT the previous successful send produced.
+    ///
+    /// Equals the `public_key` argument that `send_coins_inner` used
+    /// the last time it advanced this account's `proof`. The next
+    /// AccountUpdate transition looks up that commitment in the
+    /// SMT to build its `prev_cmp` merkle proofs — historically the
+    /// client passed this in as `prev_commitment_pubkey`, which broke
+    /// every time the client's local BIP-32 child-index counter
+    /// drifted from the server's (typical after a seed restore, an
+    /// app deploy with an unrelated state-shape change, or a TOCTOU
+    /// race between a balance fetch and the actual send).
+    ///
+    /// Storing it here makes the server the single source of truth
+    /// for this lookup and reduces the client's send-request payload
+    /// to inputs that ARE the client's authoritative concern
+    /// (the signing pubkey + the next pubkey). The legacy
+    /// `prev_commitment_pubkey` request field is kept on the wire for
+    /// backwards-compat with already-deployed wallets but is ignored
+    /// on this code path.
+    ///
+    /// Invariant: see [`Self::num_sends`] — `Some` iff `proof.is_some()`.
+    #[serde(default)]
+    pub commitment_public_key: Option<PublicKey>,
 }
 
 impl Account {
@@ -96,6 +127,7 @@ impl Account {
             coin_history: SparseMerkleTree::new(),
             balance: 0,
             num_sends: 0,
+            commitment_public_key: None,
         }
     }
     /// Uses the coin_template and next_public_key to create the next account_state and generates a
@@ -583,8 +615,30 @@ impl AccountNode {
 
         let proof: Proof = match &account.proof {
             Some(account_proof) => {
-                let account_commitment_public_key = prev_commitment_pubkey
-                    .ok_or("prev_commitment_pubkey required for account update")?;
+                // The server is the single source of truth for the
+                // previous commitment's pubkey: it set this field
+                // atomically with `account.proof` the last time
+                // `send_coins_inner` succeeded for this account. The
+                // legacy caller-supplied `prev_commitment_pubkey` is
+                // ignored on this branch — it produced a class of
+                // 400s every time the wallet's local BIP-32
+                // child-index counter drifted from the server's
+                // (seed restore + stale app deploy + TOCTOU between
+                // balance fetch and send-request signing). See the
+                // field doc on `Account::commitment_public_key` for
+                // the full story.
+                //
+                // The `expect` is the documentation of the invariant
+                // `proof.is_some() iff commitment_public_key.is_some()`
+                // (also `iff num_sends > 0`). It is mutated only here,
+                // atomically with `proof`, so the only way to reach
+                // the panic is a persisted blob that violates the
+                // invariant — which migration 0012 wipes pre-emptively
+                // and which no code path can produce going forward.
+                let _ = prev_commitment_pubkey; // legacy field, see note above.
+                let account_commitment_public_key = account
+                    .commitment_public_key
+                    .expect("commitment_public_key is Some whenever proof is Some — see invariant on Account");
                 let prev_cmp = Self::get_merkle_proofs(
                     account_proof.clone(),
                     account_commitment_public_key,
@@ -627,6 +681,18 @@ impl AccountNode {
         // at 2^32 sends (4 billion); the prover would melt long before
         // that, but we don't want a panic on the hot path.
         account.num_sends = account.num_sends.saturating_add(1);
+        // Record the pubkey that backed THIS send's commitment. The
+        // NEXT AccountUpdate transition for this account will read it
+        // back from here to build the previous-commitment merkle proof
+        // — making the server the single source of truth for the
+        // `prev_commitment_pubkey` lookup instead of trusting the
+        // client to re-derive it from a BIP-32 child index that
+        // routinely drifts after a seed restore. See the field doc on
+        // `Account::commitment_public_key`. Set last (after the proof
+        // + num_sends mutations) so the three fields commit together
+        // — the function as a whole is the atomic unit (the caller
+        // commits the account-bytes upsert post-prove).
+        account.commitment_public_key = Some(public_key);
 
         // Build CoinProof entries for distribution to recipients.
         //
