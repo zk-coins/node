@@ -899,7 +899,7 @@ async fn send_coin_handler(
             // builder — `map_send_coins_error` is pure but the
             // duplicate call was needless work.
             let mapped = map_send_coins_error(e);
-            tracing::warn!("send_coins error: {} (status={})", e, mapped.0);
+            tracing::warn!("send_coins rejected: {} (status={})", e, mapped.0);
             send_coins_error_response(mapped)
         }
     }
@@ -1072,7 +1072,7 @@ async fn mint_handler(
             // both. Map once and thread the tuple into the response
             // builder.
             let mapped = map_send_coins_error(e);
-            tracing::warn!("Mint prepare: err — {} (status={})", e, mapped.0);
+            tracing::warn!("Mint prepare rejected — {} (status={})", e, mapped.0);
             return send_coins_error_response(mapped);
         }
     };
