@@ -1501,3 +1501,32 @@ fn test_send_coins_rejects_source_commitment_missing_from_history_mmr() {
         "desynced `state.prev_mmr_root` must surface the off-circuit history-MMR rejection at account_node.rs:419",
     );
 }
+
+#[test]
+fn log_prove_account_update_failure_emits_label_and_logs_chain() {
+    // The helper exists purely to surface the plonky2 anyhow chain on
+    // stderr (operator visibility via `docker logs`) while keeping the
+    // caller-facing wire body at the static
+    // `"prove_account_update_with_in_and_out_coins_and_sources failed"`
+    // label that `map_send_coins_error` collapses to 500 "prove failed".
+    //
+    // The label assertion pins that contract; the stderr line is a
+    // side-effect we cannot directly observe in-process, but its
+    // existence keeps the line statement-covered for the gate.
+    let label = super::log_prove_account_update_failure(anyhow::anyhow!("plonky2-rejected"));
+    assert_eq!(
+        label,
+        "prove_account_update_with_in_and_out_coins_and_sources failed"
+    );
+}
+
+#[test]
+fn log_prove_initial_failure_emits_label_and_logs_chain() {
+    // Mirror of `log_prove_account_update_failure_emits_label_and_logs_chain`
+    // for the AccountCreation branch.
+    let label = super::log_prove_initial_failure(anyhow::anyhow!("plonky2-rejected"));
+    assert_eq!(
+        label,
+        "prove_initial_with_in_and_out_coins_and_sources failed"
+    );
+}

@@ -183,6 +183,29 @@ impl Account {
     }
 }
 
+/// Log the full plonky2 error chain from a failed
+/// `prove_account_update_with_in_and_out_coins_and_sources` call and
+/// return the static label the handler propagates to the wire. The
+/// wire body stays exactly `"prove failed"` (see `map_send_coins_error`
+/// in `router.rs`), so this only affects what the operator sees in
+/// `docker logs zkcoins-node` — the call-site signature on the
+/// `send_coins_inner` AccountUpdate branch becomes
+/// `.map_err(log_prove_account_update_failure)?`, which costs zero
+/// additional uncovered lines because the function pointer carries no
+/// closure body. Extracted so the failure path can be unit-tested
+/// directly.
+pub(crate) fn log_prove_account_update_failure(e: anyhow::Error) -> &'static str {
+    eprintln!("prove_account_update error: {e:#}");
+    "prove_account_update_with_in_and_out_coins_and_sources failed"
+}
+
+/// Mirror of [`log_prove_account_update_failure`] for the
+/// AccountCreation branch (`prove_initial_with_in_and_out_coins_and_sources`).
+pub(crate) fn log_prove_initial_failure(e: anyhow::Error) -> &'static str {
+    eprintln!("prove_initial error: {e:#}");
+    "prove_initial_with_in_and_out_coins_and_sources failed"
+}
+
 pub struct AccountNode {
     accounts: HashMap<Address, Account>,
     prover: Prover,
@@ -655,30 +678,7 @@ impl AccountNode {
                         &next_public_key_bytes,
                         &sources,
                     )
-                    .map_err(|e| {
-                        // Surface the full plonky2 error chain plus
-                        // every load-bearing witness handle to stderr.
-                        // The string the handler propagates to the
-                        // caller stays exactly
-                        // `"prove_account_update_with_in_and_out_coins
-                        // _and_sources failed"`, so
-                        // `map_send_coins_error`'s
-                        // `s.ends_with("failed") => 500 "prove failed"`
-                        // and the wire body are unchanged.
-                        //
-                        // Without this log a Plonky2 rejection on the
-                        // AccountUpdate branch leaves only the opaque
-                        // `"prove failed"` body — the api_remote test
-                        // `second_send_succeeds_without_prev_commitment
-                        // _pubkey_field` started failing post-#132 with
-                        // exactly this signature, and the off-circuit
-                        // defense-in-depth gates earlier in
-                        // `send_coins_inner` all pass, so the only way
-                        // to triage further is the anyhow chain plus
-                        // the witness snapshot the prover actually saw.
-                        eprintln!("prove_account_update error: {e:#}");
-                        "prove_account_update_with_in_and_out_coins_and_sources failed"
-                    })?
+                    .map_err(log_prove_account_update_failure)?
             }
             None => prover
                 .prove_initial_with_in_and_out_coins_and_sources(
@@ -689,10 +689,7 @@ impl AccountNode {
                     &next_public_key_bytes,
                     &sources,
                 )
-                .map_err(|e| {
-                    eprintln!("prove_initial error: {e:#}");
-                    "prove_initial_with_in_and_out_coins_and_sources failed"
-                })?,
+                .map_err(log_prove_initial_failure)?,
         };
 
         // Proof generation succeeded — commit the state changes.
