@@ -67,6 +67,10 @@ async fn connect_and_migrate_creates_all_tables() {
     //   * After 0007 (request_log):      9 tables
     //   * After 0008 (full DB trail):   19 tables + 1 trigger
     //   * After 0009 / 0010:            19 tables (polish only)
+    //   * After 0013 (R2 probe results): 22 tables + 1 view
+    //     (`r2_probe_runs_summary` lives in `information_schema.views`,
+    //     not `information_schema.tables`, so it is intentionally not
+    //     listed here.)
     assert_eq!(
         names,
         vec![
@@ -83,6 +87,9 @@ async fn connect_and_migrate_creates_all_tables() {
             "mmr_state".to_string(),
             "observed_inscriptions".to_string(),
             "pending_inscriptions".to_string(),
+            "r2_probe_hosts".to_string(),
+            "r2_probe_runs".to_string(),
+            "r2_probe_warm_calls".to_string(),
             "request_log".to_string(),
             "smt_state".to_string(),
             "state_update_log".to_string(),
