@@ -29,6 +29,7 @@ pub mod account_node;
 pub mod audit;
 pub mod db;
 pub mod publisher;
+pub mod r2_probe;
 pub mod router;
 pub mod runtime;
 pub mod scanner;
