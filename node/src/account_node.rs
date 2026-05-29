@@ -676,35 +676,7 @@ impl AccountNode {
                         // `send_coins_inner` all pass, so the only way
                         // to triage further is the anyhow chain plus
                         // the witness snapshot the prover actually saw.
-                        let prev_pis: [zkcoins_program::F;
-                            zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] =
-                            account_proof.public_inputs
-                                [..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
-                                .try_into()
-                                .expect("Plonky2 Proof emits N_PROOF_DATA_PUBLIC_INPUTS field elements");
-                        let prev_pd =
-                            zkcoins_program::types::ProofData::from_field_elements(&prev_pis);
-                        eprintln!(
-                            "prove_account_update error: {:#}\n  account_owner={}  account_balance={}  account_pubkey={}\n  next_public_key={}  account_cpk={}  active_in_coins={}  active_out_coins={}\n  history_root_extended={:?}\n  prev_proof.account_state_hash={:?}  prev_proof.output_coins_root={:?}\n  prev_proof.commitment_history_root={:?}  prev_proof.coin_history_root={:?}\n  prev_cmp.commitment_root={:?}  prev_cmp.commitment_root_mmr_sibling={:?}\n  prev_cmp.commitment_account_state_hash={:?}  prev_cmp.commitment_out_coins_root={:?}\n  prev_cmp.previous_root_history_proof.0={:?}",
-                            e,
-                            hex::encode(zkcoins_program::hash::digest_to_bytes(&account_state_for_prove.owner)),
-                            account_state_for_prove.balance,
-                            hex::encode(account_state_for_prove.public_key),
-                            hex::encode(next_public_key.serialize()),
-                            account_commitment_public_key,
-                            in_coin_slots.iter().filter(|s| s.0).count(),
-                            out_coin_slots.iter().filter(|s| s.0).count(),
-                            history_root_extended,
-                            prev_pd.account_state_hash,
-                            prev_pd.output_coins_root,
-                            prev_pd.commitment_history_root,
-                            prev_pd.coin_history_root,
-                            prev_cmp.commitment_root,
-                            prev_cmp.commitment_root_mmr_sibling,
-                            prev_cmp.commitment_account_state_hash,
-                            prev_cmp.commitment_out_coins_root,
-                            prev_cmp.previous_root_history_proof.0,
-                        );
+                        eprintln!("prove_account_update error: {e:#}");
                         "prove_account_update_with_in_and_out_coins_and_sources failed"
                     })?
             }
@@ -717,7 +689,10 @@ impl AccountNode {
                     &next_public_key_bytes,
                     &sources,
                 )
-                .map_err(|_| "prove_initial_with_in_and_out_coins_and_sources failed")?,
+                .map_err(|e| {
+                    eprintln!("prove_initial error: {e:#}");
+                    "prove_initial_with_in_and_out_coins_and_sources failed"
+                })?,
         };
 
         // Proof generation succeeded — commit the state changes.
