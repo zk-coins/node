@@ -565,13 +565,14 @@ async fn balance_includes_username_when_claimed() {
 /// `BalanceResponse::num_sends` must reflect the queried account's
 /// per-account send counter (`Account::num_sends`).
 ///
-/// Regression for the seed-restore desync that surfaced as
-/// `07-send.spec.ts::send-success` failing with
-/// `"prev_commitment_pubkey required for account update"` (400).
-/// The wallet derives both its current pubkey and
-/// `prev_commitment_pubkey` from this counter; a stale `0` from the
-/// balance endpoint sends the wallet into the wrong SMT slot or
-/// omits the `prev` parameter when the server side expects it.
+/// The wallet uses this counter to choose its next signing pubkey
+/// (BIP-32 child index). `prev_commitment_pubkey` is no longer
+/// derived from this counter — the server reads it directly from
+/// `Account::commitment_public_key`. See the field doc on
+/// `Account::commitment_public_key` for the bug class that change
+/// eliminated (the wallet's local counter drifting from the server's
+/// after a seed restore or stale-app deploy and surfacing as
+/// `07-send.spec.ts::send-success` 400ing).
 ///
 /// Driven via the in-memory `AccountNode` knob rather than a full
 /// `/api/send` round-trip: prover initialisation alone costs ~50 s
@@ -584,13 +585,15 @@ async fn balance_response_emits_num_sends_from_account() {
     let address_bytes = [0x77u8; 32];
     let address = zkcoins_program::hash::digest_from_bytes(&address_bytes);
 
-    // Inject an account whose `proof` is None but `num_sends` is
-    // non-zero — an impossible production state (the invariant says
-    // `num_sends > 0 iff proof.is_some()`), but the handler does not
-    // re-check the invariant on read; it emits whatever the field
-    // holds. Setting `num_sends` directly is the smallest possible
-    // signal that the handler reads the right field. (The invariant
-    // itself is covered by the `account_node_tests` unit test
+    // Inject an account whose `proof` is None and
+    // `commitment_public_key` is None but `num_sends` is non-zero —
+    // an impossible production state (the invariant says
+    // `num_sends > 0 iff proof.is_some() iff commitment_public_key.is_some()`),
+    // but the handler does not re-check the invariant on read; it
+    // emits whatever the field holds. Setting `num_sends` directly
+    // is the smallest possible signal that the handler reads the
+    // right field. (The invariant itself is covered by the
+    // `account_node_tests` unit test
     // `test_send_coins_twice_from_same_account_uses_update_account`,
     // which exercises the real bump path through `send_coins_inner`.)
     {
@@ -3169,12 +3172,21 @@ fn map_send_coins_error_unknown_account_address_is_404() {
     assert_eq!(body, "Unknown account address");
 }
 
+/// Historical `"prev_commitment_pubkey required for account update"`
+/// 400 is unreachable as of the `Account::commitment_public_key`
+/// refactor — the server reads the previous commitment pubkey from
+/// its own state, and the `send_coins_inner` AccountUpdate branch no
+/// longer consults the caller-supplied `prev_commitment_pubkey`. The
+/// error string is no longer mapped, so it falls through the catch-all
+/// 500 arm. The test pins THAT (i.e. "if some future regression
+/// re-introduces this string, it must NOT be silently mapped to 400
+/// without also restoring the architectural choice it implies").
 #[test]
-fn map_send_coins_error_prev_commitment_pubkey_required_is_400() {
+fn map_send_coins_error_legacy_prev_commitment_pubkey_string_is_unmapped_500() {
     let (status, body) =
         crate::router::map_send_coins_error("prev_commitment_pubkey required for account update");
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body, "prev_commitment_pubkey required for account update");
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body, "internal error");
 }
 
 #[test]

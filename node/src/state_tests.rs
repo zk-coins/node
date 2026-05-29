@@ -918,3 +918,134 @@ fn derive_num_pubkeys_from_smt_panics_on_loop_bound_exceeded() {
     }
     let _ = derive_num_pubkeys_from_smt_with_bound(&xpriv, &smt, BOUND);
 }
+
+// ---- canonical SMT value from wallet-shaped commit message ----------------
+
+/// A 64-byte wallet-shaped `Commitment.message` (raw
+/// `account_state_hash || output_coins_root` concatenation, as built by
+/// `zk-coins/app/rust/client/src/lib.rs::create_commitment` and mirrored
+/// by `TestWallet::sign_commit` in `node/tests/api_remote.rs`) must end
+/// up in the SMT as the canonical Poseidon combiner
+/// `hash_concat(digest_from_bytes(ash), digest_from_bytes(ocr))`.
+///
+/// This is the value the in-circuit `CommitmentMerkleProofs::commitment()`
+/// (`program-plonky2/src/inputs.rs`) reconstructs and feeds back into
+/// the SMT inclusion check. Storing the sha256 of the 64-byte message
+/// (the legacy `get_account_state_hash` shape) caused
+/// `prove_account_update_with_in_and_out_coins_and_sources` to reject
+/// the second send from any wallet-built account — the e2e regression
+/// is `second_send_succeeds_without_prev_commitment_pubkey_field` in
+/// PR #132.
+#[test]
+fn update_with_64_byte_wallet_commitment_stores_canonical_hash_concat() {
+    let mut state = State::new();
+
+    // Build a 64-byte message: 32 ash bytes || 32 ocr bytes. Distinct
+    // byte patterns so the two halves can't accidentally agree.
+    let ash_bytes: [u8; 32] = [0xAAu8; 32];
+    let ocr_bytes: [u8; 32] = [0xCCu8; 32];
+    let mut message = Vec::with_capacity(64);
+    message.extend_from_slice(&ash_bytes);
+    message.extend_from_slice(&ocr_bytes);
+    assert_eq!(message.len(), 64);
+
+    let secret_key =
+        SecretKey::from_str("000000000000000000000000000000000000000000000000000000000000000a")
+            .expect("Invalid key");
+    let commitment = Commitment::new(&secret_key, message).expect("commitment");
+
+    state
+        .update(std::slice::from_ref(&commitment))
+        .expect("update");
+
+    // Independently compute the canonical SMT value the in-circuit
+    // gadget reconstructs.
+    let expected = hash_concat(
+        &digest_from_bytes(&ash_bytes),
+        &digest_from_bytes(&ocr_bytes),
+    );
+
+    // Retrieve the stored leaf via the SMT inclusion proof and assert
+    // it equals the canonical value.
+    let key_bytes = commitment.public_key.serialize();
+    let key: [u8; 32] = bitcoin::hashes::sha256::Hash::hash(&key_bytes).to_byte_array();
+    let (_proof, stored) = state
+        .smt
+        .generate_inclusion_proof(&key)
+        .expect("inclusion proof for wallet commitment key");
+    assert_eq!(
+        stored, expected,
+        "wallet 64-byte commit message must produce the canonical hash_concat(ash, ocr) SMT value"
+    );
+}
+
+/// Equivalence test: a 32-byte canonical-digest commit message (mint
+/// flow shape, `ClientAccount::create_commitment` in `shared/src/lib.rs`)
+/// and a 64-byte wallet-shape commit message over the SAME (ash, ocr)
+/// pair must produce the SAME SMT entry. Documents that the two
+/// on-the-wire shapes agree on the canonical SMT value, so a wallet
+/// commitment and a mint commitment over identical halves are
+/// indistinguishable from the SMT's perspective.
+///
+/// Uses two distinct secret keys so both commitments coexist in the
+/// same SMT — the assertion is on the stored leaf VALUES, not on the
+/// keys.
+#[test]
+fn update_with_32_byte_canonical_commitment_stores_same_hash_concat_as_64_byte_form() {
+    let mut state = State::new();
+
+    let ash_bytes: [u8; 32] = [0x11u8; 32];
+    let ocr_bytes: [u8; 32] = [0x22u8; 32];
+    let ash = digest_from_bytes(&ash_bytes);
+    let ocr = digest_from_bytes(&ocr_bytes);
+    let canonical_digest = hash_concat(&ash, &ocr);
+    let canonical_bytes = zkcoins_program::hash::digest_to_bytes(&canonical_digest);
+
+    // 32-byte canonical-digest form (mint flow shape).
+    let mint_secret =
+        SecretKey::from_str("000000000000000000000000000000000000000000000000000000000000000b")
+            .expect("invalid key");
+    let mint_commitment =
+        Commitment::new(&mint_secret, canonical_bytes.to_vec()).expect("mint commitment");
+    assert_eq!(mint_commitment.message.len(), 32);
+
+    // 64-byte wallet wire form over the SAME (ash, ocr).
+    let mut wallet_message = Vec::with_capacity(64);
+    wallet_message.extend_from_slice(&ash_bytes);
+    wallet_message.extend_from_slice(&ocr_bytes);
+    let wallet_secret =
+        SecretKey::from_str("000000000000000000000000000000000000000000000000000000000000000c")
+            .expect("invalid key");
+    let wallet_commitment =
+        Commitment::new(&wallet_secret, wallet_message).expect("wallet commitment");
+    assert_eq!(wallet_commitment.message.len(), 64);
+
+    state
+        .update(&[mint_commitment.clone(), wallet_commitment.clone()])
+        .expect("update");
+
+    let mint_key: [u8; 32] =
+        bitcoin::hashes::sha256::Hash::hash(&mint_commitment.public_key.serialize())
+            .to_byte_array();
+    let wallet_key: [u8; 32] =
+        bitcoin::hashes::sha256::Hash::hash(&wallet_commitment.public_key.serialize())
+            .to_byte_array();
+
+    let (_mint_proof, mint_stored) = state
+        .smt
+        .generate_inclusion_proof(&mint_key)
+        .expect("mint inclusion proof");
+    let (_wallet_proof, wallet_stored) = state
+        .smt
+        .generate_inclusion_proof(&wallet_key)
+        .expect("wallet inclusion proof");
+
+    assert_eq!(
+        mint_stored, wallet_stored,
+        "32-byte canonical and 64-byte wallet commit-message forms must store the same SMT value"
+    );
+    assert_eq!(
+        mint_stored, canonical_digest,
+        "stored SMT value must equal hash_concat(ash, ocr)"
+    );
+}
