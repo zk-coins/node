@@ -373,6 +373,31 @@ jobs:
             --test-threads 1 \
             -E 'not binary(api_remote)'
 
+      # On gate failure, re-format the existing llvm-cov data (no
+      # re-run, no new test execution — `report` reads the on-disk
+      # profraw / profdata produced by the previous step) and emit
+      # the per-file "Uncovered Lines" block plus a json digest of
+      # files below 100% line / function. `--show-missing-lines` on
+      # the gate step sometimes elides this section depending on the
+      # llvm-cov build (observed empirically across this repo's
+      # llvm-cov upgrades), so this step makes the detail
+      # deterministic: whenever the gate fails, the operator sees
+      # which file/line/function is below 100% without having to
+      # reproduce locally.
+      - name: Show missing coverage on gate failure
+        if: failure()
+        run: |
+          echo "--- llvm-cov report: --show-missing-lines (text) ---"
+          cargo llvm-cov report --show-missing-lines \
+            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|_tests\.rs$|bin/.*\.rs$' || true
+          echo "--- llvm-cov report: per-file json (filter < 100%) ---"
+          cargo llvm-cov report --json \
+            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|_tests\.rs$|bin/.*\.rs$' \
+            | jq -r '.data[0].files[]
+                | select(.summary.lines.percent < 100 or .summary.functions.percent < 100)
+                | {filename, lines: .summary.lines, functions: .summary.functions}' \
+          || echo "(jq not available or json parse failed)"
+
       - name: sccache stats (post-build)
         if: always()
         run: sccache --show-stats
