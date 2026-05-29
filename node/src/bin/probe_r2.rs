@@ -15,7 +15,9 @@
 //!
 //! This binary closes that gap. It is a standalone diagnostic tool —
 //! NOT wired into `node`'s `main.rs`, never reached by Esplora /
-//! Postgres / WebSocket code paths, no global allocator override.
+//! Postgres / WebSocket code paths. It uses mimalloc as the global
+//! allocator to match `node/src/main.rs` (PR #134), so the probe
+//! measures the same allocator behaviour PRD experiences.
 //!
 //! ## Where to run
 //!
@@ -55,9 +57,13 @@
 //! - The warm sweep reuses the same `prev` proof + `cmp` witness;
 //!   we want pure prove-wall, not the per-send bookkeeping overhead
 //!   the live node carries (state lookups, MMR appends, DB writes).
-//! - No mimalloc override — keeping the system allocator here matches
-//!   the integration tests, and isolates the prover-side measurement
-//!   from the allocator choice in `main.rs`.
+
+// Match the production node binary's allocator (see node/src/main.rs
+// and PR #134). The R2 budgets gate the PRD binary, so the probe
+// must use the same allocator — otherwise warm-wall and peak-RSS
+// numbers diverge from what PRD experiences.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::fs;
 use std::io::Write;
