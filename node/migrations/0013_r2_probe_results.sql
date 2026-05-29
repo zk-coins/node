@@ -122,7 +122,11 @@ SELECT
     r.prove_warm_p90_ms,
     r.prove_warm_p99_ms,
     r.peak_rss_kb,
-    (r.prove_cold_wall_ms <= r.r2_cold_budget_ms)                          AS r2_cold_pass,
+    -- cold-start = build + first prove combined; ROADMAP §Step 9
+    -- (`BUDGET_COLD_START_MS = 30_000`). The probe binary computes
+    -- the verdict the same way; matching it here keeps the view,
+    -- console verdict and trend table semantically aligned.
+    ((r.circuit_build_wall_ms + r.prove_cold_wall_ms) <= r.r2_cold_budget_ms) AS r2_cold_pass,
     (r.prove_warm_p50_ms IS NOT NULL
          AND r.prove_warm_p50_ms <= r.r2_warm_budget_ms)                   AS r2_warm_pass,
     (r.peak_rss_kb <= r.r2_mem_budget_kb)                                  AS r2_mem_pass,

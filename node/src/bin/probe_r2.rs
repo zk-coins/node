@@ -640,12 +640,19 @@ fn check(ok: bool) -> &'static str {
 /// ASCII trend table — last few persisted runs newest first. Width
 /// is tuned for an 80-column terminal; the columns map 1:1 to the
 /// `r2_probe_runs_summary` view.
+///
+/// `coldstart_ms` is `circuit_build_wall_ms + prove_cold_wall_ms` to
+/// match the cold-start budget (`BUDGET_COLD_START_MS`, ROADMAP §Step
+/// 9). The `C` pass marker in the same row reads the view's
+/// `r2_cold_pass` which is computed against the same sum — so the
+/// number the operator sees is exactly what the pass/fail is judged
+/// against.
 fn print_history_table(rows: &[SummaryRow]) {
     eprintln!();
     eprintln!("===== Recent runs (from DB) =====");
     eprintln!(
-        "  {:<25} {:<14} {:>9} {:>9} {:>10}  W  C  M",
-        "ran_at", "git_sha", "cold_ms", "warm_p50", "rss_kb"
+        "  {:<25} {:<14} {:>12} {:>9} {:>10}  W  C  M",
+        "ran_at", "git_sha", "coldstart_ms", "warm_p50", "rss_kb"
     );
     for r in rows {
         let git_sha_short = r.git_sha.chars().take(12).collect::<String>();
@@ -653,11 +660,12 @@ fn print_history_table(rows: &[SummaryRow]) {
             .prove_warm_p50_ms
             .map(|v| v.to_string())
             .unwrap_or_else(|| "n/a".into());
+        let cold_start_ms = r.circuit_build_wall_ms + r.prove_cold_wall_ms;
         eprintln!(
-            "  {:<25} {:<14} {:>9} {:>9} {:>10}  {} {} {}",
+            "  {:<25} {:<14} {:>12} {:>9} {:>10}  {} {} {}",
             r.ran_at,
             git_sha_short,
-            r.prove_cold_wall_ms,
+            cold_start_ms,
             warm_p50,
             r.peak_rss_kb,
             pass_marker(r.r2_warm_pass),
