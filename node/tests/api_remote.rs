@@ -1954,7 +1954,7 @@ async fn balance_response_num_sends_starts_zero_and_bumps_on_send() {
 /// send #2 with `prev_commitment_pubkey` deliberately omitted →
 /// MUST succeed (AccountUpdate branch reads its own stored value).
 #[tokio::test]
-async fn second_send_succeeds_without_prev_commitment_pubkey_field() {
+async fn second_send_roundtrip_succeeds_without_prev_commitment_pubkey_field() {
     let client = http_client();
     let alice = TestWallet::new();
     let bob = TestWallet::new();
