@@ -108,6 +108,21 @@ tracing-subscriber = { workspace = true }
 # rustls); declared here so the bin target's `unsafe` block resolves
 # without leaning on an unstable transitive path.
 libc = "0.2"
+# Cross-platform host introspection for `r2_probe::detect()` (hostname,
+# CPU brand, total RAM, CPU core count). Replaces a previous shape that
+# shelled out to `hostname` / `sysctl` on macOS and read
+# `/proc/{cpuinfo,meminfo}` on Linux: subprocess- and FS-error arms are
+# not deterministically reachable on a healthy CI host, so the 100%
+# line/function coverage gate could only be satisfied with
+# `#[cfg_attr(coverage_nightly, coverage(off))]` markers on the
+# per-platform `_impl` helpers. The `sysinfo` API has a single success
+# path (one `Option<String>` for hostname, one `&[Cpu]` slice for CPU
+# info, one `u64` for total RAM) so every branch the gate sees is
+# reachable from a single `detect()` call. `default-features = false`
+# disables `disk`, `network`, `component`, and `user` — `detect()` only
+# touches the system / host-name surface, and the disabled features
+# pull in `windows` / `objc2-*` crates we don't need on Linux+macOS.
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

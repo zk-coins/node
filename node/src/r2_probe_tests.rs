@@ -80,15 +80,42 @@ fn sample_run(host_id: i32) -> ProbeRun {
 
 #[tokio::test]
 async fn detect_returns_a_host_struct() {
-    // Smoke test: detect() must never panic, and the strings must be
-    // populated even on weird CI hosts. Exact values vary by runner
-    // so we only assert non-empty + sane bounds.
+    // `detect()` now sits on top of the `sysinfo` crate (cross-platform
+    // host introspection). Every field has exactly one success path and
+    // a conservative fallback, so the assertions below pin the actual
+    // observable contract — not just "the function didn't panic":
+    //
+    //   * `hostname` is non-empty (either the OS-reported value or the
+    //     `"unknown"` fallback when `sysinfo::System::host_name()` is
+    //     `None` / empty);
+    //   * `os` / `arch` come from `std::env::consts::{OS,ARCH}` which
+    //     are compile-time constants and always non-empty;
+    //   * `cpu_brand` is non-empty for the same reason (real brand or
+    //     the `"unknown"` fallback);
+    //   * `cpu_cores >= 1` — any host that can run this test has at
+    //     least one schedulable thread, so `available_parallelism()`
+    //     returning 0 would be a real bug, not a CI quirk;
+    //   * `total_ram_gb` is either `None` (sysinfo couldn't read it)
+    //     or `>= 1` (the `> 0` filter in `detect()` collapses the
+    //     zero-reading case into `None`).
     let info = detect();
-    assert!(!info.hostname.is_empty());
-    assert!(!info.os.is_empty());
-    assert!(!info.arch.is_empty());
-    assert!(!info.cpu_brand.is_empty());
-    assert!(info.cpu_cores >= 0);
+    assert!(!info.hostname.is_empty(), "hostname must be non-empty");
+    assert!(!info.os.is_empty(), "os must be non-empty");
+    assert!(!info.arch.is_empty(), "arch must be non-empty");
+    assert!(!info.cpu_brand.is_empty(), "cpu_brand must be non-empty");
+    assert!(
+        info.cpu_cores >= 1,
+        "cpu_cores must be at least 1 on any host that runs this test, got {}",
+        info.cpu_cores,
+    );
+    match info.total_ram_gb {
+        Some(g) => assert!(
+            g >= 1,
+            "total_ram_gb Some(_) must be >= 1 (zero is collapsed to None), got {}",
+            g,
+        ),
+        None => {}
+    }
 }
 
 #[tokio::test]

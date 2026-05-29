@@ -61,157 +61,69 @@ pub struct HostInfo {
 
 /// Best-effort detection of the host running the probe.
 ///
-/// Reads `sysctl` on macOS and `/proc/{cpuinfo,meminfo}` on Linux.
-/// Returns a struct with empty / fallback strings when a probe leg
-/// fails; the row still lands so the operator can correct it later.
+/// Backed by the [`sysinfo`] crate, which wraps the per-platform host
+/// introspection APIs (sysctl on macOS, `/proc` on Linux, Win32 on
+/// Windows) behind a single Rust surface. Every leg has exactly one
+/// success path — there are no subprocess- or FS-error arms that the
+/// test gate can't reach on a healthy CI host, so the 100% line /
+/// function coverage gate is satisfied without any `coverage(off)`
+/// markers. The earlier shape shelled out to `hostname` / `sysctl` /
+/// `/proc/...` directly and had to opt the per-platform helpers out
+/// of the gate; that's gone now.
+///
+/// Fallbacks are conservative: an unknown hostname becomes
+/// `"unknown"`, an empty CPU brand becomes `"unknown"`, a zero or
+/// missing total-RAM reading becomes `None` (matching the nullable
+/// DB column). The row still lands so the operator can correct it
+/// later.
 pub fn detect() -> HostInfo {
-    // The hostname-subprocess closure is written as a single
-    // `.filter().and_then().map()` chain rather than an `if
-    // o.status.success() { ... } else { None }` branch on purpose: the
-    // `else None` arm is a non-deterministic error path (the `hostname`
-    // binary does not fail on a healthy host) and llvm-cov flagged it
-    // as uncovered on the 100% line/function gate. The chained form has
-    // no explicit `else` branch in the LLVM IR, so the gate stays
-    // green without sacrificing test signal on the success path.
-    let hostname = std::env::var("HOSTNAME")
-        .ok()
-        .or_else(|| {
-            std::process::Command::new("hostname")
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-        })
+    // `RefreshKind::nothing().with_cpu(...).with_memory(...)` keeps
+    // the constructor from touching the (expensive) process list. The
+    // CPU refresh asks for frequency only — the CPU `brand` field is
+    // populated as a side-effect of the first CPU refresh on every
+    // backend (apple sysctl, linux `/proc/cpuinfo`), and we don't need
+    // usage / per-core stats.
+    let mut sys = sysinfo::System::new_with_specifics(
+        sysinfo::RefreshKind::nothing()
+            .with_cpu(sysinfo::CpuRefreshKind::nothing().with_frequency())
+            .with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram()),
+    );
+    // Explicit refresh calls are belt-and-braces over the constructor
+    // refresh: on platforms where `new_with_specifics` is a no-op for
+    // a given kind (rare, but documented for some embedded targets)
+    // this guarantees the fields we read below are populated.
+    sys.refresh_cpu_all();
+    sys.refresh_memory();
+
+    let hostname = sysinfo::System::host_name()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let os = std::env::consts::OS.to_string();
-    let arch = std::env::consts::ARCH.to_string();
-    let cpu_brand = detect_cpu_brand().unwrap_or_else(|| "unknown".to_string());
-    let cpu_cores = detect_cpu_cores();
-    let total_ram_gb = detect_total_ram_gb();
+    let cpu_brand = sys
+        .cpus()
+        .first()
+        .map(|c| c.brand().trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let cpu_cores = std::thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(0);
+
+    // `sysinfo::System::total_memory()` returns bytes (see crate docs
+    // and `src/common/system.rs` upstream). Divide down to whole GiB
+    // and treat a zero reading as "unknown" so we don't persist a
+    // nonsense `0` on a backend that failed to populate the field.
+    let total_ram_gb = Some((sys.total_memory() / (1024 * 1024 * 1024)) as i32).filter(|&g| g > 0);
 
     HostInfo {
         hostname,
-        os,
-        arch,
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
         cpu_brand,
         cpu_cores,
         total_ram_gb,
     }
-}
-
-// The per-platform `_impl` helpers below are gated with `#[cfg(target_os =
-// "...")]` rather than runtime `cfg!(...)` so the inactive platform body
-// is never compiled into the binary. `cargo llvm-cov` only sees the
-// active impl + the wrapper, so the coverage gate stays clean on a
-// single-platform runner (e.g. the macOS M3-Ultra coverage host).
-//
-// Each `_impl` carries `#[cfg_attr(coverage_nightly, coverage(off))]`
-// for two reasons: (1) llvm-cov still lists `#[cfg]`-gated functions
-// from non-active branches as missing functions (the multi-definition
-// shape confuses the function-coverage counter), and (2) the success
-// path's subprocess-error arms (`return None;`, `if s.is_empty()`) are
-// non-deterministic — `sysctl` / `/proc/...` do not fail on a healthy
-// host, so the gate cannot reach those lines from a CI test. The same
-// pattern is used by `program-plonky2/src/hash.rs:70` and
-// `script-plonky2/src/lib.rs:270`. The thin wrappers below
-// (`detect_cpu_brand`, `detect_total_ram_gb`) stay in coverage and are
-// exercised by `detect_returns_a_host_struct` in the tests module.
-
-#[cfg(target_os = "macos")]
-#[cfg_attr(coverage_nightly, coverage(off))]
-fn detect_cpu_brand_impl() -> Option<String> {
-    let out = std::process::Command::new("sysctl")
-        .args(["-n", "machdep.cpu.brand_string"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[cfg_attr(coverage_nightly, coverage(off))]
-fn detect_cpu_brand_impl() -> Option<String> {
-    let contents = std::fs::read_to_string("/proc/cpuinfo").ok()?;
-    for line in contents.lines() {
-        if let Some(rest) = line.strip_prefix("model name") {
-            if let Some(idx) = rest.find(':') {
-                let v = rest[idx + 1..].trim();
-                if !v.is_empty() {
-                    return Some(v.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-#[cfg_attr(coverage_nightly, coverage(off))]
-fn detect_cpu_brand_impl() -> Option<String> {
-    None
-}
-
-fn detect_cpu_brand() -> Option<String> {
-    detect_cpu_brand_impl()
-}
-
-fn detect_cpu_cores() -> i32 {
-    std::thread::available_parallelism()
-        .map(|n| n.get() as i32)
-        .unwrap_or(0)
-}
-
-// See the rationale above `detect_cpu_brand_impl` for why each
-// platform variant carries `#[cfg_attr(coverage_nightly,
-// coverage(off))]`.
-
-#[cfg(target_os = "macos")]
-#[cfg_attr(coverage_nightly, coverage(off))]
-fn detect_total_ram_gb_impl() -> Option<i32> {
-    let out = std::process::Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    let bytes: u64 = s.parse().ok()?;
-    Some((bytes / (1024 * 1024 * 1024)) as i32)
-}
-
-#[cfg(target_os = "linux")]
-#[cfg_attr(coverage_nightly, coverage(off))]
-fn detect_total_ram_gb_impl() -> Option<i32> {
-    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in contents.lines() {
-        if let Some(rest) = line.strip_prefix("MemTotal:") {
-            let kb_str = rest.trim().trim_end_matches("kB").trim();
-            let kb: u64 = kb_str.parse().ok()?;
-            return Some((kb / (1024 * 1024)) as i32);
-        }
-    }
-    None
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-#[cfg_attr(coverage_nightly, coverage(off))]
-fn detect_total_ram_gb_impl() -> Option<i32> {
-    None
-}
-
-fn detect_total_ram_gb() -> Option<i32> {
-    detect_total_ram_gb_impl()
 }
 
 /// Full row written to `r2_probe_runs`. Every field maps 1:1 to a
