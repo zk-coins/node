@@ -308,6 +308,20 @@ jobs:
       RUSTC_WRAPPER: sccache
       # See `node-tests` env block above for the 50-GiB rationale.
       SCCACHE_CACHE_SIZE: "50G"
+      # Activate the workspace's `coverage_nightly` cfg gate so the
+      # `#[cfg_attr(coverage_nightly, coverage(off))]` annotations
+      # (14× repo-wide, plus the platform-detection helpers in
+      # `node/src/r2_probe.rs`) actually take effect under
+      # `cargo llvm-cov`. cargo-llvm-cov does NOT auto-set this cfg —
+      # without it every `coverage(off)` in the workspace is inert and
+      # llvm-cov counts the excluded fns / lines as uncovered, which
+      # silently broke the 100%-line + 100%-function gate the moment
+      # the first annotation landed in the `node` crate. Set only on
+      # the coverage job: the `lint-and-build` job runs stable 1.81.0
+      # and would reject `feature(coverage_attribute)`, and
+      # `node-tests` doesn't need the cfg (test execution is
+      # orthogonal to the gate).
+      RUSTFLAGS: "--cfg coverage_nightly"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
