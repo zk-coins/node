@@ -8,6 +8,16 @@
 //! duplicating definitions or making the binary itself reachable
 //! from a `cargo test --test ...` target.
 
+// mimalloc replaces the default allocator process-wide. Scoped to the
+// binary (`main.rs`) so the `node` library crate, integration tests,
+// and the `program-plonky2` / `script-plonky2` crates continue to use
+// the system allocator — keeps unit-test behaviour identical to CI
+// and avoids pulling a C build dependency into every test target.
+// See the comment on the `mimalloc` line in `node/Cargo.toml` for the
+// rationale.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use node::account_node;
 use node::db;
 use node::publisher::EsploraConfig;
