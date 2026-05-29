@@ -100,37 +100,52 @@ pub fn detect() -> HostInfo {
     }
 }
 
-fn detect_cpu_brand() -> Option<String> {
-    if cfg!(target_os = "macos") {
-        let out = std::process::Command::new("sysctl")
-            .args(["-n", "machdep.cpu.brand_string"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
-        if s.is_empty() {
-            None
-        } else {
-            Some(s)
-        }
-    } else if cfg!(target_os = "linux") {
-        let contents = std::fs::read_to_string("/proc/cpuinfo").ok()?;
-        for line in contents.lines() {
-            if let Some(rest) = line.strip_prefix("model name") {
-                if let Some(idx) = rest.find(':') {
-                    let v = rest[idx + 1..].trim();
-                    if !v.is_empty() {
-                        return Some(v.to_string());
-                    }
+// The per-platform `_impl` helpers below are gated with `#[cfg(target_os =
+// "...")]` rather than runtime `cfg!(...)` so the inactive platform body
+// is never compiled into the binary. `cargo llvm-cov` only sees the
+// active impl + the wrapper, so the coverage gate stays clean on a
+// single-platform runner (e.g. the macOS M3-Ultra coverage host).
+
+#[cfg(target_os = "macos")]
+fn detect_cpu_brand_impl() -> Option<String> {
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", "machdep.cpu.brand_string"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_cpu_brand_impl() -> Option<String> {
+    let contents = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("model name") {
+            if let Some(idx) = rest.find(':') {
+                let v = rest[idx + 1..].trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
                 }
             }
         }
-        None
-    } else {
-        None
     }
+    None
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn detect_cpu_brand_impl() -> Option<String> {
+    None
+}
+
+fn detect_cpu_brand() -> Option<String> {
+    detect_cpu_brand_impl()
 }
 
 fn detect_cpu_cores() -> i32 {
@@ -139,31 +154,40 @@ fn detect_cpu_cores() -> i32 {
         .unwrap_or(0)
 }
 
-fn detect_total_ram_gb() -> Option<i32> {
-    if cfg!(target_os = "macos") {
-        let out = std::process::Command::new("sysctl")
-            .args(["-n", "hw.memsize"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
-        let bytes: u64 = s.parse().ok()?;
-        Some((bytes / (1024 * 1024 * 1024)) as i32)
-    } else if cfg!(target_os = "linux") {
-        let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
-        for line in contents.lines() {
-            if let Some(rest) = line.strip_prefix("MemTotal:") {
-                let kb_str = rest.trim().trim_end_matches("kB").trim();
-                let kb: u64 = kb_str.parse().ok()?;
-                return Some((kb / (1024 * 1024)) as i32);
-            }
-        }
-        None
-    } else {
-        None
+#[cfg(target_os = "macos")]
+fn detect_total_ram_gb_impl() -> Option<i32> {
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
     }
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    let bytes: u64 = s.parse().ok()?;
+    Some((bytes / (1024 * 1024 * 1024)) as i32)
+}
+
+#[cfg(target_os = "linux")]
+fn detect_total_ram_gb_impl() -> Option<i32> {
+    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb_str = rest.trim().trim_end_matches("kB").trim();
+            let kb: u64 = kb_str.parse().ok()?;
+            return Some((kb / (1024 * 1024)) as i32);
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn detect_total_ram_gb_impl() -> Option<i32> {
+    None
+}
+
+fn detect_total_ram_gb() -> Option<i32> {
+    detect_total_ram_gb_impl()
 }
 
 /// Full row written to `r2_probe_runs`. Every field maps 1:1 to a
