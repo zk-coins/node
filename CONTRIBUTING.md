@@ -267,6 +267,13 @@ changing it, drop the local database (`docker rm -f zkcoins-pg`) and
 re-run `sqlx migrate run` against a fresh instance — there is no
 `down` migration in the MVP, the migration set is forward-only.
 
+R2-probe results land in `r2_probe_runs` (+ `r2_probe_hosts` /
+`r2_probe_warm_calls`) added by migration `0013_r2_probe_results.sql`.
+The `r2_probe_runs_summary` view drives `GET
+/api/admin/r2-probe/history`; the `probe_r2` binary writes via
+`--persist` when `DATABASE_URL` is set. See `node/src/r2_probe.rs`
+for the persistence module and the schema rationale.
+
 ## Setup
 
 After cloning, enable the repo's pre-push hook. The hook runs `cargo
