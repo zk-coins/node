@@ -33,6 +33,20 @@
 //!     --output /tmp/r2-probe-$(date +%s).json
 //! ```
 //!
+//! ## Persistence (`--persist`)
+//!
+//! When `--persist` is set the probe writes its results into Postgres
+//! via the `node::r2_probe` module (migration 0013):
+//!
+//!   * one row in `r2_probe_hosts` (idempotent on the natural key);
+//!   * one row in `r2_probe_runs` with every scalar measurement plus
+//!     run-time context (git sha, rustc version, allocator, circuit
+//!     params) and the R2 budgets the run was checked against;
+//!   * N rows in `r2_probe_warm_calls`, one per warm call.
+//!
+//! Requires `DATABASE_URL` — same env var the node binary uses; the
+//! probe panics on bootstrap if it is unset, mirroring `node::DATABASE_URL`.
+//!
 //! ## What it measures
 //!
 //! 1. `circuit_build_wall_ms` — `Prover::new()` (cold circuit
@@ -47,12 +61,12 @@
 //!    on Linux; this binary normalises both to KB and notes the
 //!    convention in the JSON.
 //!
-//! Console output prints a ✓/✗ verdict against each of the three
+//! Console output prints a PASS/FAIL verdict against each of the three
 //! ROADMAP budgets.
 //!
 //! ## What it intentionally does NOT do
 //!
-//! - No Postgres connection, no Esplora HTTP, no WebSocket subscription.
+//! - No Esplora HTTP, no WebSocket subscription.
 //! - No on-disk state — the AccountState + Coin witness lives in RAM.
 //! - The warm sweep reuses the same `prev` proof + `cmp` witness;
 //!   we want pure prove-wall, not the per-send bookkeeping overhead
@@ -72,8 +86,13 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use serde_json::json;
+use sqlx::postgres::PgPoolOptions;
+use tokio::runtime::Runtime;
 
-use zkcoins_program::circuit::main::MMR_PROOF_PATH_LEN;
+use node::r2_probe::{
+    detect, fetch_recent_summary, insert_run, insert_warm_calls, upsert_host, ProbeRun, SummaryRow,
+};
+use zkcoins_program::circuit::main::{MAX_IN_COINS, MAX_OUT_COINS, MMR_PROOF_PATH_LEN};
 use zkcoins_program::hash::{digest_to_bytes, hash_bytes, hash_concat, HashDigest, ZERO_HASH};
 use zkcoins_program::inputs::CommitmentMerkleProofs;
 use zkcoins_program::merkle::merkle_mountain_range::MerkleMountainRange;
@@ -81,10 +100,18 @@ use zkcoins_program::merkle::sparse_merkle_tree::SparseMerkleTree;
 use zkcoins_program::types::{AccountState, MINTING_ADDRESS};
 use zkcoins_prover::Prover;
 
-// ROADMAP step 9 budgets (Mac Studio M3 Ultra reference).
-const BUDGET_WARM_PROVE_MS: u128 = 5_000;
-const BUDGET_COLD_START_MS: u128 = 30_000;
-const BUDGET_PEAK_RSS_BYTES: u64 = 64 * 1024 * 1024 * 1024; // 64 GiB
+// ROADMAP step 9 budgets (Mac Studio M3 Ultra reference). These are
+// the defaults; the CLI accepts overrides for experimentation.
+const BUDGET_WARM_PROVE_MS: i64 = 5_000;
+const BUDGET_COLD_START_MS: i64 = 30_000;
+const BUDGET_PEAK_RSS_KB: i64 = 64 * 1024 * 1024; // 64 GiB in KB
+
+/// Inner-pad-bits constant the active Phase 2b shape was built with
+/// (see `INNER_PAD_BITS_STAGE_5D_NEXT_5` in
+/// `program-plonky2/src/circuit/main.rs`). Recorded so the R2
+/// regression view can later answer "did the prove wall move when
+/// we changed pad bits?".
+const INNER_PAD_BITS: i32 = 15;
 
 // ===== CLI =====
 
@@ -92,17 +119,38 @@ const BUDGET_PEAK_RSS_BYTES: u64 = 64 * 1024 * 1024 * 1024; // 64 GiB
 struct CliArgs {
     warm_calls: usize,
     output: Option<PathBuf>,
+    persist: bool,
+    notes: Option<String>,
+    tags: Vec<String>,
+    warm_budget_ms: i64,
+    cold_budget_ms: i64,
+    mem_budget_kb: i64,
 }
 
 fn print_usage(program: &str) {
     eprintln!(
-        "usage: {program} [--warm-calls N] [--output <path>]
+        "usage: {program} [--warm-calls N] [--output <path>] [--persist] \
+                [--notes <text>] [--tags a,b,c] \
+                [--warm-budget-ms <ms>] [--cold-budget-ms <ms>] [--mem-budget-kb <kb>]
 
-  --warm-calls N   number of warm prove_account_update calls (default 5)
-  --output PATH    write JSON report to PATH (default: stdout)
+  --warm-calls N      number of warm prove_account_update calls (default 5)
+  --output PATH       write JSON report to PATH (default: stdout)
+  --persist           persist results into Postgres (requires DATABASE_URL)
+  --notes TEXT        free-form note attached to the persisted run
+  --tags A,B,C        comma-separated tags attached to the persisted run
+  --warm-budget-ms N  override warm prove budget (default {warm} ms)
+  --cold-budget-ms N  override cold-start budget (default {cold} ms)
+  --mem-budget-kb N   override peak-RSS budget (default {mem} KB)
 
-env: RUST_LOG (optional, log level — defaults to off here)
-"
+env:
+  DATABASE_URL  required when --persist is set
+  GIT_SHA       optional override for the recorded git sha
+  RUSTC_VERSION optional override for the recorded rustc version
+  RUST_LOG      optional, log level (defaults to off here)
+",
+        warm = BUDGET_WARM_PROVE_MS,
+        cold = BUDGET_COLD_START_MS,
+        mem = BUDGET_PEAK_RSS_KB
     );
 }
 
@@ -112,6 +160,12 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, String> {
 
     let mut warm_calls: usize = 5;
     let mut output: Option<PathBuf> = None;
+    let mut persist = false;
+    let mut notes: Option<String> = None;
+    let mut tags: Vec<String> = Vec::new();
+    let mut warm_budget_ms = BUDGET_WARM_PROVE_MS;
+    let mut cold_budget_ms = BUDGET_COLD_START_MS;
+    let mut mem_budget_kb = BUDGET_PEAK_RSS_KB;
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -129,6 +183,49 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, String> {
                     .ok_or_else(|| "--output requires a value".to_string())?;
                 output = Some(PathBuf::from(v));
             }
+            "--persist" => {
+                persist = true;
+            }
+            "--notes" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--notes requires a value".to_string())?;
+                notes = Some(v);
+            }
+            "--tags" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--tags requires a value".to_string())?;
+                tags = v
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            "--warm-budget-ms" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--warm-budget-ms requires a value".to_string())?;
+                warm_budget_ms = v
+                    .parse::<i64>()
+                    .map_err(|e| format!("--warm-budget-ms: {e}"))?;
+            }
+            "--cold-budget-ms" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--cold-budget-ms requires a value".to_string())?;
+                cold_budget_ms = v
+                    .parse::<i64>()
+                    .map_err(|e| format!("--cold-budget-ms: {e}"))?;
+            }
+            "--mem-budget-kb" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--mem-budget-kb requires a value".to_string())?;
+                mem_budget_kb = v
+                    .parse::<i64>()
+                    .map_err(|e| format!("--mem-budget-kb: {e}"))?;
+            }
             "-h" | "--help" => {
                 print_usage(&program);
                 std::process::exit(0);
@@ -137,7 +234,16 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, String> {
         }
     }
 
-    Ok(CliArgs { warm_calls, output })
+    Ok(CliArgs {
+        warm_calls,
+        output,
+        persist,
+        notes,
+        tags,
+        warm_budget_ms,
+        cold_budget_ms,
+        mem_budget_kb,
+    })
 }
 
 // ===== Witness construction =====
@@ -227,29 +333,55 @@ fn peak_rss_kb() -> u64 {
     }
 }
 
-// ===== Platform snapshot =====
+// ===== Run-time context =====
 
-fn cpu_brand() -> Option<String> {
-    // macOS: `sysctl -n machdep.cpu.brand_string`. Best-effort —
-    // silently None on Linux / other.
-    if cfg!(target_os = "macos") {
-        let out = std::process::Command::new("sysctl")
-            .args(["-n", "machdep.cpu.brand_string"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
+fn detect_git_sha() -> String {
+    if let Ok(v) = std::env::var("GIT_SHA") {
+        if !v.trim().is_empty() {
+            return v.trim().to_string();
         }
-        let s = String::from_utf8(out.stdout).ok()?;
-        let trimmed = s.trim().to_string();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    } else {
-        None
     }
+    std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn detect_rustc_version() -> String {
+    if let Ok(v) = std::env::var("RUSTC_VERSION") {
+        if !v.trim().is_empty() {
+            return v.trim().to_string();
+        }
+    }
+    std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Compute a percentile (0..=100) of `samples` in milliseconds. Uses
+/// the nearest-rank method — adequate for the small N this probe
+/// captures (typically 5–20 warm calls).
+fn percentile_ms(samples: &[i64], p: f64) -> Option<i64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let n = sorted.len();
+    let rank = ((p / 100.0) * n as f64).ceil() as usize;
+    let idx = rank.saturating_sub(1).min(n - 1);
+    Some(sorted[idx])
 }
 
 // ===== Main =====
@@ -264,11 +396,15 @@ fn run() -> Result<(), String> {
         std::env::consts::ARCH
     );
 
+    let host_info = detect();
+    let git_sha = detect_git_sha();
+    let rustc_version = detect_rustc_version();
+
     // 1) Circuit build.
     eprintln!("[probe_r2] building circuit (cold) ...");
     let t = Instant::now();
     let prover = Prover::new();
-    let circuit_build_wall_ms = t.elapsed().as_millis();
+    let circuit_build_wall_ms = t.elapsed().as_millis() as i64;
     eprintln!("[probe_r2] circuit_build_wall_ms = {circuit_build_wall_ms}");
 
     // 2) Account state for the init proof + downstream updates.
@@ -282,42 +418,36 @@ fn run() -> Result<(), String> {
     let init_proof = prover
         .prove_initial(&account_state, ZERO_HASH)
         .map_err(|e| format!("prove_initial: {e}"))?;
-    let prove_cold_wall_ms = t.elapsed().as_millis();
+    let prove_cold_wall_ms = t.elapsed().as_millis() as i64;
     eprintln!("[probe_r2] prove_cold_wall_ms = {prove_cold_wall_ms}");
 
     // Verify the init proof once so a regression in the prove path
     // doesn't quietly produce garbage timings.
+    let t = Instant::now();
     prover
         .verify(&init_proof)
         .map_err(|e| format!("verify cold init: {e}"))?;
+    let verify_wall_ms = t.elapsed().as_millis() as i64;
 
     // 4) Build the AccountUpdate witness ONCE and reuse it across
     //    warm calls. We want pure prove-wall, not witness-construction
     //    cost.
     let prev_asth = account_state.hash();
-    // Empty out-coins root coincides with `DEFAULT_HASHES[0]`. The
-    // probe doesn't depend on coin slots being populated — the
-    // AccountUpdate branch with all-inactive in/out coins is the
-    // minimal hot-path that still exercises the recursive verifier
-    // gadget, which dominates prove wall.
     let prev_ocr = init_proof_out_coins_root_from_init(&prev_asth);
     let (cmp, history_root_extended) = build_commitment_witness(prev_asth, prev_ocr);
 
     // 5) Warm prove sweep.
-    let mut prove_warm_wall_ms: Vec<u128> = Vec::with_capacity(args.warm_calls);
+    let mut prove_warm_wall_ms: Vec<i64> = Vec::with_capacity(args.warm_calls);
     for i in 0..args.warm_calls {
         eprintln!("[probe_r2] warm prove {} / {} ...", i + 1, args.warm_calls);
         let t = Instant::now();
         let update_proof = prover
             .prove_account_update(&account_state, history_root_extended, &init_proof, &cmp)
             .map_err(|e| format!("warm prove_account_update #{i}: {e}"))?;
-        let ms = t.elapsed().as_millis();
+        let ms = t.elapsed().as_millis() as i64;
         prove_warm_wall_ms.push(ms);
         eprintln!("[probe_r2] warm[{i}] = {ms} ms");
 
-        // Verify once on the first warm prove only — verification
-        // wall doesn't matter for the budget, but a broken proof
-        // would otherwise be invisible.
         if i == 0 {
             prover
                 .verify(&update_proof)
@@ -325,37 +455,56 @@ fn run() -> Result<(), String> {
         }
     }
 
-    let peak_rss = peak_rss_kb();
+    let peak_rss = peak_rss_kb() as i64;
 
     // ===== Report =====
 
     let cold_start_ms = circuit_build_wall_ms + prove_cold_wall_ms;
+    let warm_p50 = percentile_ms(&prove_warm_wall_ms, 50.0);
+    let warm_p90 = percentile_ms(&prove_warm_wall_ms, 90.0);
+    let warm_p99 = percentile_ms(&prove_warm_wall_ms, 99.0);
     let warm_min = prove_warm_wall_ms.iter().min().copied().unwrap_or(0);
     let warm_max = prove_warm_wall_ms.iter().max().copied().unwrap_or(0);
     let warm_mean = if prove_warm_wall_ms.is_empty() {
         0
     } else {
-        prove_warm_wall_ms.iter().sum::<u128>() / prove_warm_wall_ms.len() as u128
+        prove_warm_wall_ms.iter().sum::<i64>() / prove_warm_wall_ms.len() as i64
     };
 
     let report = json!({
         "platform": {
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
-            "cpu": cpu_brand(),
+            "hostname": host_info.hostname,
+            "cpu_brand": host_info.cpu_brand,
+            "cpu_cores": host_info.cpu_cores,
+            "total_ram_gb": host_info.total_ram_gb,
         },
+        "git_sha": git_sha,
+        "rustc_version": rustc_version,
         "build_profile": "release",
+        "allocator": "mimalloc",
+        "max_in_coins": MAX_IN_COINS,
+        "max_out_coins": MAX_OUT_COINS,
+        "inner_pad_bits": INNER_PAD_BITS,
+        "warm_calls_requested": args.warm_calls,
         "circuit_build_wall_ms": circuit_build_wall_ms,
         "prove_cold_wall_ms": prove_cold_wall_ms,
+        "verify_wall_ms": verify_wall_ms,
         "prove_warm_wall_ms": prove_warm_wall_ms,
+        "prove_warm_p50_ms": warm_p50,
+        "prove_warm_p90_ms": warm_p90,
+        "prove_warm_p99_ms": warm_p99,
         "peak_rss_kb": peak_rss,
         "rss_unit_note":
             "macOS reports ru_maxrss in bytes; Linux reports KB. This tool normalises to KB.",
         "budgets": {
-            "warm_prove_ms_max": BUDGET_WARM_PROVE_MS,
-            "cold_start_ms_max": BUDGET_COLD_START_MS,
-            "peak_rss_bytes_max": BUDGET_PEAK_RSS_BYTES,
+            "warm_prove_ms_max": args.warm_budget_ms,
+            "cold_start_ms_max": args.cold_budget_ms,
+            "peak_rss_kb_max": args.mem_budget_kb,
         },
+        "notes": args.notes,
+        "tags": args.tags,
     });
 
     let json_text =
@@ -373,39 +522,109 @@ fn run() -> Result<(), String> {
         println!("{json_text}");
     }
 
+    // ===== Optional persistence =====
+
+    let mut history_after: Option<Vec<SummaryRow>> = None;
+    if args.persist {
+        let database_url = std::env::var("DATABASE_URL").map_err(|_| {
+            "--persist requires DATABASE_URL to be set (e.g. \
+             postgresql://zkcoins:<pw>@postgres:5432/zkcoins)"
+                .to_string()
+        })?;
+        eprintln!("[probe_r2] persisting to DATABASE_URL ...");
+
+        let rt = Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
+        let rows = rt.block_on(async {
+            let pool = PgPoolOptions::new()
+                .max_connections(2)
+                .connect(&database_url)
+                .await
+                .map_err(|e| format!("connect DATABASE_URL: {e}"))?;
+            let host_id = upsert_host(&pool, &host_info)
+                .await
+                .map_err(|e| format!("upsert_host: {e}"))?;
+            let run_row = ProbeRun {
+                host_id,
+                git_sha: git_sha.clone(),
+                binary_version: env!("CARGO_PKG_VERSION").to_string(),
+                rustc_version: rustc_version.clone(),
+                build_profile: "release".to_string(),
+                allocator: "mimalloc".to_string(),
+                max_in_coins: MAX_IN_COINS as i32,
+                max_out_coins: MAX_OUT_COINS as i32,
+                inner_pad_bits: INNER_PAD_BITS,
+                warm_calls_requested: args.warm_calls as i32,
+                circuit_build_wall_ms,
+                prove_cold_wall_ms,
+                verify_wall_ms,
+                peak_rss_kb: peak_rss,
+                prove_warm_p50_ms: warm_p50,
+                prove_warm_p90_ms: warm_p90,
+                prove_warm_p99_ms: warm_p99,
+                succeeded: true,
+                error_message: None,
+                notes: args.notes.clone(),
+                tags: args.tags.clone(),
+                r2_warm_budget_ms: args.warm_budget_ms,
+                r2_cold_budget_ms: args.cold_budget_ms,
+                r2_mem_budget_kb: args.mem_budget_kb,
+            };
+            let run_id = insert_run(&pool, &run_row)
+                .await
+                .map_err(|e| format!("insert_run: {e}"))?;
+            insert_warm_calls(&pool, run_id, &prove_warm_wall_ms)
+                .await
+                .map_err(|e| format!("insert_warm_calls: {e}"))?;
+            let rows = fetch_recent_summary(&pool, 5)
+                .await
+                .map_err(|e| format!("fetch_recent_summary: {e}"))?;
+            Ok::<Vec<SummaryRow>, String>(rows)
+        })?;
+        eprintln!(
+            "[probe_r2] persisted run; {} recent rows read back",
+            rows.len()
+        );
+        history_after = Some(rows);
+    }
+
     // Console verdict against the three ROADMAP budgets.
-    let peak_rss_bytes = peak_rss.saturating_mul(1024);
-    let warm_ok = warm_max <= BUDGET_WARM_PROVE_MS;
-    let cold_ok = cold_start_ms <= BUDGET_COLD_START_MS;
-    let rss_ok = peak_rss_bytes < BUDGET_PEAK_RSS_BYTES;
+    let warm_ok = (warm_p50.unwrap_or(i64::MAX)) <= args.warm_budget_ms;
+    let cold_ok = cold_start_ms <= args.cold_budget_ms;
+    let rss_ok = peak_rss <= args.mem_budget_kb;
 
     eprintln!();
     eprintln!("===== ROADMAP step 9 budgets =====");
     eprintln!(
-        "  warm prove (max over {} calls): {} ms   {}  [budget {} ms]",
+        "  warm prove p50 over {} calls: {} ms   {}  [budget {} ms]",
         args.warm_calls,
-        warm_max,
+        warm_p50
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "n/a".into()),
         check(warm_ok),
-        BUDGET_WARM_PROVE_MS
+        args.warm_budget_ms
     );
     eprintln!(
         "  cold start (build + first prove): {} ms   {}  [budget {} ms]",
         cold_start_ms,
         check(cold_ok),
-        BUDGET_COLD_START_MS
+        args.cold_budget_ms
     );
     eprintln!(
-        "  peak RSS: {} KB ({} MiB)   {}  [budget {} GiB]",
+        "  peak RSS: {} KB ({} MiB)   {}  [budget {} KB]",
         peak_rss,
         peak_rss / 1024,
         check(rss_ok),
-        BUDGET_PEAK_RSS_BYTES / (1024 * 1024 * 1024)
+        args.mem_budget_kb
     );
     eprintln!();
     eprintln!(
         "  warm distribution: min {} / mean {} / max {} ms",
         warm_min, warm_mean, warm_max
     );
+
+    if let Some(rows) = history_after.as_ref() {
+        print_history_table(rows);
+    }
 
     Ok(())
 }
@@ -418,15 +637,50 @@ fn check(ok: bool) -> &'static str {
     }
 }
 
+/// ASCII trend table — last few persisted runs newest first. Width
+/// is tuned for an 80-column terminal; the columns map 1:1 to the
+/// `r2_probe_runs_summary` view.
+fn print_history_table(rows: &[SummaryRow]) {
+    eprintln!();
+    eprintln!("===== Recent runs (from DB) =====");
+    eprintln!(
+        "  {:<25} {:<14} {:>9} {:>9} {:>10}  W  C  M",
+        "ran_at", "git_sha", "cold_ms", "warm_p50", "rss_kb"
+    );
+    for r in rows {
+        let git_sha_short = r.git_sha.chars().take(12).collect::<String>();
+        let warm_p50 = r
+            .prove_warm_p50_ms
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "n/a".into());
+        eprintln!(
+            "  {:<25} {:<14} {:>9} {:>9} {:>10}  {} {} {}",
+            r.ran_at,
+            git_sha_short,
+            r.prove_cold_wall_ms,
+            warm_p50,
+            r.peak_rss_kb,
+            pass_marker(r.r2_warm_pass),
+            pass_marker(r.r2_cold_pass),
+            pass_marker(r.r2_mem_pass),
+        );
+    }
+}
+
+fn pass_marker(ok: bool) -> &'static str {
+    if ok {
+        "+"
+    } else {
+        "-"
+    }
+}
+
 /// The post-Init `coin_history_root` is conventionally
 /// `DEFAULT_HASHES[0]` — the empty SMT root. Independent of `prev_asth`
 /// but kept as a function so the call site reads symmetrically. We
 /// hash a sentinel to obtain that empty-tree root without depending on
 /// the `DEFAULT_HASHES` private indexing.
 fn init_proof_out_coins_root_from_init(_prev_asth: &HashDigest) -> HashDigest {
-    // The empty SparseMerkleTree's root equals `DEFAULT_HASHES[0]` by
-    // construction. Building one is cheap and avoids re-exporting the
-    // const.
     SparseMerkleTree::new().root()
 }
 
