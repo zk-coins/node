@@ -3,6 +3,14 @@ name = "node"
 version.workspace = true
 edition.workspace = true
 
+[lints.rust]
+# Register the `coverage_nightly` cfg so `#[cfg_attr(coverage_nightly,
+# coverage(off))]` annotations in `src/r2_probe.rs` don't trip
+# `unexpected_cfgs` under `-D warnings`. `cargo llvm-cov` injects this
+# cfg automatically on a nightly toolchain; the lint stays a warn-level
+# diagnostic to match `program-plonky2` and `script-plonky2`.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
+
 [dependencies]
 bitcoin = { workspace = true }
 bitcoin_hashes = { version = "0.16.0", features = ["std"] }
