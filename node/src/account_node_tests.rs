@@ -771,7 +771,7 @@ fn test_send_coins_twice_from_same_account_uses_update_account() {
 /// `"prev_commitment_pubkey required for account update"`.
 ///
 /// Live-server analogue is the api_remote test
-/// `second_send_succeeds_without_prev_commitment_pubkey_field` —
+/// `second_send_roundtrip_succeeds_without_prev_commitment_pubkey_field` —
 /// this one drives the same code path through `account_node` directly
 /// (no prover, no HTTP) so the contract is pinned even when the
 /// `api_remote` suite is skipped (slim CI).
