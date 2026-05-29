@@ -388,10 +388,10 @@ jobs:
         if: failure()
         run: |
           echo "--- llvm-cov report: --show-missing-lines (text) ---"
-          cargo llvm-cov report --show-missing-lines \
+          cargo llvm-cov report --release --show-missing-lines \
             --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|_tests\.rs$|bin/.*\.rs$' || true
           echo "--- llvm-cov report: per-file json (filter < 100%) ---"
-          cargo llvm-cov report --json \
+          cargo llvm-cov report --release --json \
             --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|_tests\.rs$|bin/.*\.rs$' \
             | jq -r '.data[0].files[]
                 | select(.summary.lines.percent < 100 or .summary.functions.percent < 100)
