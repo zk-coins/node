@@ -1314,6 +1314,41 @@ is a build-time signal, not a runtime-readiness signal.
 deploy-dev post-curl-retry fires on every DEV deploy. A regression
 that brings back the silent-panic shape fails one or both gates.
 
+### 7.24 Self-hosted `mempool/backend:v3.3.1` does not implement the `track-tx` WS action — **codified**
+
+**Discovered:** DEV operations (May 2026), via combined evidence:
+DEV `request_log` showed `/api/mint` p50 ≈ 40 s and
+`/api/send` p50 = 11 s + `/api/commit` p50 = 30.7 s — both with the
+30 s shape characteristic of the publisher's `track-tx` safety-net;
+16/16 REST fallbacks in the 72 h sample succeeded with 0 not-found
+and 0 errors; a direct WS probe against
+`mempool-api-mutinynet:8999/api/v1/ws` with
+`{"action":"track-tx","data":"<txid>"}` returned 0 frames in 15 s,
+while `{"action":"want","data":["blocks"]}` answered immediately.
+
+**Root cause:** the self-hosted `mempool/backend:v3.3.1` version
+does not emit any frame in response to `track-tx` (the action is
+recognised but no event arrives). Issue #84's original design
+assumed a public mutinynet endpoint where the action does fire;
+self-hosting flipped that assumption silently.
+
+**Fix:** drop the entire WS subscribe + safety-net + REST fallback
+path from `publisher::broadcast_inscription_txs`. The publisher now
+runs `client.broadcast(commit) → client.broadcast(reveal)` back to
+back; race-freedom comes from the deployment topology (node +
+electrs + bitcoind in the shared Docker `bitcoin` network,
+`bitcoind::sendrawtransaction` returns only after local-mempool
+accept), not from a WS subscription. Expected effect:
+`/api/mint` p50 ~40 s → ~11 s, `/api/send + /api/commit`
+~42 s → ~13 s. See the perf PR for the removed code.
+
+**Generalisation for future migrations:** when porting an
+event-driven path that was designed against a public upstream onto
+a self-hosted reimplementation of the same protocol, smoke-test
+each WS action against the self-hosted endpoint before assuming
+parity. Empty-frame-budget probe is cheap; silent latency tax is
+expensive.
+
 ---
 
 ## 8. Local Artifacts
