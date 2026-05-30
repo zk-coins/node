@@ -28,25 +28,12 @@ pub struct EsploraConfig {
     pub url: String,
     pub is_mainnet: bool,
     pub network_name: String,
-    /// Esplora WebSocket endpoint used by the publisher's per-broadcast
-    /// `track-tx` wait (issue #84). `None` falls back to
-    /// `ESPLORA_WS_URL` (defaulting to `wss://mutinynet.com/api/v1/ws`);
-    /// tests inject an in-process URL to avoid hitting the real
-    /// upstream.
+    /// Esplora WebSocket endpoint consumed by the block-tip scanner
+    /// (`scanner_ws::run_scanner_ws`). `None` falls back to
+    /// `ESPLORA_WS_URL` (defaulting to `wss://mutinynet.com/api/v1/ws`).
+    /// The publisher no longer uses this field — see
+    /// `broadcast_inscription_txs` for the direct-broadcast rationale.
     pub ws_url: Option<String>,
-    /// Override for the per-broadcast `track-tx` safety-net (issue
-    /// #84). `None` uses the production default
-    /// `TRACK_TX_TIMEOUT_SECS = 30`; tests pass a short Duration so
-    /// the "broadcast genuinely failed" path (short WS timeout +
-    /// wiremock default 404 on `GET /tx/{txid}` ⇒ REST fallback returns
-    /// `None` ⇒ hard `WsError::Timeout`) does not stall the suite for
-    /// the full 30 s.
-    ///
-    /// Test-injection backdoor: production callers always leave this
-    /// `None` and inherit the 30 s safety-net. Hidden from the
-    /// rustdoc index (issue #84 review round 4 MINOR 5).
-    #[doc(hidden)]
-    pub track_tx_timeout: Option<std::time::Duration>,
 }
 
 impl EsploraConfig {
@@ -65,23 +52,6 @@ pub const INSCRIPTION_MARKER_PREFIX: &str = "4242";
 const MAX_CHUNK_SIZE: usize = 520;
 const MAX_MINING_ATTEMPTS: u32 = 400000;
 const MIN_INSCRIPTION_AMOUNT: u64 = 800;
-
-/// Safety-net deadline for the per-broadcast `track-tx` WS wait
-/// (issue #84). The publisher subscribes to the Esplora WS for the
-/// commit txid before broadcasting the reveal, and proceeds the
-/// moment the peer reports the commit as seen. If 30 s pass without
-/// any track-tx event, the publisher issues a SINGLE REST
-/// `GET /tx/{commit_txid}` fallback against the Esplora endpoint:
-/// a 200 means the tx is in mempool / a block (the WS just missed
-/// the frame, a regularly-observed Mutinynet failure mode) and the
-/// publisher proceeds with the reveal; a 404 or any other error
-/// propagates `WsError::Timeout`. The underlying rationale is
-/// unchanged: a missing event without REST corroboration is still
-/// a real upstream / network problem worth surfacing — never a
-/// silent fallback to "broadcast the reveal anyway".
-const TRACK_TX_TIMEOUT_SECS: u64 = 30;
-
-use crate::scanner_ws::DEFAULT_ESPLORA_WS_URL;
 
 const COMMIT_TX_WITNESS_WEIGHT: Weight = Weight::from_wu(68);
 const REVEAL_TX_WITNESS_WEIGHT: Weight = Weight::from_wu(295);
@@ -424,36 +394,43 @@ fn build_reveal_only_inner(
 }
 
 /// Broadcasts the commit and reveal transactions to the Bitcoin
-/// network via the Esplora REST API and waits for the commit
-/// transaction to appear in the mempool before sending the reveal.
+/// network via the Esplora REST API as a sequential pair.
 ///
-/// The propagation gap used to be papered over by a fixed 5 s
-/// `PROPAGATION_WAIT_SECS` async sleep; issue #84 replaces
-/// that polling wait with a short-lived WebSocket subscription to
-/// `{"action":"track-tx","data":"<commit_txid>"}` against the
-/// Esplora WS endpoint, returning the moment the peer reports the
-/// commit txid as seen. A 30 s safety-net (`TRACK_TX_TIMEOUT_SECS`)
-/// caps the WS wait; if it elapses we issue ONE REST
-/// `GET /tx/{commit_txid}` against the Esplora endpoint and treat a
-/// 200 as success (the tx is in mempool / a block and the WS just
-/// missed the frame, a regularly-observed Mutinynet failure mode).
-/// A 404 propagates the original WS timeout — the broadcast genuinely
-/// did not land. This is a single REST GET, NOT a poll loop; the
-/// no-polling invariant from the `CONTRIBUTING.md` "No polling —
-/// events only" section is preserved.
+/// Implementation: a plain
+/// `client.broadcast(commit_tx).await?; client.broadcast(reveal_tx).await?;`
+/// sequence. No WebSocket subscription, no inter-tx sleep, no
+/// propagation watchdog — the two REST POSTs run back to back.
 ///
-/// The fallback fires on the OUTER `TRACK_TX_TIMEOUT_SECS` budget
-/// (exposed via `TrackTxStream::wait` in `scanner_ws.rs`) — the
-/// inner per-frame `TRACK_TX_FRAME_WATCHDOG` reconnect loop in
-/// `scanner_ws.rs` is untouched.
+/// Why this is race-free on our deployment topology: the node, the
+/// `electrs` REST endpoint, and `bitcoind` share a single Docker
+/// `bitcoin` network. `bitcoind::sendrawtransaction` only returns
+/// after the tx has been accepted into the local mempool, so by the
+/// time the commit POST resolves the commit UTXO is visible to the
+/// same `bitcoind`'s mempool — which is the same mempool the reveal
+/// POST hits a moment later via the same `electrs`. There is no
+/// cross-host propagation window to bridge.
 ///
-/// Order of operations is load-bearing: the `track-tx` subscription
-/// MUST be established BEFORE the commit broadcast. Otherwise the
-/// upstream may finish propagating the tx between
-/// `client.broadcast(commit_tx)` and `subscribe_track_tx(...)`, and
-/// the "tx in mempool" event would fire before any subscriber is
-/// listening — wedging the wait for the full 30 s safety-net even
-/// on the happy path.
+/// Why we used to wait: issue #84 replaced a fixed 5 s
+/// `PROPAGATION_WAIT_SECS` sleep with a `{"action":"track-tx",...}`
+/// WS subscription against the upstream Esplora WS. That made sense
+/// when the upstream was the public mutinynet endpoint with real
+/// cross-host propagation latency. After self-hosting our own
+/// `mempool/backend:v3.3.1` we observed empirically that the backend
+/// version does NOT emit any frame for `track-tx`; the WS wait always
+/// timed out and the single-shot REST fallback (`GET /tx/{commit}`)
+/// always confirmed the tx as already on-chain (DEV `request_log`:
+/// `/api/mint` p50 ≈ 40 s of which ~30 s was watchdog; 16/16 REST
+/// fallbacks in 72 h succeeded, 0 not-found, 0 errors). The wait was
+/// pure latency tax for an in-cluster scenario it was never designed
+/// for. Removing the subscribe + REST fallback brings `/api/mint`
+/// from p50 ~40 s to ~11 s and `/api/send + /api/commit` from ~42 s
+/// to ~13 s.
+///
+/// "Events only" invariant from CONTRIBUTING.md is preserved: a
+/// straight sequential broadcast is neither a poll loop nor a timed
+/// sleep, so the CI "Forbid polling patterns" grep (see
+/// CONTRIBUTING.md § "No polling — events only") keeps passing —
+/// this PR strictly REMOVES sleeps from `publisher.rs`.
 pub async fn broadcast_inscription_txs(
     config: &EsploraConfig,
     commit_tx: &Transaction,
@@ -463,79 +440,10 @@ pub async fn broadcast_inscription_txs(
     let builder = EsploraBuilder::new(&config.url);
     let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(builder)?;
 
-    let commit_txid = commit_tx.compute_txid();
-    let ws_url = config.ws_url.clone().unwrap_or_else(|| {
-        std::env::var("ESPLORA_WS_URL").unwrap_or_else(|_| DEFAULT_ESPLORA_WS_URL.to_string())
-    });
-    let track_tx_timeout = config
-        .track_tx_timeout
-        .unwrap_or_else(|| std::time::Duration::from_secs(TRACK_TX_TIMEOUT_SECS));
-
-    // Subscribe to the `track-tx` WS BEFORE broadcasting the commit
-    // (issue #84). The previous ordering opened a race window between
-    // the REST broadcast and the WS subscribe: if the peer finished
-    // propagating the tx in that window, the event fired before any
-    // listener was attached.
-    println!(
-        "Subscribing to commit tx {} via WS ({}) before broadcast...",
-        commit_txid, ws_url
-    );
-    let stream = crate::scanner_ws::subscribe_track_tx(&ws_url, commit_txid).await?;
-
-    println!("Broadcasting commit transaction...");
     client.broadcast(commit_tx).await?;
+    let commit_txid = commit_tx.compute_txid();
     println!("Commit transaction broadcast successfully: {}", commit_txid);
 
-    // Wait for the commit txid to surface in the upstream mempool
-    // before broadcasting the reveal. Event-driven (issue #84),
-    // not a fixed sleep — see the function docstring for the design.
-    println!(
-        "Waiting for commit tx {} to appear in mempool via WS (deadline {:?})...",
-        commit_txid, track_tx_timeout
-    );
-    match stream.wait(track_tx_timeout).await {
-        Ok(()) => {}
-        Err(crate::scanner_ws::WsError::Timeout) => {
-            // Mutinynet's public WS endpoint regularly goes 30-90 s
-            // between frames; a 30 s WS timeout therefore does NOT
-            // prove the tx is not on-chain. Issue ONE REST GET to
-            // distinguish "WS missed the frame" (tx is in
-            // mempool / a block → success) from "broadcast genuinely
-            // failed" (404 → propagate the original timeout).
-            //
-            // Single GET, NOT a poll loop — see the
-            // "No polling — events only" section in CONTRIBUTING.md.
-            println!(
-                "WS timeout for {}; falling back to esplora-REST GET /tx/{}",
-                commit_txid, commit_txid
-            );
-            match client.get_tx(&commit_txid).await {
-                Ok(Some(_)) => {
-                    println!(
-                        "esplora-REST fallback confirmed commit tx {} is on-chain / in mempool",
-                        commit_txid
-                    );
-                }
-                Ok(None) => {
-                    println!(
-                        "esplora-REST fallback: commit tx {} not found (404); broadcast genuinely failed",
-                        commit_txid
-                    );
-                    return Err(Box::new(crate::scanner_ws::WsError::Timeout));
-                }
-                Err(e) => {
-                    println!(
-                        "esplora-REST fallback failed for {}: {}; propagating original WS timeout",
-                        commit_txid, e
-                    );
-                    return Err(Box::new(crate::scanner_ws::WsError::Timeout));
-                }
-            }
-        }
-        Err(other) => return Err(other.into()),
-    }
-
-    println!("Broadcasting reveal transaction...");
     client.broadcast(reveal_tx).await?;
     let reveal_txid = reveal_tx.compute_txid();
     println!("Reveal transaction broadcast successfully: {}", reveal_txid);
@@ -795,20 +703,7 @@ pub async fn broadcast_inscription_txs_with_persistence(
 
     let commit_txid = commit_tx.compute_txid();
     let commit_txid_bytes = *commit_txid.as_byte_array();
-    let ws_url = config.ws_url.clone().unwrap_or_else(|| {
-        std::env::var("ESPLORA_WS_URL").unwrap_or_else(|_| DEFAULT_ESPLORA_WS_URL.to_string())
-    });
-    let track_tx_timeout = config
-        .track_tx_timeout
-        .unwrap_or_else(|| std::time::Duration::from_secs(TRACK_TX_TIMEOUT_SECS));
 
-    println!(
-        "Subscribing to commit tx {} via WS ({}) before broadcast...",
-        commit_txid, ws_url
-    );
-    let stream = crate::scanner_ws::subscribe_track_tx(&ws_url, commit_txid).await?;
-
-    println!("Broadcasting commit transaction...");
     client.broadcast(commit_tx).await?;
     println!("Commit transaction broadcast successfully: {}", commit_txid);
     advance_pending_status(
@@ -818,49 +713,6 @@ pub async fn broadcast_inscription_txs_with_persistence(
     )
     .await;
 
-    println!(
-        "Waiting for commit tx {} to appear in mempool via WS (deadline {:?})...",
-        commit_txid, track_tx_timeout
-    );
-    match stream.wait(track_tx_timeout).await {
-        Ok(()) => {}
-        Err(crate::scanner_ws::WsError::Timeout) => {
-            // Mutinynet's public WS endpoint regularly goes 30-90 s
-            // between frames; the REST fallback distinguishes "WS
-            // missed the frame" from a genuine broadcast failure.
-            // Same shape as `broadcast_inscription_txs` — see that
-            // function's docstring for the full rationale.
-            println!(
-                "WS timeout for {}; falling back to esplora-REST GET /tx/{}",
-                commit_txid, commit_txid
-            );
-            match client.get_tx(&commit_txid).await {
-                Ok(Some(_)) => {
-                    println!(
-                        "esplora-REST fallback confirmed commit tx {} is on-chain / in mempool",
-                        commit_txid
-                    );
-                }
-                Ok(None) => {
-                    println!(
-                        "esplora-REST fallback: commit tx {} not found (404); broadcast genuinely failed",
-                        commit_txid
-                    );
-                    return Err(Box::new(crate::scanner_ws::WsError::Timeout));
-                }
-                Err(e) => {
-                    println!(
-                        "esplora-REST fallback failed for {}: {}; propagating original WS timeout",
-                        commit_txid, e
-                    );
-                    return Err(Box::new(crate::scanner_ws::WsError::Timeout));
-                }
-            }
-        }
-        Err(other) => return Err(other.into()),
-    }
-
-    println!("Broadcasting reveal transaction...");
     client.broadcast(reveal_tx).await?;
     let reveal_txid = reveal_tx.compute_txid();
     println!("Reveal transaction broadcast successfully: {}", reveal_txid);

@@ -35,11 +35,26 @@ Bitcoin / Esplora signals on the node's hot path are subscribed to,
 never polled. The scanner consumes block events from the
 mempool.space-compatible WebSocket stream (`scanner_ws.rs`,
 `ESPLORA_WS_URL`, default `wss://mutinynet.com/api/v1/ws`); the
-publisher waits for `track-tx` events between commit and reveal
-broadcasts instead of sleeping a fixed propagation interval. The
-previous 30-s tip-poll gated `/api/mint` and `/api/send` visibility
-by up to a full block-time + poll-interval (issue #84); event-driven
-ingestion brings that down to the WS round-trip.
+publisher broadcasts the commit and reveal transactions back-to-back
+via REST and never sleeps or polls between them. The previous 30-s
+tip-poll gated `/api/mint` and `/api/send` visibility by up to a full
+block-time + poll-interval (issue #84); event-driven ingestion brings
+that down to the WS round-trip.
+
+Historical note: issue #84 originally replaced a fixed 5 s
+`PROPAGATION_WAIT_SECS` sleep with a `{"action":"track-tx","data":"<commit_txid>"}`
+WS wait + REST safety-net. After the deployment moved to a
+self-hosted `mempool/backend:v3.3.1`, empirical measurement showed
+that backend version emits zero frames for `track-tx`, so the WS
+wait always timed out and the REST fallback always confirmed the
+tx as already on-chain. 16/16 fallbacks in 72 h DEV `request_log`,
+0 not-found, 0 errors. The wait was pure latency tax (~30 s/mint
+and ~30 s/send+commit) for an in-cluster scenario where bitcoind's
+local-mempool accept already orders the two POSTs correctly. The
+publisher now runs `client.broadcast(commit) → client.broadcast(reveal)`
+sequentially; race-freedom follows from the topology (node, electrs,
+bitcoind share the Docker `bitcoin` network), not from a WS
+subscription.
 
 Where it applies:
 
@@ -47,7 +62,7 @@ Where it applies:
 - `node/src/scanner_runtime.rs` — block-walk loop, drains the WS-fed channel.
 - `node/src/scanner_ws.rs` — WS subscriber + reconnect-with-backoff.
 - `node/src/scanner_ws_parse.rs` — pure WS frame parsers.
-- `node/src/publisher.rs` — `track-tx` wait between commit and reveal.
+- `node/src/publisher.rs` — direct sequential commit→reveal broadcast.
 
 Where it does NOT apply: integration tests
 (`node/tests/api_remote.rs`), health-readiness probes, and any
@@ -71,12 +86,15 @@ fails the build with a pointer to issue #84. The token is a plain
 comment marker — not an `#[allow(...)]` attribute, which would have
 been mistakable for a real lint suppression — and is the documented
 per-line opt-out for genuinely justified exceptions (today: the
-WS-reconnect backoff in `scanner_ws`, the inner `track-tx`
-reconnect-with-backoff in `scanner_ws`, and the bounded HTTP-retry
+WS-reconnect backoff in `scanner_ws` and the bounded HTTP-retry
 sleep in `scanner_runtime`). The same line must carry a comment
 explaining WHY this particular sleep is not a chain-tip poll. New
 uses require either changing the design or extending this section
 with the rationale.
+
+The publisher's previous per-broadcast `track-tx` reconnect-with-
+backoff inside `scanner_ws.rs` is no longer in the file — it was
+removed alongside the WS wait itself (see historical note above).
 
 ### Project invariants (non-negotiable)
 
@@ -465,8 +483,10 @@ The node continuously scans the Bitcoin blockchain:
 The publisher (`publisher.rs`) creates Taproot Inscriptions:
 - Commit/reveal pattern (two transactions)
 - Data split into 520-byte chunks (max push size)
-- Broadcasts via Esplora API, then waits for the WS `track-tx` event
-  between commit and reveal instead of sleeping a fixed interval
+- Broadcasts via Esplora REST: commit and reveal POSTs run back to
+  back with no inter-tx wait. Sequencing is provided by bitcoind's
+  local-mempool accept (node, electrs, bitcoind share the Docker
+  `bitcoin` network), not by a WS `track-tx` subscription.
 
 ### Plonky2 State-Transition Circuit
 
