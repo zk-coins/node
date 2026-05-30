@@ -14,6 +14,14 @@
 //! Everything declared here is also `use`d from `main.rs` so the
 //! production binary keeps working with no change in behaviour.
 
+// Opt in to the unstable `coverage_attribute` feature only when
+// `cargo llvm-cov` defines the `coverage_nightly` cfg (it injects the
+// flag automatically on a nightly toolchain). The `coverage(off)`
+// annotations on the platform-`_impl` helpers in `r2_probe.rs` rely on
+// this feature being enabled; the same pattern is used in
+// `program-plonky2/src/lib.rs` and `script-plonky2/src/lib.rs`. Without
+// the cfg gate the stable toolchain would refuse to compile the crate.
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 // `Account::new()` and `State::new()` are visible from the lib root
 // after the binary → bin+lib split. Clippy's `new_without_default`
 // lint did not fire while these types lived in a `bin` target — the
@@ -29,6 +37,7 @@ pub mod account_node;
 pub mod audit;
 pub mod db;
 pub mod publisher;
+pub mod r2_probe;
 pub mod router;
 pub mod runtime;
 pub mod scanner;
@@ -140,7 +149,6 @@ where
         is_mainnet,
         network_name,
         ws_url,
-        track_tx_timeout: None,
     }
 }
 

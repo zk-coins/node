@@ -69,7 +69,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-pub use crate::scanner_ws_parse::{frame_signals_tx_seen, parse_ws_frame};
+pub use crate::scanner_ws_parse::parse_ws_frame;
 
 /// Default endpoint for Mutinynet's mempool.space-compatible WebSocket
 /// API. Overridable via `ESPLORA_WS_URL` for self-host operators and
@@ -143,19 +143,10 @@ pub const DEFAULT_ESPLORA_HTTP_URL: &str = "https://mutinynet.com/api";
 /// Issue #84 review (round 4) MAJOR 1.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Initial backoff between failed `track-tx` reconnect attempts inside
-/// `wait_for_tx_inner_resilient`. Doubles up to `TRACK_TX_RECONNECT_BACKOFF_MAX`.
-/// Issue #84 review (round 4) MAJOR 2: prevents a tight handshake-spin
-/// loop against an immediate-close peer; the outer 30 s `track-tx`
-/// timeout still bounds total work.
-const TRACK_TX_RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(50);
-
-/// Cap on the inner `track-tx` reconnect backoff.
-const TRACK_TX_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(1);
-
-/// Errors surfaced by the per-broadcast `subscribe_track_tx` +
-/// `TrackTxStream::wait` two-phase helper used by
-/// `publisher::broadcast_inscription_txs`.
+/// Errors surfaced by the block-tip scanner's connect/subscribe/drain
+/// cycle. The publisher's commit→reveal broadcast pair no longer uses
+/// any of these — it talks REST-only and runs both broadcasts back to
+/// back without an inter-tx wait (see `publisher::broadcast_inscription_txs`).
 #[derive(Debug)]
 pub enum WsError {
     /// `tokio_tungstenite::connect_async` returned an error.
@@ -165,8 +156,6 @@ pub enum WsError {
     /// The peer closed the socket or surfaced an error mid-stream
     /// before the expected event arrived.
     Stream(String),
-    /// The safety-net deadline elapsed without the expected event.
-    Timeout,
 }
 
 impl std::fmt::Display for WsError {
@@ -175,7 +164,6 @@ impl std::fmt::Display for WsError {
             WsError::Connect(e) => write!(f, "WS connect failed: {}", e),
             WsError::Subscribe(e) => write!(f, "WS subscribe failed: {}", e),
             WsError::Stream(e) => write!(f, "WS stream error: {}", e),
-            WsError::Timeout => write!(f, "WS timeout (no expected event in window)"),
         }
     }
 }
@@ -572,196 +560,6 @@ async fn anchor_on_current_tip(
         return Err("receiver dropped".into());
     }
     Ok(())
-}
-
-/// Per-frame watchdog used by the inner `track-tx` wait loop. The
-/// outer 30 s `TRACK_TX_TIMEOUT_SECS` budget is owned by the publisher;
-/// this inner watchdog detects a half-open peer that swallows frames
-/// without delivering any event, so we can reconnect-and-re-subscribe
-/// within the outer envelope rather than sitting for the full 30 s on
-/// a wedged socket.
-const TRACK_TX_FRAME_WATCHDOG: Duration = Duration::from_secs(10);
-
-/// A live `track-tx` subscription against the Esplora WS. Returned by
-/// [`subscribe_track_tx`]. Calling [`TrackTxStream::wait`] drains the
-/// subscription until the peer reports the tracked txid as seen, or
-/// until `timeout` elapses (whichever comes first).
-///
-/// The split between `subscribe_track_tx` and `wait` is load-bearing
-/// (issue #84): the publisher MUST establish the subscription BEFORE
-/// broadcasting the commit transaction, otherwise the upstream may
-/// propagate the tx between the broadcast and the subscribe and the
-/// "tx in mempool" event would fire before we are listening. With the
-/// split, the subscribe handshake is complete before the broadcast
-/// races against it.
-pub struct TrackTxStream {
-    ws: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-    url: String,
-    txid: bitcoin::Txid,
-    txid_str: String,
-}
-
-impl std::fmt::Debug for TrackTxStream {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TrackTxStream")
-            .field("url", &self.url)
-            .field("txid", &self.txid)
-            .finish_non_exhaustive()
-    }
-}
-
-impl TrackTxStream {
-    /// Drain the subscription until the peer reports the tracked
-    /// txid, or the outer `timeout` elapses. The implementation also
-    /// runs a per-frame watchdog ([`TRACK_TX_FRAME_WATCHDOG`]) so a
-    /// silent half-open peer triggers a forced reconnect within the
-    /// outer budget rather than wedging the full window.
-    ///
-    /// On reconnect we re-open the WS and re-send the `track-tx`
-    /// subscribe frame, then continue waiting against the remaining
-    /// outer budget. This keeps the publisher's contract simple: a
-    /// missing event surfaces as `WsError::Timeout` exactly when the
-    /// caller's deadline elapses, regardless of how many half-open
-    /// reconnects happened in between.
-    pub async fn wait(self, timeout: Duration) -> Result<(), WsError> {
-        tokio::time::timeout(timeout, wait_for_tx_inner_resilient(self))
-            .await
-            .map_err(|_| WsError::Timeout)?
-    }
-}
-
-/// Open a short-lived WS to `url`, subscribe to `track-tx` for
-/// `txid`, and return the live stream WITHOUT yet waiting for an
-/// event. The caller is expected to drive the actual wait via
-/// [`TrackTxStream::wait`] after performing whatever side-effect the
-/// subscription is gating (in our case: broadcasting the commit
-/// transaction on the Esplora REST endpoint).
-///
-/// Splitting the two-phase API away from the old all-in-one
-/// `wait_for_tx_in_mempool` plugs the issue #84 race: with the
-/// single-call helper, the publisher used to broadcast the commit
-/// BEFORE the subscribe completed, so the "tx in mempool" event
-/// could fire before any listener was attached.
-pub async fn subscribe_track_tx(url: &str, txid: bitcoin::Txid) -> Result<TrackTxStream, WsError> {
-    let mut ws = connect_with_timeout(url).await?;
-
-    let txid_str = txid.to_string();
-    let subscribe = serde_json::json!({
-        "action": "track-tx",
-        "data": txid_str,
-    })
-    .to_string();
-    ws.send(WsMessage::Text(subscribe))
-        .await
-        .map_err(|e| WsError::Subscribe(e.to_string()))?;
-
-    Ok(TrackTxStream {
-        ws,
-        url: url.to_string(),
-        txid,
-        txid_str,
-    })
-}
-
-/// Inner loop with per-frame watchdog + transparent reconnect. On a
-/// per-frame timeout (`TRACK_TX_FRAME_WATCHDOG`), tear the current WS
-/// down and re-subscribe; continue draining until the outer caller's
-/// deadline elapses (which it does via `tokio::time::timeout` wrapping
-/// this future in `TrackTxStream::wait`).
-///
-/// Issue #84 review (round 4) MAJOR 2: a peer that accepts and
-/// immediately closes (or drops every frame) used to make this loop
-/// tight-spin a fresh TCP+TLS handshake per iteration. We now apply
-/// an exponential backoff between failed reconnects (50 ms → 1 s)
-/// and reset it to 50 ms on the next successful connect+subscribe so
-/// a single transient drop does not penalise subsequent good runs.
-/// The outer 30 s `tokio::time::timeout` continues to bound total
-/// work, so the backoff can never starve the publisher.
-async fn wait_for_tx_inner_resilient(stream: TrackTxStream) -> Result<(), WsError> {
-    let TrackTxStream {
-        mut ws,
-        url,
-        txid,
-        txid_str,
-    } = stream;
-
-    // Per-reconnect backoff. Doubles per consecutive failure, capped
-    // at `TRACK_TX_RECONNECT_BACKOFF_MAX`. Reset to MIN whenever the
-    // current session yields any frame from the peer ("good run").
-    let mut reconnect_backoff = TRACK_TX_RECONNECT_BACKOFF_MIN;
-
-    loop {
-        let next = tokio::time::timeout(TRACK_TX_FRAME_WATCHDOG, ws.next()).await;
-        match next {
-            Ok(Some(Ok(WsMessage::Text(text)))) => {
-                if frame_signals_tx_seen(&text, &txid_str) {
-                    return Ok(());
-                }
-                // Non-matching text frame (heartbeat, position update
-                // for some other tx, mempool stats). Keep draining.
-                // The peer is delivering frames → this is a "good
-                // run", so reset the reconnect backoff.
-                reconnect_backoff = TRACK_TX_RECONNECT_BACKOFF_MIN;
-            }
-            Ok(Some(Ok(WsMessage::Close(_)))) | Ok(None) => {
-                // Peer closed the socket before delivering the event.
-                // Reconnect and re-subscribe; the outer timeout caps
-                // how long we keep trying.
-                eprintln!(
-                    "scanner_ws: track-tx peer closed before event for {}; reconnecting after {:?}",
-                    txid, reconnect_backoff
-                );
-                tokio::time::sleep(reconnect_backoff).await; // scanner-polling-ok: reconnect-backoff between failed track-tx sessions (issue #84 round-4 MAJOR 2)
-                ws = reconnect_track_tx(&url, &txid_str).await?;
-                reconnect_backoff = (reconnect_backoff * 2).min(TRACK_TX_RECONNECT_BACKOFF_MAX);
-            }
-            Ok(Some(Ok(_))) => {
-                // Binary / ping / pong / raw frame — tungstenite
-                // handles ping/pong internally and the others are not
-                // emitted by Esplora for this subscription. Ignore,
-                // but treat as evidence of a live peer.
-                reconnect_backoff = TRACK_TX_RECONNECT_BACKOFF_MIN;
-            }
-            Ok(Some(Err(e))) => {
-                return Err(WsError::Stream(e.to_string()));
-            }
-            Err(_) => {
-                // Per-frame watchdog elapsed. Treat as half-open and
-                // reconnect within the outer caller's budget.
-                eprintln!(
-                    "scanner_ws: track-tx frame watchdog ({:?}) elapsed for {}; reconnecting after {:?}",
-                    TRACK_TX_FRAME_WATCHDOG, txid, reconnect_backoff
-                );
-                tokio::time::sleep(reconnect_backoff).await; // scanner-polling-ok: reconnect-backoff between failed track-tx sessions (issue #84 round-4 MAJOR 2)
-                ws = reconnect_track_tx(&url, &txid_str).await?;
-                reconnect_backoff = (reconnect_backoff * 2).min(TRACK_TX_RECONNECT_BACKOFF_MAX);
-            }
-        }
-    }
-}
-
-/// Helper used by the inner wait loop: tear down the current ws (the
-/// drop happens by reassignment in the caller) and open a fresh
-/// connection with the same `track-tx` subscription frame.
-async fn reconnect_track_tx(
-    url: &str,
-    txid_str: &str,
-) -> Result<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    WsError,
-> {
-    let mut ws = connect_with_timeout(url).await?;
-    let subscribe = serde_json::json!({
-        "action": "track-tx",
-        "data": txid_str,
-    })
-    .to_string();
-    ws.send(WsMessage::Text(subscribe))
-        .await
-        .map_err(|e| WsError::Subscribe(e.to_string()))?;
-    Ok(ws)
 }
 
 #[cfg(test)]
