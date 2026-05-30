@@ -141,11 +141,6 @@ async fn info_returns_network_name_capabilities_and_username_domain() {
         info.capabilities.address_list,
         cfg!(feature = "address-list")
     );
-    // Mint is permanent MVP — `faucet` is hardcoded `true`, not cfg-derived.
-    assert!(info.capabilities.faucet);
-    // Username *resolve* is permanent MVP — `usernames` is hardcoded `true`.
-    assert!(info.capabilities.usernames);
-    // Username *claim* is gated on the `username-claim` Cargo feature.
     assert_eq!(
         info.capabilities.username_claim,
         cfg!(feature = "username-claim")
@@ -171,13 +166,7 @@ async fn info_serialization_format_is_stable() {
     assert!(v["username_domain"].is_string());
 
     let caps = &v["capabilities"];
-    for key in [
-        "address_list",
-        "faucet",
-        "usernames",
-        "username_claim",
-        "lnurl",
-    ] {
+    for key in ["address_list", "username_claim", "lnurl"] {
         assert!(caps[key].is_boolean(), "capability `{key}` must be bool");
     }
 }
@@ -5603,7 +5592,6 @@ mod inscriptions_endpoint_tests {
 // =======================================================================
 
 #[cfg(feature = "username-claim")]
-#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_precheck_reject_persists_log_row() {
     use crate::db::connect_and_migrate;
@@ -5689,7 +5677,6 @@ async fn claim_username_precheck_reject_persists_log_row() {
 /// arm at router.rs line 1767. The fire-and-forget spawn calls
 /// `insert_username_claim_log` — we DROP the table out from under it
 /// so the insert fails and the eprintln line runs.
-#[cfg(feature = "username-claim")]
 #[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_log_spawn_handles_insert_error() {

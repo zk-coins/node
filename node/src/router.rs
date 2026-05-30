@@ -504,19 +504,15 @@ pub struct InfoResponse {
 
 /// Node-side feature gates exposed to clients so the app can render
 /// capability-driven UI without a parallel build-time env-flag set.
-/// Each bool reflects a compile-time Cargo feature on the node binary,
-/// except `faucet`: mint is part of the MVP and is always available, so
-/// the field is hardcoded `true`. It is kept on the struct for API
-/// back-compat with wallet clients that introspect `/api/info`.
+/// Each bool reflects a compile-time Cargo feature on the node binary.
+///
+/// Only opt-in features appear here. Permanent MVP endpoints (mint,
+/// username resolve) are always available and intentionally have no
+/// capability bit — clients must not gate their UI on flags that
+/// would always be `true`.
 #[derive(Serialize, Deserialize)]
 pub struct Capabilities {
     pub address_list: bool,
-    /// Always `true`. Mint is permanently part of the MVP binary; the
-    /// field is retained only so existing wallet clients deserialising
-    /// `/api/info` don't break.
-    pub faucet: bool,
-    /// Username *resolve* + display. Permanent MVP, hardcoded `true`.
-    pub usernames: bool,
     /// Username *claim* (write path). Gated by the `username-claim`
     /// Cargo feature; off in hosted DEV + PRD images. Wallet clients
     /// hide the claim input when this is `false`. Always present in
@@ -1775,10 +1771,6 @@ async fn info_handler() -> impl IntoResponse {
         network: NETWORK_CONFIG.network_name.clone(),
         capabilities: Capabilities {
             address_list: cfg!(feature = "address-list"),
-            // Hardcoded — mint is permanent MVP; field is back-compat only.
-            faucet: true,
-            // Hardcoded — usernames are permanent MVP; field is back-compat only.
-            usernames: true,
             username_claim: cfg!(feature = "username-claim"),
             lnurl: cfg!(feature = "lnurl"),
         },
