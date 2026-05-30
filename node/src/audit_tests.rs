@@ -149,7 +149,6 @@ async fn build_state_with_pool() -> (
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
         ws_url: None,
-        track_tx_timeout: None,
     };
 
     let tmp = tempfile::tempdir().expect("tempdir");

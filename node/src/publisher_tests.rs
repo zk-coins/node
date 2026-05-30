@@ -13,14 +13,10 @@ use bitcoin::hashes::Hash;
 use bitcoin::script::Instruction;
 use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
 use bitcoin::{Address, Network, OutPoint, Txid, XOnlyPublicKey};
-use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::str::FromStr;
-use std::time::Duration;
 use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
-use tokio::net::TcpListener;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -56,62 +52,8 @@ async fn setup_mock_esplora() -> (MockServer, EsploraConfig) {
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
         ws_url: None,
-        track_tx_timeout: None,
     };
     (mock_server, config)
-}
-
-/// Spin up an in-process WS server that emulates the Esplora
-/// `track-tx` flow used by `broadcast_inscription_txs` (issue #84):
-/// accept the subscribe frame and, depending on `mode`, either echo
-/// back a `mempool: true` event for the txid the client subscribed
-/// to (mode = "echo") or stay silent (mode = "silent") so the
-/// publisher's 30-s safety-net fires. Returns the `ws://` URL.
-async fn spawn_track_tx_ws(mode: &'static str) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let url = format!("ws://{}", addr);
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let mut ws = match tokio_tungstenite::accept_async(stream).await {
-                Ok(w) => w,
-                Err(_) => continue,
-            };
-            // Read the subscribe frame.
-            let first = match ws.next().await {
-                Some(Ok(WsMessage::Text(t))) => t,
-                _ => continue,
-            };
-            let value: serde_json::Value = match serde_json::from_str(&first) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if value.get("action") == Some(&serde_json::json!("track-tx")) {
-                if let Some(txid_str) = value.get("data").and_then(|v| v.as_str()) {
-                    if mode == "echo" {
-                        // Documented mempool.space `txPosition` shape;
-                        // see `scanner_ws::frame_signals_tx_seen`.
-                        let frame = format!(
-                            r#"{{"txPosition":{{"txid":"{}","position":{{"block":1,"vsize":120}}}}}}"#,
-                            txid_str
-                        );
-                        let _ = ws.send(WsMessage::Text(frame)).await;
-                    }
-                }
-            }
-            // Hold the connection open until the test aborts the
-            // task. `std::future::pending` keeps the socket alive
-            // indefinitely so a slow CI runner can never let the
-            // helper observe a clean close before the event arrives;
-            // a bounded `sleep(60s)` could expire and mask a race.
-            std::future::pending::<()>().await;
-        }
-    });
-    url
 }
 
 // -----------------------------------------------------------------------------
@@ -127,7 +69,6 @@ fn inscription_txs_produces_taproot_commit_and_reveal_with_marker_prefix() {
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
         ws_url: None,
-        track_tx_timeout: None,
     };
     let publisher_address = test_publisher_address(config.network());
     let outpoints = vec![(fake_outpoint(0), 100_000u64)];
@@ -167,7 +108,6 @@ fn inscription_txs_embeds_commitment_data_in_reveal_script() {
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
         ws_url: None,
-        track_tx_timeout: None,
     };
     let publisher_address = test_publisher_address(config.network());
     let payload = b"Hello, zkCoins!".to_vec();
@@ -233,7 +173,6 @@ fn inscription_txs_chunks_large_commitment_data() {
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
         ws_url: None,
-        track_tx_timeout: None,
     };
     let publisher_address = test_publisher_address(config.network());
     // 600 bytes of repeating non-zero pattern (zero bytes would collide
@@ -295,7 +234,6 @@ fn inscription_txs_signs_commit_input_with_taproot_keyspend() {
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
         ws_url: None,
-        track_tx_timeout: None,
     };
     let publisher_address = test_publisher_address(config.network());
     let outpoints = vec![(fake_outpoint(0), 100_000u64)];
@@ -335,7 +273,6 @@ fn inscription_txs_uses_signet_when_is_mainnet_false() {
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
         ws_url: None,
-        track_tx_timeout: None,
     };
     assert_eq!(config.network(), Network::Signet);
 
@@ -345,7 +282,6 @@ fn inscription_txs_uses_signet_when_is_mainnet_false() {
         is_mainnet: true,
         network_name: "Mainnet".to_string(),
         ws_url: None,
-        track_tx_timeout: None,
     };
     assert_eq!(mainnet_config.network(), Network::Bitcoin);
 }
@@ -433,10 +369,7 @@ async fn get_publisher_utxo_returns_empty_when_total_below_minimum() {
 
 #[tokio::test]
 async fn broadcast_inscription_txs_returns_both_txids_on_success() {
-    let (server, mut config) = setup_mock_esplora().await;
-    // Plug a mock WS server in so the publisher's track-tx wait
-    // resolves immediately instead of hitting its 30-s safety-net.
-    config.ws_url = Some(spawn_track_tx_ws("echo").await);
+    let (server, config) = setup_mock_esplora().await;
     let publisher_address = test_publisher_address(config.network());
     let outpoints = vec![(fake_outpoint(0), 100_000u64)];
 
@@ -465,49 +398,6 @@ async fn broadcast_inscription_txs_returns_both_txids_on_success() {
 
     assert_eq!(got_commit, expected_commit_txid);
     assert_eq!(got_reveal, expected_reveal_txid);
-}
-
-#[tokio::test]
-async fn broadcast_inscription_txs_errors_when_track_tx_event_never_arrives() {
-    // Silent WS mock — exercises the "broadcast genuinely failed"
-    // path: the short WS timeout elapses, the publisher's REST
-    // fallback hits the wiremock default (no `GET /tx/{txid}` route
-    // mounted ⇒ 404 ⇒ esplora-client returns `Ok(None)`), and the
-    // publisher surfaces a hard `WsError::Timeout` instead of
-    // silently broadcasting the reveal (issue #84 design).
-    let (server, mut config) = setup_mock_esplora().await;
-    config.ws_url = Some(spawn_track_tx_ws("silent").await);
-    // Override the production 30-s deadline so the test fails fast
-    // rather than blocking the suite for half a minute.
-    config.track_tx_timeout = Some(Duration::from_millis(300));
-    let publisher_address = test_publisher_address(config.network());
-    let outpoints = vec![(fake_outpoint(0), 100_000u64)];
-
-    let (commit_tx, reveal_tx, _stats) = inscription_txs(
-        b"Hello, zkCoins!",
-        &publisher_address,
-        outpoints,
-        TEST_PUBLISHER_KEY,
-        &config,
-    );
-
-    Mock::given(method("POST"))
-        .and(path("/tx"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_string(commit_tx.compute_txid().to_string()),
-        )
-        .mount(&server)
-        .await;
-
-    let err = broadcast_inscription_txs(&config, &commit_tx, &reveal_tx)
-        .await
-        .expect_err("silent WS must surface a hard error, not silent fallback");
-    assert!(
-        err.to_string().to_lowercase().contains("timeout")
-            || err.to_string().to_lowercase().contains("ws"),
-        "error should mention the WS timeout, got: {}",
-        err
-    );
 }
 
 #[tokio::test]
@@ -574,8 +464,7 @@ async fn create_and_broadcast_inscription_fails_when_no_utxos() {
 
 #[tokio::test]
 async fn create_and_broadcast_inscription_succeeds_end_to_end_with_mocked_esplora() {
-    let (server, mut config) = setup_mock_esplora().await;
-    config.ws_url = Some(spawn_track_tx_ws("echo").await);
+    let (server, config) = setup_mock_esplora().await;
     let publisher_address = test_publisher_address(config.network());
 
     // 1) Address-UTXO lookup — return one UTXO with enough sats to cover
@@ -696,7 +585,6 @@ fn build_test_pair(commitment_data: &[u8]) -> (Transaction, Transaction) {
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
         ws_url: None,
-        track_tx_timeout: None,
     };
     let publisher_address = test_publisher_address(config.network());
     let outpoints = vec![(fake_outpoint(0), 100_000u64)];
@@ -747,8 +635,7 @@ async fn seed_pending_row(
 #[tokio::test]
 async fn broadcast_persists_constructed_row_before_commit_broadcast() {
     let (pool, _container) = setup_phaseb_pool().await;
-    let (server, mut config) = setup_mock_esplora().await;
-    config.ws_url = Some(spawn_track_tx_ws("echo").await);
+    let (server, config) = setup_mock_esplora().await;
     let publisher_address = test_publisher_address(config.network());
 
     let funding_txid = "3333333333333333333333333333333333333333333333333333333333333333";
@@ -803,13 +690,7 @@ async fn broadcast_persists_constructed_row_before_commit_broadcast() {
 #[tokio::test]
 async fn broadcast_advances_to_commit_broadcast_after_commit_success() {
     let (pool, _container) = setup_phaseb_pool().await;
-    let (server, mut config) = setup_mock_esplora().await;
-    // Silent WS so the post-commit track-tx wait times out and the
-    // REST fallback (no GET mounted ⇒ 404) propagates the WS timeout.
-    // This stops the broadcast BEFORE the reveal POST fires, leaving
-    // the row in `commit_broadcast`.
-    config.ws_url = Some(spawn_track_tx_ws("silent").await);
-    config.track_tx_timeout = Some(Duration::from_millis(200));
+    let (server, config) = setup_mock_esplora().await;
     let publisher_address = test_publisher_address(config.network());
 
     Mock::given(method("GET"))
@@ -824,14 +705,22 @@ async fn broadcast_advances_to_commit_broadcast_after_commit_success() {
         ])))
         .mount(&server)
         .await;
-    // Accept the commit POST (200) — every POST /tx hits this single
-    // mock. The publisher then waits for the WS event that never
-    // arrives, and the broadcast errors out before the reveal POST is
-    // attempted, so we can observe the intermediate `commit_broadcast`
-    // status.
+    // Two stacked POST /tx mocks (LIFO): the FIRST request matches the
+    // `up_to_n_times(1)` 200 (commit POST accepts), every subsequent
+    // POST falls through to the 400 fallback (reveal POST is rejected
+    // so the broadcast errors after advancing the row to
+    // `commit_broadcast`). The post-broadcast WS wait was removed
+    // alongside `track-tx`, so this stacked mock is now the only way
+    // to observe the intermediate `commit_broadcast` status.
+    Mock::given(method("POST"))
+        .and(path("/tx"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("simulated reveal failure"))
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(path("/tx"))
         .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .up_to_n_times(1)
         .mount(&server)
         .await;
 
@@ -842,11 +731,11 @@ async fn broadcast_advances_to_commit_broadcast_after_commit_success() {
         Some(&pool),
     )
     .await
-    .expect_err("WS timeout (silent mock + no REST fallback) must surface");
+    .expect_err("reveal POST 400 must surface as Err");
 
     // One row, advanced from `constructed` to `commit_broadcast` by
     // the commit-OK hook but stuck there because the reveal step
-    // never ran.
+    // failed.
     assert_eq!(count_pending_rows(&pool).await, 1);
     let (commit_txid_bytes,): (Vec<u8>,) =
         sqlx::query_as("SELECT commit_txid FROM pending_inscriptions")
@@ -868,8 +757,7 @@ async fn broadcast_advances_to_reveal_broadcast_after_reveal_success() {
     // test exercises the publisher in isolation (no mint flow), so the
     // expected terminal status here is `reveal_broadcast`.
     let (pool, _container) = setup_phaseb_pool().await;
-    let (server, mut config) = setup_mock_esplora().await;
-    config.ws_url = Some(spawn_track_tx_ws("echo").await);
+    let (server, config) = setup_mock_esplora().await;
     let publisher_address = test_publisher_address(config.network());
 
     Mock::given(method("GET"))
@@ -1217,8 +1105,7 @@ async fn resume_tolerates_bad_inputs_error_on_double_spend() {
 #[tokio::test]
 async fn mint_handler_advances_state_synchronously_with_broadcast() {
     let (pool, _container) = setup_phaseb_pool().await;
-    let (server, mut config) = setup_mock_esplora().await;
-    config.ws_url = Some(spawn_track_tx_ws("echo").await);
+    let (server, config) = setup_mock_esplora().await;
     let publisher_address = test_publisher_address(config.network());
 
     Mock::given(method("GET"))

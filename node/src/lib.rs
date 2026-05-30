@@ -149,7 +149,6 @@ where
         is_mainnet,
         network_name,
         ws_url,
-        track_tx_timeout: None,
     }
 }
 
