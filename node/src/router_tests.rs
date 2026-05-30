@@ -143,8 +143,13 @@ async fn info_returns_network_name_capabilities_and_username_domain() {
     );
     // Mint is permanent MVP — `faucet` is hardcoded `true`, not cfg-derived.
     assert!(info.capabilities.faucet);
-    // Usernames are permanent MVP — `usernames` is hardcoded `true`.
+    // Username *resolve* is permanent MVP — `usernames` is hardcoded `true`.
     assert!(info.capabilities.usernames);
+    // Username *claim* is gated on the `username-claim` Cargo feature.
+    assert_eq!(
+        info.capabilities.username_claim,
+        cfg!(feature = "username-claim")
+    );
     assert_eq!(info.capabilities.lnurl, cfg!(feature = "lnurl"));
 
     // The lazy_static defaults to "zkcoins.app" (PRD) when USERNAME_DOMAIN is unset
@@ -166,7 +171,13 @@ async fn info_serialization_format_is_stable() {
     assert!(v["username_domain"].is_string());
 
     let caps = &v["capabilities"];
-    for key in ["address_list", "faucet", "usernames", "lnurl"] {
+    for key in [
+        "address_list",
+        "faucet",
+        "usernames",
+        "username_claim",
+        "lnurl",
+    ] {
         assert!(caps[key].is_boolean(), "capability `{key}` must be bool");
     }
 }
@@ -425,6 +436,7 @@ async fn resolve_minting_address_by_hex_prefix() {
 
 // --- POST /api/username/claim ---
 
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_empty_body_returns_422() {
     let req = Request::post("/api/username/claim")
@@ -436,6 +448,7 @@ async fn claim_username_empty_body_returns_422() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_no_content_type_returns_415() {
     let req = Request::post("/api/username/claim")
@@ -886,6 +899,7 @@ fn send_signature_rejects_wrong_signature() {
 
 // --- POST /api/username/claim with valid Schnorr signature ---
 
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_with_valid_signature() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -985,6 +999,7 @@ async fn claim_username_with_valid_signature() {
 /// form (`"alice"`) and sends the user-typed form (`"Alice"`) is
 /// accepted and persisted under `"alice"`. Guards the case-mismatch
 /// squat fix from PR #76's prod-readiness review.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_mixed_case_input_normalised_before_hashing() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -1076,6 +1091,7 @@ async fn claim_username_mixed_case_input_normalised_before_hashing() {
 /// node, because the node hashes the normalised form. Without
 /// this, the case-mismatch squat is reachable: attacker signs `"Bob"`,
 /// node persists `"bob"`, the legitimate `bob` owner is locked out.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_raw_case_signature_rejected() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -1138,6 +1154,7 @@ async fn claim_username_raw_case_signature_rejected() {
 /// the in-memory mirror is pre-seeded via `insert_for_test`, the
 /// signature is valid, and the handler short-circuits before the
 /// `db::claim_username` call.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_precheck_conflict_returns_409() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -1206,6 +1223,7 @@ async fn claim_username_precheck_conflict_returns_409() {
     );
 }
 
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_wrong_pubkey() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -1257,6 +1275,7 @@ async fn claim_username_wrong_pubkey() {
     );
 }
 
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_expired_timestamp() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -1311,6 +1330,7 @@ async fn claim_username_expired_timestamp() {
 /// `UsernameStore::validate` rejects names outside `[a-z0-9._-]{1,64}`.
 /// Drives the handler's first early-return arm (the `validate` `Err`
 /// branch), so no DB round-trip and no signature work is needed.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_invalid_format_returns_422() {
     let body = serde_json::json!({
@@ -1342,6 +1362,7 @@ async fn claim_username_invalid_format_returns_422() {
 }
 
 /// Non-hex address payload triggers the `hex::decode` early-return arm.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_invalid_address_hex_returns_422() {
     let body = serde_json::json!({
@@ -1373,6 +1394,7 @@ async fn claim_username_invalid_address_hex_returns_422() {
 }
 
 /// Valid hex address but not 32 bytes triggers the length-check arm.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_wrong_address_length_returns_422() {
     let body = serde_json::json!({
@@ -1406,6 +1428,7 @@ async fn claim_username_wrong_address_length_returns_422() {
 /// Address matches `sha256(pubkey)` and the timestamp is fresh, so the
 /// handler reaches the signature-hex decode step before bailing on the
 /// non-hex `signature` field.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_invalid_signature_hex_returns_422() {
     use bitcoin::secp256k1::SecretKey;
@@ -1447,6 +1470,7 @@ async fn claim_username_invalid_signature_hex_returns_422() {
 
 /// Signature is valid hex but the wrong length for a BIP-340 Schnorr
 /// signature (64 bytes), so `SchnorrSignature::from_slice` rejects it.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_invalid_signature_format_returns_422() {
     use bitcoin::secp256k1::SecretKey;
@@ -1491,6 +1515,7 @@ async fn claim_username_invalid_signature_format_returns_422() {
 /// after the in-memory `precheck` passes. The handler must map that
 /// onto a 503. Mirrors `claim_propagates_db_error_when_pool_is_dead`
 /// from `username_tests.rs`, but exercises the handler's error arm.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_db_error_returns_503() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -1546,6 +1571,7 @@ async fn claim_username_db_error_returns_503() {
 /// string. Mirrors `claim_falls_back_to_validation_when_sql_layer_catches_race`
 /// from `username_tests.rs`, but exercises the handler's `!inserted`
 /// arm rather than the `UsernameStore::claim` wrapper.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_sql_race_returns_409() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -5576,6 +5602,8 @@ mod inscriptions_endpoint_tests {
 // and asserts the row landed.
 // =======================================================================
 
+#[cfg(feature = "username-claim")]
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_precheck_reject_persists_log_row() {
     use crate::db::connect_and_migrate;
@@ -5661,6 +5689,8 @@ async fn claim_username_precheck_reject_persists_log_row() {
 /// arm at router.rs line 1767. The fire-and-forget spawn calls
 /// `insert_username_claim_log` — we DROP the table out from under it
 /// so the insert fails and the eprintln line runs.
+#[cfg(feature = "username-claim")]
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_log_spawn_handles_insert_error() {
     use crate::db::connect_and_migrate;

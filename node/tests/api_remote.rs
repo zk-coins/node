@@ -191,6 +191,9 @@ async fn fetch_capabilities(client: &reqwest::Client) -> Capabilities {
         usernames: body["capabilities"]["usernames"].as_bool().expect(
             "/api/info capabilities.usernames must be a bool — missing field is a contract regression",
         ),
+        username_claim: body["capabilities"]["username_claim"].as_bool().expect(
+            "/api/info capabilities.username_claim must be a bool — missing field is a contract regression",
+        ),
         lnurl: body["capabilities"]["lnurl"].as_bool().expect(
             "/api/info capabilities.lnurl must be a bool — missing field is a contract regression",
         ),
@@ -213,6 +216,7 @@ async fn fetch_capabilities(client: &reqwest::Client) -> Capabilities {
                         "ZKCOINS_FORCE_DISABLE_FEATURES: `usernames` is permanent MVP — ignored"
                     );
                 }
+                "username_claim" | "username-claim" => caps.username_claim = false,
                 "lnurl" => caps.lnurl = false,
                 other => {
                     eprintln!(

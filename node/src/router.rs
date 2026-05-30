@@ -515,12 +515,19 @@ pub struct Capabilities {
     /// field is retained only so existing wallet clients deserialising
     /// `/api/info` don't break.
     pub faucet: bool,
+    /// Username *resolve* + display. Permanent MVP, hardcoded `true`.
     pub usernames: bool,
+    /// Username *claim* (write path). Gated by the `username-claim`
+    /// Cargo feature; off in hosted DEV + PRD images. Wallet clients
+    /// hide the claim input when this is `false`. Always present in
+    /// the response so the app does not have to sniff build flags.
+    pub username_claim: bool,
     pub lnurl: bool,
 }
 
 // --- Username & LNURL types ---
 
+#[cfg(feature = "username-claim")]
 #[derive(Deserialize)]
 pub struct ClaimUsernameRequest {
     username: String,
@@ -1772,6 +1779,7 @@ async fn info_handler() -> impl IntoResponse {
             faucet: true,
             // Hardcoded — usernames are permanent MVP; field is back-compat only.
             usernames: true,
+            username_claim: cfg!(feature = "username-claim"),
             lnurl: cfg!(feature = "lnurl"),
         },
         username_domain: USERNAME_DOMAIN.clone(),
@@ -1825,6 +1833,7 @@ async fn root_handler() -> impl IntoResponse {
 
 // --- Username & LNURL handlers ---
 
+#[cfg(feature = "username-claim")]
 async fn claim_username_handler(
     State(state): State<AppState>,
     Json(request): Json<ClaimUsernameRequest>,
@@ -2188,7 +2197,6 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/api/commit", post(commit_handler))
         .route("/api/mint", post(mint_handler))
         .route("/api/inscriptions/:txid", get(get_inscription_handler))
-        .route("/api/username/claim", post(claim_username_handler))
         .route(
             "/api/username/resolve/:username",
             get(resolve_username_handler),
@@ -2204,6 +2212,9 @@ pub(crate) fn create_router(state: AppState) -> Router {
     // and there is no code path to execute.
     #[cfg(feature = "address-list")]
     let app = app.route("/api/address", get(get_address_handler));
+
+    #[cfg(feature = "username-claim")]
+    let app = app.route("/api/username/claim", post(claim_username_handler));
 
     #[cfg(feature = "lnurl")]
     let app = app

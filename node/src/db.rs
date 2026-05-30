@@ -807,6 +807,13 @@ pub async fn load_all_usernames(pool: &PgPool) -> Result<Vec<(String, Vec<u8>)>,
 /// fresh claim, `Ok(false)` if the name is already taken (no row
 /// inserted, existing row left untouched). The `ON CONFLICT DO
 /// NOTHING` makes this race-free at the SQL level.
+///
+/// Gated by the `username-claim` Cargo feature so the write path can
+/// be excluded from hosted images that don't offer claim as a UX
+/// policy. The shared `usernames` table + `resolve_username` /
+/// `load_all_usernames` read paths stay unconditional so existing
+/// claimed names continue to resolve.
+#[cfg(feature = "username-claim")]
 pub async fn claim_username(
     pool: &PgPool,
     name: &str,
