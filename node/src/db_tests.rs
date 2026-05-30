@@ -310,6 +310,7 @@ async fn load_all_usernames_returns_empty_initially() {
     assert!(rows.is_empty());
 }
 
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_returns_true_on_new() {
     let (pool, _container) = setup_pool().await;
@@ -320,6 +321,7 @@ async fn claim_username_returns_true_on_new() {
     assert_eq!(rows, vec![("alice".to_string(), addr)]);
 }
 
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_returns_false_on_conflict() {
     let (pool, _container) = setup_pool().await;
@@ -333,6 +335,11 @@ async fn claim_username_returns_false_on_conflict() {
     assert_eq!(rows, vec![("alice".to_string(), addr1)]);
 }
 
+// Setup uses `claim_username` to seed a row, so this test only runs
+// when the claim path is compiled in. The pure resolve-by-raw-INSERT
+// path is exercised by `resolve_username_returns_none_for_unknown`
+// plus the `username_tests.rs::resolve_*` cases.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn resolve_username_returns_address_for_claimed_name() {
     let (pool, _container) = setup_pool().await;

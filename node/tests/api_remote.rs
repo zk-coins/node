@@ -142,22 +142,26 @@ macro_rules! feature_skip {
 // ---------------------------------------------------------------------------
 // Capability detection
 //
-// Mint (`/api/mint`) and the username routes (`/api/username/claim`,
-// `/api/username/resolve/:u`) are part of the MVP and are always
-// present, so they are no longer gated here. The remaining post-MVP
-// routes (`address-list`, `lnurl`) are still optional: the default
-// deploy ships without them and the axum fallback answers 404 instead
-// of the per-handler error codes. We fetch `/api/info` once per gated
-// test, deserialise the well-known `Capabilities` shape, and skip the
-// rest of the test if the relevant feature flag is `false`.
+// Mint (`/api/mint`) and username *resolve* (`/api/username/resolve/:u`)
+// are permanent MVP endpoints — always registered, never gated. They
+// have no capability bit on `/api/info` (only opt-in features do), so
+// tests against those routes do not consult `fetch_capabilities`.
+//
+// The optional, feature-gated routes (`address-list`, `username-claim`
+// write path, `lnurl`) are off in the default deploy: the axum fallback
+// answers 404 instead of the per-handler error codes. We fetch
+// `/api/info` once per gated test, deserialise the well-known
+// `Capabilities` shape, and skip the rest of the test if the relevant
+// feature flag is `false`.
 //
 // `ZKCOINS_FORCE_DISABLE_FEATURES` (comma-separated list, e.g.
 // `address_list,lnurl`) overrides any flag returned by the node
 // to `false`. This is the local dry-run hook — point the suite at the
 // live DEV node, force features off, and confirm that every gated
 // test prints `SKIP …` instead of hitting a disabled-on-paper but
-// actually-running endpoint. Forcing `faucet` or `usernames` off is a
-// no-op (the routes are always registered) and the flags are ignored.
+// actually-running endpoint. Unknown flags (including the retired
+// `faucet` / `usernames` permanent-MVP names) are ignored with a
+// warning.
 // ---------------------------------------------------------------------------
 
 async fn fetch_capabilities(client: &reqwest::Client) -> Capabilities {
@@ -185,11 +189,8 @@ async fn fetch_capabilities(client: &reqwest::Client) -> Capabilities {
         address_list: body["capabilities"]["address_list"].as_bool().expect(
             "/api/info capabilities.address_list must be a bool — missing field is a contract regression",
         ),
-        faucet: body["capabilities"]["faucet"].as_bool().expect(
-            "/api/info capabilities.faucet must be a bool — missing field is a contract regression",
-        ),
-        usernames: body["capabilities"]["usernames"].as_bool().expect(
-            "/api/info capabilities.usernames must be a bool — missing field is a contract regression",
+        username_claim: body["capabilities"]["username_claim"].as_bool().expect(
+            "/api/info capabilities.username_claim must be a bool — missing field is a contract regression",
         ),
         lnurl: body["capabilities"]["lnurl"].as_bool().expect(
             "/api/info capabilities.lnurl must be a bool — missing field is a contract regression",
@@ -199,20 +200,7 @@ async fn fetch_capabilities(client: &reqwest::Client) -> Capabilities {
         for flag in force.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
             match flag {
                 "address_list" | "address-list" => caps.address_list = false,
-                "faucet" => {
-                    // Mint is permanent MVP. The route is always
-                    // registered, so forcing it "off" cannot disable
-                    // it — log + ignore to keep callers honest.
-                    eprintln!(
-                        "ZKCOINS_FORCE_DISABLE_FEATURES: `faucet` is permanent MVP — ignored"
-                    );
-                }
-                "usernames" => {
-                    // Usernames are permanent MVP — same shape as `faucet`.
-                    eprintln!(
-                        "ZKCOINS_FORCE_DISABLE_FEATURES: `usernames` is permanent MVP — ignored"
-                    );
-                }
+                "username_claim" | "username-claim" => caps.username_claim = false,
                 "lnurl" => caps.lnurl = false,
                 other => {
                     eprintln!(
@@ -424,7 +412,7 @@ async fn info_returns_well_formed_response() {
         body["username_domain"]
     );
 
-    for cap in ["address_list", "faucet", "usernames", "lnurl"] {
+    for cap in ["address_list", "username_claim", "lnurl"] {
         assert!(
             body["capabilities"][cap].is_boolean(),
             "capability `{cap}` must be a bool, got {:?}",
@@ -926,6 +914,10 @@ async fn commit_bad_message_hex_returns_422_or_404() {
 #[tokio::test]
 async fn claim_username_pk_mismatch_returns_401() {
     let client = http_client();
+    let caps = fetch_capabilities(&client).await;
+    if !caps.username_claim {
+        feature_skip!("username_claim", "claim_username_pk_mismatch_returns_401");
+    }
     let alice = TestWallet::new();
     let mallory = TestWallet::new();
     let username = format!("mallory_{}", random_suffix());
@@ -952,6 +944,10 @@ async fn claim_username_pk_mismatch_returns_401() {
 #[tokio::test]
 async fn claim_username_bad_signature_returns_401() {
     let client = http_client();
+    let caps = fetch_capabilities(&client).await;
+    if !caps.username_claim {
+        feature_skip!("username_claim", "claim_username_bad_signature_returns_401");
+    }
     let alice = TestWallet::new();
     let username = format!("alice_{}", random_suffix());
     let body = json!({
@@ -973,6 +969,13 @@ async fn claim_username_bad_signature_returns_401() {
 #[tokio::test]
 async fn claim_username_stale_timestamp_returns_401() {
     let client = http_client();
+    let caps = fetch_capabilities(&client).await;
+    if !caps.username_claim {
+        feature_skip!(
+            "username_claim",
+            "claim_username_stale_timestamp_returns_401"
+        );
+    }
     let alice = TestWallet::new();
     let username = format!("alice_{}", random_suffix());
     let stale_ts = unix_now().saturating_sub(600);
@@ -1247,9 +1250,13 @@ async fn send_commit_roundtrip_moves_balance() {
 async fn username_claim_resolve_lnurlp_roundtrip() {
     let client = http_client();
     let caps = fetch_capabilities(&client).await;
-    // Claim + resolve are permanent MVP. The LNURLp leg still depends
-    // on the `lnurl` Cargo feature — if it's off we skip the whole
-    // cascade because the trailing well-known probe cannot succeed.
+    // The cascade hits three gated/permanent endpoints: claim (gated
+    // on `username_claim`), resolve (permanent MVP), and the LNURLp
+    // well-known leg (gated on `lnurl`). Skip if either gated feature
+    // is off — the trailing probe cannot succeed without both.
+    if !caps.username_claim {
+        feature_skip!("username_claim", "username_claim_resolve_lnurlp_roundtrip");
+    }
     if !caps.lnurl {
         feature_skip!("lnurl", "username_claim_resolve_lnurlp_roundtrip");
     }
@@ -1611,11 +1618,11 @@ async fn commit_response_carries_state_hash_and_coins_root() {
 async fn balance_response_carries_username_after_claim() {
     let client = http_client();
     let caps = fetch_capabilities(&client).await;
-    // `usernames` is permanent MVP per `fetch_capabilities`, so the
-    // skip path is unreachable in practice — keep the gate honest in
-    // case a future feature trim disables it.
-    if !caps.usernames {
-        feature_skip!("usernames", "balance_response_carries_username_after_claim");
+    if !caps.username_claim {
+        feature_skip!(
+            "username_claim",
+            "balance_response_carries_username_after_claim"
+        );
     }
 
     let alice = TestWallet::new();
@@ -1668,8 +1675,8 @@ async fn balance_response_carries_username_after_claim() {
 async fn claim_response_carries_address() {
     let client = http_client();
     let caps = fetch_capabilities(&client).await;
-    if !caps.usernames {
-        feature_skip!("usernames", "claim_response_carries_address");
+    if !caps.username_claim {
+        feature_skip!("username_claim", "claim_response_carries_address");
     }
     let alice = TestWallet::new();
     let username = format!("u_{}", random_suffix());
