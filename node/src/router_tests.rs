@@ -5731,3 +5731,204 @@ async fn claim_username_log_spawn_handles_insert_error() {
     // Give the fire-and-forget spawn time to hit the eprintln path.
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 }
+
+// --- GET /api/admin/r2-probe/history ---
+//
+// The handler reads from the `r2_probe_runs_summary` view. The happy-
+// path tests below boot a real Postgres 17 testcontainer because the
+// view + tables only exist after migration; the dead_pool path stays
+// in `r2_probe_history_db_error_returns_500`.
+
+#[tokio::test]
+async fn clamp_r2_probe_history_limit_handles_default_and_clamps() {
+    assert_eq!(
+        clamp_r2_probe_history_limit(None),
+        R2_PROBE_HISTORY_DEFAULT_LIMIT
+    );
+    assert_eq!(
+        clamp_r2_probe_history_limit(Some(0)),
+        R2_PROBE_HISTORY_DEFAULT_LIMIT
+    );
+    assert_eq!(
+        clamp_r2_probe_history_limit(Some(-5)),
+        R2_PROBE_HISTORY_DEFAULT_LIMIT
+    );
+    assert_eq!(clamp_r2_probe_history_limit(Some(7)), 7);
+    assert_eq!(
+        clamp_r2_probe_history_limit(Some(10_000)),
+        R2_PROBE_HISTORY_MAX_LIMIT
+    );
+    assert_eq!(
+        clamp_r2_probe_history_limit(Some(R2_PROBE_HISTORY_MAX_LIMIT)),
+        R2_PROBE_HISTORY_MAX_LIMIT
+    );
+}
+
+#[tokio::test]
+async fn r2_probe_history_db_error_returns_500() {
+    // The default test_state() uses a dead PgPool whose connect
+    // attempts time out fast — exercises the handler's error arm.
+    let req = Request::get("/api/admin/r2-probe/history")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let resp: SendCoinResponse = serde_json::from_str(&body).expect("valid JSON");
+    assert!(!resp.success);
+    assert_eq!(
+        resp.error.as_deref(),
+        Some("Database error while reading R2 probe history")
+    );
+}
+
+#[tokio::test]
+async fn r2_probe_history_empty_returns_empty_array() {
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container.get_host().await.expect("host");
+    let port = pg_container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
+    let state = live_test_state(pool);
+    let req = Request::get("/api/admin/r2-probe/history")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let arr: Vec<serde_json::Value> = serde_json::from_str(&body).expect("valid JSON");
+    assert!(arr.is_empty());
+}
+
+#[tokio::test]
+async fn r2_probe_history_returns_rows_with_pass_flags() {
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container.get_host().await.expect("host");
+    let port = pg_container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
+    // Seed two runs: one within budget, one over warm budget.
+    let host_info = crate::r2_probe::HostInfo {
+        hostname: "router-test-host".to_string(),
+        os: "macos".to_string(),
+        arch: "aarch64".to_string(),
+        cpu_brand: "Apple M3 Ultra".to_string(),
+        cpu_cores: 24,
+        total_ram_gb: Some(96),
+    };
+    let host_id = crate::r2_probe::upsert_host(&pool, &host_info)
+        .await
+        .expect("host");
+    let mut run = crate::r2_probe::ProbeRun {
+        host_id,
+        git_sha: "abc123".to_string(),
+        binary_version: "0.1.0".to_string(),
+        rustc_version: "rustc 1.81.0".to_string(),
+        build_profile: "release".to_string(),
+        allocator: "mimalloc".to_string(),
+        max_in_coins: 8,
+        max_out_coins: 8,
+        inner_pad_bits: 15,
+        warm_calls_requested: 3,
+        circuit_build_wall_ms: 8_000,
+        prove_cold_wall_ms: 18_000,
+        verify_wall_ms: 30,
+        peak_rss_kb: 40 * 1024 * 1024,
+        prove_warm_p50_ms: Some(800),
+        prove_warm_p90_ms: Some(1_000),
+        prove_warm_p99_ms: Some(1_300),
+        succeeded: true,
+        error_message: None,
+        notes: None,
+        tags: vec!["router-test".to_string()],
+        r2_warm_budget_ms: 5_000,
+        r2_cold_budget_ms: 30_000,
+        r2_mem_budget_kb: 64 * 1024 * 1024,
+    };
+    crate::r2_probe::insert_run(&pool, &run)
+        .await
+        .expect("run 1");
+
+    // Second run blows past the warm budget.
+    run.prove_warm_p50_ms = Some(7_000);
+    crate::r2_probe::insert_run(&pool, &run)
+        .await
+        .expect("run 2");
+
+    let state = live_test_state(pool);
+    let req = Request::get("/api/admin/r2-probe/history?limit=10")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let arr: Vec<serde_json::Value> = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(arr.len(), 2);
+
+    // Newest first — the warm-fail row landed last.
+    assert_eq!(arr[0]["r2_warm_pass"].as_bool(), Some(false));
+    assert_eq!(arr[1]["r2_warm_pass"].as_bool(), Some(true));
+    // Cold + mem budgets pass for both.
+    assert_eq!(arr[0]["r2_cold_pass"].as_bool(), Some(true));
+    assert_eq!(arr[1]["r2_cold_pass"].as_bool(), Some(true));
+    assert_eq!(arr[0]["r2_mem_pass"].as_bool(), Some(true));
+    assert_eq!(arr[1]["r2_mem_pass"].as_bool(), Some(true));
+    // Joined host info surfaces in the response.
+    assert_eq!(arr[0]["hostname"].as_str(), Some("router-test-host"));
+    assert_eq!(arr[0]["cpu_brand"].as_str(), Some("Apple M3 Ultra"));
+}
+
+#[tokio::test]
+async fn r2_probe_history_limit_clamped_to_max() {
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container.get_host().await.expect("host");
+    let port = pg_container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
+    let state = live_test_state(pool);
+    // Caller asks for 10_000 — the clamp keeps us at 200. With zero
+    // rows seeded the response body is still empty, but the path
+    // reaches `fetch_recent_summary` (the clamp lives in the handler,
+    // not the SQL layer).
+    let req = Request::get("/api/admin/r2-probe/history?limit=10000")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let arr: Vec<serde_json::Value> = serde_json::from_str(&body).expect("valid JSON");
+    assert!(arr.is_empty());
+}

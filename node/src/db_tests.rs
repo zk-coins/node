@@ -67,6 +67,12 @@ async fn connect_and_migrate_creates_all_tables() {
     //   * After 0007 (request_log):      9 tables
     //   * After 0008 (full DB trail):   19 tables + 1 trigger
     //   * After 0009 / 0010:            19 tables (polish only)
+    //   * After 0013 (R2 probe results): 22 tables + 1 view
+    //     (`r2_probe_runs_summary` is a VIEW from migration 0013.
+    //     Postgres lists views in BOTH `information_schema.views` AND
+    //     `information_schema.tables` (with `table_type = 'VIEW'`), so
+    //     it shows up here when introspecting without a `table_type`
+    //     filter — included at the correct alphabetic position below.)
     assert_eq!(
         names,
         vec![
@@ -83,6 +89,10 @@ async fn connect_and_migrate_creates_all_tables() {
             "mmr_state".to_string(),
             "observed_inscriptions".to_string(),
             "pending_inscriptions".to_string(),
+            "r2_probe_hosts".to_string(),
+            "r2_probe_runs".to_string(),
+            "r2_probe_runs_summary".to_string(),
+            "r2_probe_warm_calls".to_string(),
             "request_log".to_string(),
             "smt_state".to_string(),
             "state_update_log".to_string(),
