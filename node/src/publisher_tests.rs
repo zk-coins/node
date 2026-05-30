@@ -705,22 +705,26 @@ async fn broadcast_advances_to_commit_broadcast_after_commit_success() {
         ])))
         .mount(&server)
         .await;
-    // Two stacked POST /tx mocks (LIFO): the FIRST request matches the
-    // `up_to_n_times(1)` 200 (commit POST accepts), every subsequent
-    // POST falls through to the 400 fallback (reveal POST is rejected
-    // so the broadcast errors after advancing the row to
-    // `commit_broadcast`). The post-broadcast WS wait was removed
-    // alongside `track-tx`, so this stacked mock is now the only way
-    // to observe the intermediate `commit_broadcast` status.
-    Mock::given(method("POST"))
-        .and(path("/tx"))
-        .respond_with(ResponseTemplate::new(400).set_body_string("simulated reveal failure"))
-        .mount(&server)
-        .await;
+    // Two POST /tx mocks differentiated by explicit `with_priority`
+    // (lower number = higher priority in wiremock; default is 5). The
+    // high-priority `up_to_n_times(1)` 200 matches the commit POST;
+    // after it is consumed, subsequent POSTs fall through to the
+    // lower-priority 400 fallback (the reveal POST is rejected so the
+    // broadcast errors after advancing the row to `commit_broadcast`).
+    // The post-broadcast WS wait was removed alongside `track-tx`, so
+    // this layered mock is now the only way to observe the
+    // intermediate `commit_broadcast` status.
     Mock::given(method("POST"))
         .and(path("/tx"))
         .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
         .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/tx"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("simulated reveal failure"))
+        .with_priority(2)
         .mount(&server)
         .await;
 
