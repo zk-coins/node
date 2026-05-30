@@ -150,6 +150,29 @@ async fn load_from_pg_returns_empty_initially() {
     assert_eq!(store.get_username(&addr(1)), None);
 }
 
+// Direct-SQL seed of the `usernames` table, then bootstrap a store via
+// `load_from_pg`. Exercises the row-conversion + `usernames.insert(...)`
+// path in `load_from_pg` without going through `UsernameStore::claim`,
+// so the coverage gate still hits this branch when the `username-claim`
+// Cargo feature is off (the read path is permanent MVP and must stay
+// covered independently of the write path).
+#[tokio::test]
+async fn load_from_pg_returns_seeded_rows() {
+    let (pool, _container) = setup_pool().await;
+    let raw = [7u8; 32];
+    let expected = digest_from_bytes(&raw);
+    sqlx::query("INSERT INTO usernames (name, address) VALUES ($1, $2)")
+        .bind("alice")
+        .bind(raw.as_slice())
+        .execute(&pool)
+        .await
+        .expect("seed row");
+
+    let store = UsernameStore::load_from_pg(&pool).await.expect("load ok");
+    assert_eq!(store.resolve("alice"), Some(expected));
+    assert_eq!(store.get_username(&expected), Some("alice"));
+}
+
 #[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_propagates_db_error_when_pool_is_dead() {
