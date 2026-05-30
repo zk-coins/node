@@ -95,34 +95,61 @@ pub fn detect() -> HostInfo {
     sys.refresh_cpu_all();
     sys.refresh_memory();
 
-    let hostname = sysinfo::System::host_name()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
+    // Pull every sysinfo-sourced datum into a plain Option / scalar
+    // value before handing off to [`detect_impl`]. The split is
+    // deliberate: on a healthy host every leg below resolves to
+    // `Some(_)` / a non-zero number, which means the `"unknown"` /
+    // zero fallback paths inside `detect_impl` are unreachable from
+    // `detect()`'s call site on the CI runner. Threading the values
+    // through a separate function lets the test suite drive the
+    // fallback closures with synthetic `None` / empty inputs, so the
+    // 100 % line / function coverage gate stays green without
+    // platform-specific test scaffolding.
+    detect_impl(
+        sysinfo::System::host_name(),
+        sys.cpus().first().map(|c| c.brand().trim().to_string()),
+        sys.total_memory(),
+        std::thread::available_parallelism()
+            .map(|n| n.get() as i32)
+            .ok(),
+    )
+}
 
-    let cpu_brand = sys
-        .cpus()
-        .first()
-        .map(|c| c.brand().trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    let cpu_cores = std::thread::available_parallelism()
-        .map(|n| n.get() as i32)
-        .unwrap_or(0);
-
-    // `sysinfo::System::total_memory()` returns bytes (see crate docs
-    // and `src/common/system.rs` upstream). Divide down to whole GiB
-    // and treat a zero reading as "unknown" so we don't persist a
-    // nonsense `0` on a backend that failed to populate the field.
-    let total_ram_gb = Some((sys.total_memory() / (1024 * 1024 * 1024)) as i32).filter(|&g| g > 0);
-
+/// Pure assembly of [`HostInfo`] from the four host-introspection
+/// readings [`detect`] pulls out of `sysinfo` and `std`. Split out so
+/// the `"unknown"` / zero fallbacks below are reachable from unit
+/// tests that pass synthetic `None` / empty-string inputs — the live
+/// `detect()` call on the CI runner never lands on those branches.
+///
+/// * `hostname_opt` — value from `sysinfo::System::host_name()`.
+///   `None` or `Some("")` collapses to the `"unknown"` fallback.
+/// * `cpu_brand_opt` — value from
+///   `sys.cpus().first().map(|c| c.brand().trim().to_string())`.
+///   `None` or `Some("")` collapses to the `"unknown"` fallback.
+/// * `total_memory_bytes` — value from `sys.total_memory()`. Divided
+///   down to whole GiB; a zero reading collapses to `None` so a
+///   sysinfo backend that failed to populate the field doesn't
+///   persist a nonsense `0`.
+/// * `cpu_cores_opt` — value from
+///   `std::thread::available_parallelism().map(|n| n.get() as i32).ok()`.
+///   `None` falls back to `0`.
+fn detect_impl(
+    hostname_opt: Option<String>,
+    cpu_brand_opt: Option<String>,
+    total_memory_bytes: u64,
+    cpu_cores_opt: Option<i32>,
+) -> HostInfo {
     HostInfo {
-        hostname,
+        hostname: hostname_opt
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".to_string()),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
-        cpu_brand,
-        cpu_cores,
-        total_ram_gb,
+        cpu_brand: cpu_brand_opt
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".to_string()),
+        cpu_cores: cpu_cores_opt.unwrap_or(0),
+        total_ram_gb: Some((total_memory_bytes / (1024 * 1024 * 1024)) as i32).filter(|&g| g > 0),
     }
 }
 

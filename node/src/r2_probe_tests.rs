@@ -118,6 +118,56 @@ async fn detect_returns_a_host_struct() {
     }
 }
 
+#[test]
+fn detect_impl_uses_fallbacks_when_inputs_are_none() {
+    // Drives every `unwrap_or_else` / `unwrap_or` fallback path in
+    // `detect_impl`. On the CI runner the live `detect()` inputs are
+    // always populated (host_name() returns `Some(_)`, the CPU list is
+    // non-empty, available_parallelism() returns `Ok(_)`), so without
+    // this synthetic call those closures would never execute and the
+    // 100 % coverage gate would mark them as uncovered functions.
+    let info = detect_impl(None, None, 0, None);
+    assert_eq!(info.hostname, "unknown");
+    assert_eq!(info.cpu_brand, "unknown");
+    assert_eq!(info.cpu_cores, 0);
+    assert_eq!(info.total_ram_gb, None);
+    // `os` / `arch` come from compile-time constants, so they remain
+    // non-empty regardless of the synthetic inputs above.
+    assert!(!info.os.is_empty());
+    assert!(!info.arch.is_empty());
+}
+
+#[test]
+fn detect_impl_uses_fallback_when_inputs_are_empty_strings() {
+    // Exercises the `.filter(|s| !s.is_empty())` branch on both string
+    // fields: a `Some("")` from sysinfo must collapse to `"unknown"`
+    // the same way a `None` does.
+    let info = detect_impl(Some(String::new()), Some(String::new()), 0, None);
+    assert_eq!(info.hostname, "unknown");
+    assert_eq!(info.cpu_brand, "unknown");
+    assert_eq!(info.cpu_cores, 0);
+    assert_eq!(info.total_ram_gb, None);
+}
+
+#[test]
+fn detect_impl_uses_inputs_when_provided() {
+    // Pins the happy path: every value flows through unchanged. 96 GiB
+    // exact bytes (96 * 1024^3) divides to `Some(96)` after the GiB
+    // collapse; the `> 0` filter keeps it as `Some(_)`.
+    let info = detect_impl(
+        Some("ci-runner.local".to_string()),
+        Some("Apple M3 Ultra".to_string()),
+        96 * 1024 * 1024 * 1024,
+        Some(32),
+    );
+    assert_eq!(info.hostname, "ci-runner.local");
+    assert_eq!(info.cpu_brand, "Apple M3 Ultra");
+    assert_eq!(info.cpu_cores, 32);
+    assert_eq!(info.total_ram_gb, Some(96));
+    assert!(!info.os.is_empty());
+    assert!(!info.arch.is_empty());
+}
+
 #[tokio::test]
 async fn upsert_host_returns_same_id_on_natural_key_match() {
     let (pool, _container) = setup_pool().await;
