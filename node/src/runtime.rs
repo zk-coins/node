@@ -22,7 +22,10 @@ use tokio::net::TcpListener;
 use crate::account_node::{persist_account, CoinProof};
 use crate::db;
 use crate::publisher::{create_and_broadcast_inscription, resume_pending_inscriptions};
-use crate::router::{lock_or_recover, SendCoinResponse};
+use crate::router::{
+    apply_commit_and_persist_phase_e, handler_error_response, lock_or_recover, PhaseEFailure,
+    SendCoinResponse,
+};
 use crate::NETWORK_CONFIG;
 use shared::ProofData;
 use zkcoins_program::hash::digest_to_bytes;
@@ -231,12 +234,12 @@ pub async fn start_rest_node(
     Ok(())
 }
 
-/// Broadcast the commit inscription and, on success, deliver the coin
-/// to the recipient and persist the account state. This contains the
-/// network call (Bitcoin broadcast) and the post-broadcast bookkeeping,
-/// plus the success/failure response dispatch — all of which cannot be
-/// exercised by unit tests, so the whole function lives in the runtime
-/// module that is excluded from the coverage scope.
+/// Broadcast the commit inscription and, on success, run the shared
+/// Phase E (SMT/MMR advance + atomic persist + `pending_inscriptions`
+/// row marked `complete`), then deliver the coin to the recipient and
+/// persist the account state. This contains the network call (Bitcoin
+/// broadcast) and the post-broadcast bookkeeping, plus the
+/// success/failure response dispatch.
 ///
 /// **Invariant (zk-coins/node#89).** The broadcast `if let Err(...)
 /// { return 503 }` MUST stay above every `receive_coin`/`upsert_account`
@@ -245,6 +248,20 @@ pub async fn start_rest_node(
 /// function does not have that bug because its broadcast is already
 /// the first effect. Any future refactor that moves a state mutation
 /// above the broadcast re-introduces the state-desync class — do not.
+///
+/// **Phase E symmetry.** Between the broadcast and the recipient
+/// `receive_coin` mutation, we invoke
+/// [`apply_commit_and_persist_phase_e`] synchronously — identical
+/// shape to `mint_handler`. Prior to this, the send-commit SMT
+/// integration ran only via the async scanner, which surfaced as a
+/// race for back-to-back `/api/send` + `/api/commit` + `/api/send`
+/// flows: the second send walked the SMT for the first commit's
+/// pubkey and found no entry, returning 422 `"Unable to get merkle
+/// proofs for provided public key"`. Running Phase E inline closes
+/// that window. The scanner remains the recovery path for external
+/// inscriptions and re-scans of our own commits hit
+/// `should_skip_scanner_state_update` because the `complete` row
+/// advance lands atomically here.
 pub(crate) async fn broadcast_commit_and_deliver(
     state: &AppState,
     commitment: Commitment,
@@ -256,19 +273,58 @@ pub(crate) async fn broadcast_commit_and_deliver(
         "Broadcasting user commitment ({} bytes)",
         commitment_data.len()
     );
-    if let Err(err) = create_and_broadcast_inscription(
+    // Use `state.esplora_config` (instead of the process-wide
+    // `NETWORK_CONFIG` lazy_static) so tests can redirect Esplora calls
+    // at a `wiremock::MockServer`, matching the testability shape
+    // already in place for `mint_handler`. In production
+    // `start_rest_node` clones `NETWORK_CONFIG` into this slot so the
+    // runtime behaviour is unchanged.
+    let broadcast_outcome = create_and_broadcast_inscription(
         &commitment_data,
         crate::db::InscriptionKind::Send,
-        &NETWORK_CONFIG,
+        &state.esplora_config,
         Some(&state.pool),
+    )
+    .await;
+    let commit_txid_bytes: [u8; 32] = match broadcast_outcome {
+        Ok((commit_txid, _reveal_txid)) => {
+            use bitcoin::hashes::Hash as _;
+            commit_txid.to_byte_array()
+        }
+        Err(err) => {
+            eprintln!("Error broadcasting commit inscription: {}", err);
+            return handler_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Failed to broadcast commitment inscription on-chain",
+            );
+        }
+    };
+
+    // ---- Phase E (broadcast OK) -----------------------------------------
+    // Run the shared SMT/MMR advance + atomic persist + mark-complete
+    // BEFORE the recipient `receive_coin` mutation. Locked-step with
+    // `mint_handler::Phase E`; see [`apply_commit_and_persist_phase_e`]
+    // for the full rationale, lock topology, and crash-recovery
+    // contract. On failure the broadcast already landed on chain — we
+    // surface 503 (no fallback, no retry) and the scanner-replay path
+    // is the single source of repair.
+    if let Err(failure) = apply_commit_and_persist_phase_e(
+        state,
+        &commitment,
+        &commit_txid_bytes,
+        "broadcast_commit_and_deliver",
     )
     .await
     {
-        eprintln!("Error broadcasting commit inscription: {}", err);
-        return crate::router::handler_error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Failed to broadcast commitment inscription on-chain",
-        );
+        let msg: &'static str = match failure {
+            PhaseEFailure::StateUpdate => {
+                "commit broadcast landed on chain but in-process state advance failed; scanner will reconcile"
+            }
+            PhaseEFailure::DurablePersist => {
+                "commit broadcast landed on chain but durable state advance failed; scanner will reconcile"
+            }
+        };
+        return handler_error_response(StatusCode::SERVICE_UNAVAILABLE, msg);
     }
 
     let mut updated_proof = coin_proof;
