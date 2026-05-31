@@ -5930,10 +5930,10 @@ async fn seed_account_history(
 }
 
 #[tokio::test]
-async fn history_missing_address_returns_400() {
+async fn history_missing_address_returns_422() {
     let req = Request::get("/api/history").body(Body::empty()).unwrap();
     let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
     assert!(
         v["error"].as_str().unwrap_or("").contains("address"),
@@ -5943,22 +5943,23 @@ async fn history_missing_address_returns_400() {
 }
 
 #[tokio::test]
-async fn history_empty_address_returns_400() {
-    // `?address=` (empty string) is treated as missing — same 400 path.
+async fn history_empty_address_returns_422() {
+    // `?address=` (empty string) is treated as missing — same 422 path
+    // as the missing-param case, mirroring `/api/balance`.
     let req = Request::get("/api/history?address=")
         .body(Body::empty())
         .unwrap();
     let (status, _body) = send_request(req).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]
-async fn history_invalid_hex_returns_400() {
+async fn history_invalid_hex_returns_422() {
     let req = Request::get("/api/history?address=not_hex")
         .body(Body::empty())
         .unwrap();
     let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
     assert!(v["error"]
         .as_str()
@@ -5968,32 +5969,32 @@ async fn history_invalid_hex_returns_400() {
 }
 
 #[tokio::test]
-async fn history_wrong_length_returns_400() {
+async fn history_wrong_length_returns_422() {
     // 16 bytes worth of hex — decoded successfully but not 32 bytes.
     let address = format!("0x{}", "ab".repeat(16));
     let req = Request::get(format!("/api/history?address={}", address))
         .body(Body::empty())
         .unwrap();
     let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
     assert!(v["error"].as_str().unwrap_or("").contains("32 bytes"));
 }
 
 #[tokio::test]
-async fn history_limit_zero_returns_400() {
+async fn history_limit_zero_returns_422() {
     let address = "00".repeat(32);
     let req = Request::get(format!("/api/history?address={}&limit=0", address))
         .body(Body::empty())
         .unwrap();
     let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
     assert!(v["error"].as_str().unwrap_or("").contains("limit"));
 }
 
 #[tokio::test]
-async fn history_limit_above_max_returns_400() {
+async fn history_limit_above_max_returns_422() {
     let address = "00".repeat(32);
     let req = Request::get(format!(
         "/api/history?address={}&limit={}",
@@ -6003,19 +6004,19 @@ async fn history_limit_above_max_returns_400() {
     .body(Body::empty())
     .unwrap();
     let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
     assert!(v["error"].as_str().unwrap_or("").contains("limit"));
 }
 
 #[tokio::test]
-async fn history_negative_offset_returns_400() {
+async fn history_negative_offset_returns_422() {
     let address = "00".repeat(32);
     let req = Request::get(format!("/api/history?address={}&offset=-1", address))
         .body(Body::empty())
         .unwrap();
     let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
     assert!(v["error"].as_str().unwrap_or("").contains("offset"));
 }
@@ -6023,7 +6024,8 @@ async fn history_negative_offset_returns_400() {
 #[tokio::test]
 async fn history_non_integer_limit_returns_400() {
     // axum's typed `Query` extractor rejects a non-integer value with
-    // 400 before the handler runs.
+    // 400 (framework-level) before the handler runs — distinct from the
+    // 422s the handler emits for its own validation branches.
     let address = "00".repeat(32);
     let req = Request::get(format!("/api/history?address={}&limit=abc", address))
         .body(Body::empty())
@@ -6034,8 +6036,10 @@ async fn history_non_integer_limit_returns_400() {
 
 #[tokio::test]
 async fn history_db_error_returns_500() {
-    // `test_state()` uses `dead_pool()` — the count query fails fast
-    // and the handler surfaces 500 + the documented error string.
+    // `test_state()` uses `dead_pool()` — the single
+    // `list_account_history` query fails fast and the handler surfaces
+    // 500 + the documented error string. Collapsing count + list into
+    // one query (round-2 fix) removes the previous dead-arm gap.
     let address = "00".repeat(32);
     let req = Request::get(format!("/api/history?address={}", address))
         .body(Body::empty())
@@ -6100,7 +6104,11 @@ async fn history_happy_path_returns_items_newest_first() {
     // Newest first: send (150), receive (250), mint (100).
     assert_eq!(items[0]["direction"], "send");
     assert_eq!(items[0]["amount"], 100, "250 -> 150 is a 100 delta");
-    assert_eq!(items[0]["status"], "confirmed");
+    // No pending_inscriptions row and no observed_inscriptions row for
+    // this address (the seed path doesn't thread the commit_txid GUC),
+    // so the wire status is `pending` — the DB write alone is not an
+    // on-chain confirmation.
+    assert_eq!(items[0]["status"], "pending");
     assert!(
         items[0]["txid"].is_null(),
         "txid is null pre-broadcast link"
@@ -6179,8 +6187,10 @@ async fn history_limit_clamps_page_size() {
 #[tokio::test]
 async fn history_scanner_source_is_filtered_out() {
     // `scanner` and `recovery` are internal mutations the user did not
-    // initiate; the handler skips them so the page never carries a
-    // bogus `direction` value.
+    // initiate; the SQL pushes the filter so they neither count toward
+    // `total` nor appear in `items`. A post-fetch filter (the previous
+    // behaviour) broke pagination — `total` over-counted and page sizes
+    // would have come back short of the requested `limit`.
     let (pool, _pg) = history_live_pool().await;
     let address: [u8; 32] = [13u8; 32];
     seed_account_history(&pool, &address, 100, "scanner").await;
@@ -6193,13 +6203,101 @@ async fn history_scanner_source_is_filtered_out() {
     let (status, body) = send_request_with_state(state, req).await;
     assert_eq!(status, StatusCode::OK, "body={}", body);
     let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    // total counts EVERY account_history row (including scanner) so the
-    // caller has the unfiltered total for pagination math; items only
-    // surfaces the user-facing trio.
-    assert_eq!(v["total"], 2);
+    assert_eq!(
+        v["total"], 1,
+        "total reflects the filtered count (scanner row excluded)"
+    );
     let items = v["items"].as_array().unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["direction"], "mint");
+}
+
+#[tokio::test]
+async fn history_pagination_walks_mixed_source_dataset_consistently() {
+    // Plant a mixed-source dataset and walk pagination across multiple
+    // pages. The client must see every user-facing row exactly once
+    // across consecutive pages, with `total` matching the cumulative
+    // page sizes — the SQL filter is what makes this true (a post-fetch
+    // filter would have left holes in pages and a `total` that no
+    // page-walk can hit).
+    let (pool, _pg) = history_live_pool().await;
+    let address: [u8; 32] = [17u8; 32];
+    // Plant in chronological order; the handler returns newest-first.
+    // 4 user-facing rows (mint, receive, send, receive) interleaved with
+    // 3 internal rows (scanner, scanner, recovery) — the internal rows
+    // must never appear and must never count toward `total`.
+    seed_account_history(&pool, &address, 100, "mint").await;
+    seed_account_history(&pool, &address, 110, "scanner").await;
+    seed_account_history(&pool, &address, 250, "receive").await;
+    seed_account_history(&pool, &address, 260, "scanner").await;
+    seed_account_history(&pool, &address, 150, "send").await;
+    seed_account_history(&pool, &address, 160, "recovery").await;
+    seed_account_history(&pool, &address, 300, "receive").await;
+
+    let state = live_test_state(pool);
+    let mut seen_directions: Vec<String> = Vec::new();
+    let mut total_seen_on_first_page: Option<i64> = None;
+    let mut offset: i64 = 0;
+    let limit: i64 = 2;
+    loop {
+        let req = Request::get(format!(
+            "/api/history?address=0x{}&limit={}&offset={}",
+            hex::encode(address),
+            limit,
+            offset
+        ))
+        .body(Body::empty())
+        .unwrap();
+        let (status, body) = send_request_with_state(state.clone(), req).await;
+        assert_eq!(status, StatusCode::OK, "body={}", body);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let total = v["total"].as_i64().expect("total i64");
+        if total_seen_on_first_page.is_none() {
+            total_seen_on_first_page = Some(total);
+        } else {
+            assert_eq!(
+                total_seen_on_first_page,
+                Some(total),
+                "total must stay constant across pages"
+            );
+        }
+        let items = v["items"].as_array().expect("items array");
+        if items.is_empty() {
+            break;
+        }
+        // The page must never come back short of the requested `limit`
+        // unless we've hit the end — that's the property the post-fetch
+        // filter violated.
+        if (offset + items.len() as i64) < total {
+            assert_eq!(
+                items.len() as i64,
+                limit,
+                "page must be full while more rows remain (post-fetch filter would shrink this)"
+            );
+        }
+        for it in items {
+            let d = it["direction"].as_str().expect("direction str").to_string();
+            assert!(
+                matches!(d.as_str(), "mint" | "send" | "receive"),
+                "internal sources must never reach the wire, got {}",
+                d
+            );
+            seen_directions.push(d);
+        }
+        offset += items.len() as i64;
+        if offset >= total {
+            break;
+        }
+    }
+    let total = total_seen_on_first_page.expect("at least one page seen");
+    assert_eq!(total, 4, "filtered total = 4 user-facing rows");
+    assert_eq!(
+        seen_directions.len() as i64,
+        total,
+        "pagination walk yields exactly `total` rows"
+    );
+    // Newest-first: last receive (300), send (150), receive (250), mint (100).
+    assert_eq!(seen_directions, vec!["receive", "send", "receive", "mint"]);
 }
 
 // --- Pure-function coverage for the helpers --------------------------------
@@ -6267,7 +6365,10 @@ fn history_row_to_item_handles_first_row_with_no_prev_data() {
         item.amount, 5_000,
         "from-zero credit is the full new balance"
     );
-    assert_eq!(item.status, "confirmed");
+    // No pending_inscriptions row + no observed_inscriptions row = the
+    // on-chain side is not yet known. DB-committed alone is NOT a
+    // confirmation; wire status defaults to `pending`.
+    assert_eq!(item.status, "pending");
     assert!(item.txid.is_none());
 }
 
@@ -6308,33 +6409,117 @@ fn history_row_to_item_maps_pending_status_to_wire_status() {
     let mut a = Account::new();
     a.balance = 100;
     let bytes = bincode::serialize(&a).unwrap();
-    let mk = |status: Option<&str>| crate::db::AccountHistoryRow {
+    let mk = |status: Option<&str>, block_height: Option<i64>| crate::db::AccountHistoryRow {
         id: 1,
         timestamp_secs: 0,
         source: "send".to_string(),
         prev_data: Some(bincode::serialize(&Account::new()).unwrap()),
         new_data: bytes.clone(),
         commit_txid: Some(vec![0xab; 32]),
-        block_height: Some(123_456),
+        block_height,
         pending_status: status.map(str::to_string),
     };
+    // Every enum variant the migration-0003 CHECK constraint allows.
     assert_eq!(
-        history_row_to_item(&mk(Some("failed"))).unwrap().status,
+        history_row_to_item(&mk(Some("failed"), Some(1)))
+            .unwrap()
+            .status,
         "failed"
     );
     assert_eq!(
-        history_row_to_item(&mk(Some("complete"))).unwrap().status,
+        history_row_to_item(&mk(Some("complete"), Some(1)))
+            .unwrap()
+            .status,
         "confirmed"
     );
     assert_eq!(
-        history_row_to_item(&mk(Some("commit_broadcast")))
+        history_row_to_item(&mk(Some("constructed"), None))
             .unwrap()
             .status,
         "pending"
     );
-    assert_eq!(history_row_to_item(&mk(None)).unwrap().status, "confirmed");
+    assert_eq!(
+        history_row_to_item(&mk(Some("commit_broadcast"), None))
+            .unwrap()
+            .status,
+        "pending"
+    );
+    assert_eq!(
+        history_row_to_item(&mk(Some("reveal_broadcast"), None))
+            .unwrap()
+            .status,
+        "pending"
+    );
+    // No pending row + no observed row -> on-chain side is unknown -> pending.
+    assert_eq!(
+        history_row_to_item(&mk(None, None)).unwrap().status,
+        "pending"
+    );
+    // No pending row but observed_inscriptions has a block height -> confirmed.
+    assert_eq!(
+        history_row_to_item(&mk(None, Some(42))).unwrap().status,
+        "confirmed"
+    );
+    // Unknown pending_inscriptions.status (defensive — CHECK prevents
+    // it in practice). The handler degrades to `pending` and logs.
+    assert_eq!(
+        history_row_to_item(&mk(Some("nonsense_state"), None))
+            .unwrap()
+            .status,
+        "pending"
+    );
     // commit_txid -> hex-encoded; block_height surfaced verbatim.
-    let item = history_row_to_item(&mk(Some("complete"))).unwrap();
+    let item = history_row_to_item(&mk(Some("complete"), Some(123_456))).unwrap();
     assert_eq!(item.txid.as_deref(), Some("ab".repeat(32).as_str()));
     assert_eq!(item.block_height, Some(123_456));
+}
+
+#[test]
+fn history_row_to_item_drops_undecodable_prev_data() {
+    // A `Some(blob)` that fails to bincode-decode is NOT the same as
+    // `None` (first INSERT). Silently treating it as zero would
+    // fabricate a full-balance delta — the row is dropped instead.
+    let mut a = Account::new();
+    a.balance = 5_000;
+    let row = crate::db::AccountHistoryRow {
+        id: 7,
+        timestamp_secs: 0,
+        source: "send".to_string(),
+        prev_data: Some(vec![0xff; 4]), // not a valid bincode Account
+        new_data: bincode::serialize(&a).unwrap(),
+        commit_txid: None,
+        block_height: None,
+        pending_status: None,
+    };
+    assert!(
+        history_row_to_item(&row).is_none(),
+        "un-decodable prev_data must drop the row, not pretend prev_balance = 0"
+    );
+}
+
+#[test]
+fn pending_inscription_status_from_db_str_round_trips_every_variant() {
+    // Mirrors migration-0003 CHECK constraint. Adding a state to
+    // `PendingInscriptionStatus` without updating this list fails CI.
+    assert_eq!(
+        PendingInscriptionStatus::from_db_str("constructed"),
+        Some(PendingInscriptionStatus::Constructed)
+    );
+    assert_eq!(
+        PendingInscriptionStatus::from_db_str("commit_broadcast"),
+        Some(PendingInscriptionStatus::CommitBroadcast)
+    );
+    assert_eq!(
+        PendingInscriptionStatus::from_db_str("reveal_broadcast"),
+        Some(PendingInscriptionStatus::RevealBroadcast)
+    );
+    assert_eq!(
+        PendingInscriptionStatus::from_db_str("complete"),
+        Some(PendingInscriptionStatus::Complete)
+    );
+    assert_eq!(
+        PendingInscriptionStatus::from_db_str("failed"),
+        Some(PendingInscriptionStatus::Failed)
+    );
+    assert_eq!(PendingInscriptionStatus::from_db_str("unknown"), None);
 }

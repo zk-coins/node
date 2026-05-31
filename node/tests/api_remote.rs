@@ -508,39 +508,39 @@ async fn balance_invalid_hex_returns_422() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn history_missing_address_returns_400() {
+async fn history_missing_address_returns_422() {
     let resp = http_client()
         .get(url("/api/history"))
         .send()
         .await
         .expect("GET /api/history (no params)");
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]
-async fn history_invalid_hex_returns_400() {
+async fn history_invalid_hex_returns_422() {
     let resp = http_client()
         .get(url("/api/history?address=not_hex"))
         .send()
         .await
         .expect("GET /api/history (bad hex)");
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let body: Value = resp.json().await.expect("history body JSON");
     assert!(
         body["error"].as_str().is_some(),
-        "400 body must carry an `error` string"
+        "422 body must carry an `error` string"
     );
 }
 
 #[tokio::test]
-async fn history_limit_above_max_returns_400() {
+async fn history_limit_above_max_returns_422() {
     let address = format!("0x{}", "00".repeat(32));
     let resp = http_client()
         .get(url(&format!("/api/history?address={}&limit=201", address)))
         .send()
         .await
         .expect("GET /api/history (oversize limit)");
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]
@@ -614,7 +614,14 @@ async fn history_after_mint_records_mint_row() {
     let head = &items[0];
     assert_eq!(head["direction"], "mint");
     assert_eq!(head["amount"], MINT_AMOUNT);
-    assert_eq!(head["status"], "confirmed");
+    // No Rust caller threads `zkcoins.account_commit_txid` through the
+    // mint path today (see the GUC TODO in db.rs::list_account_history),
+    // so `triggering_commit_txid` is NULL, the LEFT JOINs return NULL,
+    // and the on-chain side is not yet observable from `/api/history`:
+    // wire status is `pending`, not `confirmed`. The default flipped
+    // from `confirmed` -> `pending` in round 2 to stop misrepresenting
+    // DB-committed-only rows as on-chain confirmations.
+    assert_eq!(head["status"], "pending");
     assert!(head["id"].as_i64().is_some(), "id must be set");
     // Spec contract — these are nullable on the wire.
     assert!(head["counterparty"].is_null() || head["counterparty"].is_string());

@@ -1249,7 +1249,7 @@ async fn get_inscription_summary_rejects_invalid_kind_in_row() {
     assert!(matches!(err, sqlx::Error::Decode(_)));
 }
 
-// ---- list_account_history / count_account_history (issue #153) ------------
+// ---- list_account_history (issue #153) ------------------------------------
 
 /// Insert a synthetic `account_history` row directly so the test can
 /// pin the timestamp ordering without racing the trigger-driven path.
@@ -1279,13 +1279,14 @@ async fn plant_history_row(
 }
 
 #[tokio::test]
-async fn count_account_history_empty_returns_zero() {
+async fn list_account_history_empty_returns_zero_total() {
     let (pool, _c) = setup_pool().await;
     let address = [0xaau8; 32];
-    let n = count_account_history(&pool, &address[..])
+    let (rows, total) = list_account_history(&pool, &address[..], 50, 0)
         .await
-        .expect("count returns Ok");
-    assert_eq!(n, 0);
+        .expect("list returns Ok");
+    assert!(rows.is_empty());
+    assert_eq!(total, 0);
 }
 
 #[tokio::test]
@@ -1298,37 +1299,40 @@ async fn list_account_history_orders_newest_first_and_paginates() {
     plant_history_row(&pool, &address[..], "receive", 200, 20).await;
     plant_history_row(&pool, &address[..], "send", 150, 10).await;
 
-    let total = count_account_history(&pool, &address[..]).await.unwrap();
-    assert_eq!(total, 3);
-
-    let page = list_account_history(&pool, &address[..], 50, 0)
+    let (page, total) = list_account_history(&pool, &address[..], 50, 0)
         .await
         .unwrap();
+    assert_eq!(total, 3);
     assert_eq!(page.len(), 3);
     assert_eq!(page[0].source, "send", "newest first");
     assert_eq!(page[1].source, "receive");
     assert_eq!(page[2].source, "mint");
 
     // Limit + offset
-    let page = list_account_history(&pool, &address[..], 1, 1)
+    let (page, total) = list_account_history(&pool, &address[..], 1, 1)
         .await
         .unwrap();
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].source, "receive");
+    assert_eq!(total, 3, "total stays consistent across pages");
 
     // Offset past total
-    let page = list_account_history(&pool, &address[..], 10, 99)
+    let (page, total) = list_account_history(&pool, &address[..], 10, 99)
         .await
         .unwrap();
     assert!(page.is_empty());
+    assert_eq!(
+        total, 3,
+        "empty page still surfaces the real total (no second-query branch needed)"
+    );
 
     // Other address never appears.
     let other = [0xccu8; 32];
-    assert!(list_account_history(&pool, &other[..], 10, 0)
+    let (page, total) = list_account_history(&pool, &other[..], 10, 0)
         .await
-        .unwrap()
-        .is_empty());
-    assert_eq!(count_account_history(&pool, &other[..]).await.unwrap(), 0);
+        .unwrap();
+    assert!(page.is_empty());
+    assert_eq!(total, 0);
 }
 
 #[tokio::test]
@@ -1336,10 +1340,11 @@ async fn list_account_history_surfaces_blob_and_metadata() {
     let (pool, _c) = setup_pool().await;
     let address = [0xddu8; 32];
     plant_history_row(&pool, &address[..], "mint", 12_345, 1).await;
-    let rows = list_account_history(&pool, &address[..], 10, 0)
+    let (rows, total) = list_account_history(&pool, &address[..], 10, 0)
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
+    assert_eq!(total, 1);
     let row = &rows[0];
     assert_eq!(row.source, "mint");
     assert!(row.prev_data.is_none(), "first INSERT has no prev_data");
@@ -1351,4 +1356,37 @@ async fn list_account_history_surfaces_blob_and_metadata() {
     let decoded: crate::account_node::Account =
         bincode::deserialize(&row.new_data).expect("decode Account");
     assert_eq!(decoded.balance, 12_345);
+}
+
+#[tokio::test]
+async fn list_account_history_filters_scanner_and_recovery_in_sql() {
+    // Scanner / recovery rows must be filtered in SQL — pushing the
+    // filter into the query is what keeps `total` and the page length
+    // honest (a post-fetch filter on the page would drop rows AFTER the
+    // LIMIT and break pagination math). Issue #153 round-2 review fix.
+    let (pool, _c) = setup_pool().await;
+    let address = [0xeeu8; 32];
+    plant_history_row(&pool, &address[..], "scanner", 50, 50).await;
+    plant_history_row(&pool, &address[..], "mint", 100, 40).await;
+    plant_history_row(&pool, &address[..], "recovery", 110, 30).await;
+    plant_history_row(&pool, &address[..], "send", 90, 20).await;
+    plant_history_row(&pool, &address[..], "receive", 200, 10).await;
+
+    let (rows, total) = list_account_history(&pool, &address[..], 50, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        total, 3,
+        "total = filtered count (mint + send + receive), excludes scanner/recovery"
+    );
+    assert_eq!(rows.len(), 3);
+    let sources: Vec<&str> = rows.iter().map(|r| r.source.as_str()).collect();
+    // Newest-first ordering preserved within the filter.
+    assert_eq!(sources, vec!["receive", "send", "mint"]);
+    assert!(
+        sources
+            .iter()
+            .all(|s| matches!(*s, "mint" | "send" | "receive")),
+        "no scanner / recovery rows leak past the SQL filter"
+    );
 }

@@ -324,35 +324,118 @@ pub(crate) fn balance_from_account_blob(blob: &[u8]) -> Option<u64> {
         .map(|a| a.balance)
 }
 
+/// Typed mirror of the `pending_inscriptions.status` CHECK constraint
+/// (migration 0003: `constructed`, `commit_broadcast`, `reveal_broadcast`,
+/// `complete`, `failed`). Parsed via [`PendingInscriptionStatus::from_db_str`]
+/// so the `match` in [`history_row_to_item`] can be exhaustive and a
+/// future schema state addition forces compile-time attention — a plain
+/// `match row.pending_status.as_deref()` on a `String` can't enforce
+/// that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingInscriptionStatus {
+    Constructed,
+    CommitBroadcast,
+    RevealBroadcast,
+    Complete,
+    Failed,
+}
+
+impl PendingInscriptionStatus {
+    /// Map a raw `pending_inscriptions.status` string to the enum.
+    /// Returns `None` for an unrecognised value — Postgres's CHECK
+    /// constraint prevents that in practice, but if it ever leaks the
+    /// handler degrades to `pending` rather than crash.
+    pub(crate) fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "constructed" => Some(Self::Constructed),
+            "commit_broadcast" => Some(Self::CommitBroadcast),
+            "reveal_broadcast" => Some(Self::RevealBroadcast),
+            "complete" => Some(Self::Complete),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
 /// Convert one [`db::AccountHistoryRow`] into a wire [`HistoryItem`].
 /// Returns `None` if the row's source is internal (`scanner` /
-/// `recovery`) or if both balance reads fail (the row has no derivable
-/// delta to expose).
+/// `recovery`), if the `new_data` blob fails to decode, or if a
+/// non-null `prev_data` blob fails to decode (treating that as zero
+/// would fabricate a full-balance delta — see the inner `match` for
+/// the warn log).
 pub(crate) fn history_row_to_item(row: &crate::db::AccountHistoryRow) -> Option<HistoryItem> {
     let direction = map_history_direction(&row.source)?;
     let new_balance = balance_from_account_blob(&row.new_data)?;
     // `prev_data` is `None` on the first INSERT for an address — treat
     // that as a from-zero delta so the very first mint / receive
-    // surfaces the full credit instead of disappearing.
-    let prev_balance = row
-        .prev_data
-        .as_deref()
-        .and_then(balance_from_account_blob)
-        .unwrap_or(0);
+    // surfaces the full credit instead of disappearing. A `Some(blob)`
+    // that fails to decode is *not* the same as `None`: silently
+    // collapsing to zero would fabricate the full new balance as the
+    // delta. Drop the row instead and log a warn so an operator can
+    // notice the schema drift.
+    let prev_balance = match row.prev_data.as_deref() {
+        None => 0,
+        Some(blob) => match balance_from_account_blob(blob) {
+            Some(b) => b,
+            None => {
+                tracing::warn!(
+                    "history_row_to_item: row id={} address has un-decodable prev_data blob (len={}); dropping row to avoid fabricating a full-balance delta",
+                    row.id,
+                    blob.len(),
+                );
+                return None;
+            }
+        },
+    };
     // Absolute delta — sends are debits (prev > new), mints / receives
     // are credits (new > prev). The `direction` field already encodes
     // the sign for the caller.
     let amount = new_balance.max(prev_balance) - new_balance.min(prev_balance);
 
-    // Status defaults to `confirmed` because every account_history row
-    // reflects a transaction that committed in Postgres. Once the
-    // pending_inscriptions join is populated, promote the per-row
-    // status to the canonical state-machine label.
-    let status = match row.pending_status.as_deref() {
-        Some("failed") => "failed",
-        Some("complete") => "confirmed",
-        Some(_) => "pending",
-        None => "confirmed",
+    // Wire status derived from `pending_inscriptions.status` (the
+    // authoritative state machine) joined to `observed_inscriptions`
+    // for the post-broadcast on-chain confirmation. A DB-committed
+    // `account_history` row only proves a server-side state change —
+    // *not* an on-chain confirmation — so the default before any
+    // matching inscription row exists is `pending`, not `confirmed`.
+    //
+    // The inner `match pending` is exhaustive over the
+    // [`PendingInscriptionStatus`] enum (which mirrors migration 0003's
+    // CHECK constraint). A future state added to the enum will fail to
+    // compile here — no silent `_ => "pending"` catch-all.
+    //
+    // The unknown-string case is handled separately via
+    // `from_db_str` returning `None`: Postgres's CHECK constraint
+    // already prevents that, but if it ever leaks we warn and degrade
+    // to `pending` rather than crash.
+    let pending_enum = row
+        .pending_status
+        .as_deref()
+        .map(|s| (s, PendingInscriptionStatus::from_db_str(s)));
+    let status = match pending_enum {
+        Some((_, Some(p))) => match p {
+            PendingInscriptionStatus::Complete => "confirmed",
+            PendingInscriptionStatus::Failed => "failed",
+            PendingInscriptionStatus::Constructed
+            | PendingInscriptionStatus::CommitBroadcast
+            | PendingInscriptionStatus::RevealBroadcast => "pending",
+        },
+        Some((raw, None)) => {
+            tracing::warn!(
+                "history_row_to_item: unknown pending_inscriptions.status={:?} (id={}); defaulting to pending",
+                raw,
+                row.id,
+            );
+            "pending"
+        }
+        // No pending_inscriptions row but the scanner has observed the
+        // inscription on-chain — it's confirmed even though we lost the
+        // pending row (the resumer prunes `complete` rows after a
+        // safe-depth threshold).
+        None if row.block_height.is_some() => "confirmed",
+        // Neither pending nor observed — the on-chain side is not yet
+        // known to us; the DB write alone does not warrant `confirmed`.
+        None => "pending",
     };
 
     Some(HistoryItem {
@@ -361,6 +444,9 @@ pub(crate) fn history_row_to_item(row: &crate::db::AccountHistoryRow) -> Option<
         timestamp: row.timestamp_secs,
         direction,
         amount,
+        // TODO(zk-coins/node#160): capture `counterparty_address` per
+        // `account_history` row (schema change) so this stops being
+        // unconditionally null.
         counterparty: None,
         status,
         block_height: row.block_height,
@@ -825,8 +911,9 @@ async fn get_balance_handler(
 /// matching test in `router_tests.rs` pins this so a future caller
 /// cannot silently flip the order.
 ///
-/// Validation contract (all return HTTP 400 with a
-/// [`HistoryErrorResponse`]):
+/// Validation contract (all return HTTP 422 with a
+/// [`HistoryErrorResponse`] — mirrors the `/api/balance` shape so the
+/// whole read surface uses the same status for malformed input):
 ///   * `address` missing.
 ///   * `address` not valid 32-byte hex.
 ///   * `limit` outside `[1, 200]` (the issue's max=200 rule). `limit=0`
@@ -858,7 +945,7 @@ async fn get_history_handler(
         Some(s) if !s.is_empty() => s,
         _ => {
             return (
-                StatusCode::BAD_REQUEST,
+                StatusCode::UNPROCESSABLE_ENTITY,
                 Json(HistoryErrorResponse {
                     error: "Missing required `address` query parameter",
                 }),
@@ -870,7 +957,7 @@ async fn get_history_handler(
         Ok(b) => b,
         Err(msg) => {
             return (
-                StatusCode::BAD_REQUEST,
+                StatusCode::UNPROCESSABLE_ENTITY,
                 Json(HistoryErrorResponse { error: msg }),
             )
                 .into_response();
@@ -878,7 +965,7 @@ async fn get_history_handler(
     };
     if !(1..=HISTORY_MAX_LIMIT).contains(&limit) {
         return (
-            StatusCode::BAD_REQUEST,
+            StatusCode::UNPROCESSABLE_ENTITY,
             Json(HistoryErrorResponse {
                 error: "limit must be in [1, 200]",
             }),
@@ -887,7 +974,7 @@ async fn get_history_handler(
     }
     if offset < 0 {
         return (
-            StatusCode::BAD_REQUEST,
+            StatusCode::UNPROCESSABLE_ENTITY,
             Json(HistoryErrorResponse {
                 error: "offset must be non-negative",
             }),
@@ -896,33 +983,28 @@ async fn get_history_handler(
     }
 
     // --- DB read ---
-    let total = match db::count_account_history(&state.pool, &address_bytes).await {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::warn!("get_history_handler: count query failed: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(HistoryErrorResponse {
-                    error: "Database error while counting history",
-                }),
-            )
-                .into_response();
-        }
-    };
-    let rows = match db::list_account_history(&state.pool, &address_bytes, limit, offset).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("get_history_handler: list query failed: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(HistoryErrorResponse {
-                    error: "Database error while reading history",
-                }),
-            )
-                .into_response();
-        }
-    };
+    // Single round-trip: page rows + filtered total in one query so the
+    // handler carries a single DB error branch.
+    let (rows, total) =
+        match db::list_account_history(&state.pool, &address_bytes, limit, offset).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("get_history_handler: list query failed: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(HistoryErrorResponse {
+                        error: "Database error while reading history",
+                    }),
+                )
+                    .into_response();
+            }
+        };
 
+    // Defense-in-depth safety net: the SQL already filters to
+    // mint/send/receive, so `filter_map` should never actually drop a
+    // row in normal operation. If it does, that's a schema drift bug —
+    // the post-fetch filter prevents a junk row from reaching the wire
+    // until someone fixes the SQL.
     let items: Vec<HistoryItem> = rows.iter().filter_map(history_row_to_item).collect();
 
     (
