@@ -11,6 +11,7 @@
 //! is measured normally.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::http::StatusCode;
@@ -92,8 +93,15 @@ pub async fn start_rest_node(
 
     let shared_username_store = Arc::new(Mutex::new(username_store));
 
+    // Background-warmup readiness flag. Default `false`; flipped to
+    // `true` by either the background `spawn_blocking` task below (once
+    // `AccountNode::warmup_prover` returns Ok) or immediately if the
+    // operator set `ZKCOINS_SKIP_BOOTSTRAP_WARMUP=1`. Consumed by
+    // `/health/ready`; see the field doc on `AppState::prover_warm`.
+    let prover_warm = Arc::new(AtomicBool::new(false));
+
     let state = AppState {
-        account_node: shared_account_node,
+        account_node: Arc::clone(&shared_account_node),
         proof_store,
         minting_account,
         username_store: shared_username_store,
@@ -101,6 +109,7 @@ pub async fn start_rest_node(
         // The readiness probe uses this to ping Esplora; in production
         // it points at the same `ESPLORA_URL` as the scanner / publisher.
         esplora_config: Arc::new(NETWORK_CONFIG.clone()),
+        prover_warm: Arc::clone(&prover_warm),
         #[cfg(test)]
         phase2_reached: Arc::new(tokio::sync::Notify::new()),
         #[cfg(test)]
@@ -216,6 +225,93 @@ pub async fn start_rest_node(
 
     println!("REST API started at {}", socket_addr);
     let listener = TcpListener::bind(socket_addr).await?;
+    tracing::info!("Listener bound on {socket_addr}; API is reachable");
+
+    // Background-warmup. A fresh `Prover` carries a cold Rayon worker
+    // pool and uninitialised AOT-compiled Plonky2 evaluator caches;
+    // empirically (dfxdev R2 probe, 2026-05-31) the first
+    // `prove_initial` after `Prover::new()` takes ~7012 ms vs the
+    // steady-state p50 of ~4777 ms for every subsequent call.
+    //
+    // The previous shape (PR #147, closed) paid that tax synchronously
+    // before binding the listener and pushed API offline time per
+    // deploy from ~14 s to ~21 s. This shape instead binds the
+    // listener FIRST (the API is reachable at ~0.1 s), then spawns
+    // `AccountNode::warmup_prover` in a `spawn_blocking` task so the
+    // tokio worker that runs `axum::serve` is not starved by the
+    // CPU-bound Plonky2 prove. While the task is running a user
+    // request still serves correctly — it just pays the ~7 s cold tax
+    // — and `/health/ready` returns 503 with `prover: warming` so an
+    // LB / Kuma can hold traffic on the previous-gen pod during a
+    // rolling deploy.
+    //
+    // Opt-out via `ZKCOINS_SKIP_BOOTSTRAP_WARMUP=1`: the smoke tests
+    // in `runtime_tests.rs` set this so each `start_rest_node_*` test
+    // does not pay the ~7 s prove tax twice over. When set,
+    // `prover_warm` is flipped to `true` immediately so the readiness
+    // probe matches the production-ready shape.
+    let skip_warmup = std::env::var("ZKCOINS_SKIP_BOOTSTRAP_WARMUP")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let warmup_handle = if skip_warmup {
+        tracing::info!(
+            "Bootstrap warmup skipped via ZKCOINS_SKIP_BOOTSTRAP_WARMUP; \
+             prover_warm = true (first user request will pay the ~7 s cold tax)"
+        );
+        prover_warm.store(true, Ordering::SeqCst);
+        None
+    } else {
+        let account_node_for_warmup = Arc::clone(&shared_account_node);
+        let prover_warm_flag = Arc::clone(&prover_warm);
+        let handle = tokio::task::spawn_blocking(move || {
+            let warmup_t = std::time::Instant::now();
+            // Hold the sync `Mutex` only for the duration of the
+            // prove call. No other writer touches the AccountNode
+            // during this window — the scanner spawns AFTER
+            // `start_rest_node` returns — so the lock is uncontended.
+            // If a request landed concurrently and tried to acquire
+            // the same Mutex it would block for ~7 s; that is the
+            // accepted trade-off documented in the function comment.
+            // The block is shorter (and aborts cleanly on shutdown)
+            // than the previous synchronous-bootstrap shape.
+            let result = {
+                let guard = account_node_for_warmup
+                    .lock()
+                    .expect("AccountNode mutex poisoned before bootstrap warmup");
+                guard.warmup_prover()
+            };
+            match result {
+                Ok(()) => {
+                    tracing::info!(
+                        elapsed_ms = warmup_t.elapsed().as_millis() as u64,
+                        "Background warmup complete; prover ready"
+                    );
+                    prover_warm_flag.store(true, Ordering::SeqCst);
+                }
+                Err(e) => {
+                    // Same severity as the previous synchronous
+                    // `expect()` — the same Prover serves every
+                    // subsequent user request, so a warmup failure
+                    // means production requests would also fail.
+                    // Crash-loop the container rather than running
+                    // a node that serves 5xx for the prove path.
+                    tracing::error!(error = %e, "Background warmup failed — exiting");
+                    std::process::exit(1);
+                }
+            }
+        });
+        tracing::info!("Bootstrap warmup spawned in background; listener serving now");
+        Some(handle)
+    };
+    // `warmup_handle` is intentionally not awaited: `axum::serve`
+    // owns the foreground future and the warmup runs to completion
+    // on its own. On graceful shutdown `axum::serve` returns first;
+    // the warmup task either completes naturally or is dropped when
+    // the tokio runtime shuts down. The binding keeps the JoinHandle
+    // alive (vs. `let _ =`) so a future shutdown signal can call
+    // `.abort()` once a signal handler is wired in.
+    let _warmup_handle = warmup_handle;
+
     // `into_make_service_with_connect_info::<SocketAddr>()` exposes the
     // peer's TCP socket to extractors — the audit middleware reads it
     // through `ConnectInfo<SocketAddr>` and writes it to

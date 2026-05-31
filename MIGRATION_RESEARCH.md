@@ -1419,6 +1419,72 @@ neither the original one:
    the client side. Always cross-check the request against a
    known-good client's wire format before blaming the server.
 
+### 7.25 Bootstrap warmup: background over synchronous to preserve API availability — **codified**
+
+The dfxdev R2 probe (2026-05-31, see `node/src/bin/probe_r2.rs`)
+measured a ~7 s cold-prove tax on the first `prove_initial` after
+`Prover::new()` — paid in production by whichever user request
+arrived first after a container restart, surfacing as a ~12 s
+`/api/mint` instead of the steady-state ~5 s p50. Two shapes were
+considered for hiding the tax inside the bootstrap.
+
+**Shape A: synchronous warmup before listener bind (PR #147,
+closed).** Run `warmup_prover` synchronously between `load_from_pg`
+and `TcpListener::bind`. Pushes API offline time per deploy from
+~14 s (circuit build) to ~21 s (circuit build + cold prove). Net
+benefit per deploy: every user request after the listener binds is
+warm. Rejected because the offline-window grew by 50%; the user
+constraint is explicit ("API soll wenn immer möglich SOFORT online
+sein").
+
+**Shape B: background warmup after listener bind (this PR).** Bind
+the listener at ~0.1 s, then spawn `warmup_prover` on the
+`tokio::task::spawn_blocking` pool so the CPU-bound prove runs on a
+blocking-pool thread and does not starve the tokio worker that owns
+`axum::serve`. Expose the warmup status as
+`AppState::prover_warm: Arc<AtomicBool>` and gate `/health/ready` on
+it: while the task is running the readiness probe returns 503 with
+`{"status":"starting","prover":"warming","failures":["prover"]}`. A
+load balancer keeps holding traffic on the previous-gen pod through
+the ~21 s warmup window; the new pod's `/health` (liveness) returns
+200 immediately so the container runtime does not restart it. A user
+request that lands DURING the warmup still serves correctly — it
+pays the ~7 s cold tax, which is the worst-case-equivalent cost to
+the pre-PR-#147 shape but bounded to the ~21 s window instead of
+"first request after every deploy".
+
+Three architecture decisions inside Shape B that are easy to get
+wrong:
+
+1. **`spawn_blocking` over `tokio::spawn`.** Plonky2 `prove_initial`
+   is CPU-bound (Rayon worker pool, AOT-compiled evaluator caches);
+   running it on a tokio worker thread would starve every other
+   future on that worker for ~7 s — including the `axum::serve`
+   future, which is the entire point of binding the listener first.
+   `spawn_blocking` runs the closure on the blocking pool, leaving
+   the tokio workers free to dispatch HTTP requests.
+
+2. **`Arc<AtomicBool>` over `Arc<RwLock<bool>>`.** The flag is
+   write-once + read-many. `AtomicBool::store(true, SeqCst)` is a
+   single instruction; `RwLock` would add a syscall on every
+   `/health/ready` read for a flag that flips exactly once per
+   process lifetime.
+
+3. **`std::process::exit(1)` over `panic!()`.** A panic inside the
+   `spawn_blocking` closure surfaces as a `JoinError` only when the
+   `JoinHandle` is awaited — but we deliberately do not await it
+   (the listener serves while the warmup runs). A bare `panic!()`
+   would leave the node running with `prover_warm = false`
+   permanently, never returning 200 on `/health/ready`. `exit(1)`
+   crash-loops the container immediately, matching the same severity
+   as the previous synchronous `expect()` shape.
+
+The user-visible behavioural change from Shape A to Shape B is the
+small window where a request lands during warmup and pays the ~7 s
+cold tax. That trade-off is documented in `CONTRIBUTING.md`
+("Bootstrap timing") so an operator does not misread the warmup-
+window p50 as a regression.
+
 ---
 
 ## 8. Local Artifacts
