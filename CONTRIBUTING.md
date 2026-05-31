@@ -42,19 +42,26 @@ block-time + poll-interval (issue #84); event-driven ingestion brings
 that down to the WS round-trip.
 
 Historical note: issue #84 originally replaced a fixed 5 s
-`PROPAGATION_WAIT_SECS` sleep with a `{"action":"track-tx","data":"<commit_txid>"}`
-WS wait + REST safety-net. After the deployment moved to a
-self-hosted `mempool/backend:v3.3.1`, empirical measurement showed
-that backend version emits zero frames for `track-tx`, so the WS
-wait always timed out and the REST fallback always confirmed the
-tx as already on-chain. 16/16 fallbacks in 72 h DEV `request_log`,
-0 not-found, 0 errors. The wait was pure latency tax (~30 s/mint
-and ~30 s/send+commit) for an in-cluster scenario where bitcoind's
-local-mempool accept already orders the two POSTs correctly. The
-publisher now runs `client.broadcast(commit) → client.broadcast(reveal)`
-sequentially; race-freedom follows from the topology (node, electrs,
-bitcoind share the Docker `bitcoin` network), not from a WS
-subscription.
+`PROPAGATION_WAIT_SECS` sleep with a WS `track-tx` wait + REST
+safety-net. PR [#144](https://github.com/zk-coins/node/pull/144)
+removed that path and replaced it with direct sequential
+`client.broadcast(commit) → client.broadcast(reveal)`. A later
+re-analysis (see `MIGRATION_RESEARCH.md` § 7.24) established that
+the publisher's subscribe frame had been sent in the wrong wire
+format — `{"action":"track-tx","data":"<txid>"}` — whereas the
+mempool.js convention and `mempool/backend:v3.3.1`'s
+`websocket-handler.ts` both expect `{"track-tx":"<txid>"}` as a
+top-level key. The backend silently dropped the malformed frame, so
+the WS wait always timed out and the REST safety-net always
+confirmed the tx as already on-chain (16/16 fallbacks in the 72 h
+DEV `request_log` sample, 0 not-found, 0 errors). PR #144 stands
+on independent grounds: in the in-cluster topology (node, electrs,
+bitcoind share the Docker `bitcoin` network) bitcoind's
+local-mempool accept already orders the two POSTs race-free, and
+the closed-test-env model (no external Esplora) means there is no
+upstream to subscribe against in the first place. The
+architecture is documented here; the wire-format bug is recorded
+for the historical record, not as a justification.
 
 Where it applies:
 
