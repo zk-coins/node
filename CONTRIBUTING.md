@@ -32,9 +32,9 @@ documents in the order given below.
 ### No polling — events only
 
 Bitcoin / Esplora signals on the node's hot path are subscribed to,
-never polled. The scanner consumes block events from the
-mempool.space-compatible WebSocket stream (`scanner_ws.rs`,
-`ESPLORA_WS_URL`, default `wss://mutinynet.com/api/v1/ws`); the
+never polled. The scanner consumes block events from the Esplora-
+compatible WebSocket stream (`scanner_ws.rs`, `ESPLORA_WS_URL` —
+required env var, no default; see README §Configuration); the
 publisher broadcasts the commit and reveal transactions back-to-back
 via REST and never sleeps or polls between them. The previous 30-s
 tip-poll gated `/api/mint` and `/api/send` visibility by up to a full
@@ -513,23 +513,26 @@ on startup if unset — there is no silent fallback.
 | `PUBLISHER_KEY` | _(required, no default)_ | 32-byte hex private key for Taproot inscription publishing. **Required on every network — DEV, signet, and mainnet.** No fallback default exists: the previous `1234…` placeholder was a publicly-known test key that drainer bots swept within minutes of any on-chain top-up (4 historical drains confirmed). Node panics on startup if unset. Generate locally via `openssl rand -hex 32`. In any deployed environment, source it from your secret manager — **never commit a real key**. |
 | `USERNAME_DOMAIN` | _(required, no default)_ | External hostname returned by `/api/info`; node panics on startup if unset (see PR [#36](https://github.com/zk-coins/node/pull/36) for the regression that introduced the global panic hook). |
 | `POSTGRES_PASSWORD` | _(required, no default for the DB container)_ | Read by the Postgres container, not by the node process itself; the node's `DATABASE_URL` already embeds the password. Listed here because it is part of the local-dev bootstrap (see `Local Development with Postgres` below). |
-| `ESPLORA_URL` | `https://mutinynet.com/api` | Esplora REST API endpoint (electrs or public). |
-| `ESPLORA_WS_URL` | `wss://mutinynet.com/api/v1/ws` | Esplora WebSocket endpoint consumed by `scanner_ws` (issue #84). DEV/PRD override only when the upstream WS path changes. |
-| `IS_MAINNET` | `false` | `true` for Bitcoin Mainnet, `false` for Mutinynet/Signet. |
-| `NETWORK_NAME` | `Mutinynet` / `Mainnet` | Human-readable name returned by `/api/info`. |
+| `IS_MAINNET` | _(required, no default)_ | Exact string `true` or `false`; any other value panics. Truthy values like `1`, `TRUE`, `yes` are rejected to prevent silent misconfiguration. |
+| `ESPLORA_URL` | _(required, no default)_ | HTTP Esplora endpoint (electrs or public-compatible) for the chain this stage serves. Empty string is treated as unset and panics. |
+| `ESPLORA_WS_URL` | _(required, no default)_ | Esplora-compatible WebSocket endpoint consumed by `scanner_ws` (issue #84). Empty string is treated as unset and panics. Previous Mutinynet default was removed because it coupled the deploy to a public third-party host. |
+| `NETWORK_NAME` | `Mutinynet` / `Mainnet` | Human-readable name returned by `/api/info`. Derived from `IS_MAINNET` if unset. Purely cosmetic — no behavioural effect. |
 | `PROOFS_DIR` | `./proofs` | Directory for per-proof bincode files (see `Persistent State` below). |
 | `SCANNER_INITIAL_SETTLE_TIMEOUT_MS` | (runtime-defined) | Override for the scanner's initial-settle deadline; see `runtime.rs`. |
 | `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`). |
 
 ### Minimal local-dev env
 
+All chain-shaping vars are required — there are no defaults. Set them
+explicitly, even for local dev:
+
 ```bash
 export DATABASE_URL="postgresql://postgres:dev@localhost:5432/postgres"
 export PUBLISHER_KEY="$(openssl rand -hex 32)"
 export USERNAME_DOMAIN="test.zkcoins.local"
-# Optional — defaults are fine for Mutinynet:
-# export ESPLORA_URL="https://mutinynet.com/api"
-# export IS_MAINNET="false"
+export IS_MAINNET="false"
+export ESPLORA_URL="http://localhost:3000"           # your local electrs
+export ESPLORA_WS_URL="ws://localhost:8999/api/v1/ws"  # your local mempool/backend, or any Esplora-compatible WS
 cargo run -p node
 ```
 

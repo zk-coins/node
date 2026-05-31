@@ -190,9 +190,10 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // initial `blocks` seed produces on subscribe (3-15 entries
     // observed), bounded so a stuck consumer cannot grow the
     // queue without bound.
-    let ws_config = ScannerWsConfig::from_env();
+    let ws_config = ScannerWsConfig::from_network_config(network_config);
     println!(
-        "Event-driven scanner: WS={} (override via ESPLORA_WS_URL)",
+        "Event-driven scanner: WS={} (sourced from NETWORK_CONFIG; \
+         set via ESPLORA_WS_URL — required, no default)",
         ws_config.url
     );
     let (tip_tx, tip_rx) = mpsc::channel::<bitcoin::BlockHash>(64);

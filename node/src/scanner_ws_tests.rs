@@ -289,18 +289,43 @@ async fn run_scanner_ws_force_reconnects_on_liveness_timeout() {
 }
 
 // -----------------------------------------------------------------------------
-// Smoke — `from_env`
+// Smoke — `from_network_config`
 // -----------------------------------------------------------------------------
 
 #[test]
-fn scanner_ws_config_from_env_uses_defaults_when_unset() {
-    // Don't touch the process-wide env; just verify the defaults
-    // are exposed via `DEFAULT_*` constants and that the struct
-    // assembles. The full `from_env` round-trip is exercised by the
-    // bootstrap in `main.rs`.
-    assert_eq!(DEFAULT_ESPLORA_WS_URL, "wss://mutinynet.com/api/v1/ws");
-    assert_eq!(DEFAULT_LIVENESS_TIMEOUT, Duration::from_secs(90));
-    assert!(DEFAULT_RECONNECT_MIN < DEFAULT_RECONNECT_MAX);
+fn scanner_ws_config_from_network_config_threads_urls_from_esplora_config() {
+    // `ScannerWsConfig` is now derived from `EsploraConfig` — there is
+    // no parallel env-resolution path. This smoke test pins the
+    // happy-path wiring (both URLs copied through, timing knobs taken
+    // from the module defaults) so a future refactor that swaps the
+    // mapping silently is caught here.
+    let esplora = crate::publisher::EsploraConfig {
+        url: "http://electrs-test:3000".to_string(),
+        is_mainnet: false,
+        network_name: "Test".to_string(),
+        ws_url: Some("ws://ws-test:8999/api/v1/ws".to_string()),
+    };
+    let cfg = ScannerWsConfig::from_network_config(&esplora);
+    assert_eq!(cfg.url, "ws://ws-test:8999/api/v1/ws");
+    assert_eq!(cfg.http_url, "http://electrs-test:3000");
+    assert_eq!(cfg.liveness_timeout, DEFAULT_LIVENESS_TIMEOUT);
+    assert!(cfg.reconnect_min < cfg.reconnect_max);
+}
+
+#[test]
+#[should_panic(expected = "EsploraConfig.ws_url must be set")]
+fn scanner_ws_config_from_network_config_panics_on_missing_ws_url() {
+    // Production callers go through `build_network_config_from_env`,
+    // which guarantees `ws_url = Some(...)`. The `expect` documents
+    // the invariant; this test ensures it panics loudly if a hand-
+    // constructed `EsploraConfig` ever omits the field.
+    let esplora = crate::publisher::EsploraConfig {
+        url: "http://electrs-test:3000".to_string(),
+        is_mainnet: false,
+        network_name: "Test".to_string(),
+        ws_url: None,
+    };
+    let _ = ScannerWsConfig::from_network_config(&esplora);
 }
 
 // -----------------------------------------------------------------------------
