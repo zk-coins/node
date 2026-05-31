@@ -40,9 +40,14 @@
 //!     funds. Recovery aborts if the recovered reveal does not spend
 //!     this address.
 //!
+//! Required flags (chain endpoint):
+//!   - `--esplora-url <url>` — HTTP Esplora endpoint for the chain
+//!     the inscription was committed against. Required, no default —
+//!     a silent Mutinynet fallback would broadcast a Mainnet recovery
+//!     against the wrong chain. Same contract as the node binary's
+//!     `ESPLORA_URL` env var (see `lib::build_network_config_from_env`).
+//!
 //! Optional flags:
-//!   - `--esplora-url <url>` — Esplora REST endpoint. Defaults to
-//!     `https://mutinynet.com/api`.
 //!   - `--dry-run` — log the reveal hex and exit without broadcasting.
 
 use std::process::ExitCode;
@@ -56,8 +61,6 @@ use esplora_client::{
 };
 
 use node::publisher;
-
-const DEFAULT_ESPLORA_URL: &str = "https://mutinynet.com/api";
 
 #[derive(Debug)]
 struct CliArgs {
@@ -76,7 +79,7 @@ fn print_usage(program: &str) {
     --commitment-hex <hex> \\
     --commit-value <sats> \\
     --anchor-address <p2tr-addr> \\
-    [--esplora-url <url>] \\
+    --esplora-url <url> \\
     [--dry-run]
 
 env: PUBLISHER_KEY (required, 32-byte hex), IS_MAINNET (required, true|false)
@@ -131,7 +134,11 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, String> {
     let commit_value = commit_value.ok_or_else(|| "--commit-value is required".to_string())?;
     let anchor_address =
         anchor_address.ok_or_else(|| "--anchor-address is required".to_string())?;
-    let esplora_url = esplora_url.unwrap_or_else(|| DEFAULT_ESPLORA_URL.to_string());
+    let esplora_url = esplora_url.ok_or_else(|| {
+        "--esplora-url is required (no default — silent fallback would \
+         broadcast against the wrong chain)"
+            .to_string()
+    })?;
 
     Ok(CliArgs {
         commit_txid,
@@ -196,12 +203,30 @@ fn validate_args(args: CliArgs, network: Network) -> Result<ValidatedArgs, Strin
     })
 }
 
-/// Resolve network from env (`IS_MAINNET=true` → Bitcoin, else
-/// Signet) and log the operator label if `NETWORK_NAME` is set.
+/// Resolve network from the required `IS_MAINNET` env var (`true` →
+/// Bitcoin, `false` → Signet) and log the operator label from
+/// `NETWORK_NAME`.
+///
+/// Panics on missing or ambiguous `IS_MAINNET` — same contract as
+/// `lib::build_network_config_from_env`. A recovery tool that
+/// silently defaulted to Mutinynet would broadcast a Mainnet recovery
+/// against the wrong chain; explicit-or-panic prevents that.
 fn resolve_network_from_env() -> Network {
-    let is_mainnet = std::env::var("IS_MAINNET")
-        .map(|v| v == "true")
-        .unwrap_or(false);
+    let is_mainnet_raw = std::env::var("IS_MAINNET").expect(
+        "IS_MAINNET env var must be set explicitly to `true` or `false` — \
+         no default exists. Match the env of the node whose inscription \
+         you are recovering (PRD: true, DEV: false).",
+    );
+    let is_mainnet = match is_mainnet_raw.as_str() {
+        "true" => true,
+        "false" => false,
+        other => panic!(
+            "IS_MAINNET must be exactly `true` or `false`, got `{}`. \
+             Truthy values like `1`, `TRUE`, or `yes` are rejected to \
+             prevent silent misconfiguration.",
+            other
+        ),
+    };
     let label = std::env::var("NETWORK_NAME").unwrap_or_else(|_| {
         if is_mainnet {
             "Mainnet".to_string()

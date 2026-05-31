@@ -60,75 +60,97 @@ use zkcoins_program::hash::HashDigest;
 /// `lazy_static` cell (whose state would leak across tests in the same
 /// binary).
 ///
-/// ## Mainnet vs Mutinynet defaults
+/// ## No silent chain defaults
 ///
-/// `ESPLORA_URL` and `ESPLORA_WS_URL` have Mutinynet defaults
-/// (`https://mutinynet.com/api`, `wss://mutinynet.com/api/v1/ws`)
-/// throughout the codebase. They are convenient for DEV (Mutinynet
-/// the chain) and harmless for unit/integration tests. But on Mainnet
-/// they are silent footguns: an `IS_MAINNET=true` deployment that
-/// forgets to set either env publishes Mutinynet block events into
-/// the scanner and / or fetches the wrong chain over REST. The
-/// failure mode is asymmetric — an HTTP-only mismatch panics quickly
-/// on the first publisher round-trip, but the event-driven scanner
-/// (#84) sits in a 5 s HTTP-retry loop with no forward progress and
-/// a green `/health/ready`.
+/// Three env vars shape the chain the node binds to:
 ///
-/// To remove the footgun, both URLs are **required env vars when
-/// `IS_MAINNET=true`** — the panic mirrors the existing pattern for
-/// `PUBLISHER_KEY`, `USERNAME_DOMAIN`, and `DATABASE_URL`. Empty-
-/// string values are treated as unset on the Mainnet path so a
-/// misconfigured compose file (`ESPLORA_URL=`) panics with the same
-/// diagnostic instead of silently producing `EsploraConfig.url = ""`.
-/// When `IS_MAINNET` is unset or `false`, the Mutinynet defaults
-/// continue to apply — DEV, the pre-push hook, and the M3 Ultra
-/// coverage gate are all unaffected.
+/// - `IS_MAINNET` (`true` | `false`)
+/// - `ESPLORA_URL` (HTTP Esplora endpoint)
+/// - `ESPLORA_WS_URL` (mempool.space-compatible WS endpoint)
 ///
-/// ## Scope of the guard
+/// All three are **required, with no default** — the builder panics if
+/// any one is missing or empty. This matches the existing pattern for
+/// `PUBLISHER_KEY`, `USERNAME_DOMAIN`, and `DATABASE_URL`, and exists
+/// because the previous "default to Mutinynet" fallbacks created two
+/// distinct silent footguns:
 ///
-/// Only the `NETWORK_CONFIG` access path is hardened here.
-/// `scanner_ws::ScannerWsConfig::from_env` and `publisher.rs` still
-/// call `std::env::var("ESPLORA_WS_URL")` independently with a
-/// Mutinynet fallback. In the production binary the panic in this
-/// builder fires before any of those reads — `main.rs` dereferences
-/// `NETWORK_CONFIG` during bootstrap — so the structural bypass is
-/// unreachable today. A follow-up that has those sites consume
-/// `NETWORK_CONFIG.ws_url` (or an explicit `&EsploraConfig`) directly
-/// would close the bypass for future entry points and is tracked as
-/// a separate refactor.
+/// 1. A Mainnet deployment that forgot `ESPLORA_URL` / `ESPLORA_WS_URL`
+///    would silently scan Mutinynet and answer `/api/info` as Mainnet —
+///    visible only as a 5 s HTTP-retry loop on `scanner_runtime` with a
+///    green `/health/ready` (zk-coins/node #84).
+/// 2. A Mutinynet deployment that left `ESPLORA_WS_URL` unset would
+///    couple itself to the public `wss://mutinynet.com/api/v1/ws`
+///    endpoint we do not operate — DEV's entire WS observability would
+///    hang on a third-party host going offline.
+///
+/// Removing the defaults closes both. Every stage (PRD, DEV,
+/// integration tests, the local dev loop, self-hosters) must state
+/// explicitly which chain it serves and which endpoints it reaches.
+///
+/// `IS_MAINNET` accepts only the exact strings `"true"` or `"false"`;
+/// anything else panics. This prevents the historical class of
+/// "I typed `1`, `TRUE`, or `yes`, it was silently treated as Mutinynet"
+/// bugs.
+///
+/// Empty-string values (`ESPLORA_URL=` in a compose file) are treated
+/// as unset so they panic with the same diagnostic instead of
+/// silently producing `EsploraConfig.url = ""`.
+///
+/// `NETWORK_NAME` remains a derived label for `/api/info` only — it
+/// has no behavioural effect on the scanner, publisher, or address
+/// derivation, so it keeps a default of `"Mainnet"` / `"Mutinynet"`
+/// derived from `IS_MAINNET`.
+///
+/// ## Single source of truth
+///
+/// `NETWORK_CONFIG.url` and `NETWORK_CONFIG.ws_url` are the only
+/// places these endpoints are read. `scanner_ws::ScannerWsConfig` is
+/// constructed via `from_network_config(&EsploraConfig)`; the
+/// publisher consumes the same struct. There is no second `env::var`
+/// path that could fall back to a hardcoded chain URL.
 pub fn build_network_config_from_env<F>(env: F) -> EsploraConfig
 where
     F: Fn(&str) -> Option<String>,
 {
-    // Treat empty strings as "unset" on the Mainnet path. Without
-    // this, `ESPLORA_URL=` in a compose file bypasses the `expect`
-    // below and leaves `EsploraConfig.url = ""` — the same class of
-    // silent misconfiguration the panic is designed to surface.
+    // Treat empty / whitespace-only strings as "unset" so an
+    // `ESPLORA_URL=` line in a compose file panics with the same
+    // diagnostic as a missing variable instead of silently producing
+    // an empty URL — same class of silent misconfiguration.
     let env_or_unset = |k: &str| env(k).filter(|v| !v.trim().is_empty());
-    let is_mainnet = env_or_unset("IS_MAINNET").as_deref() == Some("true");
-    let url = if is_mainnet {
-        env_or_unset("ESPLORA_URL").expect(
-            "IS_MAINNET=true requires ESPLORA_URL to be set to a non-empty value — \
-             the Mutinynet default is unsafe on Mainnet. Set ESPLORA_URL \
-             to a Mainnet HTTP Esplora endpoint (e.g. http://electrs-mainnet:3000 \
-             on the DFX Mainnet stack, or https://mempool.space/api)",
-        )
-    } else {
-        env_or_unset("ESPLORA_URL").unwrap_or_else(|| "https://mutinynet.com/api".to_string())
+
+    let is_mainnet_raw = env_or_unset("IS_MAINNET").expect(
+        "IS_MAINNET env var must be set explicitly to `true` or `false` — \
+         no default exists. PRD sets `IS_MAINNET=true`, DEV sets \
+         `IS_MAINNET=false`. Self-hosters and integration tests must \
+         set it explicitly too.",
+    );
+    let is_mainnet = match is_mainnet_raw.as_str() {
+        "true" => true,
+        "false" => false,
+        other => panic!(
+            "IS_MAINNET must be exactly `true` or `false`, got `{}`. \
+             Truthy values like `1`, `TRUE`, or `yes` are rejected to \
+             prevent silent misconfiguration (a typo used to land you \
+             on Mutinynet).",
+            other
+        ),
     };
-    let ws_url = if is_mainnet {
-        Some(env_or_unset("ESPLORA_WS_URL").expect(
-            "IS_MAINNET=true requires ESPLORA_WS_URL to be set to a non-empty value — \
-             the Mutinynet default (wss://mutinynet.com/api/v1/ws) is unsafe on \
-             Mainnet: the event-driven scanner subscribes to Mutinynet block \
-             events and 404s against the Mainnet HTTP Esplora in a 5 s retry \
-             loop with no forward progress (zk-coins/node #84). Set \
-             ESPLORA_WS_URL to a Mainnet mempool.space-compatible WebSocket \
-             (e.g. wss://mempool.space/api/v1/ws)",
-        ))
-    } else {
-        env_or_unset("ESPLORA_WS_URL")
-    };
+
+    let url = env_or_unset("ESPLORA_URL").expect(
+        "ESPLORA_URL env var must be set — no default exists. Set it \
+         to the HTTP Esplora endpoint for the chain this stage serves; \
+         see README §Configuration for the per-stage endpoints.",
+    );
+
+    let ws_url = env_or_unset("ESPLORA_WS_URL").expect(
+        "ESPLORA_WS_URL env var must be set — no default exists. Set \
+         it to the Esplora-compatible WebSocket endpoint for the \
+         chain this stage serves; see README §Configuration for the \
+         per-stage endpoints. The previous default fell back to a \
+         public third-party host, coupling availability to a service \
+         we do not operate (zk-coins/node #84).",
+    );
+
     let network_name = env_or_unset("NETWORK_NAME").unwrap_or_else(|| {
         if is_mainnet {
             "Mainnet".to_string()
@@ -136,19 +158,12 @@ where
             "Mutinynet".to_string()
         }
     });
-    println!(
-        "Network config: {} ({}) ws={}",
-        network_name,
-        url,
-        ws_url
-            .as_deref()
-            .unwrap_or(crate::scanner_ws::DEFAULT_ESPLORA_WS_URL)
-    );
+    println!("Network config: {} ({}) ws={}", network_name, url, ws_url);
     EsploraConfig {
         url,
         is_mainnet,
         network_name,
-        ws_url,
+        ws_url: Some(ws_url),
     }
 }
 

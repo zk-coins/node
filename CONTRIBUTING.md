@@ -32,9 +32,9 @@ documents in the order given below.
 ### No polling — events only
 
 Bitcoin / Esplora signals on the node's hot path are subscribed to,
-never polled. The scanner consumes block events from the
-mempool.space-compatible WebSocket stream (`scanner_ws.rs`,
-`ESPLORA_WS_URL`, default `wss://mutinynet.com/api/v1/ws`); the
+never polled. The scanner consumes block events from the Esplora-
+compatible WebSocket stream (`scanner_ws.rs`, `ESPLORA_WS_URL` —
+required env var, no default; see README §Configuration); the
 publisher broadcasts the commit and reveal transactions back-to-back
 via REST and never sleeps or polls between them. The previous 30-s
 tip-poll gated `/api/mint` and `/api/send` visibility by up to a full
@@ -42,19 +42,26 @@ block-time + poll-interval (issue #84); event-driven ingestion brings
 that down to the WS round-trip.
 
 Historical note: issue #84 originally replaced a fixed 5 s
-`PROPAGATION_WAIT_SECS` sleep with a `{"action":"track-tx","data":"<commit_txid>"}`
-WS wait + REST safety-net. After the deployment moved to a
-self-hosted `mempool/backend:v3.3.1`, empirical measurement showed
-that backend version emits zero frames for `track-tx`, so the WS
-wait always timed out and the REST fallback always confirmed the
-tx as already on-chain. 16/16 fallbacks in 72 h DEV `request_log`,
-0 not-found, 0 errors. The wait was pure latency tax (~30 s/mint
-and ~30 s/send+commit) for an in-cluster scenario where bitcoind's
-local-mempool accept already orders the two POSTs correctly. The
-publisher now runs `client.broadcast(commit) → client.broadcast(reveal)`
-sequentially; race-freedom follows from the topology (node, electrs,
-bitcoind share the Docker `bitcoin` network), not from a WS
-subscription.
+`PROPAGATION_WAIT_SECS` sleep with a WS `track-tx` wait + REST
+safety-net. PR [#144](https://github.com/zk-coins/node/pull/144)
+removed that path and replaced it with direct sequential
+`client.broadcast(commit) → client.broadcast(reveal)`. A later
+re-analysis (see `MIGRATION_RESEARCH.md` § 7.24) established that
+the publisher's subscribe frame had been sent in the wrong wire
+format — `{"action":"track-tx","data":"<txid>"}` — whereas the
+mempool.js convention and `mempool/backend:v3.3.1`'s
+`websocket-handler.ts` both expect `{"track-tx":"<txid>"}` as a
+top-level key. The backend silently dropped the malformed frame, so
+the WS wait always timed out and the REST safety-net always
+confirmed the tx as already on-chain (16/16 fallbacks in the 72 h
+DEV `request_log` sample, 0 not-found, 0 errors). PR #144 stands
+on independent grounds: in the in-cluster topology (node, electrs,
+bitcoind share the Docker `bitcoin` network) bitcoind's
+local-mempool accept already orders the two POSTs race-free, and
+the closed-test-env model (no external Esplora) means there is no
+upstream to subscribe against in the first place. The
+architecture is documented here; the wire-format bug is recorded
+for the historical record, not as a justification.
 
 Where it applies:
 
@@ -376,12 +383,15 @@ node/
 
 | Branch | Purpose | Deploy target |
 |---|---|---|
-| `develop` | Default branch, active development | DEV node |
-| `main` | Production releases | PRD node |
+| `staging` | Integration buffer — feature PRs land here first | none |
+| `develop` | Active development, promoted from `staging` in batches | DEV node |
+| `main` | Production releases, promoted from `develop` | PRD node |
 
-- **Push to `develop` via feature branch + PR** (branch ruleset active)
-- **`main` is protected** — changes only via PR
-- Never force-push, never amend
+- **Open feature PRs against `staging`** (not `develop`) — `staging` is the integration buffer where multiple feature branches accumulate before being batched into a single `develop` promotion. This keeps `develop` clean for DEV-deploy churn and gives reviewers a smaller blast radius per merge.
+- **`develop` and `main` are protected** — direct pushes are rejected. `develop` accepts only the auto-PR from `staging`; `main` accepts only the auto-PR from `develop`. Hotfixes still go through `staging` so the same review path applies.
+- **`develop` is auto-PR'd from `staging`** by `auto-release-pr-staging.yaml` whenever new commits land on `staging`. Merge that PR to promote the batch to DEV. Promote PRs intentionally skip the `ci:full` label — heavy M3 Ultra tests stay reserved for the develop → main Release PR.
+- **`main` is auto-PR'd from `develop`** by `auto-release-pr.yaml` (with `ci:full` applied automatically). Merge to release to PRD.
+- Never force-push, never amend.
 
 ### Commit Messages
 
@@ -513,23 +523,26 @@ on startup if unset — there is no silent fallback.
 | `PUBLISHER_KEY` | _(required, no default)_ | 32-byte hex private key for Taproot inscription publishing. **Required on every network — DEV, signet, and mainnet.** No fallback default exists: the previous `1234…` placeholder was a publicly-known test key that drainer bots swept within minutes of any on-chain top-up (4 historical drains confirmed). Node panics on startup if unset. Generate locally via `openssl rand -hex 32`. In any deployed environment, source it from your secret manager — **never commit a real key**. |
 | `USERNAME_DOMAIN` | _(required, no default)_ | External hostname returned by `/api/info`; node panics on startup if unset (see PR [#36](https://github.com/zk-coins/node/pull/36) for the regression that introduced the global panic hook). |
 | `POSTGRES_PASSWORD` | _(required, no default for the DB container)_ | Read by the Postgres container, not by the node process itself; the node's `DATABASE_URL` already embeds the password. Listed here because it is part of the local-dev bootstrap (see `Local Development with Postgres` below). |
-| `ESPLORA_URL` | `https://mutinynet.com/api` | Esplora REST API endpoint (electrs or public). |
-| `ESPLORA_WS_URL` | `wss://mutinynet.com/api/v1/ws` | Esplora WebSocket endpoint consumed by `scanner_ws` (issue #84). DEV/PRD override only when the upstream WS path changes. |
-| `IS_MAINNET` | `false` | `true` for Bitcoin Mainnet, `false` for Mutinynet/Signet. |
-| `NETWORK_NAME` | `Mutinynet` / `Mainnet` | Human-readable name returned by `/api/info`. |
+| `IS_MAINNET` | _(required, no default)_ | Exact string `true` or `false`; any other value panics. Truthy values like `1`, `TRUE`, `yes` are rejected to prevent silent misconfiguration. |
+| `ESPLORA_URL` | _(required, no default)_ | HTTP Esplora endpoint (electrs or public-compatible) for the chain this stage serves. Empty string is treated as unset and panics. |
+| `ESPLORA_WS_URL` | _(required, no default)_ | Esplora-compatible WebSocket endpoint consumed by `scanner_ws` (issue #84). Empty string is treated as unset and panics. Previous Mutinynet default was removed because it coupled the deploy to a public third-party host. |
+| `NETWORK_NAME` | `Mutinynet` / `Mainnet` | Human-readable name returned by `/api/info`. Derived from `IS_MAINNET` if unset. Purely cosmetic — no behavioural effect. |
 | `PROOFS_DIR` | `./proofs` | Directory for per-proof bincode files (see `Persistent State` below). |
 | `SCANNER_INITIAL_SETTLE_TIMEOUT_MS` | (runtime-defined) | Override for the scanner's initial-settle deadline; see `runtime.rs`. |
 | `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`). |
 
 ### Minimal local-dev env
 
+All chain-shaping vars are required — there are no defaults. Set them
+explicitly, even for local dev:
+
 ```bash
 export DATABASE_URL="postgresql://postgres:dev@localhost:5432/postgres"
 export PUBLISHER_KEY="$(openssl rand -hex 32)"
 export USERNAME_DOMAIN="test.zkcoins.local"
-# Optional — defaults are fine for Mutinynet:
-# export ESPLORA_URL="https://mutinynet.com/api"
-# export IS_MAINNET="false"
+export IS_MAINNET="false"
+export ESPLORA_URL="http://localhost:3000"           # your local electrs
+export ESPLORA_WS_URL="ws://localhost:8999/api/v1/ws"  # your local mempool/backend, or any Esplora-compatible WS
 cargo run -p node
 ```
 
@@ -603,7 +616,8 @@ See [docs.zkcoins.app/infrastructure/backend](https://docs.zkcoins.app/infrastru
 | `ci.yaml` (Coverage Gate) | Ready PR → develop with `ci:full` label, push to develop | `cargo llvm-cov nextest` with the 100% line + function gate, MVP scope, on the same runner pool. |
 | `deploy-dev.yaml` | Push to develop | Docker build (ARM64) → push `zkcoins/node:beta` → deploy to DEV |
 | `deploy-prd.yaml` | Push to main | Docker build (ARM64) → push `zkcoins/node:latest` → deploy to PRD |
-| `auto-release-pr.yaml` | Push to develop | Creates Release PR (develop → main) |
+| `auto-release-pr-staging.yaml` | Push to staging | Creates Promote PR (staging → develop) |
+| `auto-release-pr.yaml` | Push to develop | Creates Release PR (develop → main) with `ci:full` label |
 
 **Draft PRs** skip every `ci.yaml` job — the workflow fires once the
 PR is marked ready-for-review.
