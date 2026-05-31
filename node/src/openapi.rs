@@ -7,27 +7,37 @@
 //! documentation is structurally impossible because the same Rust
 //! type drives both serde and the schema.
 //!
-//! Two routes are wired in [`crate::router::create_router`]:
+//! Four routes are wired in [`crate::router::create_router`]:
 //!
 //! - `GET /openapi.json` — returns the generated spec as JSON. The
 //!   serialised bytes are produced once at first call into
 //!   [`openapi_json`] and cached in a process-wide `OnceLock<String>`;
 //!   subsequent calls return the same slice without re-serialising.
-//! - `GET /docs` — serves a static HTML page that loads Swagger UI
-//!   from the `unpkg.com` CDN with the asset version pinned. The
-//!   embedded spec URL is `/openapi.json` (relative), so the docs page
-//!   keeps working behind any reverse proxy that preserves path order.
+//! - `GET /docs` — serves a static HTML page that boots Swagger UI
+//!   from two same-origin assets:
+//!   - `GET /docs/swagger-ui.css`
+//!   - `GET /docs/swagger-ui-bundle.js`
+//!
+//! The asset bytes are bundled into the binary via the
+//! `utoipa-swagger-ui` crate's `vendored` feature, so the page works
+//! offline, behind any reverse proxy that preserves path ordering, and
+//! has no runtime CDN dependency. The `axum` feature of
+//! `utoipa-swagger-ui` is deliberately disabled because it requires
+//! axum 0.8; we hit the framework-agnostic [`utoipa_swagger_ui::serve`]
+//! entrypoint from our own axum 0.7 handler instead.
 //!
 //! Feature-gated handlers are conditionally registered via
 //! `#[cfg(feature = "...")]` on both the `paths(...)` list and the
 //! handler's own annotation, so the spec describes exactly the routes
 //! that exist in the running binary — not a superset.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
+use axum::extract::Path;
 use axum::http::{header, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use utoipa::OpenApi;
+use utoipa_swagger_ui::Config;
 
 use crate::db::{InscriptionKind, InscriptionSummary};
 use crate::router::{
@@ -35,23 +45,19 @@ use crate::router::{
     SendCoinRequest, SendCoinResponse, UsernameResponse,
 };
 
-#[cfg(any(feature = "address-list", feature = "lnurl"))]
+#[cfg(feature = "address-list")]
 use crate::router::AddressesResponse;
 #[cfg(feature = "username-claim")]
 use crate::router::ClaimUsernameRequest;
 #[cfg(feature = "lnurl")]
 use crate::router::LnurlpResponse;
 
-/// CDN-pinned Swagger UI asset version. Bumped intentionally; never
-/// use a major-range (`@5`) or `@latest`. Verified against `npm view
-/// swagger-ui-dist version` before each bump. Exposed so the smoke
-/// test can assert the [`DOCS_HTML`] string carries this exact pin.
-pub const SWAGGER_UI_VERSION: &str = "5.32.6";
-
-/// Pinned Swagger UI HTML page served at `GET /docs`. Loads the CSS
-/// and bundle from `unpkg.com/swagger-ui-dist@<version>/` and points
-/// the renderer at the relative `/openapi.json` URL so the page works
-/// behind any reverse proxy that preserves path ordering.
+/// Static Swagger UI HTML page served at `GET /docs`. References two
+/// same-origin assets (`/docs/swagger-ui.css`, `/docs/swagger-ui-bundle.js`)
+/// served from the bundled `utoipa-swagger-ui` `vendored` snapshot, and
+/// points the renderer at the relative `/openapi.json` URL so the page
+/// works behind any reverse proxy that preserves path ordering. No
+/// external URLs — verified by the `openapi_smoke` suite.
 pub const DOCS_HTML: &str = concat!(
     "<!DOCTYPE html>\n",
     "<html lang=\"en\">\n",
@@ -59,11 +65,11 @@ pub const DOCS_HTML: &str = concat!(
     "<meta charset=\"UTF-8\">\n",
     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n",
     "<title>zkCoins API</title>\n",
-    "<link rel=\"stylesheet\" href=\"https://unpkg.com/swagger-ui-dist@5.32.6/swagger-ui.css\">\n",
+    "<link rel=\"stylesheet\" href=\"/docs/swagger-ui.css\">\n",
     "</head>\n",
     "<body>\n",
     "<div id=\"swagger-ui\"></div>\n",
-    "<script src=\"https://unpkg.com/swagger-ui-dist@5.32.6/swagger-ui-bundle.js\" charset=\"UTF-8\"></script>\n",
+    "<script src=\"/docs/swagger-ui-bundle.js\" charset=\"UTF-8\"></script>\n",
     "<script>\n",
     "window.onload = function() {\n",
     "  window.ui = SwaggerUIBundle({\n",
@@ -93,10 +99,10 @@ pub const DOCS_HTML: &str = concat!(
                        node serves. Interactive Swagger UI: `/docs`.",
         license(name = "MIT"),
     ),
-    servers(
-        (url = "https://api.zkcoins.app", description = "Production node (Bitcoin Mainnet)"),
-        (url = "https://dev-api.zkcoins.app", description = "DEV node (Mutinynet)"),
-    ),
+    // No `servers(...)` block: per OpenAPI 3.x, the document then
+    // applies to the host it was fetched from, so each self-hoster's
+    // node automatically advertises its own URL instead of pointing at
+    // the hosted DFX deployments.
     paths(
         crate::router::info_handler,
         crate::router::get_balance_handler,
@@ -201,6 +207,33 @@ pub async fn docs_handler() -> impl IntoResponse {
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         DOCS_HTML,
     )
+}
+
+/// Shared [`utoipa_swagger_ui::Config`] used to look up bundled assets.
+/// The path argument matches the spec URL embedded in [`DOCS_HTML`] so
+/// Swagger UI itself loads `/openapi.json` (this struct does not gate
+/// asset lookup — `serve()` keys solely off the relative file name).
+fn swagger_ui_config() -> Arc<Config<'static>> {
+    static CONFIG: OnceLock<Arc<Config<'static>>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| Arc::new(Config::from("/openapi.json")))
+        .clone()
+}
+
+/// `GET /docs/{file}` — serve a single Swagger UI asset (CSS, JS, font,
+/// map) bundled into the binary by the `utoipa-swagger-ui` `vendored`
+/// feature. Returns 404 for unknown files.
+pub async fn swagger_asset_handler(Path(file): Path<String>) -> Response {
+    match utoipa_swagger_ui::serve(&file, swagger_ui_config()) {
+        Ok(Some(asset)) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, asset.content_type)],
+            asset.bytes.to_vec(),
+        )
+            .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 // Foreign types like `bitcoin::secp256k1::PublicKey` cannot derive

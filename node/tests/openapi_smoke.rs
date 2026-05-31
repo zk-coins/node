@@ -15,9 +15,11 @@
 //!   - `InfoResponse` carries the `username_domain` field — its
 //!     absence in an earlier Zod-driven mirror is what motivated the
 //!     switch to annotation-driven generation in the first place
-//!   - the static Swagger UI page served at `/docs` pins the exact
-//!     `SWAGGER_UI_VERSION` constant, so a future bump to the version
-//!     constant cannot diverge from the `<script src="…">` tag
+//!   - the static Swagger UI page served at `/docs` references the
+//!     bundled `swagger-ui-bundle.js` and `swagger-ui.css` assets via
+//!     same-origin relative URLs, with no `https://` references and no
+//!     `servers(...)` block in the spec — both would couple the
+//!     document to a specific deployment host
 //!
 //! Read by: `cargo test -p node --test openapi_smoke` (CI, both the
 //! slim PR job and the full release job).
@@ -137,34 +139,62 @@ fn info_response_carries_username_domain() {
 }
 
 #[test]
-fn docs_html_pins_the_swagger_ui_version_constant() {
-    // The HTML is a `concat!` literal and the version is a separate
-    // `pub const`. A future bump must update both — this test fails
-    // if the constant and the literal drift apart.
+fn docs_html_loads_bundled_swagger_ui_assets() {
     let html = node::openapi::DOCS_HTML;
-    let version = node::openapi::SWAGGER_UI_VERSION;
+    // Same-origin relative URLs served by `swagger_asset_handler` from
+    // the binary-bundled `utoipa-swagger-ui` `vendored` snapshot. A
+    // leading `https://` here would re-introduce the CDN dependency
+    // the bundled-assets refactor was supposed to remove.
     assert!(
-        html.contains(version),
-        "`DOCS_HTML` must embed the `SWAGGER_UI_VERSION` constant (`{version}`) verbatim"
-    );
-}
-
-#[test]
-fn docs_html_loads_swagger_ui_assets() {
-    let html = node::openapi::DOCS_HTML;
-    assert!(
-        html.contains("swagger-ui-bundle.js"),
-        "`DOCS_HTML` must load the Swagger UI JS bundle"
+        html.contains("/docs/swagger-ui-bundle.js"),
+        "`DOCS_HTML` must load the Swagger UI JS bundle from the same-origin `/docs/` path"
     );
     assert!(
-        html.contains("swagger-ui.css"),
-        "`DOCS_HTML` must load the Swagger UI stylesheet"
+        html.contains("/docs/swagger-ui.css"),
+        "`DOCS_HTML` must load the Swagger UI stylesheet from the same-origin `/docs/` path"
     );
-    // Relative URL so the page works behind any reverse proxy that
-    // preserves the path. A leading `https://` here would couple the
-    // docs page to a specific deployment URL.
     assert!(
         html.contains("url: '/openapi.json'"),
         "`DOCS_HTML` must point Swagger UI at the relative `/openapi.json` URL"
     );
+}
+
+#[test]
+fn docs_html_has_no_external_urls() {
+    // The whole point of the bundling refactor: zero CDN dependencies
+    // in the docs page so the node ships a self-contained binary.
+    let html = node::openapi::DOCS_HTML;
+    assert!(
+        !html.contains("http://"),
+        "`DOCS_HTML` must not reference any external `http://` URL"
+    );
+    assert!(
+        !html.contains("https://"),
+        "`DOCS_HTML` must not reference any external `https://` URL — \
+         Swagger UI assets are bundled into the binary"
+    );
+}
+
+#[test]
+fn spec_has_no_hardcoded_servers_block() {
+    // The previous shape pinned `servers(...)` to the hosted DFX
+    // deployments, which leaks DFX infrastructure into every
+    // self-hoster's binary and confuses Swagger UI's "Try it out"
+    // panel. Per OpenAPI 3.x, omitting `servers` (or leaving it empty)
+    // means "same host as the document was fetched from" — exactly
+    // the self-host-friendly default we want.
+    let v = parse_spec();
+    match v.get("servers") {
+        None => {}
+        Some(serde_json::Value::Array(arr)) => {
+            for entry in arr {
+                let url = entry["url"].as_str().unwrap_or("");
+                assert!(
+                    !url.starts_with("http://") && !url.starts_with("https://"),
+                    "spec.servers must not hardcode an absolute URL, got `{url}`"
+                );
+            }
+        }
+        Some(other) => panic!("spec.servers must be absent or an array, got {other}"),
+    }
 }

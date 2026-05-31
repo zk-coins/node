@@ -2950,6 +2950,7 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/health/publisher", get(publisher_health_handler))
         .route("/openapi.json", get(crate::openapi::openapi_json_handler))
         .route("/docs", get(crate::openapi::docs_handler))
+        .route("/docs/:file", get(crate::openapi::swagger_asset_handler))
         .route("/api/info", get(info_handler))
         .route("/api/balance", get(get_balance_handler))
         .route("/api/history", get(get_history_handler))
