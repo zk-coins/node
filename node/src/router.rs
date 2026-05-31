@@ -7,7 +7,6 @@ use axum::{
     Router,
 };
 use bitcoin::secp256k1::{self as secp, schnorr::Signature as SchnorrSignature, Message};
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shared::ClientAccount;
@@ -15,7 +14,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -26,7 +25,7 @@ use crate::account_node::{AccountNode, CoinProof};
 use crate::db;
 use crate::db::InscriptionSummary;
 use crate::flow;
-use crate::job_dispatcher::JobEnvelope;
+use crate::job_dispatcher::{JobEnvelope, JobNotifyMap, JobPhaseEvent};
 use crate::job_store::{CreateResult, JobKind, JobStatus, JobStore};
 use crate::publisher::EsploraConfig;
 use crate::username::UsernameStore;
@@ -155,13 +154,19 @@ pub struct AppState {
     /// dropping the last `AppState`) shuts the dispatcher's recv
     /// loop down cleanly.
     pub(crate) job_tx: mpsc::Sender<JobEnvelope>,
-    /// Per-job `Notify` channels populated by the dispatcher when a
-    /// send-job reaches `awaiting_signature` and drained by the
-    /// matching `POST /api/jobs/:id/commit` handler. `DashMap`
-    /// (rather than `Mutex<HashMap>`) so concurrent inserts /
-    /// removes / lookups stay lock-free on the typical access
-    /// pattern (one wallet per job).
-    pub(crate) job_notify_map: Arc<DashMap<Uuid, Arc<Notify>>>,
+    /// Per-job `JobNotifier` channels populated by the dispatcher (a)
+    /// when a send-job reaches `awaiting_signature` (the commit
+    /// handler drains its `commit_wake` Notify) and (b) when a SSE
+    /// stream subscribes to a non-terminal job (it holds a
+    /// `phase_tx.subscribe()` receiver). `DashMap` (rather than
+    /// `Mutex<HashMap>`) so concurrent inserts / removes / lookups
+    /// stay lock-free on the typical access pattern (one wallet per
+    /// job + at most a handful of SSE streams).
+    ///
+    /// See [`JobNotifier`] for the two coordination primitives the
+    /// dispatcher and the SSE handler share via this map; see
+    /// [`stream_job_handler`] for the subscriber-side wiring.
+    pub(crate) job_notify_map: JobNotifyMap,
 }
 
 // Response types for our API
@@ -1712,10 +1717,10 @@ pub(crate) async fn jobs_commit_handler(
     // exists in the notify_map the dispatcher already gave up
     // (e.g. timed out and removed the entry); surface 409 so the
     // wallet does not silently spin.
-    let notify = state.job_notify_map.get(&id).map(|e| e.value().clone());
-    match notify {
+    let notifier = state.job_notify_map.get(&id).map(|e| e.value().clone());
+    match notifier {
         Some(n) => {
-            n.notify_one();
+            n.commit_wake.notify_one();
             (
                 StatusCode::OK,
                 Json(serde_json::json!({"status": "broadcasting"})),
@@ -1759,11 +1764,32 @@ pub(crate) async fn jobs_cancel_handler(
     Path(id): Path<Uuid>,
 ) -> axum::response::Response {
     match state.job_store.cancel(id).await {
-        Ok(true) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "cancelled"})),
-        )
-            .into_response(),
+        Ok(true) => {
+            // Publish the terminal `cancelled` event to any attached
+            // SSE listener BEFORE the dispatcher's notify-map entry
+            // drops (it won't drop until the next admit, but the
+            // explicit publish here guarantees a listener that was
+            // attached before cancel sees the event without waiting
+            // on the dispatcher's terminal-cleanup path — cancel
+            // succeeds only while `status = queued`, before the
+            // dispatcher ever picks the row up).
+            crate::job_dispatcher::publish_phase(
+                &state.job_notify_map,
+                id,
+                JobPhaseEvent {
+                    status: JobStatus::Cancelled,
+                    phase: "cancelled".to_string(),
+                    proof_id: None,
+                    result: None,
+                    error: None,
+                },
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "cancelled"})),
+            )
+                .into_response()
+        }
         Ok(false) => (
             StatusCode::CONFLICT,
             Json(JobErrorResponse {

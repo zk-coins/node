@@ -2960,8 +2960,9 @@ mod jobs_endpoint_tests {
             .set_awaiting_signature(job_id, 7)
             .await
             .expect("aw sig");
-        let notify = Arc::new(tokio::sync::Notify::new());
-        state.job_notify_map.insert(job_id, notify.clone());
+        let notifier = Arc::new(crate::job_dispatcher::JobNotifier::new());
+        let commit_wake = notifier.commit_wake.clone();
+        state.job_notify_map.insert(job_id, notifier);
 
         let commit_body = serde_json::json!({
             "proof_id": 7u64,
@@ -2977,10 +2978,10 @@ mod jobs_endpoint_tests {
         assert_eq!(status, StatusCode::OK, "body: {}", body);
         let v: serde_json::Value = serde_json::from_str(&body).expect("json");
         assert_eq!(v["status"], "broadcasting");
-        // The handler signals the notify; verifying that requires
-        // observing the wake-up. We assert that .notified() resolves
-        // immediately afterwards.
-        tokio::time::timeout(std::time::Duration::from_secs(1), notify.notified())
+        // The handler signals the notifier's commit_wake; verifying
+        // that requires observing the wake-up. We assert that
+        // .notified() resolves immediately afterwards.
+        tokio::time::timeout(std::time::Duration::from_secs(1), commit_wake.notified())
             .await
             .expect("notify_one must have been called");
     }
@@ -3227,8 +3228,8 @@ mod jobs_endpoint_tests {
             .set_awaiting_signature(job_id, 7)
             .await
             .expect("aw sig");
-        let notify = Arc::new(tokio::sync::Notify::new());
-        state.job_notify_map.insert(job_id, notify);
+        let notifier = Arc::new(crate::job_dispatcher::JobNotifier::new());
+        state.job_notify_map.insert(job_id, notifier);
 
         // Install a CHECK constraint that no future UPDATE can
         // satisfy. NOT VALID lets the existing (already-stored) row
