@@ -213,7 +213,7 @@ pub async fn docs_handler() -> impl IntoResponse {
 /// The path argument matches the spec URL embedded in [`DOCS_HTML`] so
 /// Swagger UI itself loads `/openapi.json` (this struct does not gate
 /// asset lookup — `serve()` keys solely off the relative file name).
-fn swagger_ui_config() -> Arc<Config<'static>> {
+pub(crate) fn swagger_ui_config() -> Arc<Config<'static>> {
     static CONFIG: OnceLock<Arc<Config<'static>>> = OnceLock::new();
     CONFIG
         .get_or_init(|| Arc::new(Config::from("/openapi.json")))
@@ -240,3 +240,7 @@ pub async fn swagger_asset_handler(Path(file): Path<String>) -> Response {
 // `ToSchema` here (orphan rule). Each use site overrides the schema
 // with `#[schema(value_type = String)]` so the spec describes the
 // hex-encoded wire form instead of the in-process representation.
+
+#[cfg(test)]
+#[path = "openapi_tests.rs"]
+mod tests;
