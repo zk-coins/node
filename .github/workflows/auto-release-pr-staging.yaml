@@ -1,0 +1,71 @@
+name: Auto Promote PR (staging → develop)
+
+on:
+  push:
+    branches: [staging]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: auto-release-pr-staging
+  cancel-in-progress: false
+
+jobs:
+  create-promote-pr:
+    name: Create Promote PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch develop branch
+        run: git fetch origin develop
+
+      - name: Check for existing PR
+        id: check-pr
+        run: |
+          PR_COUNT=$(gh pr list --base develop --head staging --state open --json number --jq 'length')
+          echo "pr_exists=$([[ $PR_COUNT -gt 0 ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for differences
+        id: check-diff
+        if: steps.check-pr.outputs.pr_exists == 'false'
+        run: |
+          DIFF_COUNT=$(git rev-list --count origin/develop..origin/staging)
+          echo "has_changes=$([[ $DIFF_COUNT -gt 0 ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          echo "commit_count=$DIFF_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Create Promote PR
+        if: steps.check-pr.outputs.pr_exists == 'false' && steps.check-diff.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMIT_COUNT: ${{ steps.check-diff.outputs.commit_count }}
+        run: |
+          # Promote PRs intentionally do NOT apply the `ci:full` label.
+          # The heavy M3 Ultra test + coverage gate stays reserved for
+          # the develop → main Release PR (auto-release-pr.yaml), which
+          # remains the authoritative pre-PRD gate. Promote PRs run the
+          # slim `Lint & Build` job + Analyze / CodeQL, mirroring what
+          # every ready feature PR sees.
+          printf '%s\n' \
+            "## Automatic Promote PR" \
+            "" \
+            "**Commits:** ${COMMIT_COUNT} new commit(s)" \
+            "" \
+            "- [ ] Review all changes" \
+            "- [ ] Verify CI passes" \
+            "- [ ] Merge to promote staging to develop (deploys to DEV)" \
+            > /tmp/pr-body.md
+
+          gh pr create \
+            --base develop \
+            --head staging \
+            --title "Promote: staging -> develop" \
+            --body-file /tmp/pr-body.md

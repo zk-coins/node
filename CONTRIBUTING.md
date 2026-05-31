@@ -376,12 +376,15 @@ node/
 
 | Branch | Purpose | Deploy target |
 |---|---|---|
-| `develop` | Default branch, active development | DEV node |
-| `main` | Production releases | PRD node |
+| `staging` | Integration buffer — feature PRs land here first | none |
+| `develop` | Active development, promoted from `staging` in batches | DEV node |
+| `main` | Production releases, promoted from `develop` | PRD node |
 
-- **Push to `develop` via feature branch + PR** (branch ruleset active)
-- **`main` is protected** — changes only via PR
-- Never force-push, never amend
+- **Open feature PRs against `staging`** (not `develop`) — `staging` is the integration buffer where multiple feature branches accumulate before being batched into a single `develop` promotion. This keeps `develop` clean for DEV-deploy churn and gives reviewers a smaller blast radius per merge.
+- **`develop` and `main` are protected** — direct pushes are rejected. `develop` accepts only the auto-PR from `staging`; `main` accepts only the auto-PR from `develop`. Hotfixes still go through `staging` so the same review path applies.
+- **`develop` is auto-PR'd from `staging`** by `auto-release-pr-staging.yaml` whenever new commits land on `staging`. Merge that PR to promote the batch to DEV. Promote PRs intentionally skip the `ci:full` label — heavy M3 Ultra tests stay reserved for the develop → main Release PR.
+- **`main` is auto-PR'd from `develop`** by `auto-release-pr.yaml` (with `ci:full` applied automatically). Merge to release to PRD.
+- Never force-push, never amend.
 
 ### Commit Messages
 
@@ -603,7 +606,8 @@ See [docs.zkcoins.app/infrastructure/backend](https://docs.zkcoins.app/infrastru
 | `ci.yaml` (Coverage Gate) | Ready PR → develop with `ci:full` label, push to develop | `cargo llvm-cov nextest` with the 100% line + function gate, MVP scope, on the same runner pool. |
 | `deploy-dev.yaml` | Push to develop | Docker build (ARM64) → push `zkcoins/node:beta` → deploy to DEV |
 | `deploy-prd.yaml` | Push to main | Docker build (ARM64) → push `zkcoins/node:latest` → deploy to PRD |
-| `auto-release-pr.yaml` | Push to develop | Creates Release PR (develop → main) |
+| `auto-release-pr-staging.yaml` | Push to staging | Creates Promote PR (staging → develop) |
+| `auto-release-pr.yaml` | Push to develop | Creates Release PR (develop → main) with `ci:full` label |
 
 **Draft PRs** skip every `ci.yaml` job — the workflow fires once the
 PR is marked ready-for-review.
