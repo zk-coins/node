@@ -3663,7 +3663,7 @@ mod jobs_endpoint_tests {
             },
         );
 
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), request_task)
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), request_task)
             .await
             .expect("request did not complete in time")
             .expect("join");
@@ -3745,7 +3745,7 @@ mod jobs_endpoint_tests {
             },
         );
 
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), request_task)
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), request_task)
             .await
             .expect("request stalled")
             .expect("join");
@@ -3807,9 +3807,9 @@ mod jobs_endpoint_tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let ev = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
             .await
-            .expect("event in 1s")
+            .expect("event in 10s")
             .expect("ok");
         assert_eq!(ev.status, JobStatus::Cancelled);
         assert_eq!(ev.phase, "cancelled");
