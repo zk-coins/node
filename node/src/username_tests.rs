@@ -43,6 +43,7 @@ async fn setup_pool() -> (PgPool, ContainerAsync<Postgres>) {
     (pool, container)
 }
 
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_and_resolve_persists_via_pg() {
     let (pool, _container) = setup_pool().await;
@@ -65,6 +66,7 @@ async fn claim_and_resolve_persists_via_pg() {
     assert_eq!(reloaded.get_username(&address), Some("alice"));
 }
 
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn duplicate_username_rejected_with_validation() {
     let (pool, _container) = setup_pool().await;
@@ -78,6 +80,7 @@ async fn duplicate_username_rejected_with_validation() {
     assert!(format!("{}", err).contains("Username already taken"));
 }
 
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn duplicate_address_rejected_with_validation() {
     let (pool, _container) = setup_pool().await;
@@ -92,6 +95,7 @@ async fn duplicate_address_rejected_with_validation() {
     assert!(format!("{}", err).contains("Address already has a username"));
 }
 
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn invalid_username_rejected() {
     let (pool, _container) = setup_pool().await;
@@ -102,6 +106,7 @@ async fn invalid_username_rejected() {
     assert!(store.claim(&pool, &"a".repeat(65), addr(4)).await.is_err());
 }
 
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn valid_usernames_accepted() {
     let (pool, _container) = setup_pool().await;
@@ -112,6 +117,11 @@ async fn valid_usernames_accepted() {
     store.claim(&pool, "dave.btc", addr(4)).await.unwrap();
 }
 
+// Setup seeds via `store.claim`, so this case-insensitivity test only
+// runs with the claim path compiled in. The pure resolve mechanics
+// are covered without claim by the `get_username_*` and `load_from_pg_*`
+// cases below plus `db_tests::resolve_*`.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn resolve_is_case_insensitive() {
     let (pool, _container) = setup_pool().await;
@@ -140,6 +150,30 @@ async fn load_from_pg_returns_empty_initially() {
     assert_eq!(store.get_username(&addr(1)), None);
 }
 
+// Direct-SQL seed of the `usernames` table, then bootstrap a store via
+// `load_from_pg`. Exercises the row-conversion + `usernames.insert(...)`
+// path in `load_from_pg` without going through `UsernameStore::claim`,
+// so the coverage gate still hits this branch when the `username-claim`
+// Cargo feature is off (the read path is permanent MVP and must stay
+// covered independently of the write path).
+#[tokio::test]
+async fn load_from_pg_returns_seeded_rows() {
+    let (pool, _container) = setup_pool().await;
+    let raw = [7u8; 32];
+    let expected = digest_from_bytes(&raw);
+    sqlx::query("INSERT INTO usernames (name, address) VALUES ($1, $2)")
+        .bind("alice")
+        .bind(raw.as_slice())
+        .execute(&pool)
+        .await
+        .expect("seed row");
+
+    let store = UsernameStore::load_from_pg(&pool).await.expect("load ok");
+    assert_eq!(store.resolve("alice"), Some(expected));
+    assert_eq!(store.get_username(&expected), Some("alice"));
+}
+
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_propagates_db_error_when_pool_is_dead() {
     // Lazy pool that never connects → claim returns Db error.
@@ -222,6 +256,7 @@ async fn load_from_pg_rejects_wrong_address_length() {
     assert!(std::error::Error::source(&err).is_none());
 }
 
+#[cfg(feature = "username-claim")]
 #[test]
 fn validation_error_display_passes_through_message() {
     let err = ClaimUsernameError::Validation("Username must be 1-64 characters");
@@ -237,6 +272,7 @@ fn validation_error_display_passes_through_message() {
 /// must surface the same "Username already taken" Validation error
 /// as the in-memory pre-check would have produced. This is the
 /// branch that wraps the SQL-layer race fallback in `username.rs`.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_falls_back_to_validation_when_sql_layer_catches_race() {
     let (pool, _container) = setup_pool().await;

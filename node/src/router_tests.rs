@@ -63,7 +63,6 @@ fn test_state() -> AppState {
             is_mainnet: false,
             network_name: "Mutinynet".to_string(),
             ws_url: None,
-            track_tx_timeout: None,
         }),
         phase2_reached: Arc::new(tokio::sync::Notify::new()),
         phase3_release_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -141,10 +140,10 @@ async fn info_returns_network_name_capabilities_and_username_domain() {
         info.capabilities.address_list,
         cfg!(feature = "address-list")
     );
-    // Mint is permanent MVP — `faucet` is hardcoded `true`, not cfg-derived.
-    assert!(info.capabilities.faucet);
-    // Usernames are permanent MVP — `usernames` is hardcoded `true`.
-    assert!(info.capabilities.usernames);
+    assert_eq!(
+        info.capabilities.username_claim,
+        cfg!(feature = "username-claim")
+    );
     assert_eq!(info.capabilities.lnurl, cfg!(feature = "lnurl"));
 
     // The lazy_static defaults to "zkcoins.app" (PRD) when USERNAME_DOMAIN is unset
@@ -166,7 +165,7 @@ async fn info_serialization_format_is_stable() {
     assert!(v["username_domain"].is_string());
 
     let caps = &v["capabilities"];
-    for key in ["address_list", "faucet", "usernames", "lnurl"] {
+    for key in ["address_list", "username_claim", "lnurl"] {
         assert!(caps[key].is_boolean(), "capability `{key}` must be bool");
     }
 }
@@ -425,6 +424,7 @@ async fn resolve_minting_address_by_hex_prefix() {
 
 // --- POST /api/username/claim ---
 
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_empty_body_returns_422() {
     let req = Request::post("/api/username/claim")
@@ -436,6 +436,7 @@ async fn claim_username_empty_body_returns_422() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_no_content_type_returns_415() {
     let req = Request::post("/api/username/claim")
@@ -886,6 +887,7 @@ fn send_signature_rejects_wrong_signature() {
 
 // --- POST /api/username/claim with valid Schnorr signature ---
 
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_with_valid_signature() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -985,6 +987,7 @@ async fn claim_username_with_valid_signature() {
 /// form (`"alice"`) and sends the user-typed form (`"Alice"`) is
 /// accepted and persisted under `"alice"`. Guards the case-mismatch
 /// squat fix from PR #76's prod-readiness review.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_mixed_case_input_normalised_before_hashing() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -1076,6 +1079,7 @@ async fn claim_username_mixed_case_input_normalised_before_hashing() {
 /// node, because the node hashes the normalised form. Without
 /// this, the case-mismatch squat is reachable: attacker signs `"Bob"`,
 /// node persists `"bob"`, the legitimate `bob` owner is locked out.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_raw_case_signature_rejected() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -1138,6 +1142,7 @@ async fn claim_username_raw_case_signature_rejected() {
 /// the in-memory mirror is pre-seeded via `insert_for_test`, the
 /// signature is valid, and the handler short-circuits before the
 /// `db::claim_username` call.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_precheck_conflict_returns_409() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -1206,6 +1211,7 @@ async fn claim_username_precheck_conflict_returns_409() {
     );
 }
 
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_wrong_pubkey() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -1257,6 +1263,7 @@ async fn claim_username_wrong_pubkey() {
     );
 }
 
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_expired_timestamp() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -1311,6 +1318,7 @@ async fn claim_username_expired_timestamp() {
 /// `UsernameStore::validate` rejects names outside `[a-z0-9._-]{1,64}`.
 /// Drives the handler's first early-return arm (the `validate` `Err`
 /// branch), so no DB round-trip and no signature work is needed.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_invalid_format_returns_422() {
     let body = serde_json::json!({
@@ -1342,6 +1350,7 @@ async fn claim_username_invalid_format_returns_422() {
 }
 
 /// Non-hex address payload triggers the `hex::decode` early-return arm.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_invalid_address_hex_returns_422() {
     let body = serde_json::json!({
@@ -1373,6 +1382,7 @@ async fn claim_username_invalid_address_hex_returns_422() {
 }
 
 /// Valid hex address but not 32 bytes triggers the length-check arm.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_wrong_address_length_returns_422() {
     let body = serde_json::json!({
@@ -1406,6 +1416,7 @@ async fn claim_username_wrong_address_length_returns_422() {
 /// Address matches `sha256(pubkey)` and the timestamp is fresh, so the
 /// handler reaches the signature-hex decode step before bailing on the
 /// non-hex `signature` field.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_invalid_signature_hex_returns_422() {
     use bitcoin::secp256k1::SecretKey;
@@ -1447,6 +1458,7 @@ async fn claim_username_invalid_signature_hex_returns_422() {
 
 /// Signature is valid hex but the wrong length for a BIP-340 Schnorr
 /// signature (64 bytes), so `SchnorrSignature::from_slice` rejects it.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_invalid_signature_format_returns_422() {
     use bitcoin::secp256k1::SecretKey;
@@ -1491,6 +1503,7 @@ async fn claim_username_invalid_signature_format_returns_422() {
 /// after the in-memory `precheck` passes. The handler must map that
 /// onto a 503. Mirrors `claim_propagates_db_error_when_pool_is_dead`
 /// from `username_tests.rs`, but exercises the handler's error arm.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_db_error_returns_503() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -1546,6 +1559,7 @@ async fn claim_username_db_error_returns_503() {
 /// string. Mirrors `claim_falls_back_to_validation_when_sql_layer_catches_race`
 /// from `username_tests.rs`, but exercises the handler's `!inserted`
 /// arm rather than the `UsernameStore::claim` wrapper.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_sql_race_returns_409() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
@@ -2308,7 +2322,6 @@ async fn send_with_insufficient_funds_returns_422_with_error_string() {
             is_mainnet: false,
             network_name: "Mutinynet".to_string(),
             ws_url: None,
-            track_tx_timeout: None,
         }),
         phase2_reached: Arc::new(tokio::sync::Notify::new()),
         phase3_release_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -2541,7 +2554,6 @@ async fn commit_with_valid_signature_fails_broadcast_returns_503() {
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
         ws_url: None,
-        track_tx_timeout: None,
     });
 
     let secret_bytes = include_bytes!("../minting_secret.bin");
@@ -3448,7 +3460,6 @@ fn ready_state(pool: Arc<sqlx::PgPool>, esplora_url: String) -> AppState {
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
         ws_url: None,
-        track_tx_timeout: None,
     });
     state
 }
@@ -3583,7 +3594,6 @@ async fn health_publisher_returns_200_with_utxo_count_and_total_sats_when_esplor
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
         ws_url: None,
-        track_tx_timeout: None,
     });
 
     let req = Request::get("/health/publisher")
@@ -3698,7 +3708,6 @@ fn mint_test_state() -> AppState {
             is_mainnet: false,
             network_name: "Mutinynet".to_string(),
             ws_url: None,
-            track_tx_timeout: None,
         }),
         phase2_reached: Arc::new(tokio::sync::Notify::new()),
         phase3_release_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -3997,15 +4006,13 @@ async fn mint_happy_path_broadcasts_and_returns_proof_id() {
         .await;
 
     // 3. Wire the AppState to the live pool + wiremock URL.
-    let ws_url = mint_broadcast_mock_ws().await;
     let mut state = mint_test_state();
     state.pool = Arc::clone(&pool);
     state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
         url: mock_server.uri(),
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
-        ws_url: Some(ws_url),
-        track_tx_timeout: None,
+        ws_url: None,
     });
 
     let recipient_bytes = [9u8; 32];
@@ -4129,61 +4136,6 @@ async fn mint_with_nonzero_num_pubkeys_covers_prev_pubkey_arm() {
 /// Spin up the wiremock Esplora + matching publisher Taproot UTXO mock
 /// used by the mint happy-path test. Returned `MockServer` is kept
 /// alive by the caller; dropping it tears down the HTTP listener.
-/// Spin up an in-process WS server that emulates the mempool.space
-/// `track-tx` flow used by `publisher::broadcast_inscription_txs`
-/// (issue #84): accept the subscribe frame and echo a documented
-/// `txPosition` event for the txid the client subscribed to, so
-/// the publisher's `wait_for_tx_in_mempool` resolves immediately.
-/// Returns the `ws://` URL.
-async fn mint_broadcast_mock_ws() -> String {
-    use futures_util::{SinkExt, StreamExt};
-    use tokio::net::TcpListener;
-    use tokio_tungstenite::tungstenite::Message as WsMessage;
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let url = format!("ws://{}", addr);
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            // Spawn per-connection so the accept loop continues
-            // immediately and tests issuing multiple sequential mints
-            // (each with its own WS connect) are not serialised behind
-            // the previous connection's 60s keepalive sleep.
-            tokio::spawn(async move {
-                let mut ws = match tokio_tungstenite::accept_async(stream).await {
-                    Ok(w) => w,
-                    Err(_) => return,
-                };
-                let first = match ws.next().await {
-                    Some(Ok(WsMessage::Text(t))) => t,
-                    _ => return,
-                };
-                let value: serde_json::Value = match serde_json::from_str(&first) {
-                    Ok(v) => v,
-                    Err(_) => return,
-                };
-                if value.get("action") == Some(&serde_json::json!("track-tx")) {
-                    if let Some(txid_str) = value.get("data").and_then(|v| v.as_str()) {
-                        // Documented mempool.space `txPosition` shape;
-                        // see `scanner_ws::frame_signals_tx_seen`.
-                        let frame = format!(
-                            r#"{{"txPosition":{{"txid":"{}","position":{{"block":1,"vsize":120}}}}}}"#,
-                            txid_str
-                        );
-                        let _ = ws.send(WsMessage::Text(frame)).await;
-                    }
-                }
-                let _ = tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            });
-        }
-    });
-    url
-}
-
 async fn mint_broadcast_mock_server() -> wiremock::MockServer {
     use bitcoin::Network;
     use bitcoin::{
@@ -4248,8 +4200,6 @@ async fn mint_broadcast_mock_server() -> wiremock::MockServer {
 #[tokio::test]
 async fn mint_pending_inscriptions_persist_failure_returns_503() {
     let mock_server = mint_broadcast_mock_server().await;
-    let ws_url = mint_broadcast_mock_ws().await;
-
     let mut state = mint_test_state();
     // dead_pool stays in place from mint_test_state; only swap the
     // Esplora URL so the broadcast succeeds.
@@ -4257,8 +4207,7 @@ async fn mint_pending_inscriptions_persist_failure_returns_503() {
         url: mock_server.uri(),
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
-        ws_url: Some(ws_url),
-        track_tx_timeout: None,
+        ws_url: None,
     });
 
     let recipient = "0x".to_string() + &hex::encode([4u8; 32]);
@@ -4336,16 +4285,13 @@ async fn mint_commit_mint_tx_failure_returns_503() {
     .unwrap();
 
     let mock_server = mint_broadcast_mock_server().await;
-    let ws_url = mint_broadcast_mock_ws().await;
-
     let mut state = mint_test_state();
     state.pool = Arc::clone(&pool);
     state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
         url: mock_server.uri(),
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
-        ws_url: Some(ws_url),
-        track_tx_timeout: None,
+        ws_url: None,
     });
 
     let recipient_bytes = [12u8; 32];
@@ -4404,7 +4350,6 @@ async fn mint_receive_coin_failure_logs_and_returns_ok() {
     );
 
     let mock_server = mint_broadcast_mock_server().await;
-    let ws_url = mint_broadcast_mock_ws().await;
 
     let recipient_bytes = [6u8; 32];
     let recipient = zkcoins_program::hash::digest_from_bytes(&recipient_bytes);
@@ -4415,8 +4360,7 @@ async fn mint_receive_coin_failure_logs_and_returns_ok() {
         url: mock_server.uri(),
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
-        ws_url: Some(ws_url),
-        track_tx_timeout: None,
+        ws_url: None,
     });
 
     // Predict the coin identifier that `prepare_mint` will assign to
@@ -4568,13 +4512,11 @@ async fn mint_retry_after_broadcast_failure_succeeds() {
 
     // ---- Second mint: working Esplora → 200 -----------------------------
     let mock_server = mint_broadcast_mock_server().await;
-    let ws_url = mint_broadcast_mock_ws().await;
     state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
         url: mock_server.uri(),
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
-        ws_url: Some(ws_url),
-        track_tx_timeout: None,
+        ws_url: None,
     });
     let cloned_state_second = state.clone();
     let body2 = serde_json::json!({
@@ -4813,16 +4755,13 @@ async fn mint_handler_advances_state_synchronously_with_broadcast() {
     );
 
     let mock_server = mint_broadcast_mock_server().await;
-    let ws_url = mint_broadcast_mock_ws().await;
-
     let mut state = mint_test_state();
     state.pool = Arc::clone(&pool);
     state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
         url: mock_server.uri(),
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
-        ws_url: Some(ws_url),
-        track_tx_timeout: None,
+        ws_url: None,
     });
 
     // Sanity: the SMT starts empty so derive_num_pubkeys_from_smt
@@ -4990,16 +4929,13 @@ async fn mint_handler_atomic_tx_rollback_leaves_state_and_row_consistent() {
     .unwrap();
 
     let mock_server = mint_broadcast_mock_server().await;
-    let ws_url = mint_broadcast_mock_ws().await;
-
     let mut state = mint_test_state();
     state.pool = Arc::clone(&pool);
     state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
         url: mock_server.uri(),
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
-        ws_url: Some(ws_url),
-        track_tx_timeout: None,
+        ws_url: None,
     });
 
     let recipient_bytes = [11u8; 32];
@@ -5138,16 +5074,13 @@ async fn mint_handler_in_process_state_advance_collision_returns_503() {
     );
 
     let mock_server = mint_broadcast_mock_server().await;
-    let ws_url = mint_broadcast_mock_ws().await;
-
     let mut state = mint_test_state();
     state.pool = Arc::clone(&pool);
     state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
         url: mock_server.uri(),
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
-        ws_url: Some(ws_url),
-        track_tx_timeout: None,
+        ws_url: None,
     });
 
     // Hold the state-advance release lock so the handler will block
@@ -5342,16 +5275,13 @@ async fn mint_handler_two_sequential_mints_with_different_recipients_advance_cle
     );
 
     let mock_server = mint_broadcast_mock_server().await;
-    let ws_url = mint_broadcast_mock_ws().await;
-
     let mut state = mint_test_state();
     state.pool = Arc::clone(&pool);
     state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
         url: mock_server.uri(),
         is_mainnet: false,
         network_name: "Mutinynet".to_string(),
-        ws_url: Some(ws_url),
-        track_tx_timeout: None,
+        ws_url: None,
     });
 
     // First mint: recipient A.
@@ -5576,6 +5506,7 @@ mod inscriptions_endpoint_tests {
 // and asserts the row landed.
 // =======================================================================
 
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_precheck_reject_persists_log_row() {
     use crate::db::connect_and_migrate;
@@ -5661,6 +5592,7 @@ async fn claim_username_precheck_reject_persists_log_row() {
 /// arm at router.rs line 1767. The fire-and-forget spawn calls
 /// `insert_username_claim_log` — we DROP the table out from under it
 /// so the insert fails and the eprintln line runs.
+#[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_log_spawn_handles_insert_error() {
     use crate::db::connect_and_migrate;
@@ -5730,4 +5662,205 @@ async fn claim_username_log_spawn_handles_insert_error() {
 
     // Give the fire-and-forget spawn time to hit the eprintln path.
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+}
+
+// --- GET /api/admin/r2-probe/history ---
+//
+// The handler reads from the `r2_probe_runs_summary` view. The happy-
+// path tests below boot a real Postgres 17 testcontainer because the
+// view + tables only exist after migration; the dead_pool path stays
+// in `r2_probe_history_db_error_returns_500`.
+
+#[tokio::test]
+async fn clamp_r2_probe_history_limit_handles_default_and_clamps() {
+    assert_eq!(
+        clamp_r2_probe_history_limit(None),
+        R2_PROBE_HISTORY_DEFAULT_LIMIT
+    );
+    assert_eq!(
+        clamp_r2_probe_history_limit(Some(0)),
+        R2_PROBE_HISTORY_DEFAULT_LIMIT
+    );
+    assert_eq!(
+        clamp_r2_probe_history_limit(Some(-5)),
+        R2_PROBE_HISTORY_DEFAULT_LIMIT
+    );
+    assert_eq!(clamp_r2_probe_history_limit(Some(7)), 7);
+    assert_eq!(
+        clamp_r2_probe_history_limit(Some(10_000)),
+        R2_PROBE_HISTORY_MAX_LIMIT
+    );
+    assert_eq!(
+        clamp_r2_probe_history_limit(Some(R2_PROBE_HISTORY_MAX_LIMIT)),
+        R2_PROBE_HISTORY_MAX_LIMIT
+    );
+}
+
+#[tokio::test]
+async fn r2_probe_history_db_error_returns_500() {
+    // The default test_state() uses a dead PgPool whose connect
+    // attempts time out fast — exercises the handler's error arm.
+    let req = Request::get("/api/admin/r2-probe/history")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let resp: SendCoinResponse = serde_json::from_str(&body).expect("valid JSON");
+    assert!(!resp.success);
+    assert_eq!(
+        resp.error.as_deref(),
+        Some("Database error while reading R2 probe history")
+    );
+}
+
+#[tokio::test]
+async fn r2_probe_history_empty_returns_empty_array() {
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container.get_host().await.expect("host");
+    let port = pg_container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
+    let state = live_test_state(pool);
+    let req = Request::get("/api/admin/r2-probe/history")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let arr: Vec<serde_json::Value> = serde_json::from_str(&body).expect("valid JSON");
+    assert!(arr.is_empty());
+}
+
+#[tokio::test]
+async fn r2_probe_history_returns_rows_with_pass_flags() {
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container.get_host().await.expect("host");
+    let port = pg_container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
+    // Seed two runs: one within budget, one over warm budget.
+    let host_info = crate::r2_probe::HostInfo {
+        hostname: "router-test-host".to_string(),
+        os: "macos".to_string(),
+        arch: "aarch64".to_string(),
+        cpu_brand: "Apple M3 Ultra".to_string(),
+        cpu_cores: 24,
+        total_ram_gb: Some(96),
+    };
+    let host_id = crate::r2_probe::upsert_host(&pool, &host_info)
+        .await
+        .expect("host");
+    let mut run = crate::r2_probe::ProbeRun {
+        host_id,
+        git_sha: "abc123".to_string(),
+        binary_version: "0.1.0".to_string(),
+        rustc_version: "rustc 1.81.0".to_string(),
+        build_profile: "release".to_string(),
+        allocator: "mimalloc".to_string(),
+        max_in_coins: 8,
+        max_out_coins: 8,
+        inner_pad_bits: 15,
+        warm_calls_requested: 3,
+        circuit_build_wall_ms: 8_000,
+        prove_cold_wall_ms: 18_000,
+        verify_wall_ms: 30,
+        peak_rss_kb: 40 * 1024 * 1024,
+        prove_warm_p50_ms: Some(800),
+        prove_warm_p90_ms: Some(1_000),
+        prove_warm_p99_ms: Some(1_300),
+        succeeded: true,
+        error_message: None,
+        notes: None,
+        tags: vec!["router-test".to_string()],
+        r2_warm_budget_ms: 5_000,
+        r2_cold_budget_ms: 30_000,
+        r2_mem_budget_kb: 64 * 1024 * 1024,
+    };
+    crate::r2_probe::insert_run(&pool, &run)
+        .await
+        .expect("run 1");
+
+    // Second run blows past the warm budget.
+    run.prove_warm_p50_ms = Some(7_000);
+    crate::r2_probe::insert_run(&pool, &run)
+        .await
+        .expect("run 2");
+
+    let state = live_test_state(pool);
+    let req = Request::get("/api/admin/r2-probe/history?limit=10")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let arr: Vec<serde_json::Value> = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(arr.len(), 2);
+
+    // Newest first — the warm-fail row landed last.
+    assert_eq!(arr[0]["r2_warm_pass"].as_bool(), Some(false));
+    assert_eq!(arr[1]["r2_warm_pass"].as_bool(), Some(true));
+    // Cold + mem budgets pass for both.
+    assert_eq!(arr[0]["r2_cold_pass"].as_bool(), Some(true));
+    assert_eq!(arr[1]["r2_cold_pass"].as_bool(), Some(true));
+    assert_eq!(arr[0]["r2_mem_pass"].as_bool(), Some(true));
+    assert_eq!(arr[1]["r2_mem_pass"].as_bool(), Some(true));
+    // Joined host info surfaces in the response.
+    assert_eq!(arr[0]["hostname"].as_str(), Some("router-test-host"));
+    assert_eq!(arr[0]["cpu_brand"].as_str(), Some("Apple M3 Ultra"));
+}
+
+#[tokio::test]
+async fn r2_probe_history_limit_clamped_to_max() {
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container.get_host().await.expect("host");
+    let port = pg_container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
+    let state = live_test_state(pool);
+    // Caller asks for 10_000 — the clamp keeps us at 200. With zero
+    // rows seeded the response body is still empty, but the path
+    // reaches `fetch_recent_summary` (the clamp lives in the handler,
+    // not the SQL layer).
+    let req = Request::get("/api/admin/r2-probe/history?limit=10000")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let arr: Vec<serde_json::Value> = serde_json::from_str(&body).expect("valid JSON");
+    assert!(arr.is_empty());
 }

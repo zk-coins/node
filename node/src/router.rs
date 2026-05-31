@@ -504,23 +504,26 @@ pub struct InfoResponse {
 
 /// Node-side feature gates exposed to clients so the app can render
 /// capability-driven UI without a parallel build-time env-flag set.
-/// Each bool reflects a compile-time Cargo feature on the node binary,
-/// except `faucet`: mint is part of the MVP and is always available, so
-/// the field is hardcoded `true`. It is kept on the struct for API
-/// back-compat with wallet clients that introspect `/api/info`.
+/// Each bool reflects a compile-time Cargo feature on the node binary.
+///
+/// Only opt-in features appear here. Permanent MVP endpoints (mint,
+/// username resolve) are always available and intentionally have no
+/// capability bit — clients must not gate their UI on flags that
+/// would always be `true`.
 #[derive(Serialize, Deserialize)]
 pub struct Capabilities {
     pub address_list: bool,
-    /// Always `true`. Mint is permanently part of the MVP binary; the
-    /// field is retained only so existing wallet clients deserialising
-    /// `/api/info` don't break.
-    pub faucet: bool,
-    pub usernames: bool,
+    /// Username *claim* (write path). Gated by the `username-claim`
+    /// Cargo feature; off in hosted DEV + PRD images. Wallet clients
+    /// hide the claim input when this is `false`. Always present in
+    /// the response so the app does not have to sniff build flags.
+    pub username_claim: bool,
     pub lnurl: bool,
 }
 
 // --- Username & LNURL types ---
 
+#[cfg(feature = "username-claim")]
 #[derive(Deserialize)]
 pub struct ClaimUsernameRequest {
     username: String,
@@ -1573,6 +1576,76 @@ async fn get_inscription_handler(
     }
 }
 
+// ---- Admin: R2 probe history --------------------------------------------
+//
+// The `probe_r2` binary persists its results into `r2_probe_runs` (see
+// `r2_probe.rs` + migration 0013). This endpoint surfaces the most
+// recent `limit` rows of the convenience view so the operator can ask
+// "did the last few probe runs hit budget?" against a deployed node
+// without shelling into the database.
+//
+// Closed test env (`feedback_zkcoins_closed_test_env`): the endpoint
+// is unauthenticated like every other route. The path lives under an
+// `/api/admin/` prefix so it is visibly separate from the user-facing
+// surface and never accidentally documented as a public contract.
+// Read-only — the handler never writes.
+
+/// `?limit=` query for `GET /api/admin/r2-probe/history`. Capped at
+/// 200 to bound the response size and the underlying DB scan.
+#[derive(Deserialize)]
+pub(crate) struct R2ProbeHistoryQuery {
+    pub limit: Option<i64>,
+}
+
+/// Default page size when `?limit` is omitted.
+pub(crate) const R2_PROBE_HISTORY_DEFAULT_LIMIT: i64 = 50;
+/// Hard cap on the `?limit` parameter — clamps oversized requests
+/// down to a sane scan budget.
+pub(crate) const R2_PROBE_HISTORY_MAX_LIMIT: i64 = 200;
+
+/// Normalise a caller-supplied `?limit` into the
+/// `[1, R2_PROBE_HISTORY_MAX_LIMIT]` window. Negative / zero /
+/// missing inputs collapse to the default; anything above the cap
+/// is clamped down. Extracted so the clamp logic is unit-testable
+/// without spinning up a Postgres container.
+pub(crate) fn clamp_r2_probe_history_limit(raw: Option<i64>) -> i64 {
+    match raw {
+        Some(n) if n <= 0 => R2_PROBE_HISTORY_DEFAULT_LIMIT,
+        Some(n) if n > R2_PROBE_HISTORY_MAX_LIMIT => R2_PROBE_HISTORY_MAX_LIMIT,
+        Some(n) => n,
+        None => R2_PROBE_HISTORY_DEFAULT_LIMIT,
+    }
+}
+
+/// `GET /api/admin/r2-probe/history?limit=<int>` — operator-facing
+/// trend view over the `r2_probe_runs_summary` view. Returns the
+/// `limit` most recent runs newest first as a JSON array. Read-only:
+/// no write path exists for this resource through HTTP.
+///
+/// The endpoint is intentionally unauthenticated — the node sits in
+/// a closed test environment where the entire request surface is
+/// fair game for the operator. Per
+/// `feedback_zkcoins_no_privacy_promise` the server makes no
+/// privacy claim; the probe rows are operational telemetry and any
+/// future hardening goes alongside the wider auth story.
+async fn r2_probe_history_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<R2ProbeHistoryQuery>,
+) -> axum::response::Response {
+    let limit = clamp_r2_probe_history_limit(query.limit);
+    match crate::r2_probe::fetch_recent_summary(&state.pool, limit).await {
+        Ok(rows) => (StatusCode::OK, Json(rows)).into_response(),
+        Err(e) => {
+            tracing::warn!("r2_probe_history_handler: db error: {}", e);
+            handler_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error while reading R2 probe history",
+            )
+            .into_response()
+        }
+    }
+}
+
 /// JSON body returned by `GET /health/ready`. `failures` is empty on a
 /// fully ready node; each failing dependency contributes one stable
 /// short tag (`"db"`, `"esplora"`) so a Kuma monitor parses the cause
@@ -1698,10 +1771,7 @@ async fn info_handler() -> impl IntoResponse {
         network: NETWORK_CONFIG.network_name.clone(),
         capabilities: Capabilities {
             address_list: cfg!(feature = "address-list"),
-            // Hardcoded — mint is permanent MVP; field is back-compat only.
-            faucet: true,
-            // Hardcoded — usernames are permanent MVP; field is back-compat only.
-            usernames: true,
+            username_claim: cfg!(feature = "username-claim"),
             lnurl: cfg!(feature = "lnurl"),
         },
         username_domain: USERNAME_DOMAIN.clone(),
@@ -1755,6 +1825,7 @@ async fn root_handler() -> impl IntoResponse {
 
 // --- Username & LNURL handlers ---
 
+#[cfg(feature = "username-claim")]
 async fn claim_username_handler(
     State(state): State<AppState>,
     Json(request): Json<ClaimUsernameRequest>,
@@ -2118,11 +2189,14 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/api/commit", post(commit_handler))
         .route("/api/mint", post(mint_handler))
         .route("/api/inscriptions/:txid", get(get_inscription_handler))
-        .route("/api/username/claim", post(claim_username_handler))
         .route(
             "/api/username/resolve/:username",
             get(resolve_username_handler),
-        );
+        )
+        // Operator-facing R2 probe trend (see `r2_probe_history_handler`
+        // doc-comment). Grouped under `/api/admin/` so it is visibly
+        // separate from the user-facing surface.
+        .route("/api/admin/r2-probe/history", get(r2_probe_history_handler));
 
     // Gated routes — only compiled in when their Cargo feature is enabled.
     // With a feature off, the handler does not exist in the binary and the
@@ -2130,6 +2204,9 @@ pub(crate) fn create_router(state: AppState) -> Router {
     // and there is no code path to execute.
     #[cfg(feature = "address-list")]
     let app = app.route("/api/address", get(get_address_handler));
+
+    #[cfg(feature = "username-claim")]
+    let app = app.route("/api/username/claim", post(claim_username_handler));
 
     #[cfg(feature = "lnurl")]
     let app = app

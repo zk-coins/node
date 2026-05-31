@@ -3,6 +3,14 @@ name = "node"
 version.workspace = true
 edition.workspace = true
 
+[lints.rust]
+# Register the `coverage_nightly` cfg so `#[cfg_attr(coverage_nightly,
+# coverage(off))]` annotations in `src/r2_probe.rs` don't trip
+# `unexpected_cfgs` under `-D warnings`. `cargo llvm-cov` injects this
+# cfg automatically on a nightly toolchain; the lint stays a warn-level
+# diagnostic to match `program-plonky2` and `script-plonky2`.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
+
 [dependencies]
 bitcoin = { workspace = true }
 bitcoin_hashes = { version = "0.16.0", features = ["std"] }
@@ -92,6 +100,29 @@ tracing = { workspace = true }
 # operator-facing aggregator (Alloy → Loki) parses the default
 # fmt-layer output today.
 tracing-subscriber = { workspace = true }
+# Used only by the `probe_r2` binary (`src/bin/probe_r2.rs`) for
+# `getrusage(RUSAGE_SELF)` to read the process peak RSS at the end of
+# the run. No production code path links against this — the main
+# binary's resident-set tracking is left to the host OS / cAdvisor.
+# Already pulled into the dependency graph transitively (tokio, mio,
+# rustls); declared here so the bin target's `unsafe` block resolves
+# without leaning on an unstable transitive path.
+libc = "0.2"
+# Cross-platform host introspection for `r2_probe::detect()` (hostname,
+# CPU brand, total RAM, CPU core count). Replaces a previous shape that
+# shelled out to `hostname` / `sysctl` on macOS and read
+# `/proc/{cpuinfo,meminfo}` on Linux: subprocess- and FS-error arms are
+# not deterministically reachable on a healthy CI host, so the 100%
+# line/function coverage gate could only be satisfied with
+# `#[cfg_attr(coverage_nightly, coverage(off))]` markers on the
+# per-platform `_impl` helpers. The `sysinfo` API has a single success
+# path (one `Option<String>` for hostname, one `&[Cpu]` slice for CPU
+# info, one `u64` for total RAM) so every branch the gate sees is
+# reachable from a single `detect()` call. `default-features = false`
+# disables `disk`, `network`, `component`, and `user` — `detect()` only
+# touches the system / host-name surface, and the disabled features
+# pull in `windows` / `objc2-*` crates we don't need on Linux+macOS.
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
@@ -138,6 +169,16 @@ socket2 = "0.5"
 default = []
 address-list = []
 lnurl = []
+# Self-host operator opt-in: write path for usernames. Resolve + display
+# is part of the MVP and stays on by default — hosted DEV + PRD images
+# do not offer claim as a UX policy. With the feature off, the
+# `POST /api/username/claim` route, its handler + request type, the
+# `db::claim_username` upsert, and the matching `UsernameStore::claim`
+# helpers are excluded from the binary at compile time. The
+# `Capabilities.username_claim` field is always present in
+# `/api/info` so wallet clients can gate their UI on a single
+# capability bit without sniffing build flags.
+username-claim = []
 # Dormant self-host operator opt-in (issue #84). When enabled, a ZMQ
 # subscriber publishes block-hash events into the same channel the
 # WebSocket scanner uses. No module activates the subscriber in this

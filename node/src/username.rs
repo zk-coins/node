@@ -4,7 +4,9 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 
 use crate::db;
-use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes};
+use zkcoins_program::hash::digest_from_bytes;
+#[cfg(feature = "username-claim")]
+use zkcoins_program::hash::digest_to_bytes;
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct UsernameStore {
@@ -40,6 +42,7 @@ impl UsernameStore {
     /// on the exact byte string, ruling out a case-mismatch squat.
     ///
     /// Returns the normalized (lowercased) name on success.
+    #[cfg(feature = "username-claim")]
     pub(crate) fn validate(username: &str) -> Result<String, &'static str> {
         let normalized = username.to_lowercase();
         if normalized.is_empty() || normalized.len() > 64 {
@@ -66,6 +69,7 @@ impl UsernameStore {
     /// `ClaimUsernameError` — keeps the handler's error mapping a flat
     /// `Result<(), &'static str>` with no unreachable `Db` arm; that
     /// would otherwise read as dead code under the 100 % coverage gate.
+    #[cfg(feature = "username-claim")]
     pub(crate) fn precheck(&self, normalized: &str, address: &Address) -> Result<(), &'static str> {
         if self.usernames.contains_key(normalized) {
             return Err("Username already taken");
@@ -80,6 +84,7 @@ impl UsernameStore {
     /// has reported `rows_affected == 1`. Held under the same short
     /// sync guard as `precheck` would be — no `.await` inside, no
     /// `mem::take`, the store is never observable as empty.
+    #[cfg(feature = "username-claim")]
     pub(crate) fn commit_after_db(&mut self, normalized: String, address: Address) {
         self.usernames.insert(normalized, address);
     }
@@ -102,6 +107,7 @@ impl UsernameStore {
     /// `claim_username_handler` calls the steps directly because it
     /// must not hold a `std::sync::Mutex` guard across the async DB
     /// round-trip.
+    #[cfg(feature = "username-claim")]
     pub async fn claim(
         &mut self,
         pool: &PgPool,
@@ -161,6 +167,7 @@ impl UsernameStore {
 /// Error type for `UsernameStore::claim`. Wraps the validation error
 /// strings (returned to the API caller as a 4xx body) and any database
 /// error from the underlying `db::claim_username` upsert.
+#[cfg(feature = "username-claim")]
 #[derive(Debug)]
 pub enum ClaimUsernameError {
     /// Caller-fixable input rejection (charset, length, duplicate).
@@ -170,6 +177,7 @@ pub enum ClaimUsernameError {
     Db(sqlx::Error),
 }
 
+#[cfg(feature = "username-claim")]
 impl std::fmt::Display for ClaimUsernameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -179,6 +187,7 @@ impl std::fmt::Display for ClaimUsernameError {
     }
 }
 
+#[cfg(feature = "username-claim")]
 impl std::error::Error for ClaimUsernameError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -188,6 +197,7 @@ impl std::error::Error for ClaimUsernameError {
     }
 }
 
+#[cfg(feature = "username-claim")]
 impl From<sqlx::Error> for ClaimUsernameError {
     fn from(e: sqlx::Error) -> Self {
         ClaimUsernameError::Db(e)

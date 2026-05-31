@@ -1,18 +1,20 @@
 //! Tests for `scanner_ws.rs`.
 //!
-//! The connect-subscribe-drain loop and the `wait_for_tx_in_mempool`
-//! helper are exercised against an in-process WebSocket server
-//! constructed with `tokio_tungstenite::accept_async` — no real
-//! network hop, no upstream dependency, no flakiness from public
-//! Mutinynet outages.
+//! The connect-subscribe-drain loop for block-tip events is
+//! exercised against an in-process WebSocket server constructed with
+//! `tokio_tungstenite::accept_async` — no real network hop, no
+//! upstream dependency, no flakiness from public Mutinynet outages.
 //!
-//! Pure parsers (`parse_ws_frame`, `frame_signals_tx_seen`) live in
-//! `scanner_ws_parse.rs` and are unit-tested in
-//! `scanner_ws_parse_tests.rs` so they stay inside the 100% coverage
-//! gate (issue #84 round-4 MINOR 6).
+//! The publisher's old per-broadcast `track-tx` WS subscription was
+//! removed (see `publisher::broadcast_inscription_txs`); these tests
+//! cover the remaining block-tip flow only.
+//!
+//! Pure parsers (`parse_ws_frame`) live in `scanner_ws_parse.rs` and
+//! are unit-tested in `scanner_ws_parse_tests.rs` so they stay inside
+//! the 100% coverage gate (issue #84 round-4 MINOR 6).
 
 use super::*;
-use bitcoin::{BlockHash, Txid};
+use bitcoin::BlockHash;
 use futures_util::{SinkExt, StreamExt};
 use std::str::FromStr;
 use std::time::Duration;
@@ -284,96 +286,6 @@ async fn run_scanner_ws_force_reconnects_on_liveness_timeout() {
     assert_eq!(h2, sample_hash_2());
 
     handle.abort();
-}
-
-// -----------------------------------------------------------------------------
-// subscribe_track_tx / TrackTxStream::wait (two-phase API, issue #84
-// round-2 MAJOR 1: subscribe MUST precede the commit broadcast)
-// -----------------------------------------------------------------------------
-
-#[tokio::test]
-async fn subscribe_track_tx_then_wait_returns_when_peer_emits_txid() {
-    let txid =
-        Txid::from_str("1111111111111111111111111111111111111111111111111111111111111111").unwrap();
-    let txid_str = txid.to_string();
-
-    let url = {
-        let txid_for_handler = txid_str.clone();
-        spawn_ws_server(move |mut ws| async move {
-            // Expect the `track-tx` subscribe frame.
-            let first = ws.next().await.unwrap().unwrap();
-            let text = match first {
-                WsMessage::Text(t) => t,
-                other => panic!("expected text frame, got {:?}", other),
-            };
-            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(value.get("action"), Some(&serde_json::json!("track-tx")));
-            assert_eq!(
-                value.get("data"),
-                Some(&serde_json::json!(txid_for_handler))
-            );
-
-            // Send the documented mempool.space `txPosition` shape.
-            let frame = format!(
-                r#"{{"txPosition":{{"txid":"{}","position":{{"block":1,"vsize":120}}}}}}"#,
-                txid_for_handler
-            );
-            ws.send(WsMessage::Text(frame)).await.unwrap();
-            // Hold forever until the test aborts.
-            std::future::pending::<()>().await;
-        })
-        .await
-    };
-
-    let stream = subscribe_track_tx(&url, txid)
-        .await
-        .expect("subscribe should succeed");
-    stream
-        .wait(Duration::from_secs(5))
-        .await
-        .expect("track-tx event should resolve the wait");
-}
-
-#[tokio::test]
-async fn track_tx_wait_returns_timeout_when_event_never_arrives() {
-    let txid =
-        Txid::from_str("2222222222222222222222222222222222222222222222222222222222222222").unwrap();
-    let url = spawn_ws_server(|mut ws| async move {
-        // Consume the subscribe frame but never echo the event.
-        let _ = ws.next().await;
-        // Hold forever until the test aborts.
-        std::future::pending::<()>().await;
-    })
-    .await;
-
-    let stream = subscribe_track_tx(&url, txid)
-        .await
-        .expect("subscribe should succeed");
-    let err = stream
-        .wait(Duration::from_millis(300))
-        .await
-        .expect_err("must surface Timeout when no event arrives");
-    assert!(
-        matches!(err, WsError::Timeout),
-        "unexpected error: {:?}",
-        err
-    );
-}
-
-#[tokio::test]
-async fn subscribe_track_tx_returns_connect_error_on_bad_url() {
-    let txid =
-        Txid::from_str("3333333333333333333333333333333333333333333333333333333333333333").unwrap();
-    // 127.0.0.1:1 is reserved (tcpmux) and refused on macOS / Linux
-    // CI runners — produces an immediate connect error.
-    let err = subscribe_track_tx("ws://127.0.0.1:1", txid)
-        .await
-        .expect_err("connect to closed port must fail");
-    assert!(
-        matches!(err, WsError::Connect(_)),
-        "expected Connect, got: {:?}",
-        err
-    );
 }
 
 // -----------------------------------------------------------------------------
