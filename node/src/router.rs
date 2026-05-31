@@ -14,7 +14,7 @@ use shared::ClientAccount;
 use shared::{Invoice, ProofData};
 use sqlx::PgPool;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tower_http::cors::CorsLayer;
 use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes};
@@ -262,6 +262,23 @@ pub(crate) struct AppState {
     /// clones `NETWORK_CONFIG` into this slot so the runtime
     /// behaviour is unchanged.
     pub(crate) esplora_config: Arc<EsploraConfig>,
+    /// Background-warmup readiness flag. Default `false` at bootstrap
+    /// start; flipped to `true` either (a) once the background
+    /// `spawn_blocking` task in `runtime::start_rest_node` reports that
+    /// `AccountNode::warmup_prover` returned Ok — at which point the
+    /// Rayon worker pool is warm and every subsequent `/api/mint` /
+    /// `/api/send` proof matches the steady-state ~5 s p50 — or (b)
+    /// immediately at bootstrap when `ZKCOINS_SKIP_BOOTSTRAP_WARMUP=1`
+    /// is set (no background task is spawned in that case).
+    ///
+    /// Consumed by `/health/ready`: while `prover_warm == false` the
+    /// handler returns 503 with a `prover: warming` tag so a rolling
+    /// deploy can keep the previous-generation pod taking traffic
+    /// until the new pod's prover is warm. The liveness probe
+    /// `/health` is unaffected — it returns 200 the moment the
+    /// listener binds, so container restart loops keyed on liveness
+    /// are not triggered during the ~21 s warmup window.
+    pub(crate) prover_warm: Arc<AtomicBool>,
     /// Test-only synchronisation primitive used by
     /// `mint_handler_concurrent_mint_during_proof_returns_503`. The
     /// production code path notifies via `notify_one()` after entering
@@ -2084,12 +2101,29 @@ async fn r2_probe_history_handler(
 
 /// JSON body returned by `GET /health/ready`. `failures` is empty on a
 /// fully ready node; each failing dependency contributes one stable
-/// short tag (`"db"`, `"esplora"`) so a Kuma monitor parses the cause
-/// without having to scrape the status code in isolation.
+/// short tag (`"db"`, `"esplora"`, `"prover"`) so a Kuma monitor parses
+/// the cause without having to scrape the status code in isolation.
+///
+/// `prover` is the background-warmup tag (see `AppState::prover_warm`):
+/// while the bootstrap warmup task is still running, the readiness
+/// probe reports `failures: ["prover"]` with `status: starting` and a
+/// 503 so a load balancer keeps holding traffic on the previous-gen
+/// pod. `/health` (liveness) is unaffected.
 #[derive(Serialize)]
 struct ReadyResponse {
     ready: bool,
     failures: Vec<&'static str>,
+    /// Lifecycle tag. `"starting"` while any failure is present,
+    /// `"ready"` once every dependency probe passes. Distinct from
+    /// `ready: bool` so a parsing consumer can branch on a short
+    /// string without re-deriving it from the bool + failures shape.
+    status: &'static str,
+    /// Background-warmup tag. `"warming"` while
+    /// `AppState::prover_warm == false`, `"ready"` afterwards.
+    /// Emitted on every response (regardless of overall readiness) so
+    /// a deploy dashboard can show the warmup progress separately
+    /// from the DB/Esplora probes.
+    prover: &'static str,
 }
 
 /// Readiness probe (`GET /health/ready`).
@@ -2125,13 +2159,36 @@ async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
         failures.push("esplora");
     }
 
+    // Background-warmup gate. `prover_warm` is flipped to true by the
+    // `spawn_blocking` task that `runtime::start_rest_node` launches
+    // immediately after binding the TCP listener (or directly at boot
+    // when `ZKCOINS_SKIP_BOOTSTRAP_WARMUP=1`). Until then a user
+    // request still succeeds but pays the ~7 s cold-prove tax — for
+    // the rolling-deploy use case the load balancer holds traffic on
+    // the previous-gen pod by treating this readiness probe as the
+    // gate, not the liveness probe.
+    let prover_warm = state.prover_warm.load(Ordering::SeqCst);
+    if !prover_warm {
+        failures.push("prover");
+    }
+
     let ready = failures.is_empty();
     let status = if ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (status, Json(ReadyResponse { ready, failures }))
+    let lifecycle_status = if ready { "ready" } else { "starting" };
+    let prover_status = if prover_warm { "ready" } else { "warming" };
+    (
+        status,
+        Json(ReadyResponse {
+            ready,
+            failures,
+            status: lifecycle_status,
+            prover: prover_status,
+        }),
+    )
 }
 
 /// Ping the configured Esplora endpoint. A successful tip-height fetch

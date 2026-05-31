@@ -64,6 +64,12 @@ fn test_state() -> AppState {
             network_name: "Mutinynet".to_string(),
             ws_url: None,
         }),
+        // Tests construct the AppState with the prover already marked
+        // warm so handlers that only consult `prover_warm` indirectly
+        // (e.g. the readiness probe) don't observe a half-bootstrapped
+        // shape. The dedicated 503/warming-tag test below overrides
+        // this back to `false` to exercise the gating arm.
+        prover_warm: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         phase2_reached: Arc::new(tokio::sync::Notify::new()),
         phase3_release_lock: Arc::new(tokio::sync::Mutex::new(())),
         state_advance_release_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -2323,6 +2329,7 @@ async fn send_with_insufficient_funds_returns_422_with_error_string() {
             network_name: "Mutinynet".to_string(),
             ws_url: None,
         }),
+        prover_warm: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         phase2_reached: Arc::new(tokio::sync::Notify::new()),
         phase3_release_lock: Arc::new(tokio::sync::Mutex::new(())),
         state_advance_release_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -3485,6 +3492,11 @@ async fn ready_returns_200_when_db_and_esplora_reachable() {
     let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
     assert_eq!(v["ready"], true);
     assert_eq!(v["failures"].as_array().unwrap().len(), 0);
+    // New fields introduced with the background-warmup feature:
+    // a 200 response means status is `ready` and prover is `ready`.
+    // The default `test_state()` shape flips `prover_warm` to true.
+    assert_eq!(v["status"], "ready");
+    assert_eq!(v["prover"], "ready");
 }
 
 #[tokio::test]
@@ -3548,6 +3560,60 @@ async fn ready_returns_503_when_esplora_unreachable() {
         .map(|s| s.as_str().unwrap().to_string())
         .collect();
     assert_eq!(failures, vec!["esplora".to_string()]);
+}
+
+/// `prover_warm == false` (the bootstrap shape while the background
+/// `spawn_blocking` task in `runtime::start_rest_node` is still
+/// running) gates `/health/ready` to 503 with a `prover` failure tag
+/// and a `status: starting` / `prover: warming` payload. The DB +
+/// Esplora paths short-circuit to an unreachable mock so the failure
+/// list contains only `prover` — proves the warmup gate is wired in
+/// isolation from the other dependencies. No Postgres needed: the
+/// failure path doesn't require a live pool because `SELECT 1`
+/// against `dead_pool()` short-circuits to a connect error that
+/// the handler treats as a `db` failure too — which is fine, the
+/// test just asserts `prover` is present.
+#[tokio::test]
+async fn ready_returns_503_with_prover_warming_when_prover_not_warm() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Esplora is healthy so it does NOT contribute to `failures`; the
+    // DB path falls through `dead_pool` and DOES contribute a `db`
+    // failure, but the assertion below only checks `prover` is
+    // present — the test is about the warmup gate, not the full
+    // failure-list shape.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/height"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("123456"))
+        .mount(&mock_server)
+        .await;
+
+    // Build the state with the prover-warm flag flipped back to false.
+    // `ready_state` calls `test_state()` which defaults to `true`, so
+    // we override the field after construction.
+    let mut state = ready_state(dead_pool(), mock_server.uri());
+    state.prover_warm = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let req = Request::get("/health/ready").body(Body::empty()).unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body={}", body);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(v["ready"], false);
+    assert_eq!(v["status"], "starting");
+    assert_eq!(v["prover"], "warming");
+    let failures: Vec<String> = v["failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        failures.contains(&"prover".to_string()),
+        "expected `prover` in failures, got {failures:?}"
+    );
 }
 
 // =======================================================================
@@ -3709,6 +3775,7 @@ fn mint_test_state() -> AppState {
             network_name: "Mutinynet".to_string(),
             ws_url: None,
         }),
+        prover_warm: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         phase2_reached: Arc::new(tokio::sync::Notify::new()),
         phase3_release_lock: Arc::new(tokio::sync::Mutex::new(())),
         state_advance_release_lock: Arc::new(tokio::sync::Mutex::new(())),

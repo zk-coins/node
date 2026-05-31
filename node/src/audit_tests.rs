@@ -161,6 +161,7 @@ async fn build_state_with_pool() -> (
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
         pool: Arc::new(pool),
         esplora_config: Arc::new(esplora_config),
+        prover_warm: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         phase2_reached: Arc::new(tokio::sync::Notify::new()),
         phase3_release_lock: Arc::new(tokio::sync::Mutex::new(())),
         state_advance_release_lock: Arc::new(tokio::sync::Mutex::new(())),

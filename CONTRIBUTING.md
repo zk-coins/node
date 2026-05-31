@@ -529,7 +529,53 @@ on startup if unset — there is no silent fallback.
 | `NETWORK_NAME` | `Mutinynet` / `Mainnet` | Human-readable name returned by `/api/info`. Derived from `IS_MAINNET` if unset. Purely cosmetic — no behavioural effect. |
 | `PROOFS_DIR` | `./proofs` | Directory for per-proof bincode files (see `Persistent State` below). |
 | `SCANNER_INITIAL_SETTLE_TIMEOUT_MS` | (runtime-defined) | Override for the scanner's initial-settle deadline; see `runtime.rs`. |
+| `ZKCOINS_SKIP_BOOTSTRAP_WARMUP` | `false` | When `1`/`true`, skip the background Plonky2 prover warmup task at startup. Sets `prover_warm = true` immediately so `/health/ready` returns 200 the moment the listener binds. Set in the runtime smoke tests so pre-push wall stays bounded; production deploys leave it unset. See **Bootstrap timing** below. |
 | `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`). |
+
+### Bootstrap timing
+
+The node bootstraps the HTTP listener and the Plonky2 prover in a
+specific sequence so the API is reachable as quickly as possible:
+
+1. `~0.1 s` — `TcpListener::bind` returns. `/health` (liveness) is now
+   200. The listener accepts connections and `axum::serve` starts
+   draining them.
+2. `~0.1 s` — `tokio::task::spawn_blocking` is launched with
+   `AccountNode::warmup_prover`, a synthetic discardable
+   `prove_initial` that wakes the Rayon worker pool and the AOT-
+   compiled Plonky2 evaluator caches. The task runs CPU-bound on a
+   blocking-pool thread so the tokio worker that owns `axum::serve` is
+   not starved.
+3. `~21 s` — `warmup_prover` returns Ok. The background task flips
+   `prover_warm = true`. `/health/ready` now returns 200 with
+   `prover: ready`.
+
+While step 3 is in progress, `/health/ready` returns 503 with
+`{"ready":false,"failures":["prover"],"status":"starting","prover":"warming"}`.
+A load balancer (or Kuma monitor) keyed on the readiness endpoint
+keeps traffic on the previous-generation pod through the warmup
+window — the new pod's `/health` still returns 200 so the container
+runtime does not restart it.
+
+A user request that lands BEFORE the warmup completes still serves
+correctly — it just pays the ~7 s cold-prove tax instead of the
+steady-state ~5 s p50. The trade-off vs. the previous synchronous
+shape (PR #147, closed): API offline time per deploy stays ~0.1 s
+instead of ~21 s; the cold-tax shifts from the first
+post-deploy user request to whichever request arrives during the
+warmup window.
+
+Empirical numbers (dfxdev R2 probe, 2026-05-31):
+
+| Stage | Wall (ms) | Notes |
+|---|---|---|
+| `circuit_build_wall_ms` | 14214 | `Prover::new()` — paid by `load_from_pg` BEFORE the listener binds. |
+| `prove_cold_wall_ms`    |  7012 | First prove call after build — what the background warmup pays. |
+| `prove_warm p50`        |  4777 | Steady state — every request after the warmup task flips the flag. |
+
+Set `ZKCOINS_SKIP_BOOTSTRAP_WARMUP=1` to skip the warmup task entirely.
+Used by the runtime smoke tests in `runtime_tests.rs`; production
+deploys leave it unset.
 
 ### Minimal local-dev env
 

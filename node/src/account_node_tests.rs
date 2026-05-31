@@ -1371,3 +1371,21 @@ fn test_send_coins_rejects_source_commitment_missing_from_history_mmr() {
         "desynced `state.prev_mmr_root` must surface the off-circuit history-MMR rejection at account_node.rs:419",
     );
 }
+
+/// `warmup_prover` runs a synthetic `prove_initial` against a fresh
+/// `AccountState` and discards the proof. It must return Ok on a
+/// freshly-constructed `AccountNode` — that is the production
+/// invariant: the same `Prover` will serve every subsequent
+/// user-facing request, so a warmup failure means production requests
+/// would also fail, and the bootstrap exits the process rather than
+/// binding a listener that would serve 500s. This test exercises the
+/// success arm. Pinned `#[ignore]`-able via cargo flags but kept in
+/// the default suite because the coverage gate would otherwise treat
+/// the helper as unreached.
+#[test]
+fn warmup_prover_completes_successfully() {
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    let node = AccountNode::new(Arc::clone(&state_arc));
+    node.warmup_prover()
+        .expect("warmup_prover must succeed on a fresh AccountNode");
+}
