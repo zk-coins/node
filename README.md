@@ -9,10 +9,10 @@ Container images: **[hub.docker.com/r/zkcoins/node](https://hub.docker.com/r/zkc
 
 ## Live
 
-| Environment | URL                                                | Image                                                                                |
-| ----------- | -------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| **PRD**     | [api.zkcoins.app](https://api.zkcoins.app)         | [`zkcoins/node:latest`](https://hub.docker.com/r/zkcoins/node/tags?name=latest)      |
-| **DEV**     | [dev-api.zkcoins.app](https://dev-api.zkcoins.app) | [`zkcoins/node:beta`](https://hub.docker.com/r/zkcoins/node/tags?name=beta)          |
+| Environment | URL                                                | Bitcoin chain | Image                                                                                |
+| ----------- | -------------------------------------------------- | ------------- | ------------------------------------------------------------------------------------ |
+| **PRD**     | [api.zkcoins.app](https://api.zkcoins.app)         | Mainnet       | [`zkcoins/node:latest`](https://hub.docker.com/r/zkcoins/node/tags?name=latest)      |
+| **DEV**     | [dev-api.zkcoins.app](https://dev-api.zkcoins.app) | Mutinynet     | [`zkcoins/node:beta`](https://hub.docker.com/r/zkcoins/node/tags?name=beta)          |
 
 ## Stack
 
