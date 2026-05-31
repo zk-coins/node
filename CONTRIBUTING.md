@@ -520,6 +520,39 @@ on startup if unset — there is no silent fallback.
 | `PROOFS_DIR` | `./proofs` | Directory for per-proof bincode files (see `Persistent State` below). |
 | `SCANNER_INITIAL_SETTLE_TIMEOUT_MS` | (runtime-defined) | Override for the scanner's initial-settle deadline; see `runtime.rs`. |
 | `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`). |
+| `ZKCOINS_SKIP_BOOTSTRAP_WARMUP` | _(unset)_ | When set to `1` or `true`, skips the synthetic `prove_initial` warmup that runs after `Prover::new()` and before the HTTP listener binds. Production deploys MUST leave this unset — see `Bootstrap timing` below. The smoke tests in `node/src/runtime_tests.rs` set this so each bootstrap test does not pay the ~7 s prove tax. |
+
+### Bootstrap timing
+
+The node's `Prover::new()` builds the Plonky2 state-transition circuit
+(~14 s on M3 Ultra at production parameters) and the first
+`prove_initial` after the build pays an additional ~7 s of Rayon
+worker-pool spinup + AOT-compiled evaluator cache warm-up before
+settling at the steady-state p50 of ~5 s. Without intervention the
+first user-facing `/api/mint` or `/api/send` request after a container
+restart pays that ~7 s cold tax on top of the ~5 s prove, plus
+bookkeeping — observed as ~12 s wall instead of the usual ~5 s.
+
+`runtime::start_rest_node` (via `AccountNode::warmup_prover`) runs a
+discardable `prove_initial` against a fresh `AccountState` AFTER
+`load_from_pg` and BEFORE `axum::serve(listener, ...)`. The cost is
+paid by the bootstrap (~21 s total wall instead of ~14 s) and the
+first user request is served against a warm Rayon pool. The proof
+itself is discarded; no state mutation, no on-chain side-effect.
+
+Deploy implications:
+- The compose `start_period` on the `node` service must allow at least
+  ~25 s for the boot sequence (build + warmup + DB load + listener
+  bind). The current `start_period: 60s` in `DFXswiss/server` has
+  ample head-room.
+- `/health/ready` (in `node/src/router.rs`) inherently returns
+  connection-refused while the warmup is in flight — the TCP listener
+  is not bound until after the warmup completes — so an LB / Kuma
+  monitor that pings the readiness endpoint will see the node as
+  "not yet ready" until the bootstrap is fully done. No readiness-
+  handler change is needed.
+- Empirical numbers measured on dfxdev, 2026-05-31 R2 probe; the
+  reference implementation lives in `node/src/bin/probe_r2.rs`.
 
 ### Minimal local-dev env
 

@@ -95,6 +95,12 @@ async fn start_rest_node_binds_and_serves_health() {
     // makes the test runnable in any environment.
     std::env::set_var("USERNAME_DOMAIN", "test.zkcoins.local");
     std::env::set_var("ESPLORA_URL", "http://127.0.0.1:1/api");
+    // Skip the bootstrap warmup prove (`AccountNode::warmup_prover`):
+    // the smoke tests in this file only need the listener to bind, not
+    // a prover that survives a cold-start. Paying the ~7 s warmup tax
+    // twice per pre-push run is wasted wall time. Production deploys
+    // leave the env var unset and pay the tax once on container start.
+    std::env::set_var("ZKCOINS_SKIP_BOOTSTRAP_WARMUP", "1");
 
     // PR-A3 moved all sibling-file state (accounts.bin, usernames.bin,
     // minting_num_pubkeys.bin) into Postgres; the bootstrap only needs
@@ -205,6 +211,9 @@ async fn bootstrap_initial_minting_account_balance_is_goldilocks_safe() {
 
     std::env::set_var("USERNAME_DOMAIN", "test.zkcoins.local");
     std::env::set_var("ESPLORA_URL", "http://127.0.0.1:1/api");
+    // Skip the bootstrap warmup prove — see the matching comment in
+    // `start_rest_node_binds_and_serves_health` above.
+    std::env::set_var("ZKCOINS_SKIP_BOOTSTRAP_WARMUP", "1");
 
     let tmp = std::env::temp_dir().join(format!(
         "zkcoins-balance-test-{}-{}",

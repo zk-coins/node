@@ -44,6 +44,44 @@ pub async fn start_rest_node(
         .parse::<SocketAddr>()
         .map_err(|e| anyhow::anyhow!("Failed to parse address: {}", e))?;
 
+    // Bootstrap warmup: a fresh `Prover` carries a cold Rayon worker
+    // pool and uninitialised AOT-compiled Plonky2 evaluator caches.
+    // Empirically (dfxdev R2 probe, 2026-05-31) the first
+    // `prove_initial` after `Prover::new()` takes ~7012 ms vs the
+    // steady-state p50 of ~4777 ms for every subsequent call. Pay that
+    // cold tax HERE — synchronously, before binding the listener — so
+    // the first user-facing mint/send request after a container restart
+    // matches the warm p50 instead of paying ~12 s. Doc on
+    // `AccountNode::warmup_prover` explains the witness shape and the
+    // production-vs-test cost trade-off.
+    //
+    // Opt-out via `ZKCOINS_SKIP_BOOTSTRAP_WARMUP=1`: the smoke tests in
+    // `runtime_tests.rs` set this so each `start_rest_node_*` test does
+    // not pay the ~7 s prove tax twice over.
+    let skip_warmup = std::env::var("ZKCOINS_SKIP_BOOTSTRAP_WARMUP")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if skip_warmup {
+        println!(
+            "Bootstrap warmup prove skipped (ZKCOINS_SKIP_BOOTSTRAP_WARMUP set); \
+             first user request will pay the ~7 s cold tax"
+        );
+    } else {
+        println!("Running bootstrap warmup prove (synthetic prove_initial) ...");
+        let warmup_start = std::time::Instant::now();
+        // Panic on failure: the same `Prover` will serve every
+        // subsequent user request, so a warmup failure means production
+        // requests would also fail. Better to crash-loop the container
+        // here than to bind the listener and serve 500s.
+        account_node
+            .warmup_prover()
+            .expect("bootstrap warmup prove must succeed");
+        println!(
+            "Bootstrap warmup prove complete in {} ms; serving with warm Rayon pool",
+            warmup_start.elapsed().as_millis()
+        );
+    }
+
     let shared_account_node = Arc::new(Mutex::new(account_node));
 
     // Proof files keep using a local directory — the proof store is
