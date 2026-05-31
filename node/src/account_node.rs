@@ -821,7 +821,7 @@ impl AccountNode {
     /// reference implementation that produced the numbers above; keep
     /// the witness shape (fresh `AccountState::new(_)` + `ZERO_HASH`) in
     /// sync if either side changes.
-    pub fn warmup_prover(&self) -> Result<(), String> {
+    pub fn warmup_prover(&self) -> anyhow::Result<()> {
         // 33-byte well-formed secp256k1-compressed pubkey placeholder.
         // The circuit does not verify the pubkey is on-curve in
         // `prove_initial`, only that the witness layout matches; the
@@ -833,10 +833,10 @@ impl AccountNode {
             *b = (7u8).wrapping_add(i as u8);
         }
         let warmup_account_state = AccountState::new(pk);
-        self.prover
-            .prove_initial(&warmup_account_state, ZERO_HASH)
-            .map(|_proof| ())
-            .map_err(|e| format!("bootstrap warmup prove_initial failed: {e}"))
+        let _proof = self
+            .prover
+            .prove_initial(&warmup_account_state, ZERO_HASH)?;
+        Ok(())
     }
 
     /// Read-only handle on the shared [`State`] (SMT + MMR). Exposed so
