@@ -96,6 +96,150 @@ pub(crate) fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     })
 }
 
+/// Phase E failure modes returned by [`apply_commit_and_persist_phase_e`].
+///
+/// Each variant maps 1:1 to the two distinct error arms in the shared
+/// helper: an in-process `state.update` rejection (typically an SMT
+/// key-collision-with-different-value, observed-but-rare), or a
+/// post-update durable-write rollback. The caller (mint or send) maps
+/// the variant onto its own flow-tagged response string so the public
+/// error message stays exactly as the wallet-side
+/// `KNOWN_SERVER_ERRORS` table expects per endpoint.
+#[derive(Debug)]
+pub(crate) enum PhaseEFailure {
+    /// `update_and_snapshot_for_persist` returned an `Err` — the
+    /// in-process SMT/MMR could not be advanced (typical cause: SMT
+    /// key collision with different value). The broadcast already
+    /// landed on chain; the scanner-replay path will reconcile.
+    StateUpdate,
+    /// `persist_state_and_mark_complete_tx` failed — the atomic tx
+    /// rolled back so SMT/MMR/root_index AND the
+    /// `pending_inscriptions.status -> 'complete'` advance all stayed
+    /// at their pre-call values on disk. The in-memory SMT/MMR HAVE
+    /// already mutated; on restart `State::load_from_pg` returns the
+    /// pre-update on-disk state and the scanner-replay path heals.
+    DurablePersist,
+}
+
+/// Apply a freshly-broadcast commitment to the in-memory SMT + MMR
+/// and persist the resulting snapshot **atomically** with the matching
+/// `pending_inscriptions.status -> 'complete'` advance.
+///
+/// This is the shared Phase E body invoked by both flows that originate
+/// inscriptions on this node:
+/// * [`mint_handler`] — for mint commits, immediately after
+///   `create_and_broadcast_inscription` returns Ok.
+/// * [`crate::runtime::broadcast_commit_and_deliver`] — for send
+///   commits, immediately after the user-signed commitment is
+///   broadcast.
+///
+/// The symmetry matters: before this helper existed, the send path
+/// relied exclusively on the async scanner to observe the commit on
+/// chain and run `state.update` itself. That left a race window in
+/// which a wallet could chain `/api/send` + `/api/commit` and then
+/// issue a second `/api/send` whose proof-build walks the SMT for the
+/// first send's commitment — and finds it missing because the scanner
+/// hadn't yet observed the new inscription (especially on Mutinynet
+/// where reveal-broadcast → scanner-observe sits at tens of seconds).
+/// Running Phase E synchronously here closes that window: by the time
+/// the handler responds 200, the SMT entry for the just-broadcast
+/// commitment is committed in memory AND on disk, and the scanner
+/// will skip its redundant integration via
+/// `should_skip_scanner_state_update`. The scanner remains the
+/// authoritative path for external / recovery inscriptions.
+///
+/// ## Lock topology (preserved across both callers)
+/// The function acquires `state.account_node` only to clone its
+/// `Arc<Mutex<State>>` reference, then drops the account-node guard
+/// **before** acquiring the state guard. `std::sync::Mutex` is held
+/// only across the synchronous `update_and_snapshot_for_persist` call
+/// and is released before the async `persist_state_and_mark_complete_tx`
+/// — keeping a `std::sync::Mutex` off any `.await` boundary.
+///
+/// ## Error handling (no fallbacks)
+/// On Err the caller logs and converts to 503. There is **no in-process
+/// retry, no spawn-async-retry, no half-state cleanup attempt** — the
+/// scanner-replay path is the single source of repair, identical for
+/// mint and send. See the memory rule on no-fallbacks for why this is
+/// not a robustness gap.
+pub(crate) async fn apply_commit_and_persist_phase_e(
+    state: &AppState,
+    commitment: &Commitment,
+    commit_txid_bytes: &[u8; 32],
+    flow_label: &'static str,
+) -> Result<zkcoins_program::hash::HashDigest, PhaseEFailure> {
+    // Test-only deterministic hold between the broadcast result and
+    // the phase-3b state advance. Pre-unlocked in all `test_state`
+    // constructors so production-shaped tests acquire + drop in one
+    // step. Holding the guard across a colliding SMT injection lets
+    // the in-process state.update Err test observe the collision when
+    // the handler's `state.update` finally runs. Production builds
+    // compile this out entirely (the field does not exist).
+    #[cfg(test)]
+    drop(state.state_advance_release_lock.lock().await);
+
+    let state_advance_outcome = {
+        let state_arc_for_advance = {
+            let account_node_guard = lock_or_recover(&state.account_node);
+            account_node_guard.state().clone()
+        };
+        let mut state_guard = lock_or_recover(&state_arc_for_advance);
+        state_guard.update_and_snapshot_for_persist(std::slice::from_ref(commitment))
+    };
+    let (new_root, smt_bytes, mmr_bytes, root_index_entry) = match state_advance_outcome {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            // The in-process SMT/MMR could not be advanced — typically
+            // an SMT key-collision-with-different-value. The broadcast
+            // already landed on chain; the publisher already advanced
+            // the row to `reveal_broadcast` BEFORE the broadcast call,
+            // so the scanner-replay path will pick the inscription up
+            // from chain and run state.update against the un-mutated
+            // SMT.
+            eprintln!(
+                "{}: in-process state.update failed: {} (broadcast already landed; scanner-replay will reconcile)",
+                flow_label, e
+            );
+            return Err(PhaseEFailure::StateUpdate);
+        }
+    };
+    let root_index_ref = root_index_entry.as_ref().map(|(p, s, i)| (p, s, *i as u64));
+    match db::persist_state_and_mark_complete_tx(
+        &state.pool,
+        &smt_bytes,
+        &mmr_bytes,
+        root_index_ref,
+        &commit_txid_bytes[..],
+    )
+    .await
+    {
+        Ok(()) => {
+            println!(
+                "{}: state.update persisted + row marked complete. New MMR root: {}",
+                flow_label,
+                hex::encode(zkcoins_program::hash::digest_to_bytes(&new_root))
+            );
+            Ok(new_root)
+        }
+        Err(e) => {
+            // The atomic tx rolled back: SMT/MMR/root_index AND the
+            // row advance all stayed at their pre-call values on disk.
+            // The in-memory SMT/MMR HAVE already been mutated (that
+            // happened above before the await), so they are now ahead
+            // of disk by exactly one leaf. On restart,
+            // `State::load_from_pg` returns the pre-update on-disk
+            // state and the scanner-replay path walks the block,
+            // observes the row at `reveal_broadcast`, and integrates
+            // the inscription itself — a clean heal.
+            eprintln!(
+                "{}: atomic persist + mark-complete failed: {} (scanner-replay will heal)",
+                flow_label, e
+            );
+            Err(PhaseEFailure::DurablePersist)
+        }
+    }
+}
+
 // Define a struct for our application state
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -1567,122 +1711,27 @@ async fn mint_handler(
     // Apply the freshly-broadcast commitment to the in-memory SMT + MMR
     // and persist the resulting snapshot — together with the
     // `pending_inscriptions.status = 'complete'` row advance — in ONE
-    // atomic Postgres transaction (`persist_state_and_mark_complete_tx`).
-    // The scanner's pre-state.update lookup uses that `complete` marker
-    // to skip its own redundant integration when it later observes the
-    // same commit on chain.
-    //
-    // Rationale (this is the regression Phase E fixes): the scanner
-    // observed a mint's commit ~20-30 s after `/api/mint` returned 200.
-    // A wallet that issued a second mint inside that window walked
-    // `derive_num_pubkeys_from_smt` against the un-updated SMT, signed
-    // with the same pubkey index as the first mint, and surfaced
-    // `Unable to get mmr inclusion proof for the previous root` at the
-    // prover. Advancing `state.update` synchronously here closes the
-    // window: the second mint's SMT walk sees the first mint's entry
-    // immediately. The scanner becomes a redundant observer for our
-    // own inscriptions and remains the authoritative path for external
-    // recovery inscriptions and out-of-band commits.
-    //
-    // Lock topology: the state lock is acquired AFTER the broadcast
-    // completes (broadcasting is slow and would otherwise serialize
-    // all `/api/mint` requests behind a single in-flight inscription).
-    //
-    // Crash-recovery contract (the BLOCKER this commit fixed): the
-    // previous two-step shape (persist SMT/MMR/root_index, then a
-    // standalone UPDATE to `complete`) opened a window where the
-    // SMT/MMR/root_index could land on disk while the row stayed at
-    // `reveal_broadcast`. On restart, `State::load_from_pg` rebuilt the
-    // in-memory state WITH the new leaf, the scanner re-scanned the
-    // block, observed `reveal_broadcast` → `should_skip_scanner_state_update`
-    // returned `false`, and `state.update` ran a second time — the SMT
-    // insert was an idempotent no-op (same key+value) but
-    // `mmr.append(leaf)` appended a DUPLICATE leaf, diverging the MMR
-    // root. The atomic single-tx persist + mark-complete below
-    // guarantees that on success, the scanner-skip predicate will
-    // correctly fire on replay. On tx failure, the row stays at
-    // `reveal_broadcast` and the in-memory state advance was NOT
-    // persisted to disk (transaction atomicity); the scanner will
-    // replay cleanly.
-    // Test-only deterministic hold between the broadcast result and
-    // the phase-3b state advance. Pre-unlocked in all `test_state`
-    // constructors so production-shaped tests acquire + drop in one
-    // step. The in-process state.update Err test holds the guard
-    // across a colliding SMT injection so the handler observes the
-    // collision when its `state.update` finally runs. Production
-    // builds compile this out entirely (the field does not exist).
-    #[cfg(test)]
-    drop(state.state_advance_release_lock.lock().await);
-
-    let state_advance_outcome = {
-        let state_arc_for_advance = {
-            let account_node_guard = lock_or_recover(&state.account_node);
-            account_node_guard.state().clone()
-        };
-        let mut state_guard = lock_or_recover(&state_arc_for_advance);
-        state_guard.update_and_snapshot_for_persist(std::slice::from_ref(&commitment))
-    };
-    let (new_root, smt_bytes, mmr_bytes, root_index_entry) = match state_advance_outcome {
-        Ok(snapshot) => snapshot,
-        Err(e) => {
-            // The in-process SMT/MMR could not be advanced — typically
-            // an SMT key-collision-with-different-value (a concurrent
-            // mint race that slipped the phase-2 re-derive gate, or a
-            // genuine bug). The broadcast already landed on chain, but
-            // the caller's mint was NOT integrated synchronously. The
-            // publisher already advanced the row to `reveal_broadcast`
-            // BEFORE the broadcast call; we keep it there so the
-            // scanner-replay path will pick the inscription up from
-            // chain and run state.update against the un-mutated SMT.
-            // Return 503 so the wallet knows the mint did NOT land
-            // synchronously and can poll for completion.
-            eprintln!(
-                "mint_handler: in-process state.update failed: {} (broadcast already landed; scanner-replay will reconcile)",
-                e
-            );
-            return handler_error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "mint broadcast landed on chain but in-process state advance failed; scanner will reconcile",
-            );
-        }
-    };
-    let root_index_ref = root_index_entry.as_ref().map(|(p, s, i)| (p, s, *i as u64));
-    match db::persist_state_and_mark_complete_tx(
-        &state.pool,
-        &smt_bytes,
-        &mmr_bytes,
-        root_index_ref,
-        &commit_txid_bytes,
-    )
-    .await
+    // atomic Postgres transaction. The shared implementation lives in
+    // [`apply_commit_and_persist_phase_e`], which is also invoked from
+    // the send path in [`crate::runtime::broadcast_commit_and_deliver`]
+    // so the two flows that originate inscriptions on this node both
+    // integrate them synchronously and the scanner becomes a redundant
+    // observer for our own commits. See the helper's docstring for the
+    // full rationale (race window, lock topology, crash-recovery
+    // contract).
+    if let Err(failure) =
+        apply_commit_and_persist_phase_e(&state, &commitment, &commit_txid_bytes, "mint_handler")
+            .await
     {
-        Ok(()) => {
-            println!(
-                "mint_handler: state.update persisted + row marked complete. New MMR root: {}",
-                hex::encode(zkcoins_program::hash::digest_to_bytes(&new_root))
-            );
-        }
-        Err(e) => {
-            // The atomic tx rolled back: SMT/MMR/root_index AND
-            // the row advance all stayed at their pre-call values
-            // on disk. The in-memory SMT/MMR HAVE already been
-            // mutated (that happened above before the await), so
-            // they are now ahead of disk by exactly one leaf.
-            // On restart, `State::load_from_pg` returns the
-            // pre-update on-disk state and the scanner-replay path
-            // walks the block, observes the row at
-            // `reveal_broadcast`, and integrates the inscription
-            // itself — a clean heal. Return 503 so the caller
-            // knows the durable state did not advance.
-            eprintln!(
-                "mint_handler: atomic persist + mark-complete failed: {} (scanner-replay will heal)",
-                e
-            );
-            return handler_error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "mint broadcast landed on chain but durable state advance failed; scanner will reconcile",
-            );
-        }
+        let msg: &'static str = match failure {
+            PhaseEFailure::StateUpdate => {
+                "mint broadcast landed on chain but in-process state advance failed; scanner will reconcile"
+            }
+            PhaseEFailure::DurablePersist => {
+                "mint broadcast landed on chain but durable state advance failed; scanner will reconcile"
+            }
+        };
+        return handler_error_response(StatusCode::SERVICE_UNAVAILABLE, msg);
     }
 
     // ---- 4. COMMIT phase (broadcast OK) ---------------------------------
@@ -1829,18 +1878,29 @@ async fn get_proof_handler(
 /// Accepts a client-signed commitment for a previously generated proof.
 /// Broadcasts the commitment as a Taproot inscription and delivers the coin to the recipient.
 ///
-/// **Broadcast-then-deliver invariant (zk-coins/node#89).** Unlike
-/// the mint flow, the `/api/commit` endpoint receives a *proof_id* the
-/// node already generated (in an earlier `/api/send` call), looks up
-/// the persisted `CoinProof`, broadcasts its commitment, and only then
-/// hands the proof to `receive_coin` for the recipient mutation. The
-/// in-memory mutation lives in [`broadcast_commit_and_deliver`] in
-/// `runtime.rs`; the broadcast call sits at the very top of
-/// that function and returns 503 on failure with NO subsequent state
-/// mutation, so there is no analogue of the mint state-desync class
-/// here. DO NOT reorder the broadcast and the `receive_coin` call —
-/// the audit in zk-coins/node#89 verified this ordering is correct
-/// and any future refactor must preserve it.
+/// **Broadcast-then-deliver invariant (zk-coins/node#89).** The
+/// `/api/commit` endpoint receives a *proof_id* the node already
+/// generated (in an earlier `/api/send` call), looks up the persisted
+/// `CoinProof`, broadcasts its commitment, advances the SMT/MMR via
+/// the shared Phase E helper synchronously, and only then hands the
+/// proof to `receive_coin` for the recipient mutation. The in-memory
+/// mutation + persistence lives in [`broadcast_commit_and_deliver`] in
+/// `runtime.rs`; the broadcast call sits at the very top of that
+/// function and returns 503 on failure with NO subsequent state
+/// mutation. DO NOT reorder the broadcast and the `receive_coin` call.
+///
+/// **Phase E symmetry (this branch).** The send-commit path now runs
+/// [`apply_commit_and_persist_phase_e`] synchronously between the
+/// broadcast and `receive_coin`, matching `mint_handler`. Before this
+/// change the send-commit SMT integration relied exclusively on the
+/// async scanner, which left a race window where a wallet that
+/// followed `/api/send` + `/api/commit` with a second `/api/send`
+/// would walk the SMT for the first commit's pubkey and find it
+/// missing — surfacing as 422 `"Unable to get merkle proofs for
+/// provided public key"`. The synchronous Phase E call closes that
+/// window; the scanner remains the authoritative path for external
+/// recovery inscriptions but is now a redundant observer for our own
+/// send commits, exactly as for mint commits.
 async fn commit_handler(
     State(state): State<AppState>,
     Json(request): Json<CommitRequest>,

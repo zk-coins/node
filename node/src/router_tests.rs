@@ -5865,6 +5865,449 @@ async fn r2_probe_history_limit_clamped_to_max() {
     assert!(arr.is_empty());
 }
 
+// ---------------------------------------------------------------------------
+// Phase E (send-commit branch) — mirrors the mint Phase E tests above.
+//
+// `broadcast_commit_and_deliver` runs the shared
+// `apply_commit_and_persist_phase_e` helper synchronously after the
+// Bitcoin broadcast. The tests below assert the two load-bearing
+// observable properties from outside the handler:
+//
+// 1. Happy path: after a 200 response the SMT contains the commit's
+//    pubkey, the MMR has advanced by one leaf, the matching
+//    `mmr_root_index` row is present, and the `pending_inscriptions`
+//    row sits at `complete` — so a scanner re-observation hits
+//    `should_skip_scanner_state_update`.
+//
+// 2. Atomic rollback (`PhaseEFailure::DurablePersist`): a trigger that
+//    blocks the in-tx UPDATE to `complete` rolls the whole transaction
+//    back. The handler surfaces 503; on-disk SMT/MMR/root_index stays
+//    unchanged; the row stays at `reveal_broadcast` so scanner-replay
+//    will integrate the inscription from chain.
+// ---------------------------------------------------------------------------
+
+/// End-to-end mirror of `mint_handler_advances_state_synchronously_with_broadcast`
+/// for the send-commit path. Runs `/api/send` (real prover) followed by
+/// `/api/commit` (real broadcast against a wiremock Esplora that
+/// accepts both the UTXO lookup and the `POST /tx`), then asserts the
+/// in-memory and on-disk Phase E aftermath that closes the second-send
+/// race (the regression that `second_send_roundtrip_succeeds_without_prev_commitment_pubkey_field`
+/// surfaced against Mutinynet).
+#[tokio::test]
+async fn commit_handler_advances_state_synchronously_with_broadcast() {
+    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container.get_host().await.unwrap();
+    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
+    // `mint_broadcast_mock_server` is publisher-key-agnostic — same
+    // `0x01` SecretKey used for every test-mode broadcast. It accepts
+    // the UTXO GET and the `POST /tx` so the commit-side
+    // `create_and_broadcast_inscription` succeeds.
+    let mock_server = mint_broadcast_mock_server().await;
+
+    // `test_state()` carries `dead_pool`; swap in the live pool and the
+    // mock Esplora before exercising the handler.
+    let mut state = test_state();
+    state.pool = Arc::clone(&pool);
+    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
+        url: mock_server.uri(),
+        is_mainnet: false,
+        network_name: "Mutinynet".to_string(),
+        ws_url: None,
+    });
+
+    // Derive the same BIP-32 child keys the other commit tests use.
+    let secret_bytes = include_bytes!("../minting_secret.bin");
+    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
+    let secp = secp::Secp256k1::new();
+    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .public_key;
+    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
+        .unwrap()
+        .public_key;
+    let sk_0: SecretKey = xpriv
+        .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .private_key;
+
+    // ---- /api/send (real prover, returns the post-state hashes) ----
+    let account_address = "0x".to_string()
+        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
+            &zkcoins_program::types::MINTING_ADDRESS,
+        ));
+    let recipient = "0x".to_string() + &hex::encode([0xa1u8; 32]);
+    let amount: u64 = 1;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut hasher = Sha256::new();
+    hasher.update(account_address.as_bytes());
+    hasher.update(recipient.as_bytes());
+    hasher.update(amount.to_le_bytes());
+    hasher.update(now.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    let msg = Message::from_digest(hash);
+    let kp = Keypair::from_secret_key(&secp, &sk_0);
+    let sig = secp.sign_schnorr(&msg, &kp);
+
+    let send_body = serde_json::json!({
+        "account_address": account_address,
+        "recipient": recipient,
+        "amount": amount,
+        "public_key": hex::encode(pk_0.serialize()),
+        "next_public_key": hex::encode(pk_1.serialize()),
+        "signature": hex::encode(sig.serialize()),
+        "timestamp": now,
+    });
+    let send_req = Request::post("/api/send")
+        .header("content-type", "application/json")
+        .body(Body::from(send_body.to_string()))
+        .unwrap();
+    let (send_status, send_body_text) = send_request_with_state(state.clone(), send_req).await;
+    assert_eq!(send_status, StatusCode::OK, "send failed: {send_body_text}");
+    let send_resp: serde_json::Value = serde_json::from_str(&send_body_text).unwrap();
+    let proof_id = send_resp["proof_id"].as_u64().unwrap();
+    let ash_hex = send_resp["account_state_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ocr_hex = send_resp["output_coins_root"].as_str().unwrap().to_string();
+
+    // Pre-commit sanity: pk_0 is NOT yet in the SMT (send_coin_handler
+    // does not advance the SMT; that is exactly the Phase E gap this
+    // commit closes for the send branch).
+    let pk0_smt_key = bitcoin::hashes::sha256::Hash::hash(&pk_0.serialize()).to_byte_array();
+    {
+        let node_guard = state.account_node.lock().unwrap();
+        let state_arc = node_guard.state().clone();
+        let state_guard = state_arc.lock().unwrap();
+        assert!(
+            state_guard.smt.get(&pk0_smt_key).is_none(),
+            "post-send / pre-commit: pk_0 must NOT be in SMT yet (commit's Phase E inserts it)"
+        );
+        assert_eq!(
+            state_guard.mmr.leaf_count(),
+            0,
+            "post-send / pre-commit: MMR must be empty"
+        );
+    }
+
+    // ---- /api/commit (broadcast OK → Phase E runs synchronously) ----
+    let ash_bytes = hex::decode(&ash_hex).unwrap();
+    let ocr_bytes = hex::decode(&ocr_hex).unwrap();
+    let mut commit_message = Vec::with_capacity(ash_bytes.len() + ocr_bytes.len());
+    commit_message.extend_from_slice(&ash_bytes);
+    commit_message.extend_from_slice(&ocr_bytes);
+    let commitment = shared::commitment::Commitment::new(&sk_0, commit_message.clone())
+        .expect("commitment creation");
+    assert!(commitment.verify(), "test commitment must verify locally");
+
+    let commit_body = serde_json::json!({
+        "proof_id": proof_id,
+        "public_key": hex::encode(commitment.public_key.serialize()),
+        "signature": hex::encode(commitment.signature.serialize()),
+        "message": hex::encode(&commitment.message),
+    });
+    let commit_req = Request::post("/api/commit")
+        .header("content-type", "application/json")
+        .body(Body::from(commit_body.to_string()))
+        .unwrap();
+    let (commit_status, commit_resp_body) =
+        send_request_with_state(state.clone(), commit_req).await;
+    assert_eq!(
+        commit_status,
+        StatusCode::OK,
+        "commit must succeed against accepting Esplora + live pool: {}",
+        commit_resp_body
+    );
+
+    // ---- Phase E aftermath: SMT/MMR/root_indices reflect the commit ----
+    let state_arc = {
+        let node_guard = state.account_node.lock().unwrap();
+        node_guard.state().clone()
+    };
+    {
+        let state_guard = state_arc.lock().unwrap();
+        assert!(
+            state_guard.smt.get(&pk0_smt_key).is_some(),
+            "Phase E regression: commit_handler must advance SMT with pk_0 before returning 200"
+        );
+        assert_eq!(
+            state_guard.mmr.leaf_count(),
+            1,
+            "Phase E: MMR must hold exactly one new leaf after the commit"
+        );
+        assert!(
+            state_guard
+                .root_indices
+                .contains_key(&state_guard.prev_mmr_root),
+            "Phase E: root_indices must hold the freshly written prev_mmr_root"
+        );
+    }
+
+    // ---- pending_inscriptions row marked `complete` atomically ----
+    let (pending_status,): (String,) =
+        sqlx::query_as("SELECT status FROM pending_inscriptions ORDER BY id DESC LIMIT 1")
+            .fetch_one(&*pool)
+            .await
+            .expect("a pending row must exist for the broadcast commit");
+    assert_eq!(
+        pending_status,
+        crate::db::PENDING_STATUS_COMPLETE,
+        "Phase E: commit_handler must mark pending_inscriptions complete after state.update"
+    );
+    let (commit_txid_bytes,): (Vec<u8>,) =
+        sqlx::query_as("SELECT commit_txid FROM pending_inscriptions ORDER BY id DESC LIMIT 1")
+            .fetch_one(&*pool)
+            .await
+            .expect("commit_txid column must populate");
+    assert!(
+        crate::scanner::should_skip_scanner_state_update(
+            crate::db::pending_inscription_status_by_commit_txid(&pool, &commit_txid_bytes)
+                .await
+                .unwrap()
+                .as_deref()
+        ),
+        "scanner must skip its redundant state.update for a Phase-E-completed send commit"
+    );
+}
+
+/// Mirror of `mint_handler_atomic_tx_rollback_leaves_state_and_row_consistent`
+/// for the send-commit path. Installs a `BEFORE UPDATE` trigger on
+/// `pending_inscriptions` that raises an exception when the new
+/// `status` value is `complete`. The trigger fires inside the atomic
+/// `persist_state_and_mark_complete_tx` envelope so the SMT/MMR/
+/// root_index UPSERTs and the mark-complete UPDATE all roll back
+/// together. `broadcast_commit_and_deliver` converts the failure to
+/// 503; on-disk durable state is unchanged; the row stays at
+/// `reveal_broadcast` so the scanner-replay path can integrate the
+/// inscription from chain without doubling up the MMR leaf.
+#[tokio::test]
+async fn commit_handler_atomic_tx_rollback_leaves_state_and_row_consistent() {
+    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
+    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container.get_host().await.unwrap();
+    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+
+    // Trigger raises on every UPDATE that sets `status = 'complete'`.
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION fail_complete_commit() RETURNS trigger AS $$
+         BEGIN
+             IF NEW.status = 'complete' THEN
+                 RAISE EXCEPTION 'simulated mark-complete failure (commit)';
+             END IF;
+             RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&*pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER block_complete_commit BEFORE UPDATE ON pending_inscriptions \
+         FOR EACH ROW EXECUTE FUNCTION fail_complete_commit()",
+    )
+    .execute(&*pool)
+    .await
+    .unwrap();
+
+    let mock_server = mint_broadcast_mock_server().await;
+    let mut state = test_state();
+    state.pool = Arc::clone(&pool);
+    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
+        url: mock_server.uri(),
+        is_mainnet: false,
+        network_name: "Mutinynet".to_string(),
+        ws_url: None,
+    });
+
+    let secret_bytes = include_bytes!("../minting_secret.bin");
+    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
+    let secp = secp::Secp256k1::new();
+    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .public_key;
+    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
+        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
+        .unwrap()
+        .public_key;
+    let sk_0: SecretKey = xpriv
+        .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
+        .unwrap()
+        .private_key;
+
+    let account_address = "0x".to_string()
+        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
+            &zkcoins_program::types::MINTING_ADDRESS,
+        ));
+    let recipient = "0x".to_string() + &hex::encode([0xa2u8; 32]);
+    let amount: u64 = 1;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut hasher = Sha256::new();
+    hasher.update(account_address.as_bytes());
+    hasher.update(recipient.as_bytes());
+    hasher.update(amount.to_le_bytes());
+    hasher.update(now.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    let msg = Message::from_digest(hash);
+    let kp = Keypair::from_secret_key(&secp, &sk_0);
+    let sig = secp.sign_schnorr(&msg, &kp);
+
+    let send_body = serde_json::json!({
+        "account_address": account_address,
+        "recipient": recipient,
+        "amount": amount,
+        "public_key": hex::encode(pk_0.serialize()),
+        "next_public_key": hex::encode(pk_1.serialize()),
+        "signature": hex::encode(sig.serialize()),
+        "timestamp": now,
+    });
+    let send_req = Request::post("/api/send")
+        .header("content-type", "application/json")
+        .body(Body::from(send_body.to_string()))
+        .unwrap();
+    let (send_status, send_body_text) = send_request_with_state(state.clone(), send_req).await;
+    assert_eq!(send_status, StatusCode::OK, "send failed: {send_body_text}");
+    let send_resp: serde_json::Value = serde_json::from_str(&send_body_text).unwrap();
+    let proof_id = send_resp["proof_id"].as_u64().unwrap();
+    let ash_hex = send_resp["account_state_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ocr_hex = send_resp["output_coins_root"].as_str().unwrap().to_string();
+
+    let ash_bytes = hex::decode(&ash_hex).unwrap();
+    let ocr_bytes = hex::decode(&ocr_hex).unwrap();
+    let mut commit_message = Vec::with_capacity(ash_bytes.len() + ocr_bytes.len());
+    commit_message.extend_from_slice(&ash_bytes);
+    commit_message.extend_from_slice(&ocr_bytes);
+    let commitment = shared::commitment::Commitment::new(&sk_0, commit_message.clone())
+        .expect("commitment creation");
+    assert!(commitment.verify(), "test commitment must verify locally");
+
+    let commit_body = serde_json::json!({
+        "proof_id": proof_id,
+        "public_key": hex::encode(commitment.public_key.serialize()),
+        "signature": hex::encode(commitment.signature.serialize()),
+        "message": hex::encode(&commitment.message),
+    });
+    let commit_req = Request::post("/api/commit")
+        .header("content-type", "application/json")
+        .body(Body::from(commit_body.to_string()))
+        .unwrap();
+    let (commit_status, commit_resp_body) = send_request_with_state(state, commit_req).await;
+
+    // Trigger fires inside the atomic tx → handler converts to 503.
+    assert_eq!(
+        commit_status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "atomic tx rollback must surface 503, body: {}",
+        commit_resp_body
+    );
+    let v: serde_json::Value = serde_json::from_str(&commit_resp_body).expect("valid JSON");
+    assert_eq!(v["success"], false);
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("durable state advance failed"),
+        "response error must explain the durable-persist failure, got: {}",
+        v["error"]
+    );
+
+    // On-disk SMT/MMR/root_index did NOT advance — the atomic
+    // envelope rolled them back together with the failed UPDATE.
+    assert_eq!(
+        crate::db::load_smt(&pool).await.unwrap(),
+        None,
+        "atomic-tx rollback must leave smt_state untouched"
+    );
+    assert_eq!(
+        crate::db::load_mmr(&pool).await.unwrap(),
+        None,
+        "atomic-tx rollback must leave mmr_state untouched"
+    );
+    assert!(
+        crate::db::load_root_indices(&pool)
+            .await
+            .unwrap()
+            .is_empty(),
+        "atomic-tx rollback must leave mmr_root_index untouched"
+    );
+
+    // Pending row stays at `reveal_broadcast`: publisher set it there
+    // before the broadcast, mark-complete was the call the trigger
+    // blocked. Scanner-replay on next boot picks up the inscription
+    // and integrates it via its own state.update path.
+    let (pending_status,): (String,) =
+        sqlx::query_as("SELECT status FROM pending_inscriptions ORDER BY id DESC LIMIT 1")
+            .fetch_one(&*pool)
+            .await
+            .expect("a pending row must exist for the broadcasted commitment");
+    assert_eq!(
+        pending_status,
+        crate::db::PENDING_STATUS_REVEAL_BROADCAST,
+        "atomic-tx rollback: pending row must stay at reveal_broadcast for scanner-replay to pick up"
+    );
+    let (commit_txid_bytes,): (Vec<u8>,) =
+        sqlx::query_as("SELECT commit_txid FROM pending_inscriptions ORDER BY id DESC LIMIT 1")
+            .fetch_one(&*pool)
+            .await
+            .unwrap();
+    assert!(
+        !crate::scanner::should_skip_scanner_state_update(
+            crate::db::pending_inscription_status_by_commit_txid(&pool, &commit_txid_bytes)
+                .await
+                .unwrap()
+                .as_deref()
+        ),
+        "scanner must NOT skip its state.update for a send commit whose mark-complete failed"
+    );
+
+    sqlx::query("DROP TRIGGER block_complete_commit ON pending_inscriptions")
+        .execute(&*pool)
+        .await
+        .unwrap();
+}
+
 // =======================================================================
 // GET /api/history — paginated per-address history (issue #153)
 //
