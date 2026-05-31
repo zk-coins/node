@@ -1,0 +1,492 @@
+openapi: 3.0.0
+info:
+  version: 0.9.0
+  title: zkCoins Node API
+  description: |-
+    Public HTTP surface of zk-coins/node. Source of truth for the published TypeScript / Dart / Rust clients consumed by external wallet integrators.
+
+    Generated from `zk-coins/app/src/lib/api/schemas.ts`. Do not hand-edit this file — regenerate via `npm run generate:openapi`.
+  license:
+    name: MIT
+    url: https://github.com/zk-coins/node/blob/develop/LICENSE
+servers:
+  - url: https://api.zkcoins.app
+    description: Production node (Mainnet)
+  - url: https://dev-api.zkcoins.app
+    description: DEV node (Mutinynet)
+components:
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          enum:
+            - false
+        error:
+          type: string
+      required:
+        - success
+        - error
+    SendResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        error:
+          type: string
+        proof_id:
+          type: number
+          nullable: true
+        account_state_hash:
+          type: string
+        output_coins_root:
+          type: string
+      required:
+        - success
+    MintResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        error:
+          type: string
+        proof_id:
+          type: number
+          nullable: true
+        account_state_hash:
+          type: string
+        output_coins_root:
+          type: string
+      required:
+        - success
+    CommitResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        error:
+          type: string
+        proof_id:
+          type: number
+          nullable: true
+        account_state_hash:
+          type: string
+        output_coins_root:
+          type: string
+      required:
+        - success
+    BalanceResponse:
+      type: object
+      properties:
+        balance:
+          type: number
+        username:
+          type: string
+        num_sends:
+          type: number
+          default: 0
+      required:
+        - balance
+    InfoResponse:
+      type: object
+      properties:
+        network:
+          type: string
+        capabilities:
+          type: object
+          properties:
+            address_list:
+              type: boolean
+            username_claim:
+              type: boolean
+            lnurl:
+              type: boolean
+          required:
+            - address_list
+            - username_claim
+            - lnurl
+      required:
+        - network
+    Capabilities:
+      type: object
+      properties:
+        address_list:
+          type: boolean
+        username_claim:
+          type: boolean
+        lnurl:
+          type: boolean
+      required:
+        - address_list
+        - username_claim
+        - lnurl
+    CapabilityName:
+      type: string
+      enum:
+        - address_list
+        - username_claim
+        - lnurl
+    UsernameResponse:
+      type: object
+      properties:
+        username:
+          type: string
+        address:
+          type: string
+      required:
+        - username
+        - address
+    ClaimUsernameResponse:
+      type: object
+      properties:
+        username:
+          type: string
+        address:
+          type: string
+      required:
+        - username
+        - address
+    ResolveUsernameResponse:
+      type: object
+      properties:
+        username:
+          type: string
+        address:
+          type: string
+      required:
+        - username
+        - address
+    MintRequest:
+      type: object
+      properties:
+        account_address:
+          type: string
+        amount:
+          type: integer
+          minimum: 0
+      required:
+        - account_address
+        - amount
+    SendRequest:
+      type: object
+      properties:
+        account_address:
+          type: string
+        recipient:
+          type: string
+        amount:
+          type: integer
+          minimum: 0
+        public_key:
+          type: string
+        next_public_key:
+          type: string
+        prev_commitment_pubkey:
+          type: string
+        signature:
+          type: string
+        timestamp:
+          type: integer
+      required:
+        - account_address
+        - recipient
+        - amount
+        - public_key
+        - next_public_key
+    CommitRequest:
+      type: object
+      properties:
+        proof_id:
+          type: integer
+          minimum: 0
+        public_key:
+          type: string
+        signature:
+          type: string
+        message:
+          type: string
+      required:
+        - proof_id
+        - public_key
+        - signature
+        - message
+    ClaimUsernameRequest:
+      type: object
+      properties:
+        username:
+          type: string
+        address:
+          type: string
+        public_key:
+          type: string
+        signature:
+          type: string
+        timestamp:
+          type: integer
+      required:
+        - username
+        - address
+        - public_key
+        - signature
+        - timestamp
+    ReceiveCoinRequest:
+      type: object
+      properties:
+        coin_proof:
+          nullable: true
+  parameters: {}
+paths:
+  /api/info:
+    get:
+      summary: Node identity and feature capabilities
+      description: Returns the network name and the boolean capability set the binary was built with. Wallets render their UI based on `capabilities.*`.
+      responses:
+        '200':
+          description: Info envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InfoResponse'
+  /api/balance:
+    get:
+      summary: Authoritative balance + send-counter for an address
+      description: Returns the on-chain balance for the supplied address along with `num_sends`, the BIP-32 index the wallet must use for the next signed request. Always call this immediately before any signed `/api/send` or `/api/commit` — the local store can drift.
+      parameters:
+        - schema:
+            type: string
+            description: 32-byte hex (with or without `0x` prefix).
+            example: aabbccdd...
+          required: true
+          description: 32-byte hex (with or without `0x` prefix).
+          name: address
+          in: query
+      responses:
+        '200':
+          description: Balance envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BalanceResponse'
+        '422':
+          description: Malformed address (not hex / wrong length).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /api/mint:
+    post:
+      summary: Mint coins to an address (faucet)
+      description: Internal/test environment faucet. Generates a fresh coin and credits the supplied address. On success returns the SendResponse envelope; the matching commitment is broadcast by the node itself (no follow-up `/api/commit` required).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MintRequest'
+      responses:
+        '200':
+          description: Mint accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MintResponse'
+        '422':
+          description: Bad mint parameters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Prover or broadcast failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Concurrent mint in flight.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /api/send:
+    post:
+      summary: Build a send proof for two-step commit/reveal
+      description: Server-side proof generation step. The node builds the ZK proof for the requested transfer and returns `proof_id` plus the hashes the wallet has to sign. The wallet then signs `account_state_hash || output_coins_root` and POSTs the signature to `/api/commit`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendRequest'
+      responses:
+        '200':
+          description: Proof generated; commit step pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SendResponse'
+        '404':
+          description: Unknown sender address.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Witness-invalid (insufficient funds, in-coin not in source root, signature shape, etc.).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Prover internal error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /api/commit:
+    post:
+      summary: Submit signed commitment for a previously generated proof
+      description: Two-step finaliser for `/api/send`. The wallet signs the hashes returned by `/api/send` with the same key referenced by `public_key`; the node verifies the Schnorr signature, broadcasts the commit/reveal pair as a Taproot inscription, and delivers the coin to the recipient on success.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommitRequest'
+      responses:
+        '200':
+          description: Commit broadcast; coin delivered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommitResponse'
+        '401':
+          description: Commitment signature invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Unknown proof_id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Malformed message or signature hex.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Bitcoin broadcast failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /api/receive:
+    post:
+      summary: Push a coin proof to the receive flow (reserved)
+      description: Currently unused — the receive path is driven by the on-chain scanner. The endpoint stays in the surface so a future authenticated push flow can land without a wire-level break.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReceiveCoinRequest'
+      responses:
+        '200':
+          description: Acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SendResponse'
+  /api/proof/{id}:
+    get:
+      summary: Download a stored coin proof by id
+      description: Returns the bincode-serialised `CoinProof` for the supplied id. Used by recovery tooling — the wallet does not need this on the hot path.
+      parameters:
+        - schema:
+            type: string
+            description: Proof id assigned by the node.
+            example: '42'
+          required: true
+          description: Proof id assigned by the node.
+          name: id
+          in: path
+      responses:
+        '200':
+          description: Binary proof blob
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: No proof with this id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /api/username/claim:
+    post:
+      summary: Claim a username for an address (gated)
+      description: Self-host opt-in (Cargo feature `username-claim`). Returns 404 on hosted DEV + PRD nodes. The address signs `"zkcoins:claim_username" || address || username || timestamp_le` with its identity key (`pubkey_0`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClaimUsernameRequest'
+      responses:
+        '200':
+          description: Username claimed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimUsernameResponse'
+        '401':
+          description: Signature invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Username already taken.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Username failed validation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /api/username/resolve/{username}:
+    get:
+      summary: Resolve a username to an address
+      description: Read-side username lookup. Always available regardless of capability flags.
+      parameters:
+        - schema:
+            type: string
+            description: URL-encoded username.
+            example: alice
+          required: true
+          description: URL-encoded username.
+          name: username
+          in: path
+      responses:
+        '200':
+          description: Resolved address
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResolveUsernameResponse'
+        '404':
+          description: No such username.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'

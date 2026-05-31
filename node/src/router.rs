@@ -1797,6 +1797,8 @@ struct RootEndpoints {
     proof: &'static str,
     inscription: &'static str,
     health: &'static str,
+    openapi: &'static str,
+    docs: &'static str,
 }
 
 /// Root handler — anything hitting `https://api.zkcoins.app/` (browser visit,
@@ -1818,6 +1820,8 @@ async fn root_handler() -> impl IntoResponse {
             proof: "GET  /api/proof/{id}",
             inscription: "GET  /api/inscriptions/{txid}",
             health: "GET  /health",
+            openapi: "GET  /openapi.json",
+            docs: "GET  /docs",
         },
         docs: "https://docs.zkcoins.app",
     })
@@ -2193,6 +2197,12 @@ pub(crate) fn create_router(state: AppState) -> Router {
             "/api/username/resolve/:username",
             get(resolve_username_handler),
         )
+        // OpenAPI 3.0 spec + Swagger UI. The spec ships as a YAML file
+        // bundled into the binary (`node/openapi/zkcoins.yaml`); the
+        // module parses it to JSON on first use and serves both
+        // surfaces from in-memory state (issue #155).
+        .route("/openapi.json", get(crate::openapi::openapi_json_handler))
+        .route("/docs", get(crate::openapi::docs_handler))
         // Operator-facing R2 probe trend (see `r2_probe_history_handler`
         // doc-comment). Grouped under `/api/admin/` so it is visibly
         // separate from the user-facing surface.

@@ -48,6 +48,10 @@ futures-util = "0.3"
 # scanner can parse the `block` / `blocks` JSON frames returned by
 # the Esplora WS endpoint.
 serde_json = "1.0"
+# YAML → JSON conversion for the bundled OpenAPI spec served at
+# `GET /openapi.json`. Parsed once at startup (see `crate::openapi`)
+# so the per-request hot path stays string-cache only.
+serde_yaml = "0.9"
 # Optional ZMQ subscriber path (issue #84, dormant in this PR). When
 # `feature = "zmq"` is enabled the operator can plug a Bitcoin Core
 # ZMQ stream into the same channel the WebSocket scanner publishes

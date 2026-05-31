@@ -80,6 +80,8 @@ API endpoints, background services, their activation status, and the tests that 
 | Download coin proof                  | `GET /api/proof/:id`                  | always                   | mvp     | 100% (router)                  |
 | Claim username                       | `POST /api/username/claim`            | always                   | mvp     | 100% (username)                |
 | Resolve username                     | `GET /api/username/resolve/:username` | always                   | mvp     | 100% (username)                |
+| OpenAPI 3.0 spec (JSON)              | `GET /openapi.json`                   | always                   | mvp     | 100% (openapi)                 |
+| Swagger UI                           | `GET /docs`                           | always                   | mvp     | 100% (openapi)                 |
 | LNURL-Pay metadata                   | `GET /.well-known/lnurlp/:username`   | feature (`lnurl`)        | gate    | 100% (router)                  |
 | LNURL-Pay callback                   | `GET /lnurl/pay/:username`            | feature (`lnurl`)        | gate    | 100% (router)                  |
 | Bitcoin block scanner (background)   | WS subscription in `scanner_ws.rs`    | env⁴                     | mvp     | 100% (scanner) · — (main, excluded) |
