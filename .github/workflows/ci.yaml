@@ -166,11 +166,16 @@ jobs:
     runs-on: [self-hosted, m3-ultra]
     timeout-minutes: 120
     env:
-      # Force Esplora broadcasts to fail fast. Some unit tests exercise
-      # the commit pipeline that ends in a real HTTP broadcast; without
-      # this, runs against the public Mutinynet API can take >60 s per
-      # test. Mirrors the pre-push hook.
+      # All three chain-shaping env vars are required by the node
+      # bootstrap — no defaults exist (see
+      # `lib::build_network_config_from_env`). CI uses
+      # `127.0.0.1:1` endpoints so any test that exercises the commit
+      # pipeline / scanner WS fails fast instead of reaching a public
+      # third-party host (a previous Mutinynet-flavoured silent
+      # fallback used to add >60 s per test).
+      IS_MAINNET: "false"
       ESPLORA_URL: http://127.0.0.1:1/api
+      ESPLORA_WS_URL: ws://127.0.0.1:1/api/v1/ws
       # `USERNAME_DOMAIN` is required by the node bootstrap (no
       # default — see node/src/main.rs and issue #95). The test value
       # is irrelevant for the `info_returns_*` assertions (they only
@@ -291,7 +296,13 @@ jobs:
     runs-on: [self-hosted, m3-ultra]
     timeout-minutes: 90
     env:
+      # All three chain-shaping env vars are required by the node
+      # bootstrap (see `lib::build_network_config_from_env`). Mirror
+      # the `node-tests` env block above — `127.0.0.1:1` endpoints
+      # fail fast for any commit-pipeline / scanner-WS path.
+      IS_MAINNET: "false"
       ESPLORA_URL: http://127.0.0.1:1/api
+      ESPLORA_WS_URL: ws://127.0.0.1:1/api/v1/ws
       USERNAME_DOMAIN: test.zkcoins.local
       # `PUBLISHER_KEY` is required on every network (no default — see
       # `node/src/lib.rs`); the value mirrors `node-tests` above and is

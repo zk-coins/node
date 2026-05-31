@@ -1,11 +1,12 @@
 //! Event-driven chain ingestion via the Esplora WebSocket stream.
 //!
 //! Subscribes to the mempool.space-compatible WebSocket endpoint
-//! (`ESPLORA_WS_URL`, default `wss://mutinynet.com/api/v1/ws`) and
-//! publishes each new tip `BlockHash` into an `mpsc::Sender` that the
-//! existing `scanner_runtime` drains. Replaces the 30-s tip polling
-//! loop that previously gated `/api/mint` and `/api/send` visibility
-//! by up to a full block-time + poll-interval (issue #84).
+//! (`ESPLORA_WS_URL` — required env var, no default; see
+//! `lib::build_network_config_from_env`) and publishes each new tip
+//! `BlockHash` into an `mpsc::Sender` that the existing
+//! `scanner_runtime` drains. Replaces the 30-s tip polling loop that
+//! previously gated `/api/mint` and `/api/send` visibility by up to a
+//! full block-time + poll-interval (issue #84).
 //!
 //! TODO(structured-logging): this module still uses `println!` /
 //! `eprintln!` for runtime logs, consistent with the rest of the
@@ -69,15 +70,8 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use crate::publisher::EsploraConfig;
 pub use crate::scanner_ws_parse::parse_ws_frame;
-
-/// Default endpoint for Mutinynet's mempool.space-compatible WebSocket
-/// API. Overridable via `ESPLORA_WS_URL` for self-host operators and
-/// for DEV failover (the URL is not officially documented for
-/// Mutinynet, but it follows the upstream mempool.space convention
-/// and was smoke-tested against `wss://mutinynet.com/api/v1/ws` and
-/// `wss://mempool.space/signet/api/v1/ws` before this PR landed).
-pub const DEFAULT_ESPLORA_WS_URL: &str = "wss://mutinynet.com/api/v1/ws";
 
 /// Default for the liveness watchdog. A real new block arrives at
 /// least every ~10 min on any live signet/mainnet, so 90 s with no
@@ -131,10 +125,6 @@ pub const DEFAULT_RECONNECT_MIN: Duration = Duration::from_millis(500);
 /// the previous polling cadence — if the upstream is genuinely
 /// down for that long, we are no worse off than before.
 pub const DEFAULT_RECONNECT_MAX: Duration = Duration::from_secs(30);
-
-/// Default fallback when no `ESPLORA_URL` is in the environment.
-/// Kept in sync with `lib.rs::NETWORK_CONFIG`.
-pub const DEFAULT_ESPLORA_HTTP_URL: &str = "https://mutinynet.com/api";
 
 /// Wall-clock budget for completing a single WS connect handshake.
 /// A half-broken middlebox can stall the TCP handshake for the
@@ -191,15 +181,18 @@ async fn connect_with_timeout(
     }
 }
 
-/// Runtime knobs for the scanner WS task. Sensible defaults are
-/// exposed via `from_env`; tests construct it directly with shorter
-/// timeouts.
+/// Runtime knobs for the scanner WS task. The URL pair is sourced
+/// from the central `NETWORK_CONFIG` via `from_network_config`; tests
+/// construct it directly with shorter timeouts.
 #[derive(Clone, Debug)]
 pub struct ScannerWsConfig {
-    /// Esplora WebSocket URL. Default: `DEFAULT_ESPLORA_WS_URL`.
+    /// Esplora WebSocket URL. Sourced from `ESPLORA_WS_URL` via
+    /// `lib::build_network_config_from_env` — no default exists.
     pub url: String,
     /// HTTP Esplora URL used to fetch the current tip after each
-    /// reconnect (plugs gaps that opened while disconnected).
+    /// reconnect (plugs gaps that opened while disconnected). Sourced
+    /// from `ESPLORA_URL` via `lib::build_network_config_from_env` —
+    /// no default exists.
     pub http_url: String,
     /// Initial reconnect delay. Doubles up to `reconnect_max`.
     pub reconnect_min: Duration,
@@ -218,17 +211,27 @@ pub struct ScannerWsConfig {
 }
 
 impl ScannerWsConfig {
-    /// Read the config from the environment, falling back to the
-    /// defaults documented above. Logged once at startup by the
-    /// caller in `main.rs`.
-    pub fn from_env() -> Self {
-        let url =
-            std::env::var("ESPLORA_WS_URL").unwrap_or_else(|_| DEFAULT_ESPLORA_WS_URL.to_string());
-        let http_url =
-            std::env::var("ESPLORA_URL").unwrap_or_else(|_| DEFAULT_ESPLORA_HTTP_URL.to_string());
+    /// Build the config from an already-resolved `EsploraConfig`. The
+    /// single env-resolution path lives in
+    /// `lib::build_network_config_from_env`, which panics on missing
+    /// `ESPLORA_URL` / `ESPLORA_WS_URL` — by the time this runs both
+    /// URLs are guaranteed non-empty.
+    ///
+    /// `network_config.ws_url` is `Option<String>` for legacy reasons
+    /// (the publisher does not need it); production callers pass a
+    /// config built by `build_network_config_from_env`, which always
+    /// populates it. The `expect` here documents that invariant —
+    /// hitting it means somebody constructed an `EsploraConfig`
+    /// manually without setting `ws_url`, which is a programmer
+    /// error, not a runtime configuration issue.
+    pub fn from_network_config(network_config: &EsploraConfig) -> Self {
+        let url = network_config
+            .ws_url
+            .clone()
+            .expect("EsploraConfig.ws_url must be set — production callers go through build_network_config_from_env");
         Self {
             url,
-            http_url,
+            http_url: network_config.url.clone(),
             reconnect_min: DEFAULT_RECONNECT_MIN,
             reconnect_max: DEFAULT_RECONNECT_MAX,
             liveness_timeout: DEFAULT_LIVENESS_TIMEOUT,
