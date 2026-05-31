@@ -24,6 +24,8 @@
 // later failure mode for schema drift, which the tests catch on the
 // first run.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes, HashDigest};
@@ -71,8 +73,19 @@ impl InscriptionKind {
 ///
 /// Used in PR-A2 from `main.rs::main` before any state load.
 pub async fn connect_and_migrate(url: &str) -> Result<PgPool, sqlx::Error> {
+    // `acquire_timeout` defaults to 30s — long enough on a quiet host,
+    // but the shared m3-ultra CI runner (dfx01) sits next to ~20
+    // production Postgres / Grafana / Loki / Vaultwarden containers
+    // and is sometimes hit by manual `cargo nextest` runs from
+    // operators. Under that load the kernel + Colima vNIC needed
+    // 30-60s to complete a TCP handshake against a freshly-started
+    // testcontainers `postgres:17`, and the 30s default surfaced as a
+    // sporadic `sqlx::Error::PoolTimedOut` in `db::tests::*`. 60s
+    // covers every observed warm-up window without slowing the
+    // healthy path (a healthy host connects in <500ms).
     let pool = PgPoolOptions::new()
         .max_connections(10)
+        .acquire_timeout(Duration::from_secs(60))
         .connect(url)
         .await?;
     sqlx::migrate!("./migrations")
