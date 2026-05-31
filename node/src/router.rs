@@ -17,11 +17,13 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tower_http::cors::CorsLayer;
+use utoipa::ToSchema;
 use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes};
 use zkcoins_prover::Proof;
 
 use crate::account_node::{AccountNode, CoinProof};
 use crate::db;
+use crate::db::InscriptionSummary;
 use crate::publisher::create_and_broadcast_inscription;
 use crate::publisher::EsploraConfig;
 use crate::username::UsernameStore;
@@ -319,9 +321,12 @@ pub(crate) struct AppState {
 }
 
 // Response types for our API
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct BalanceResponse {
+    /// Total spendable balance of the account, in atomic zkCoin units.
+    /// `u64::MAX` for the minting account.
     balance: u64,
+    /// Username bound to this address, if any has been claimed.
     #[serde(skip_serializing_if = "Option::is_none")]
     username: Option<String>,
     /// Authoritative BIP-32 child-index counter for the queried account.
@@ -350,8 +355,9 @@ pub struct BalanceResponse {
 }
 
 #[cfg(any(feature = "address-list", feature = "lnurl"))]
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct AddressesResponse {
+    /// Known account addresses as `0x`-prefixed 32-byte hex strings.
     addresses: Vec<String>,
 }
 
@@ -633,12 +639,23 @@ pub(crate) fn history_row_to_item(row: &crate::db::AccountHistoryRow) -> Option<
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct SendCoinRequest {
+    /// Sender account address (`0x`-prefixed 32-byte hex, sha256 over the
+    /// sender's BIP-32 root public key).
     account_address: String,
+    /// Recipient identifier — either a `0x`-prefixed 32-byte hex address
+    /// or a known username this node can resolve.
     recipient: String,
+    /// Amount to send, in atomic zkCoin units.
     amount: u64,
+    /// Compressed secp256k1 public key (33 bytes) at the sender's current
+    /// `num_pubkeys` BIP-32 child index. Serialised as a hex string.
+    #[schema(value_type = String, example = "02a34b6d…")]
     public_key: bitcoin::secp256k1::PublicKey,
+    /// Compressed secp256k1 public key (33 bytes) at the sender's next
+    /// BIP-32 child index (`num_pubkeys + 1`). Serialised as a hex string.
+    #[schema(value_type = String, example = "03f128e2…")]
     next_public_key: bitcoin::secp256k1::PublicKey,
     /// Legacy field — IGNORED by `send_coin_handler` as of the
     /// [`crate::account_node::Account::commitment_public_key`]
@@ -649,14 +666,22 @@ pub struct SendCoinRequest {
     /// 4xx for an unknown field. Drop entirely once every published
     /// wallet has cycled off this contract.
     #[serde(default)]
+    #[schema(value_type = Option<String>)]
     prev_commitment_pubkey: Option<bitcoin::secp256k1::PublicKey>,
+    /// Hex-encoded Schnorr signature (64 bytes) over
+    /// `SHA256(account_address || recipient || amount || timestamp)`.
     signature: Option<String>,
+    /// Unix epoch seconds the signature was produced at. Must be within
+    /// 5 minutes of the server's wall clock.
     timestamp: Option<u64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct MintRequest {
+    /// Recipient account address (`0x`-prefixed 32-byte hex). The node
+    /// signs the inscription using its own minting key.
     account_address: String,
+    /// Amount to mint, in atomic zkCoin units.
     amount: u64,
 }
 
@@ -761,8 +786,11 @@ impl ProofStore {
     }
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, ToSchema)]
 pub struct SendCoinResponse {
+    /// `true` on success, `false` on every error path. Errors also
+    /// populate [`SendCoinResponse::error`] and surface the appropriate
+    /// HTTP status code.
     pub(crate) success: bool,
     /// Structured error message on failure. `None` on success. Mirrors
     /// the body string returned alongside a 4xx/5xx status code, so
@@ -919,10 +947,12 @@ pub(crate) fn concurrent_mint_during_proof_response(
     handler_error_response(StatusCode::SERVICE_UNAVAILABLE, "Concurrent mint detected")
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct CommitRequest {
+    /// `proof_id` returned by a previous `POST /api/send` call.
     proof_id: u64,
     /// Hex-encoded compressed public key (33 bytes) that signed the commitment.
+    #[schema(value_type = String)]
     public_key: bitcoin::secp256k1::PublicKey,
     /// Hex-encoded Schnorr signature (64 bytes).
     signature: String,
@@ -930,9 +960,12 @@ pub struct CommitRequest {
     message: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct InfoResponse {
+    /// Network the node is connected to (`Mainnet`, `Mutinynet`, …).
     network: String,
+    /// Per-build capability flags for clients to gate UI on a single
+    /// node-side source of truth.
     capabilities: Capabilities,
     /// External hostname this node serves, used by the client to render
     /// `<hex|username>@<domain>`. DEV and PRD share the chain identifier
@@ -949,55 +982,91 @@ pub struct InfoResponse {
 /// username resolve) are always available and intentionally have no
 /// capability bit — clients must not gate their UI on flags that
 /// would always be `true`.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct Capabilities {
+    /// `true` when the `address-list` Cargo feature is compiled in.
     pub address_list: bool,
     /// Username *claim* (write path). Gated by the `username-claim`
     /// Cargo feature; off in hosted DEV + PRD images. Wallet clients
     /// hide the claim input when this is `false`. Always present in
     /// the response so the app does not have to sniff build flags.
     pub username_claim: bool,
+    /// `true` when the `lnurl` Cargo feature is compiled in.
     pub lnurl: bool,
 }
 
 // --- Username & LNURL types ---
 
 #[cfg(feature = "username-claim")]
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct ClaimUsernameRequest {
+    /// Username to claim. Normalised to lowercase before persistence.
     username: String,
+    /// `0x`-prefixed 32-byte hex address.
     address: String,
+    /// Compressed secp256k1 public key (33 bytes), hex-encoded.
+    #[schema(value_type = String)]
     public_key: bitcoin::secp256k1::PublicKey,
+    /// Hex-encoded Schnorr signature (64 bytes).
     signature: String,
+    /// Unix epoch seconds.
     timestamp: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct UsernameResponse {
+    /// Resolved (lowercase) username.
     username: String,
+    /// `0x`-prefixed 32-byte hex address the username binds to.
     address: String,
 }
 
 #[cfg(feature = "lnurl")]
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct LnurlpResponse {
+    /// Always `payRequest` per LUD-06.
     tag: String,
+    /// LNURL-pay callback URL the wallet should call.
     callback: String,
+    /// Minimum sendable amount (millisats).
     #[serde(rename = "minSendable")]
+    #[schema(rename = "minSendable")]
     min_sendable: u64,
+    /// Maximum sendable amount (millisats).
     #[serde(rename = "maxSendable")]
+    #[schema(rename = "maxSendable")]
     max_sendable: u64,
+    /// JSON-encoded metadata array per LUD-06.
     metadata: String,
 }
 
-#[derive(Serialize, Deserialize)]
+/// Error envelope used by username and LNURL endpoints (LUD-style).
+/// Other endpoints return [`SendCoinResponse`] with `success: false`.
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct LnurlErrorResponse {
+    /// Always `ERROR` on failure.
     status: String,
+    /// Human-readable failure reason.
     reason: String,
 }
 
 // Handler functions for our REST API
-async fn get_balance_handler(
+#[utoipa::path(
+    get,
+    path = "/api/balance",
+    tag = "Accounts",
+    params(
+        ("address" = String, Query, description = "Account address as `0x`-prefixed 32-byte hex"),
+    ),
+    responses(
+        (status = 200, description = "Balance lookup result. A well-formed address with no \
+            on-chain activity returns `balance: 0` (canonical zero), not 404.",
+            body = BalanceResponse),
+        (status = 422, description = "Malformed address (bad hex, wrong length) or missing query parameter.",
+            body = BalanceResponse),
+    ),
+)]
+pub(crate) async fn get_balance_handler(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
@@ -1199,7 +1268,17 @@ async fn get_history_handler(
 }
 
 #[cfg(feature = "address-list")]
-async fn get_address_handler(State(state): State<AppState>) -> impl IntoResponse {
+#[utoipa::path(
+    get,
+    path = "/api/address",
+    tag = "Accounts",
+    responses(
+        (status = 200, description = "List of all known account addresses (`0x`-prefixed hex). \
+            Only compiled in when the `address-list` Cargo feature is enabled.",
+            body = AddressesResponse),
+    ),
+)]
+pub(crate) async fn get_address_handler(State(state): State<AppState>) -> impl IntoResponse {
     let account_node = lock_or_recover(&state.account_node);
 
     // Convert addresses to hex strings
@@ -1214,7 +1293,24 @@ async fn get_address_handler(State(state): State<AppState>) -> impl IntoResponse
     })
 }
 
-async fn receive_coin_handler(
+#[utoipa::path(
+    post,
+    path = "/api/receive",
+    tag = "Coins",
+    request_body(
+        description = "Bincode-serialised `CoinProof` blob produced by the sender's \
+            `POST /api/send` round. The body is binary — NOT JSON.",
+        content_type = "application/octet-stream",
+        content = Vec<u8>,
+    ),
+    responses(
+        (status = 200, description = "On success, returns `{ \"success\": true }`. \
+            A malformed binary body returns `{ \"success\": false }` with HTTP 200 \
+            for back-compat with deployed wallets.",
+            body = SendCoinResponse),
+    ),
+)]
+pub(crate) async fn receive_coin_handler(
     State(state): State<AppState>,
     body: Bytes, // Accept raw binary data instead of multipart
 ) -> impl IntoResponse {
@@ -1262,7 +1358,28 @@ async fn receive_coin_handler(
     }
 }
 
-async fn send_coin_handler(
+#[utoipa::path(
+    post,
+    path = "/api/send",
+    tag = "Coins",
+    request_body = SendCoinRequest,
+    responses(
+        (status = 200, description = "Proof generated and persisted. Returns `proof_id`, \
+            `account_state_hash`, and `output_coins_root` for the client to sign as the \
+            commitment input to `POST /api/commit`.",
+            body = SendCoinResponse),
+        (status = 401, description = "Missing signature or stale timestamp.",
+            body = SendCoinResponse),
+        (status = 404, description = "Unknown sender address.",
+            body = SendCoinResponse),
+        (status = 422, description = "Malformed request, invalid signature, insufficient \
+            funds, or Merkle witness validation failure.",
+            body = SendCoinResponse),
+        (status = 500, description = "Internal prover failure (proof generation crashed).",
+            body = SendCoinResponse),
+    ),
+)]
+pub(crate) async fn send_coin_handler(
     State(state): State<AppState>,
     Json(request): Json<SendCoinRequest>,
 ) -> impl IntoResponse {
@@ -1532,7 +1649,26 @@ async fn send_coin_handler(
 /// scanner sweep, the next mint's `derive_num_pubkeys_from_smt` walks
 /// past it cleanly, and the wallet's retry semantics drive progress.
 /// Document-only — no in-handler retry.
-async fn mint_handler(
+#[utoipa::path(
+    post,
+    path = "/api/mint",
+    tag = "Coins",
+    request_body = MintRequest,
+    responses(
+        (status = 200, description = "Mint succeeded. The on-chain inscription has been \
+            broadcast and the recipient account credited.",
+            body = SendCoinResponse),
+        (status = 422, description = "Malformed `account_address`.",
+            body = SendCoinResponse),
+        (status = 500, description = "Internal error (minting account not configured, \
+            prover failure).",
+            body = SendCoinResponse),
+        (status = 503, description = "Concurrent mint detected or inscription broadcast \
+            failed (publisher wallet underfunded, Esplora unreachable).",
+            body = SendCoinResponse),
+    ),
+)]
+pub(crate) async fn mint_handler(
     State(state): State<AppState>,
     Json(request): Json<MintRequest>,
 ) -> impl IntoResponse {
@@ -1880,7 +2016,21 @@ async fn mint_handler(
 }
 
 // New handler to get a binary proof by ID
-async fn get_proof_handler(
+#[utoipa::path(
+    get,
+    path = "/api/proof/{id}",
+    tag = "Coins",
+    params(
+        ("id" = u64, Path, description = "`proof_id` returned by a previous `POST /api/send`"),
+    ),
+    responses(
+        (status = 200, description = "Binary `CoinProof` blob (bincode-serialised).",
+            content_type = "application/octet-stream",
+            body = Vec<u8>),
+        (status = 404, description = "No proof exists for this `id`."),
+    ),
+)]
+pub(crate) async fn get_proof_handler(
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
@@ -1936,7 +2086,27 @@ async fn get_proof_handler(
 /// window; the scanner remains the authoritative path for external
 /// recovery inscriptions but is now a redundant observer for our own
 /// send commits, exactly as for mint commits.
-async fn commit_handler(
+#[utoipa::path(
+    post,
+    path = "/api/commit",
+    tag = "Coins",
+    request_body = CommitRequest,
+    responses(
+        (status = 200, description = "Commitment verified, inscription broadcast on-chain, \
+            recipient credited.",
+            body = SendCoinResponse),
+        (status = 401, description = "Commitment signature invalid.",
+            body = SendCoinResponse),
+        (status = 404, description = "Unknown `proof_id`.",
+            body = SendCoinResponse),
+        (status = 422, description = "Malformed signature, message, or signature format.",
+            body = SendCoinResponse),
+        (status = 503, description = "Inscription broadcast failed (Esplora down, publisher \
+            wallet underfunded).",
+            body = SendCoinResponse),
+    ),
+)]
+pub(crate) async fn commit_handler(
     State(state): State<AppState>,
     Json(request): Json<CommitRequest>,
 ) -> impl IntoResponse {
@@ -2001,7 +2171,24 @@ async fn commit_handler(
 /// Returns 404 when no row exists — the inscription either never went
 /// through this node (e.g. external recovery via `recover_inscription`
 /// CLI) or the txid is unknown.
-async fn get_inscription_handler(
+#[utoipa::path(
+    get,
+    path = "/api/inscriptions/{txid}",
+    tag = "Inscriptions",
+    params(
+        ("txid" = String, Path, description = "Commit transaction id (64 hex characters, \
+            big-endian display order — matches what block explorers show)"),
+    ),
+    responses(
+        (status = 200, description = "Inscription metadata.", body = InscriptionSummary),
+        (status = 404, description = "No inscription matches this `txid`.",
+            body = SendCoinResponse),
+        (status = 422, description = "Malformed `txid` (not 32-byte hex).",
+            body = SendCoinResponse),
+        (status = 500, description = "Database error.", body = SendCoinResponse),
+    ),
+)]
+pub(crate) async fn get_inscription_handler(
     State(state): State<AppState>,
     Path(txid_hex): Path<String>,
 ) -> axum::response::Response {
@@ -2276,7 +2463,17 @@ async fn publisher_health_handler(State(state): State<AppState>) -> impl IntoRes
     }
 }
 
-async fn info_handler() -> impl IntoResponse {
+#[utoipa::path(
+    get,
+    path = "/api/info",
+    tag = "Node",
+    responses(
+        (status = 200, description = "Node metadata: connected network, per-build \
+            capability flags, and external username domain.",
+            body = InfoResponse),
+    ),
+)]
+pub(crate) async fn info_handler() -> impl IntoResponse {
     Json(InfoResponse {
         network: NETWORK_CONFIG.network_name.clone(),
         capabilities: Capabilities {
@@ -2338,7 +2535,26 @@ async fn root_handler() -> impl IntoResponse {
 // --- Username & LNURL handlers ---
 
 #[cfg(feature = "username-claim")]
-async fn claim_username_handler(
+#[utoipa::path(
+    post,
+    path = "/api/username/claim",
+    tag = "Usernames",
+    request_body = ClaimUsernameRequest,
+    responses(
+        (status = 200, description = "Username claimed and bound to the address.",
+            body = UsernameResponse),
+        (status = 401, description = "Public key does not match address, signature \
+            verification failed, or timestamp out of window.",
+            body = LnurlErrorResponse),
+        (status = 409, description = "Username already taken.",
+            body = LnurlErrorResponse),
+        (status = 422, description = "Malformed username, address, signature, or public key.",
+            body = LnurlErrorResponse),
+        (status = 503, description = "Database error while persisting the claim.",
+            body = LnurlErrorResponse),
+    ),
+)]
+pub(crate) async fn claim_username_handler(
     State(state): State<AppState>,
     Json(request): Json<ClaimUsernameRequest>,
 ) -> impl IntoResponse {
@@ -2598,7 +2814,21 @@ fn resolve_identifier(
         .map(|addr| (addr, normalized))
 }
 
-async fn resolve_username_handler(
+#[utoipa::path(
+    get,
+    path = "/api/username/resolve/{username}",
+    tag = "Usernames",
+    params(
+        ("username" = String, Path, description = "Username or hex address prefix to resolve"),
+    ),
+    responses(
+        (status = 200, description = "Resolved address for the identifier.",
+            body = UsernameResponse),
+        (status = 404, description = "Identifier did not match any known username or address.",
+            body = LnurlErrorResponse),
+    ),
+)]
+pub(crate) async fn resolve_username_handler(
     State(state): State<AppState>,
     Path(username): Path<String>,
 ) -> impl IntoResponse {
@@ -2623,7 +2853,19 @@ async fn resolve_username_handler(
 }
 
 #[cfg(feature = "lnurl")]
-async fn lnurlp_handler(
+#[utoipa::path(
+    get,
+    path = "/.well-known/lnurlp/{username}",
+    tag = "LNURL",
+    params(
+        ("username" = String, Path, description = "Username or hex address prefix"),
+    ),
+    responses(
+        (status = 200, description = "LNURL-pay metadata per LUD-06.", body = LnurlpResponse),
+        (status = 404, description = "Username not found.", body = LnurlErrorResponse),
+    ),
+)]
+pub(crate) async fn lnurlp_handler(
     State(state): State<AppState>,
     Path(username): Path<String>,
     headers: axum::http::HeaderMap,
@@ -2669,7 +2911,20 @@ async fn lnurlp_handler(
 }
 
 #[cfg(feature = "lnurl")]
-async fn lnurl_callback_handler(
+#[utoipa::path(
+    get,
+    path = "/lnurl/pay/{username}",
+    tag = "LNURL",
+    params(
+        ("username" = String, Path, description = "Username or hex address prefix"),
+    ),
+    responses(
+        (status = 200, description = "LNURL-pay callback response. The current implementation \
+            is a stub that always returns a phase-2 error.",
+            body = LnurlErrorResponse),
+    ),
+)]
+pub(crate) async fn lnurl_callback_handler(
     State(_state): State<AppState>,
     Path(_username): Path<String>,
 ) -> impl IntoResponse {
@@ -2693,6 +2948,8 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/health", get(|| async { "ok" }))
         .route("/health/ready", get(ready_handler))
         .route("/health/publisher", get(publisher_health_handler))
+        .route("/openapi.json", get(crate::openapi::openapi_json_handler))
+        .route("/docs", get(crate::openapi::docs_handler))
         .route("/api/info", get(info_handler))
         .route("/api/balance", get(get_balance_handler))
         .route("/api/history", get(get_history_handler))

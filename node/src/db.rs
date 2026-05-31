@@ -42,7 +42,7 @@ use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes, HashDigest};
 ///
 /// Persisting this is the difference between a DB row that tells you
 /// *what happened* and one that only tells you *that something happened*.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum InscriptionKind {
     Mint,
@@ -1091,7 +1091,7 @@ pub async fn load_pending_in_progress(
 /// Returns `Ok(None)` when no row exists — either because this node
 /// never originated the inscription (e.g. an external recovery via the
 /// `recover_inscription` CLI) or because the txid was never seen here.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct InscriptionSummary {
     /// Commit txid as a lowercase hex string. Mirrors the on-chain
     /// txid shown in block explorers — i.e. big-endian display order,

@@ -87,6 +87,8 @@ API endpoints, background services, their activation status, and the tests that 
 | State persistence (SMT/MMR write)    | Scanner callback on commitment match  | always                   | mvp     | 100% (state)                   |
 | Taproot inscription broadcast        | Called by `/api/commit`               | env³                     | mvp     | 0% (publisher)                |
 | Publisher UTXO lookup                | Internal, before broadcast            | env³                     | mvp     | 0% (publisher)                |
+| OpenAPI 3.x spec                     | `GET /openapi.json`                   | always                   | mvp     | 100% (openapi_smoke)           |
+| Swagger UI                           | `GET /docs`                           | always                   | mvp     | 100% (openapi_smoke)           |
 | Explorer endpoints (`/api/stats`, …) | n/a                                   | planned                  | planned | —                             |
 | Light client support                 | n/a                                   | planned                  | planned | —                             |
 

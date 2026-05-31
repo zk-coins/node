@@ -123,6 +123,17 @@ libc = "0.2"
 # touches the system / host-name surface, and the disabled features
 # pull in `windows` / `objc2-*` crates we don't need on Linux+macOS.
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+# OpenAPI 3.x spec generated from handler annotations + response /
+# request types at compile time. utoipa's core crate is web-framework
+# agnostic (its only normal deps are `indexmap`, `serde`, `serde_json`,
+# `serde_norway`, and `utoipa-gen`), so it composes with the workspace's
+# axum 0.7.9 without pulling in `utoipa-axum` — that companion crate
+# requires `axum ^0.8` and would force a framework-major bump. The spec
+# is built once at startup, cached as JSON in an `OnceLock<String>`,
+# and served from `GET /openapi.json`; `GET /docs` returns a static
+# HTML page that loads Swagger UI from unpkg with the asset version
+# pinned. No runtime swagger-ui crate dependency.
+utoipa = { version = "5.5", features = ["macros"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
