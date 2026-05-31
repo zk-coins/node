@@ -40,9 +40,14 @@
 //!     funds. Recovery aborts if the recovered reveal does not spend
 //!     this address.
 //!
+//! Required flags (chain endpoint):
+//!   - `--esplora-url <url>` — HTTP Esplora endpoint for the chain
+//!     the inscription was committed against. Required, no default —
+//!     a silent Mutinynet fallback would broadcast a Mainnet recovery
+//!     against the wrong chain. Same contract as the node binary's
+//!     `ESPLORA_URL` env var (see `lib::build_network_config_from_env`).
+//!
 //! Optional flags:
-//!   - `--esplora-url <url>` — Esplora REST endpoint. Defaults to
-//!     `https://mutinynet.com/api`.
 //!   - `--dry-run` — log the reveal hex and exit without broadcasting.
 
 use std::process::ExitCode;
@@ -56,8 +61,6 @@ use esplora_client::{
 };
 
 use node::publisher;
-
-const DEFAULT_ESPLORA_URL: &str = "https://mutinynet.com/api";
 
 #[derive(Debug)]
 struct CliArgs {
@@ -76,7 +79,7 @@ fn print_usage(program: &str) {
     --commitment-hex <hex> \\
     --commit-value <sats> \\
     --anchor-address <p2tr-addr> \\
-    [--esplora-url <url>] \\
+    --esplora-url <url> \\
     [--dry-run]
 
 env: PUBLISHER_KEY (required, 32-byte hex), IS_MAINNET (required, true|false)
@@ -131,7 +134,11 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, String> {
     let commit_value = commit_value.ok_or_else(|| "--commit-value is required".to_string())?;
     let anchor_address =
         anchor_address.ok_or_else(|| "--anchor-address is required".to_string())?;
-    let esplora_url = esplora_url.unwrap_or_else(|| DEFAULT_ESPLORA_URL.to_string());
+    let esplora_url = esplora_url.ok_or_else(|| {
+        "--esplora-url is required (no default — silent fallback would \
+         broadcast against the wrong chain)"
+            .to_string()
+    })?;
 
     Ok(CliArgs {
         commit_txid,

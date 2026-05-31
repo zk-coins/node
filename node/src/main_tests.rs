@@ -37,17 +37,14 @@ fn fake_env(entries: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -
 fn build_network_config_full_mutinynet() {
     let cfg = build_network_config_from_env(fake_env(&[
         ("IS_MAINNET", "false"),
-        ("ESPLORA_URL", "http://electrs-mutinynet:3000"),
-        (
-            "ESPLORA_WS_URL",
-            "ws://mempool-api-mutinynet:8999/api/v1/ws",
-        ),
+        ("ESPLORA_URL", "http://electrs-mutinynet.test:3000"),
+        ("ESPLORA_WS_URL", "ws://mutinynet-ws.test/api/v1/ws"),
     ]));
     assert!(!cfg.is_mainnet);
-    assert_eq!(cfg.url, "http://electrs-mutinynet:3000");
+    assert_eq!(cfg.url, "http://electrs-mutinynet.test:3000");
     assert_eq!(
         cfg.ws_url.as_deref(),
-        Some("ws://mempool-api-mutinynet:8999/api/v1/ws")
+        Some("ws://mutinynet-ws.test/api/v1/ws")
     );
     assert_eq!(cfg.network_name, "Mutinynet");
 }
@@ -56,12 +53,15 @@ fn build_network_config_full_mutinynet() {
 fn build_network_config_full_mainnet() {
     let cfg = build_network_config_from_env(fake_env(&[
         ("IS_MAINNET", "true"),
-        ("ESPLORA_URL", "http://electrs-mainnet:3000"),
-        ("ESPLORA_WS_URL", "wss://mempool.space/api/v1/ws"),
+        ("ESPLORA_URL", "http://electrs-mainnet.test:3000"),
+        ("ESPLORA_WS_URL", "wss://mainnet-ws.test/api/v1/ws"),
     ]));
     assert!(cfg.is_mainnet);
-    assert_eq!(cfg.url, "http://electrs-mainnet:3000");
-    assert_eq!(cfg.ws_url.as_deref(), Some("wss://mempool.space/api/v1/ws"));
+    assert_eq!(cfg.url, "http://electrs-mainnet.test:3000");
+    assert_eq!(
+        cfg.ws_url.as_deref(),
+        Some("wss://mainnet-ws.test/api/v1/ws")
+    );
     assert_eq!(cfg.network_name, "Mainnet");
 }
 
@@ -72,8 +72,8 @@ fn build_network_config_explicit_network_name_overrides_default_label() {
     // touching IS_MAINNET, e.g. "Mainnet-Canary".
     let cfg = build_network_config_from_env(fake_env(&[
         ("IS_MAINNET", "true"),
-        ("ESPLORA_URL", "http://electrs-mainnet:3000"),
-        ("ESPLORA_WS_URL", "wss://mempool.space/api/v1/ws"),
+        ("ESPLORA_URL", "http://electrs-mainnet.test:3000"),
+        ("ESPLORA_WS_URL", "wss://mainnet-ws.test/api/v1/ws"),
         ("NETWORK_NAME", "Mainnet-Canary"),
     ]));
     assert!(cfg.is_mainnet);
@@ -88,8 +88,8 @@ fn build_network_config_panics_on_missing_is_mainnet() {
     // No silent default to false (Mutinynet). Every stage must say
     // explicitly which chain it serves.
     let _ = build_network_config_from_env(fake_env(&[
-        ("ESPLORA_URL", "http://electrs-mainnet:3000"),
-        ("ESPLORA_WS_URL", "wss://mempool.space/api/v1/ws"),
+        ("ESPLORA_URL", "http://electrs-mainnet.test:3000"),
+        ("ESPLORA_WS_URL", "wss://mainnet-ws.test/api/v1/ws"),
     ]));
 }
 
@@ -100,8 +100,8 @@ fn build_network_config_panics_on_empty_is_mainnet() {
     // unset, same as missing.
     let _ = build_network_config_from_env(fake_env(&[
         ("IS_MAINNET", ""),
-        ("ESPLORA_URL", "http://electrs-mainnet:3000"),
-        ("ESPLORA_WS_URL", "wss://mempool.space/api/v1/ws"),
+        ("ESPLORA_URL", "http://electrs-mainnet.test:3000"),
+        ("ESPLORA_WS_URL", "wss://mainnet-ws.test/api/v1/ws"),
     ]));
 }
 
@@ -112,8 +112,8 @@ fn build_network_config_panics_on_truthy_is_mainnet() {
     // to silently mean Mutinynet. Reject ambiguous values loudly.
     let _ = build_network_config_from_env(fake_env(&[
         ("IS_MAINNET", "1"),
-        ("ESPLORA_URL", "http://electrs-mainnet:3000"),
-        ("ESPLORA_WS_URL", "wss://mempool.space/api/v1/ws"),
+        ("ESPLORA_URL", "http://electrs-mainnet.test:3000"),
+        ("ESPLORA_WS_URL", "wss://mainnet-ws.test/api/v1/ws"),
     ]));
 }
 
@@ -124,7 +124,7 @@ fn build_network_config_panics_on_truthy_is_mainnet() {
 fn build_network_config_panics_on_missing_esplora_url_mainnet() {
     let _ = build_network_config_from_env(fake_env(&[
         ("IS_MAINNET", "true"),
-        ("ESPLORA_WS_URL", "wss://mempool.space/api/v1/ws"),
+        ("ESPLORA_WS_URL", "wss://mainnet-ws.test/api/v1/ws"),
     ]));
 }
 
@@ -135,10 +135,7 @@ fn build_network_config_panics_on_missing_esplora_url_mutinynet() {
     // now panics. Previously fell back silently to mutinynet.com.
     let _ = build_network_config_from_env(fake_env(&[
         ("IS_MAINNET", "false"),
-        (
-            "ESPLORA_WS_URL",
-            "ws://mempool-api-mutinynet:8999/api/v1/ws",
-        ),
+        ("ESPLORA_WS_URL", "ws://mutinynet-ws.test/api/v1/ws"),
     ]));
 }
 
@@ -153,7 +150,7 @@ fn build_network_config_panics_on_empty_esplora_url() {
     let _ = build_network_config_from_env(fake_env(&[
         ("IS_MAINNET", "true"),
         ("ESPLORA_URL", ""),
-        ("ESPLORA_WS_URL", "wss://mempool.space/api/v1/ws"),
+        ("ESPLORA_WS_URL", "wss://mainnet-ws.test/api/v1/ws"),
     ]));
 }
 
@@ -164,7 +161,7 @@ fn build_network_config_panics_on_empty_esplora_url() {
 fn build_network_config_panics_on_missing_esplora_ws_url_mainnet() {
     let _ = build_network_config_from_env(fake_env(&[
         ("IS_MAINNET", "true"),
-        ("ESPLORA_URL", "http://electrs-mainnet:3000"),
+        ("ESPLORA_URL", "http://electrs-mainnet.test:3000"),
     ]));
 }
 
@@ -177,7 +174,7 @@ fn build_network_config_panics_on_missing_esplora_ws_url_mutinynet() {
     // operate.
     let _ = build_network_config_from_env(fake_env(&[
         ("IS_MAINNET", "false"),
-        ("ESPLORA_URL", "http://electrs-mutinynet:3000"),
+        ("ESPLORA_URL", "http://electrs-mutinynet.test:3000"),
     ]));
 }
 
@@ -188,7 +185,7 @@ fn build_network_config_panics_on_whitespace_esplora_ws_url() {
     // class as the empty string, just easier to miss in a diff.
     let _ = build_network_config_from_env(fake_env(&[
         ("IS_MAINNET", "true"),
-        ("ESPLORA_URL", "http://electrs-mainnet:3000"),
+        ("ESPLORA_URL", "http://electrs-mainnet.test:3000"),
         ("ESPLORA_WS_URL", "   "),
     ]));
 }

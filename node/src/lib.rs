@@ -138,9 +138,8 @@ where
 
     let url = env_or_unset("ESPLORA_URL").expect(
         "ESPLORA_URL env var must be set — no default exists. Set it \
-         to the HTTP Esplora endpoint for the chain this stage serves \
-         (PRD: http://electrs-mainnet:3000, DEV: \
-         http://electrs-mutinynet:3000, self-host: your electrs URL).",
+         to the HTTP Esplora endpoint for the chain this stage serves; \
+         see README §Configuration for the per-stage endpoints.",
     );
 
     let ws_url = env_or_unset("ESPLORA_WS_URL").expect(
