@@ -167,6 +167,16 @@ dashmap = "6"
 # `chrono` feature wires the encoder; the workspace already pulls
 # chrono in transitively via the bitcoin / tokio paths.
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+# `async_stream::stream! {}` macro used by `router::build_phase_stream`
+# to express the SSE fan-out as a single async block. The alternative
+# (`futures_util::stream::unfold`) would force the cross-await state to
+# be encoded as a state enum — async-stream's syntactic sugar keeps the
+# control flow readable and matches the upstream axum SSE docs. Already
+# in the dependency graph transitively (via `tokio-stream` /
+# `reqwest`); declared here so the router resolves it deterministically
+# rather than through a transitive path that could shift on `cargo
+# update`.
+async-stream = "0.3"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

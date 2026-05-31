@@ -2048,6 +2048,7 @@ name = "node"
 version = "1.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "axum 0.7.9",
  "bincode",
  "bitcoin",
