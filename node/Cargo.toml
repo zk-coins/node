@@ -169,6 +169,16 @@ socket2 = "0.5"
 default = []
 address-list = []
 lnurl = []
+# Self-host operator opt-in: write path for usernames. Resolve + display
+# is part of the MVP and stays on by default — hosted DEV + PRD images
+# do not offer claim as a UX policy. With the feature off, the
+# `POST /api/username/claim` route, its handler + request type, the
+# `db::claim_username` upsert, and the matching `UsernameStore::claim`
+# helpers are excluded from the binary at compile time. The
+# `Capabilities.username_claim` field is always present in
+# `/api/info` so wallet clients can gate their UI on a single
+# capability bit without sniffing build flags.
+username-claim = []
 # Dormant self-host operator opt-in (issue #84). When enabled, a ZMQ
 # subscriber publishes block-hash events into the same channel the
 # WebSocket scanner uses. No module activates the subscriber in this
