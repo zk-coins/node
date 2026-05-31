@@ -838,9 +838,8 @@ impl AccountNode {
         }
         let warmup_account_state = AccountState::new(pk);
         self.prover
-            .prove_initial(&warmup_account_state, ZERO_HASH)
-            .map(|_proof| ())
-            .map_err(|e| anyhow::anyhow!("bootstrap warmup prove_initial failed: {e}"))
+            .prove_initial(&warmup_account_state, ZERO_HASH)?;
+        Ok(())
     }
 
     /// Read-only handle on the shared [`State`] (SMT + MMR). Exposed so
