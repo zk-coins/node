@@ -1371,3 +1371,30 @@ fn test_send_coins_rejects_source_commitment_missing_from_history_mmr() {
         "desynced `state.prev_mmr_root` must surface the off-circuit history-MMR rejection at account_node.rs:419",
     );
 }
+
+/// Bootstrap warmup smoke test: `warmup_prover()` runs `prove_initial`
+/// on a dummy `AccountState` and discards the proof. Used by
+/// `runtime::start_rest_node` to pre-warm the Rayon worker pool so
+/// User 1's first request pays the warm-prove tax (~5 s) instead of
+/// the cold-start tax (~12 s). See the `warmup_prover` doc-comment in
+/// `account_node.rs` for the empirical R2-probe numbers
+/// (`circuit_build_wall_ms = 14214`, `prove_cold_wall_ms = 7012`,
+/// `prove_warm p50 = 4777`) that motivate the pre-warm. This test
+/// exercises the same in-memory path as the production bootstrap, so
+/// a regression in `prove_initial` against a fresh `AccountState`
+/// surfaces here before it ships.
+///
+/// Also serves as the coverage gate's one-and-only caller of
+/// `warmup_prover` — `runtime_tests.rs` sets
+/// `ZKCOINS_SKIP_BOOTSTRAP_WARMUP=1` to dodge the ~7 s prove cost in
+/// its HTTP-listener tests, so without this test the new pub fn would
+/// be uncovered. Heavy (~7 s wall on M3 Ultra at production
+/// parameters); runs once here.
+#[test]
+fn warmup_prover_completes_successfully() {
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    let node = AccountNode::new(Arc::clone(&state_arc));
+
+    node.warmup_prover()
+        .expect("warmup_prover must succeed — same prover serves production requests");
+}
