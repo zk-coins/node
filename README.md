@@ -78,6 +78,7 @@ API endpoints, background services, their activation status, and the tests that 
 | Admit send job (phase 1)             | `POST /api/jobs/send`                 | env²                     | mvp     | 100% (router)                  |
 | Attach signed commit (phase 2)       | `POST /api/jobs/:id/commit`           | env³                     | mvp     | 100% (router) · 0% (flow)      |
 | Poll job status                      | `GET /api/jobs/:id`                   | always                   | mvp     | 100% (router)                  |
+| Stream job phase events (SSE)        | `GET /api/jobs/:id/stream`            | always                   | mvp     | 100% (router)                  |
 | Cancel queued job                    | `POST /api/jobs/:id/cancel`           | always                   | mvp     | 100% (router)                  |
 | Receive coin                         | `POST /api/receive`                   | always                   | mvp     | 100% (account_node)                 |
 | Download coin proof                  | `GET /api/proof/:id`                  | always                   | mvp     | 100% (router)                  |
