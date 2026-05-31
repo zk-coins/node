@@ -266,14 +266,16 @@ pub async fn start_rest_node(
         let handle = tokio::task::spawn_blocking(move || {
             let warmup_t = std::time::Instant::now();
             // Hold the sync `Mutex` only for the duration of the
-            // prove call. No other writer touches the AccountNode
-            // during this window — the scanner spawns AFTER
-            // `start_rest_node` returns — so the lock is uncontended.
-            // If a request landed concurrently and tried to acquire
-            // the same Mutex it would block for ~7 s; that is the
-            // accepted trade-off documented in the function comment.
-            // The block is shorter (and aborts cleanly on shutdown)
-            // than the previous synchronous-bootstrap shape.
+            // prove call. The scanner — spawned in parallel by
+            // `main.rs` — locks `state`, not `account_node`, so it
+            // does not contend with this guard. The only realistic
+            // contender is a user request that lands during the
+            // ~7 s warmup window; that request blocks on
+            // `account_node.lock()` for the remainder of the warmup
+            // (then runs warm), which is the accepted trade-off
+            // documented in the function comment. The block is
+            // shorter (and aborts cleanly on shutdown) than the
+            // previous synchronous-bootstrap shape.
             let result = {
                 let guard = account_node_for_warmup
                     .lock()
