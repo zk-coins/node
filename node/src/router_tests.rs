@@ -5864,3 +5864,477 @@ async fn r2_probe_history_limit_clamped_to_max() {
     let arr: Vec<serde_json::Value> = serde_json::from_str(&body).expect("valid JSON");
     assert!(arr.is_empty());
 }
+
+// =======================================================================
+// GET /api/history — paginated per-address history (issue #153)
+//
+// The handler is read-only against `account_history`; tests below cover
+// both the validation branches (dead pool — handler never reaches the
+// query) and the live-DB branches (live Postgres 17 container, accounts
+// upserted via `upsert_account_with_source` so the migration-0008
+// trigger fills the history rows).
+// =======================================================================
+
+/// Spin up a Postgres 17 testcontainer and return a migrated pool —
+/// shared shape with the readiness / r2-probe live tests above. The
+/// container handle must outlive the pool (testcontainers tears the
+/// container down on `Drop`).
+async fn history_live_pool() -> (
+    Arc<sqlx::PgPool>,
+    testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
+) {
+    use testcontainers::{runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::postgres::Postgres;
+
+    let pg_container = Postgres::default()
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = pg_container
+        .get_host()
+        .await
+        .expect("failed to get container host");
+    let port = pg_container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("failed to get container port");
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = Arc::new(
+        crate::db::connect_and_migrate(&url)
+            .await
+            .expect("connect_and_migrate failed"),
+    );
+    (pool, pg_container)
+}
+
+/// Seed an `Account { balance, .. }` row for `address` via the
+/// `upsert_account_with_source` path so the migration-0008 trigger
+/// writes the matching `account_history` row with the requested
+/// `source`. Returns the bincode bytes for the caller to chain a
+/// second upsert that mutates the same account (the trigger captures
+/// `prev_data` from the previous row).
+async fn seed_account_history(
+    pool: &sqlx::PgPool,
+    address: &[u8; 32],
+    balance: u64,
+    source: &str,
+) -> Vec<u8> {
+    let mut acct = Account::new();
+    acct.balance = balance;
+    let bytes = bincode::serialize(&acct).expect("Account serializable");
+    crate::db::upsert_account_with_source(pool, address.as_slice(), &bytes, source)
+        .await
+        .expect("upsert seeded account");
+    bytes
+}
+
+#[tokio::test]
+async fn history_missing_address_returns_400() {
+    let req = Request::get("/api/history").body(Body::empty()).unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert!(
+        v["error"].as_str().unwrap_or("").contains("address"),
+        "expected address-related error, got {}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn history_empty_address_returns_400() {
+    // `?address=` (empty string) is treated as missing — same 400 path.
+    let req = Request::get("/api/history?address=")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _body) = send_request(req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn history_invalid_hex_returns_400() {
+    let req = Request::get("/api/history?address=not_hex")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert!(v["error"]
+        .as_str()
+        .unwrap_or("")
+        .to_lowercase()
+        .contains("hex"));
+}
+
+#[tokio::test]
+async fn history_wrong_length_returns_400() {
+    // 16 bytes worth of hex — decoded successfully but not 32 bytes.
+    let address = format!("0x{}", "ab".repeat(16));
+    let req = Request::get(format!("/api/history?address={}", address))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert!(v["error"].as_str().unwrap_or("").contains("32 bytes"));
+}
+
+#[tokio::test]
+async fn history_limit_zero_returns_400() {
+    let address = "00".repeat(32);
+    let req = Request::get(format!("/api/history?address={}&limit=0", address))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert!(v["error"].as_str().unwrap_or("").contains("limit"));
+}
+
+#[tokio::test]
+async fn history_limit_above_max_returns_400() {
+    let address = "00".repeat(32);
+    let req = Request::get(format!(
+        "/api/history?address={}&limit={}",
+        address,
+        HISTORY_MAX_LIMIT + 1
+    ))
+    .body(Body::empty())
+    .unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert!(v["error"].as_str().unwrap_or("").contains("limit"));
+}
+
+#[tokio::test]
+async fn history_negative_offset_returns_400() {
+    let address = "00".repeat(32);
+    let req = Request::get(format!("/api/history?address={}&offset=-1", address))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert!(v["error"].as_str().unwrap_or("").contains("offset"));
+}
+
+#[tokio::test]
+async fn history_non_integer_limit_returns_400() {
+    // axum's typed `Query` extractor rejects a non-integer value with
+    // 400 before the handler runs.
+    let address = "00".repeat(32);
+    let req = Request::get(format!("/api/history?address={}&limit=abc", address))
+        .body(Body::empty())
+        .unwrap();
+    let (status, _body) = send_request(req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn history_db_error_returns_500() {
+    // `test_state()` uses `dead_pool()` — the count query fails fast
+    // and the handler surfaces 500 + the documented error string.
+    let address = "00".repeat(32);
+    let req = Request::get(format!("/api/history?address={}", address))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains("database"),
+        "expected database error, got {}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn history_empty_result_returns_ok_with_zero_total() {
+    let (pool, _pg) = history_live_pool().await;
+    let state = live_test_state(pool);
+    let address = "ab".repeat(32);
+    let req = Request::get(format!("/api/history?address=0x{}", address))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::OK, "body={}", body);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(v["total"], 0);
+    assert_eq!(v["limit"], HISTORY_DEFAULT_LIMIT);
+    assert_eq!(v["offset"], 0);
+    assert_eq!(v["items"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn history_happy_path_returns_items_newest_first() {
+    let (pool, _pg) = history_live_pool().await;
+    let address: [u8; 32] = [7u8; 32];
+
+    // Three mutations on the same address: 0 -> 100 (mint),
+    // 100 -> 250 (receive), 250 -> 150 (send).
+    seed_account_history(&pool, &address, 100, "mint").await;
+    seed_account_history(&pool, &address, 250, "receive").await;
+    seed_account_history(&pool, &address, 150, "send").await;
+
+    let state = live_test_state(pool);
+    let req = Request::get(format!("/api/history?address=0x{}", hex::encode(address)))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::OK, "body={}", body);
+
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(
+        v["total"], 3,
+        "total must reflect every account_history row"
+    );
+    let items = v["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 3, "all three rows returned with default limit");
+
+    // Newest first: send (150), receive (250), mint (100).
+    assert_eq!(items[0]["direction"], "send");
+    assert_eq!(items[0]["amount"], 100, "250 -> 150 is a 100 delta");
+    assert_eq!(items[0]["status"], "confirmed");
+    assert!(
+        items[0]["txid"].is_null(),
+        "txid is null pre-broadcast link"
+    );
+    assert!(items[0]["counterparty"].is_null());
+    assert!(items[0]["block_height"].is_null());
+    assert!(items[0]["memo"].is_null());
+
+    assert_eq!(items[1]["direction"], "receive");
+    assert_eq!(items[1]["amount"], 150, "100 -> 250 is a 150 delta");
+
+    assert_eq!(items[2]["direction"], "mint");
+    assert_eq!(items[2]["amount"], 100, "0 -> 100 is a 100 delta");
+
+    // id field always present, monotonic descending (newest = highest id)
+    let id0 = items[0]["id"].as_i64().expect("id is i64");
+    let id1 = items[1]["id"].as_i64().expect("id is i64");
+    let id2 = items[2]["id"].as_i64().expect("id is i64");
+    assert!(id0 > id1 && id1 > id2, "ids are monotonic descending");
+}
+
+#[tokio::test]
+async fn history_pagination_offset_beyond_total_returns_empty_items_with_total() {
+    let (pool, _pg) = history_live_pool().await;
+    let address: [u8; 32] = [9u8; 32];
+    seed_account_history(&pool, &address, 100, "mint").await;
+    seed_account_history(&pool, &address, 200, "receive").await;
+
+    let state = live_test_state(pool);
+    let req = Request::get(format!(
+        "/api/history?address=0x{}&limit=10&offset=99",
+        hex::encode(address)
+    ))
+    .body(Body::empty())
+    .unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::OK, "body={}", body);
+
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(v["total"], 2, "total still reflects the seeded rows");
+    assert_eq!(v["limit"], 10);
+    assert_eq!(v["offset"], 99);
+    assert_eq!(
+        v["items"].as_array().unwrap().len(),
+        0,
+        "offset past total -> empty page"
+    );
+}
+
+#[tokio::test]
+async fn history_limit_clamps_page_size() {
+    let (pool, _pg) = history_live_pool().await;
+    let address: [u8; 32] = [11u8; 32];
+    // Five rows.
+    for (i, src) in ["mint", "receive", "send", "receive", "send"]
+        .iter()
+        .enumerate()
+    {
+        seed_account_history(&pool, &address, 100 + 50 * i as u64, src).await;
+    }
+    let state = live_test_state(pool);
+    let req = Request::get(format!(
+        "/api/history?address=0x{}&limit=2",
+        hex::encode(address)
+    ))
+    .body(Body::empty())
+    .unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::OK, "body={}", body);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(v["total"], 5);
+    assert_eq!(v["limit"], 2);
+    assert_eq!(v["items"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn history_scanner_source_is_filtered_out() {
+    // `scanner` and `recovery` are internal mutations the user did not
+    // initiate; the handler skips them so the page never carries a
+    // bogus `direction` value.
+    let (pool, _pg) = history_live_pool().await;
+    let address: [u8; 32] = [13u8; 32];
+    seed_account_history(&pool, &address, 100, "scanner").await;
+    seed_account_history(&pool, &address, 200, "mint").await;
+
+    let state = live_test_state(pool);
+    let req = Request::get(format!("/api/history?address=0x{}", hex::encode(address)))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::OK, "body={}", body);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    // total counts EVERY account_history row (including scanner) so the
+    // caller has the unfiltered total for pagination math; items only
+    // surfaces the user-facing trio.
+    assert_eq!(v["total"], 2);
+    let items = v["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["direction"], "mint");
+}
+
+// --- Pure-function coverage for the helpers --------------------------------
+
+#[test]
+fn decode_history_address_accepts_with_and_without_0x_prefix() {
+    let plain = "ab".repeat(32);
+    let prefixed = format!("0x{}", plain);
+    assert!(decode_history_address(&plain).is_ok());
+    assert!(decode_history_address(&prefixed).is_ok());
+}
+
+#[test]
+fn decode_history_address_rejects_short_input() {
+    let bad = "ab".repeat(16);
+    let err = decode_history_address(&bad).unwrap_err();
+    assert!(err.contains("32 bytes"));
+}
+
+#[test]
+fn decode_history_address_rejects_non_hex() {
+    let err = decode_history_address("zzzz").unwrap_err();
+    assert!(err.to_lowercase().contains("hex"));
+}
+
+#[test]
+fn map_history_direction_covers_all_branches() {
+    assert_eq!(map_history_direction("mint"), Some("mint"));
+    assert_eq!(map_history_direction("send"), Some("send"));
+    assert_eq!(map_history_direction("receive"), Some("receive"));
+    assert_eq!(map_history_direction("scanner"), None);
+    assert_eq!(map_history_direction("recovery"), None);
+    assert_eq!(map_history_direction("anything-else"), None);
+}
+
+#[test]
+fn balance_from_account_blob_round_trips() {
+    let mut a = Account::new();
+    a.balance = 42_000;
+    let bytes = bincode::serialize(&a).unwrap();
+    assert_eq!(balance_from_account_blob(&bytes), Some(42_000));
+    // Garbage bytes -> None (defensive).
+    assert!(balance_from_account_blob(&[0u8, 1, 2, 3]).is_none());
+}
+
+#[test]
+fn history_row_to_item_handles_first_row_with_no_prev_data() {
+    let mut a = Account::new();
+    a.balance = 5_000;
+    let new_bytes = bincode::serialize(&a).unwrap();
+    let row = crate::db::AccountHistoryRow {
+        id: 42,
+        timestamp_secs: 1_700_000_000,
+        source: "mint".to_string(),
+        prev_data: None,
+        new_data: new_bytes,
+        commit_txid: None,
+        block_height: None,
+        pending_status: None,
+    };
+    let item = history_row_to_item(&row).expect("item produced");
+    assert_eq!(item.id, 42);
+    assert_eq!(item.direction, "mint");
+    assert_eq!(
+        item.amount, 5_000,
+        "from-zero credit is the full new balance"
+    );
+    assert_eq!(item.status, "confirmed");
+    assert!(item.txid.is_none());
+}
+
+#[test]
+fn history_row_to_item_drops_unknown_source() {
+    let mut a = Account::new();
+    a.balance = 1;
+    let row = crate::db::AccountHistoryRow {
+        id: 1,
+        timestamp_secs: 0,
+        source: "scanner".to_string(),
+        prev_data: None,
+        new_data: bincode::serialize(&a).unwrap(),
+        commit_txid: None,
+        block_height: None,
+        pending_status: None,
+    };
+    assert!(history_row_to_item(&row).is_none());
+}
+
+#[test]
+fn history_row_to_item_drops_undecodable_new_data() {
+    let row = crate::db::AccountHistoryRow {
+        id: 1,
+        timestamp_secs: 0,
+        source: "mint".to_string(),
+        prev_data: None,
+        new_data: vec![0xff; 4], // not a valid bincode Account
+        commit_txid: None,
+        block_height: None,
+        pending_status: None,
+    };
+    assert!(history_row_to_item(&row).is_none());
+}
+
+#[test]
+fn history_row_to_item_maps_pending_status_to_wire_status() {
+    let mut a = Account::new();
+    a.balance = 100;
+    let bytes = bincode::serialize(&a).unwrap();
+    let mk = |status: Option<&str>| crate::db::AccountHistoryRow {
+        id: 1,
+        timestamp_secs: 0,
+        source: "send".to_string(),
+        prev_data: Some(bincode::serialize(&Account::new()).unwrap()),
+        new_data: bytes.clone(),
+        commit_txid: Some(vec![0xab; 32]),
+        block_height: Some(123_456),
+        pending_status: status.map(str::to_string),
+    };
+    assert_eq!(
+        history_row_to_item(&mk(Some("failed"))).unwrap().status,
+        "failed"
+    );
+    assert_eq!(
+        history_row_to_item(&mk(Some("complete"))).unwrap().status,
+        "confirmed"
+    );
+    assert_eq!(
+        history_row_to_item(&mk(Some("commit_broadcast")))
+            .unwrap()
+            .status,
+        "pending"
+    );
+    assert_eq!(history_row_to_item(&mk(None)).unwrap().status, "confirmed");
+    // commit_txid -> hex-encoded; block_height surfaced verbatim.
+    let item = history_row_to_item(&mk(Some("complete"))).unwrap();
+    assert_eq!(item.txid.as_deref(), Some("ab".repeat(32).as_str()));
+    assert_eq!(item.block_height, Some(123_456));
+}

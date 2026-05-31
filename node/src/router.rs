@@ -194,6 +194,180 @@ pub struct AddressesResponse {
     addresses: Vec<String>,
 }
 
+// ----- /api/history (issue #153) ------------------------------------------
+
+/// Default page size when `/api/history?limit` is omitted.
+pub(crate) const HISTORY_DEFAULT_LIMIT: i64 = 50;
+/// Hard cap on `/api/history?limit`. Anything outside `[1, MAX]` is a
+/// 400 — clamping silently was rejected as a footgun (callers that pass
+/// `limit=1000` should learn about the cap, not get an unexplained 200
+/// with 200 rows).
+pub(crate) const HISTORY_MAX_LIMIT: i64 = 200;
+
+/// `?address=&limit=&offset=` query for `GET /api/history`. All three
+/// are parsed via the typed `Query` extractor so axum surfaces a 400 on
+/// a non-integer `limit` / `offset` without the handler having to
+/// re-parse.
+#[derive(Deserialize)]
+pub(crate) struct HistoryQuery {
+    pub address: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// One entry in the `/api/history` response. Field names match the
+/// issue #153 contract verbatim; `null`-able fields use `Option<T>`
+/// with `serialize_with = Some` so the wire shape stays
+/// `"field": null` rather than the field being elided.
+///
+/// Memo / counterparty / block_height stay `null` today: the current
+/// schema does not store the recipient address per-mutation
+/// (`account_history` is keyed on the address that changed, not the
+/// counterparty), no memo column exists, and `triggering_commit_txid`
+/// is unset by every Rust caller — see [`db::AccountHistoryRow::commit_txid`]
+/// for the GUC-plumbing story.
+#[derive(Serialize)]
+pub struct HistoryItem {
+    /// Server-internal monotonic id. Always set — sourced from
+    /// `account_history.id`.
+    pub id: i64,
+    /// Bitcoin txid (lower-case hex, 64 chars) of the commit inscription
+    /// for this state change, once the publisher has broadcast it.
+    /// `null` while no commit_txid is linked to the row.
+    pub txid: Option<String>,
+    /// Unix epoch in seconds of the state change.
+    pub timestamp: i64,
+    /// `"send"`, `"receive"`, or `"mint"`. `scanner` / `recovery`
+    /// `account_history` rows are filtered out before the handler maps
+    /// to this enum.
+    pub direction: &'static str,
+    /// Absolute balance delta in sats (`|new_balance − prev_balance|`).
+    /// For a `receive` / `mint` this is the amount credited; for a
+    /// `send` this is the amount debited.
+    pub amount: u64,
+    /// Counterparty address (lower-case hex, 64 chars). Always `null`
+    /// in the current schema — see the type-level doc-comment.
+    pub counterparty: Option<String>,
+    /// `"pending"`, `"confirmed"`, or `"failed"`. Every persisted
+    /// `account_history` row reflects a state mutation that committed
+    /// in Postgres, so the default is `"confirmed"`; the alternative
+    /// values surface once the `pending_inscriptions` join lights up.
+    pub status: &'static str,
+    /// Bitcoin block height that contains the commit inscription, or
+    /// `null` while the scanner has not integrated it (and while the
+    /// `commit_txid` link is missing).
+    pub block_height: Option<i64>,
+    /// Free-text memo attached to the operation. Always `null` — no
+    /// memo column exists in the current schema.
+    pub memo: Option<String>,
+}
+
+/// Paginated wrapper around [`HistoryItem`]. `total` is the unfiltered
+/// count for the queried address (not the count of returned `items`)
+/// so the caller can drive pagination without a separate query.
+#[derive(Serialize)]
+pub struct HistoryResponse {
+    pub items: Vec<HistoryItem>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// JSON envelope returned by the validation-failure branches of
+/// `get_history_handler`. Distinct from the existing `SendCoinResponse`
+/// shape because `/api/history` is a read endpoint with no `success` /
+/// `proof_id` machinery — a flat `{ "error": "..." }` is the contract
+/// the issue documents.
+#[derive(Serialize)]
+pub struct HistoryErrorResponse {
+    pub error: &'static str,
+}
+
+/// Decode the 64-char (or 64 char + 0x prefix) hex `address` argument
+/// into the raw 32-byte form `account_history.address` is keyed on.
+/// Reuses the exact decode + length rules `get_balance_handler` applies
+/// — `Err` on non-hex characters or a length that does not unpack to
+/// 32 bytes.
+pub(crate) fn decode_history_address(raw: &str) -> Result<[u8; 32], &'static str> {
+    let bytes = hex::decode(raw.trim_start_matches("0x")).map_err(|_| "Invalid address hex")?;
+    if bytes.len() != 32 {
+        return Err("Address must be 32 bytes (64 hex chars)");
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+/// Map an `account_history.source` string into the user-facing
+/// `direction` enum. Returns `None` for the `scanner` and `recovery`
+/// sources, which are internal mutations the user did not initiate and
+/// the handler filters out before serialising.
+pub(crate) fn map_history_direction(source: &str) -> Option<&'static str> {
+    match source {
+        "mint" => Some("mint"),
+        "send" => Some("send"),
+        "receive" => Some("receive"),
+        // `scanner` and `recovery` are internal replays / operator-only
+        // mutations. Surface a `None` so the handler skips them.
+        _ => None,
+    }
+}
+
+/// Recover the `balance` field out of a bincode-serialised
+/// [`crate::account_node::Account`] blob. Returns `None` if the bytes
+/// fail to round-trip — defensive, the handler treats a decode failure
+/// as a missing prior balance (so the delta collapses to the absolute
+/// new balance instead of producing a fabricated number).
+pub(crate) fn balance_from_account_blob(blob: &[u8]) -> Option<u64> {
+    bincode::deserialize::<crate::account_node::Account>(blob)
+        .ok()
+        .map(|a| a.balance)
+}
+
+/// Convert one [`db::AccountHistoryRow`] into a wire [`HistoryItem`].
+/// Returns `None` if the row's source is internal (`scanner` /
+/// `recovery`) or if both balance reads fail (the row has no derivable
+/// delta to expose).
+pub(crate) fn history_row_to_item(row: &crate::db::AccountHistoryRow) -> Option<HistoryItem> {
+    let direction = map_history_direction(&row.source)?;
+    let new_balance = balance_from_account_blob(&row.new_data)?;
+    // `prev_data` is `None` on the first INSERT for an address — treat
+    // that as a from-zero delta so the very first mint / receive
+    // surfaces the full credit instead of disappearing.
+    let prev_balance = row
+        .prev_data
+        .as_deref()
+        .and_then(balance_from_account_blob)
+        .unwrap_or(0);
+    // Absolute delta — sends are debits (prev > new), mints / receives
+    // are credits (new > prev). The `direction` field already encodes
+    // the sign for the caller.
+    let amount = new_balance.max(prev_balance) - new_balance.min(prev_balance);
+
+    // Status defaults to `confirmed` because every account_history row
+    // reflects a transaction that committed in Postgres. Once the
+    // pending_inscriptions join is populated, promote the per-row
+    // status to the canonical state-machine label.
+    let status = match row.pending_status.as_deref() {
+        Some("failed") => "failed",
+        Some("complete") => "confirmed",
+        Some(_) => "pending",
+        None => "confirmed",
+    };
+
+    Some(HistoryItem {
+        id: row.id,
+        txid: row.commit_txid.as_deref().map(hex::encode),
+        timestamp: row.timestamp_secs,
+        direction,
+        amount,
+        counterparty: None,
+        status,
+        block_height: row.block_height,
+        memo: None,
+    })
+}
+
 #[derive(Deserialize)]
 pub struct SendCoinRequest {
     account_address: String,
@@ -642,6 +816,125 @@ async fn get_balance_handler(
             }),
         )
     }
+}
+
+/// `GET /api/history?address=<hex>&limit=<n>&offset=<n>` — paginated
+/// per-address transaction history. Implements issue #153.
+///
+/// Sort order is fixed `ORDER BY changed_at DESC` (newest first); the
+/// matching test in `router_tests.rs` pins this so a future caller
+/// cannot silently flip the order.
+///
+/// Validation contract (all return HTTP 400 with a
+/// [`HistoryErrorResponse`]):
+///   * `address` missing.
+///   * `address` not valid 32-byte hex.
+///   * `limit` outside `[1, 200]` (the issue's max=200 rule). `limit=0`
+///     is rejected because a successful response with zero items would
+///     be indistinguishable from "no rows", masking the misuse.
+///   * `offset` negative.
+///
+/// A successful response with `offset >= total` returns
+/// `items: [], total: N` so the caller can detect end-of-list without
+/// a second round-trip.
+///
+/// Persistence: pure read from `account_history` (joined with
+/// `observed_inscriptions` + `pending_inscriptions` for the future
+/// txid/block_height/status link — see [`db::AccountHistoryRow`] for
+/// the today-vs-tomorrow story). No new schema work.
+async fn get_history_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<HistoryQuery>,
+) -> impl IntoResponse {
+    // Resolve defaults first so the rest of the validation block can
+    // assume concrete values. `Option::get().copied().unwrap_or(...)`
+    // would also work but the field is already an `Option<i64>` from
+    // the typed extractor — `unwrap_or` is the same shape.
+    let limit = query.limit.unwrap_or(HISTORY_DEFAULT_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+
+    // --- validation ---
+    let address_hex = match query.address.as_deref() {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(HistoryErrorResponse {
+                    error: "Missing required `address` query parameter",
+                }),
+            )
+                .into_response();
+        }
+    };
+    let address_bytes = match decode_history_address(address_hex) {
+        Ok(b) => b,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(HistoryErrorResponse { error: msg }),
+            )
+                .into_response();
+        }
+    };
+    if !(1..=HISTORY_MAX_LIMIT).contains(&limit) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(HistoryErrorResponse {
+                error: "limit must be in [1, 200]",
+            }),
+        )
+            .into_response();
+    }
+    if offset < 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(HistoryErrorResponse {
+                error: "offset must be non-negative",
+            }),
+        )
+            .into_response();
+    }
+
+    // --- DB read ---
+    let total = match db::count_account_history(&state.pool, &address_bytes).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("get_history_handler: count query failed: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(HistoryErrorResponse {
+                    error: "Database error while counting history",
+                }),
+            )
+                .into_response();
+        }
+    };
+    let rows = match db::list_account_history(&state.pool, &address_bytes, limit, offset).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("get_history_handler: list query failed: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(HistoryErrorResponse {
+                    error: "Database error while reading history",
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let items: Vec<HistoryItem> = rows.iter().filter_map(history_row_to_item).collect();
+
+    (
+        StatusCode::OK,
+        Json(HistoryResponse {
+            items,
+            total,
+            limit,
+            offset,
+        }),
+    )
+        .into_response()
 }
 
 #[cfg(feature = "address-list")]
@@ -1791,6 +2084,7 @@ struct RootResponse {
 struct RootEndpoints {
     info: &'static str,
     balance: &'static str,
+    history: &'static str,
     send: &'static str,
     receive: &'static str,
     commit: &'static str,
@@ -1812,6 +2106,7 @@ async fn root_handler() -> impl IntoResponse {
         endpoints: RootEndpoints {
             info: "GET  /api/info",
             balance: "GET  /api/balance?address={hex}",
+            history: "GET  /api/history?address={hex}&limit={n}&offset={n}",
             send: "POST /api/send",
             receive: "POST /api/receive",
             commit: "POST /api/commit",
@@ -2183,6 +2478,7 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/health/publisher", get(publisher_health_handler))
         .route("/api/info", get(info_handler))
         .route("/api/balance", get(get_balance_handler))
+        .route("/api/history", get(get_history_handler))
         .route("/api/send", post(send_coin_handler))
         .route("/api/receive", post(receive_coin_handler))
         .route("/api/proof/:id", get(get_proof_handler))

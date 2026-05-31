@@ -72,6 +72,7 @@ API endpoints, background services, their activation status, and the tests that 
 | Health check                         | `GET /health`                         | always                   | mvp     | 100% (router)                  |
 | Network info                         | `GET /api/info`                       | env¹                     | mvp     | 100% (router)                  |
 | Get balance                          | `GET /api/balance?address=<hex>`      | always                   | mvp     | 100% (router)                  |
+| List per-address history             | `GET /api/history?address=<hex>&limit=<n>&offset=<n>` | always   | mvp     | 100% (router)                  |
 | List all addresses                   | `GET /api/address`                    | feature (`address-list`) | gate    | 100% (router)                  |
 | Mint coins (single-phase)            | `POST /api/mint`                      | always²                  | mvp     | 100% (account_node)                 |
 | Send — phase 1 (generate proof)      | `POST /api/send`                      | env²                     | mvp     | 100% (router)                  |
