@@ -522,10 +522,11 @@ pub(crate) fn history_row_to_item(row: &crate::db::AccountHistoryRow) -> Option<
         Some(blob) => match balance_from_account_blob(blob) {
             Some(b) => b,
             None => {
+                let blob_len = blob.len();
                 tracing::warn!(
                     "history_row_to_item: row id={} address has un-decodable prev_data blob (len={}); dropping row to avoid fabricating a full-balance delta",
                     row.id,
-                    blob.len(),
+                    blob_len,
                 );
                 return None;
             }
