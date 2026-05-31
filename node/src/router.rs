@@ -651,11 +651,17 @@ pub struct SendCoinRequest {
     amount: u64,
     /// Compressed secp256k1 public key (33 bytes) at the sender's current
     /// `num_pubkeys` BIP-32 child index. Serialised as a hex string.
-    #[schema(value_type = String, example = "02a34b6d…")]
+    #[schema(
+        value_type = String,
+        example = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    )]
     public_key: bitcoin::secp256k1::PublicKey,
     /// Compressed secp256k1 public key (33 bytes) at the sender's next
     /// BIP-32 child index (`num_pubkeys + 1`). Serialised as a hex string.
-    #[schema(value_type = String, example = "03f128e2…")]
+    #[schema(
+        value_type = String,
+        example = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+    )]
     next_public_key: bitcoin::secp256k1::PublicKey,
     /// Legacy field — IGNORED by `send_coin_handler` as of the
     /// [`crate::account_node::Account::commitment_public_key`]
@@ -962,7 +968,7 @@ pub struct CommitRequest {
 
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct InfoResponse {
-    /// Network the node is connected to (`Mainnet`, `Mutinynet`, …).
+    /// Network the node is connected to (`Mainnet`, `Mutinynet`, ...).
     network: String,
     /// Per-build capability flags for clients to gate UI on a single
     /// node-side source of truth.
@@ -1030,11 +1036,9 @@ pub struct LnurlpResponse {
     callback: String,
     /// Minimum sendable amount (millisats).
     #[serde(rename = "minSendable")]
-    #[schema(rename = "minSendable")]
     min_sendable: u64,
     /// Maximum sendable amount (millisats).
     #[serde(rename = "maxSendable")]
-    #[schema(rename = "maxSendable")]
     max_sendable: u64,
     /// JSON-encoded metadata array per LUD-06.
     metadata: String,
@@ -1524,7 +1528,7 @@ pub(crate) async fn send_coin_handler(
             // `commitment: None`). The mint flow constructs and
             // broadcasts its own commitment inside `mint_handler`. The
             // pre-MVP `if let Some(commitment) = coin_proofs[0]
-            // .commitment.as_ref() { … broadcast … }` block that used
+            // .commitment.as_ref() { ... broadcast ... }` block that used
             // to live here was dead under both flows and has been
             // removed; clients commit explicitly via `/api/commit`.
 
@@ -1767,7 +1771,7 @@ pub(crate) async fn mint_handler(
             // error arm: 5xx-class mappings (prover failure,
             // unmapped string) are already logged at `error` by the
             // deeper layer, and 4xx-class mappings (insufficient
-            // funds, malformed proofs, …) are caller-fixable input.
+            // funds, malformed proofs, ...) are caller-fixable input.
             // `warn` is the correct request-level summary level for
             // both. Map once and thread the tuple into the response
             // builder.
