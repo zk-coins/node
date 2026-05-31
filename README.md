@@ -42,7 +42,7 @@ The **on-chain footprint stays private** — Plonky2 ensures that the public out
 | | Hosted (`api.zkcoins.app`) | Self-hosted |
 | --- | --- | --- |
 | On-chain privacy (vs. block explorers) | ✅ | ✅ |
-| Operator sees plaintext transaction data | ❌ Yes — DFX runs the hosted node | ✅ No |
+| Operator sees plaintext transaction data | ❌ Yes — `api.zkcoins.app` is operated by [zkcoins.app](https://zkcoins.app) | ✅ No |
 | Setup effort | ✅ None | ⚠️ Postgres + electrs + Bitcoin node |
 
 **If you need full transaction privacy, run your own node.** Every release is shipped as `zkcoins/node:latest` (see [Live](#live)), the build recipe is [`Dockerfile`](./Dockerfile), and runtime knobs are documented in [Configuration](#configuration). Point the [zkcoins.app](https://zkcoins.app) client at your self-hosted instance for end-to-end self-custody of transaction data.
@@ -219,8 +219,8 @@ Features tagged `mvp` whose current test coverage is insufficient — these bloc
 | Variable          | Default                    | Effect                                                                                                                                                        |
 | ----------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `IS_MAINNET`      | _(required, no default)_   | Exact string `true` or `false` — anything else panics. PRD sets `true`, DEV sets `false`. Drives the `Network` enum (Mainnet vs Signet) used for address derivation. Truthy values like `1`, `TRUE`, `yes` are rejected to prevent silent misconfiguration. |
-| `ESPLORA_URL`     | _(required, no default)_   | HTTP Esplora endpoint for the chain this stage serves. PRD: `http://electrs-mainnet:3000` (DFX Mainnet stack). DEV: `http://electrs-mutinynet:3000`. Self-host: your electrs URL. Empty string is treated as unset.                                       |
-| `ESPLORA_WS_URL`  | _(required, no default)_   | Esplora-compatible WebSocket endpoint consumed by `scanner_ws` (issue #84). PRD: `wss://mempool.space/api/v1/ws`. DEV: `ws://mempool-api-mutinynet:8999/api/v1/ws` on the DFX mempool/backend stack. Empty string is treated as unset.                    |
+| `ESPLORA_URL`     | _(required, no default)_   | HTTP Esplora endpoint for the chain this stage serves. On the `api.zkcoins.app` stack: PRD `http://electrs-mainnet:3000`, DEV `http://electrs-mutinynet:3000`. Self-host: your electrs URL. Empty string is treated as unset.                                       |
+| `ESPLORA_WS_URL`  | _(required, no default)_   | Esplora-compatible WebSocket endpoint consumed by `scanner_ws` (issue #84). On the `api.zkcoins.app` stack: PRD `wss://mempool.space/api/v1/ws`, DEV `ws://mempool-api-mutinynet:8999/api/v1/ws` (self-hosted mempool/backend sidecar). Empty string is treated as unset.                    |
 | `NETWORK_NAME`    | `Mutinynet` / `Mainnet`    | Human-readable name returned by `/api/info`. Default depends on `IS_MAINNET`. Purely cosmetic — has no behavioural effect on the scanner, publisher, or address derivation.                                                                              |
 | `USERNAME_DOMAIN` | _(required, no default)_   | External hostname returned by `/api/info`. The client renders `<hex\|username>@<domain>` from this. **Node panics on startup if unset.** PRD sets `zkcoins.app`, DEV sets `dev.zkcoins.app` — silent fallback would let a misconfigured stage reproduce the cross-network routing bug (#95) |
 | `PUBLISHER_KEY`   | _(required, no default)_   | 32-byte hex private key for inscription publishing. Node panics on startup if unset. On `IS_MAINNET=true` an additional check refuses the well-known test key.                                                                                            |
