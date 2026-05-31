@@ -1314,40 +1314,110 @@ is a build-time signal, not a runtime-readiness signal.
 deploy-dev post-curl-retry fires on every DEV deploy. A regression
 that brings back the silent-panic shape fails one or both gates.
 
-### 7.24 Self-hosted `mempool/backend:v3.3.1` does not implement the `track-tx` WS action — **codified**
+### 7.24 Wrong WS subscribe wire format on self-hosted `mempool/backend` — empirical correction — **codified**
 
-**Discovered:** DEV operations (May 2026), via combined evidence:
-DEV `request_log` showed `/api/mint` p50 ≈ 40 s and
-`/api/send` p50 = 11 s + `/api/commit` p50 = 30.7 s — both with the
-30 s shape characteristic of the publisher's `track-tx` safety-net;
-16/16 REST fallbacks in the 72 h sample succeeded with 0 not-found
-and 0 errors; a direct WS probe against
-`mempool-api-mutinynet:8999/api/v1/ws` with
-`{"action":"track-tx","data":"<txid>"}` returned 0 frames in 15 s,
-while `{"action":"want","data":["blocks"]}` answered immediately.
+**Status correction.** An earlier revision of this section claimed
+that `mempool/backend:v3.3.1` "does not implement the `track-tx` WS
+action". That conclusion was wrong. The backend implements
+`track-tx` correctly; the zkCoins publisher had been sending the
+subscribe frame in the wrong wire format. Both PR
+[#144](https://github.com/zk-coins/node/pull/144) (drop the WS
+path) and this codification stand — but for different reasons than
+the original write-up gave.
 
-**Root cause:** the self-hosted `mempool/backend:v3.3.1` version
-does not emit any frame in response to `track-tx` (the action is
-recognised but no event arrives). Issue #84's original design
-assumed a public mutinynet endpoint where the action does fire;
-self-hosting flipped that assumption silently.
+**What the publisher actually sent (pre-PR-#144,
+`node/src/scanner_ws.rs:650-655` on `ae78798^`):**
 
-**Fix:** drop the entire WS subscribe + safety-net + REST fallback
-path from `publisher::broadcast_inscription_txs`. The publisher now
-runs `client.broadcast(commit) → client.broadcast(reveal)` back to
-back; race-freedom comes from the deployment topology (node +
-electrs + bitcoind in the shared Docker `bitcoin` network,
-`bitcoind::sendrawtransaction` returns only after local-mempool
-accept), not from a WS subscription. Expected effect:
-`/api/mint` p50 ~40 s → ~11 s, `/api/send + /api/commit`
-~42 s → ~13 s. See the perf PR for the removed code.
+```rust
+let subscribe = serde_json::json!({
+    "action": "track-tx",
+    "data": txid_str,
+});
+```
 
-**Generalisation for future migrations:** when porting an
-event-driven path that was designed against a public upstream onto
-a self-hosted reimplementation of the same protocol, smoke-test
-each WS action against the self-hosted endpoint before assuming
-parity. Empty-frame-budget probe is cheap; silent latency tax is
-expensive.
+**What `mempool/backend:v3.3.1` parses
+(`backend/src/api/websocket-handler.ts`, lines ~165-175):**
+
+```typescript
+if (parsedMessage && parsedMessage['track-tx']) {
+  if (/^[a-fA-F0-9]{64}$/.test(parsedMessage['track-tx'])) {
+    client['track-tx'] = parsedMessage['track-tx'];
+    // ... subscribe, will emit txPosition / txConfirmed frames
+  }
+}
+```
+
+The backend looks at the top-level `track-tx` key. The publisher's
+`{action, data}` envelope has no such key, so the handler falls
+through silently — no error frame, no log line, no rejection.
+
+**What mempool.js (the canonical client) actually sends
+(`https://raw.githubusercontent.com/mempool/mempool.js/main/src/services/ws/ws-client-node.ts`,
+`wsTrackTransaction`):**
+
+```typescript
+export const wsTrackTransaction = (ws: WebSocket, txid: string): void => {
+  wsActionWrapper(ws, { 'track-tx': txid });
+}
+```
+
+i.e. `{"track-tx": "<txid>"}` as a top-level key — exactly the
+shape `websocket-handler.ts` parses. The publisher's frame did
+not follow this convention.
+
+**Empirical verification (dfxdev, post-PR-#144 re-probe, May 2026).**
+A direct `websocat` probe against
+`ws://mempool-api-mutinynet:8999/api/v1/ws` with a live mempool
+txid:
+
+- `{"action":"track-tx","data":"<txid>"}` → 0 frames in 6 s
+  (matches the production observation that motivated PR #144).
+- `{"track-tx":"<txid>"}` → immediate `{"txPosition":...}` frame,
+  followed by `{"txConfirmed":...}` when the next block arrived.
+
+So the backend was working all along; the publisher's frame was
+malformed.
+
+**Why PR #144 still stands.** Reverting to a WS path with the
+correct wire format is not the right move:
+
+1. **Closed test environment, no external Esplora.** zkCoins runs
+   against a self-hosted `mempool/backend` colocated with node,
+   electrs, and bitcoind in the shared Docker `bitcoin` network.
+   There is no upstream public endpoint to subscribe against.
+2. **Topology is race-free without a subscribe.** In that
+   topology, `bitcoind::sendrawtransaction` returns only after
+   local-mempool accept, so a sequential
+   `client.broadcast(commit) → client.broadcast(reveal)` is
+   already ordered. The WS round-trip the subscribe gave us was a
+   confirmation of something the REST call already guaranteed.
+3. **Simpler code.** The WS subscribe + reconnect-with-backoff +
+   REST safety-net was three failure modes for a problem the REST
+   call alone does not have. Removing it shrinks
+   `publisher.rs`/`scanner_ws.rs` by ~200 lines (see PR #144 diff).
+
+**Empirically measured impact of PR #144 on DEV `request_log`:**
+`/api/mint` p50 40 s → 8.7 s (4.6×); `/api/send + /api/commit` p50
+42 s → 12.7 s (3.3×). Numbers match the predicted shape — the
+removed wait was indeed ~30 s of pure latency tax (15 s WS
+timeout + REST fallback round-trip).
+
+**Generalisation for future migrations.** Two distinct lessons,
+neither the original one:
+
+1. When a WebSocket subscribe "doesn't work", verify the wire
+   format against the canonical client's source before concluding
+   the server is broken. `mempool.js` is the reference; copy its
+   frame shape verbatim, do not reconstruct it from the action
+   name.
+2. The original investigation (latency probe → REST-fallback hit
+   rate → empty-frame WS probe with the wrong format) reached a
+   plausible-but-wrong root cause because every signal was
+   consistent with both "backend broken" and "client malformed".
+   When a server silently drops a request, "the server doesn't
+   support it" and "we asked for it wrong" look identical from
+   the client side. Always cross-check the request against a
+   known-good client's wire format before blaming the server.
 
 ---
 

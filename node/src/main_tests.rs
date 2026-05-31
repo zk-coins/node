@@ -8,8 +8,12 @@ use testcontainers_modules::postgres::Postgres;
 
 // --- build_network_config_from_env -------------------------------
 //
-// These tests cover the panic-on-missing rules for the Mainnet path.
-// They use a fake `env` closure rather than `std::env::set_var` so
+// These tests cover the "explicit-or-panic" contract: every chain-
+// shaping env var (`IS_MAINNET`, `ESPLORA_URL`, `ESPLORA_WS_URL`) is
+// required, with no default. No stage — PRD, DEV, integration, the
+// local dev loop — gets a silent Mutinynet fallback.
+//
+// Tests use a fake `env` closure rather than `std::env::set_var` so
 // the panic side-effect cannot poison the `NETWORK_CONFIG`
 // lazy_static cell (shared across tests in this binary) and so the
 // tests do not race other test threads via the process-wide
@@ -30,80 +34,114 @@ fn fake_env(entries: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -
 }
 
 #[test]
-fn build_network_config_defaults_to_mutinynet_when_is_mainnet_unset() {
-    let cfg = build_network_config_from_env(fake_env(&[]));
-    assert!(!cfg.is_mainnet);
-    assert_eq!(cfg.url, "https://mutinynet.com/api");
-    assert_eq!(cfg.network_name, "Mutinynet");
-    assert!(cfg.ws_url.is_none());
-}
-
-#[test]
-fn build_network_config_defaults_to_mutinynet_when_is_mainnet_is_not_true() {
-    // Any value other than the literal string "true" is treated as
-    // "not mainnet" — same semantics as the legacy `.map(|v| v == "true")`
-    // pattern. Guards against accidental "TRUE" / "1" / "yes" thinking
-    // it switches the network.
-    let cfg = build_network_config_from_env(fake_env(&[("IS_MAINNET", "1")]));
-    assert!(!cfg.is_mainnet);
-    assert_eq!(cfg.url, "https://mutinynet.com/api");
-    assert!(cfg.ws_url.is_none());
-}
-
-#[test]
-fn build_network_config_respects_explicit_urls_on_mutinynet() {
+fn build_network_config_full_mutinynet() {
     let cfg = build_network_config_from_env(fake_env(&[
-        ("ESPLORA_URL", "http://electrs-mutinynet:3000"),
-        ("ESPLORA_WS_URL", "wss://example.test/ws"),
-        ("NETWORK_NAME", "Custom"),
+        ("IS_MAINNET", "false"),
+        ("ESPLORA_URL", "http://electrs-mutinynet.test:3000"),
+        ("ESPLORA_WS_URL", "ws://mutinynet-ws.test/api/v1/ws"),
     ]));
     assert!(!cfg.is_mainnet);
-    assert_eq!(cfg.url, "http://electrs-mutinynet:3000");
-    assert_eq!(cfg.ws_url.as_deref(), Some("wss://example.test/ws"));
-    assert_eq!(cfg.network_name, "Custom");
+    assert_eq!(cfg.url, "http://electrs-mutinynet.test:3000");
+    assert_eq!(
+        cfg.ws_url.as_deref(),
+        Some("ws://mutinynet-ws.test/api/v1/ws")
+    );
+    assert_eq!(cfg.network_name, "Mutinynet");
 }
 
 #[test]
 fn build_network_config_full_mainnet() {
     let cfg = build_network_config_from_env(fake_env(&[
         ("IS_MAINNET", "true"),
-        ("ESPLORA_URL", "http://electrs-mainnet:3000"),
-        ("ESPLORA_WS_URL", "wss://mempool.space/api/v1/ws"),
+        ("ESPLORA_URL", "http://electrs-mainnet.test:3000"),
+        ("ESPLORA_WS_URL", "wss://mainnet-ws.test/api/v1/ws"),
     ]));
     assert!(cfg.is_mainnet);
-    assert_eq!(cfg.url, "http://electrs-mainnet:3000");
-    assert_eq!(cfg.ws_url.as_deref(), Some("wss://mempool.space/api/v1/ws"));
+    assert_eq!(cfg.url, "http://electrs-mainnet.test:3000");
+    assert_eq!(
+        cfg.ws_url.as_deref(),
+        Some("wss://mainnet-ws.test/api/v1/ws")
+    );
     assert_eq!(cfg.network_name, "Mainnet");
 }
 
 #[test]
-fn build_network_config_mainnet_with_explicit_network_name() {
-    // Mainnet path with `NETWORK_NAME` set: the override must win
-    // over the `if is_mainnet { "Mainnet" } else { "Mutinynet" }`
-    // default branch. Documents that operators can rename the chain
-    // label (e.g. "Mainnet-Canary") without changing IS_MAINNET.
+fn build_network_config_explicit_network_name_overrides_default_label() {
+    // `NETWORK_NAME` is the only env var that remains derived (purely
+    // cosmetic — feeds `/api/info`). Operators can override it without
+    // touching IS_MAINNET, e.g. "Mainnet-Canary".
     let cfg = build_network_config_from_env(fake_env(&[
         ("IS_MAINNET", "true"),
-        ("ESPLORA_URL", "http://electrs-mainnet:3000"),
-        ("ESPLORA_WS_URL", "wss://mempool.space/api/v1/ws"),
+        ("ESPLORA_URL", "http://electrs-mainnet.test:3000"),
+        ("ESPLORA_WS_URL", "wss://mainnet-ws.test/api/v1/ws"),
         ("NETWORK_NAME", "Mainnet-Canary"),
     ]));
     assert!(cfg.is_mainnet);
     assert_eq!(cfg.network_name, "Mainnet-Canary");
 }
 
+// --- panic paths: IS_MAINNET ------------------------------------
+
 #[test]
-#[should_panic(expected = "IS_MAINNET=true requires ESPLORA_URL")]
-fn build_network_config_panics_on_mainnet_missing_esplora_url() {
+#[should_panic(expected = "IS_MAINNET env var must be set")]
+fn build_network_config_panics_on_missing_is_mainnet() {
+    // No silent default to false (Mutinynet). Every stage must say
+    // explicitly which chain it serves.
     let _ = build_network_config_from_env(fake_env(&[
-        ("IS_MAINNET", "true"),
-        ("ESPLORA_WS_URL", "wss://mempool.space/api/v1/ws"),
+        ("ESPLORA_URL", "http://electrs-mainnet.test:3000"),
+        ("ESPLORA_WS_URL", "wss://mainnet-ws.test/api/v1/ws"),
     ]));
 }
 
 #[test]
-#[should_panic(expected = "IS_MAINNET=true requires ESPLORA_URL")]
-fn build_network_config_panics_on_mainnet_empty_esplora_url() {
+#[should_panic(expected = "IS_MAINNET env var must be set")]
+fn build_network_config_panics_on_empty_is_mainnet() {
+    // `IS_MAINNET=` in a compose file → empty string → treated as
+    // unset, same as missing.
+    let _ = build_network_config_from_env(fake_env(&[
+        ("IS_MAINNET", ""),
+        ("ESPLORA_URL", "http://electrs-mainnet.test:3000"),
+        ("ESPLORA_WS_URL", "wss://mainnet-ws.test/api/v1/ws"),
+    ]));
+}
+
+#[test]
+#[should_panic(expected = "IS_MAINNET must be exactly `true` or `false`")]
+fn build_network_config_panics_on_truthy_is_mainnet() {
+    // Historical class of bugs: a typed `1`, `TRUE`, or `yes` used
+    // to silently mean Mutinynet. Reject ambiguous values loudly.
+    let _ = build_network_config_from_env(fake_env(&[
+        ("IS_MAINNET", "1"),
+        ("ESPLORA_URL", "http://electrs-mainnet.test:3000"),
+        ("ESPLORA_WS_URL", "wss://mainnet-ws.test/api/v1/ws"),
+    ]));
+}
+
+// --- panic paths: ESPLORA_URL -----------------------------------
+
+#[test]
+#[should_panic(expected = "ESPLORA_URL env var must be set")]
+fn build_network_config_panics_on_missing_esplora_url_mainnet() {
+    let _ = build_network_config_from_env(fake_env(&[
+        ("IS_MAINNET", "true"),
+        ("ESPLORA_WS_URL", "wss://mainnet-ws.test/api/v1/ws"),
+    ]));
+}
+
+#[test]
+#[should_panic(expected = "ESPLORA_URL env var must be set")]
+fn build_network_config_panics_on_missing_esplora_url_mutinynet() {
+    // Symmetric: even on the non-Mainnet path, an unset ESPLORA_URL
+    // now panics. Previously fell back silently to mutinynet.com.
+    let _ = build_network_config_from_env(fake_env(&[
+        ("IS_MAINNET", "false"),
+        ("ESPLORA_WS_URL", "ws://mutinynet-ws.test/api/v1/ws"),
+    ]));
+}
+
+#[test]
+#[should_panic(expected = "ESPLORA_URL env var must be set")]
+fn build_network_config_panics_on_empty_esplora_url() {
     // `ESPLORA_URL=` in a compose file resolves to `Some("")`. Without
     // the empty-string filter in `env_or_unset`, the `expect` would
     // be bypassed and `EsploraConfig.url` would be left as `""` —
@@ -112,27 +150,42 @@ fn build_network_config_panics_on_mainnet_empty_esplora_url() {
     let _ = build_network_config_from_env(fake_env(&[
         ("IS_MAINNET", "true"),
         ("ESPLORA_URL", ""),
-        ("ESPLORA_WS_URL", "wss://mempool.space/api/v1/ws"),
+        ("ESPLORA_WS_URL", "wss://mainnet-ws.test/api/v1/ws"),
     ]));
 }
 
+// --- panic paths: ESPLORA_WS_URL --------------------------------
+
 #[test]
-#[should_panic(expected = "IS_MAINNET=true requires ESPLORA_WS_URL")]
-fn build_network_config_panics_on_mainnet_missing_esplora_ws_url() {
+#[should_panic(expected = "ESPLORA_WS_URL env var must be set")]
+fn build_network_config_panics_on_missing_esplora_ws_url_mainnet() {
     let _ = build_network_config_from_env(fake_env(&[
         ("IS_MAINNET", "true"),
-        ("ESPLORA_URL", "http://electrs-mainnet:3000"),
+        ("ESPLORA_URL", "http://electrs-mainnet.test:3000"),
     ]));
 }
 
 #[test]
-#[should_panic(expected = "IS_MAINNET=true requires ESPLORA_WS_URL")]
-fn build_network_config_panics_on_mainnet_whitespace_esplora_ws_url() {
+#[should_panic(expected = "ESPLORA_WS_URL env var must be set")]
+fn build_network_config_panics_on_missing_esplora_ws_url_mutinynet() {
+    // Symmetric: an unset ESPLORA_WS_URL now panics even on the
+    // non-Mainnet path. Previously DEV silently bound to the public
+    // `wss://mutinynet.com/api/v1/ws` — an external host we do not
+    // operate.
+    let _ = build_network_config_from_env(fake_env(&[
+        ("IS_MAINNET", "false"),
+        ("ESPLORA_URL", "http://electrs-mutinynet.test:3000"),
+    ]));
+}
+
+#[test]
+#[should_panic(expected = "ESPLORA_WS_URL env var must be set")]
+fn build_network_config_panics_on_whitespace_esplora_ws_url() {
     // Whitespace-only values are also rejected — same misconfiguration
     // class as the empty string, just easier to miss in a diff.
     let _ = build_network_config_from_env(fake_env(&[
         ("IS_MAINNET", "true"),
-        ("ESPLORA_URL", "http://electrs-mainnet:3000"),
+        ("ESPLORA_URL", "http://electrs-mainnet.test:3000"),
         ("ESPLORA_WS_URL", "   "),
     ]));
 }

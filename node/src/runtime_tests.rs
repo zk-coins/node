@@ -93,8 +93,15 @@ async fn start_rest_node_binds_and_serves_health() {
     // happen on first access in this test binary. The pre-push hook
     // exports both of these already; setting them here defensively
     // makes the test runnable in any environment.
+    // `NETWORK_CONFIG` is a process-wide `lazy_static` cell — the first
+    // test in this binary that touches it freezes the values for the
+    // rest of the run. All three chain-shaping env vars are required
+    // (see `lib::build_network_config_from_env`), so set them
+    // defensively here even though pre-push exports them too.
     std::env::set_var("USERNAME_DOMAIN", "test.zkcoins.local");
+    std::env::set_var("IS_MAINNET", "false");
     std::env::set_var("ESPLORA_URL", "http://127.0.0.1:1/api");
+    std::env::set_var("ESPLORA_WS_URL", "ws://127.0.0.1:1/api/v1/ws");
     // Skip the bootstrap warmup prove (`AccountNode::warmup_prover`):
     // the smoke tests in this file only need the listener to bind, not
     // a prover that survives a cold-start. Paying the ~7 s warmup tax
@@ -209,8 +216,15 @@ async fn bootstrap_initial_minting_account_balance_is_goldilocks_safe() {
     drop(probe);
     let addr = format!("127.0.0.1:{}", port);
 
+    // `NETWORK_CONFIG` is a process-wide `lazy_static` cell — the first
+    // test in this binary that touches it freezes the values for the
+    // rest of the run. All three chain-shaping env vars are required
+    // (see `lib::build_network_config_from_env`), so set them
+    // defensively here even though pre-push exports them too.
     std::env::set_var("USERNAME_DOMAIN", "test.zkcoins.local");
+    std::env::set_var("IS_MAINNET", "false");
     std::env::set_var("ESPLORA_URL", "http://127.0.0.1:1/api");
+    std::env::set_var("ESPLORA_WS_URL", "ws://127.0.0.1:1/api/v1/ws");
     // Skip the bootstrap warmup prove — see the matching comment in
     // `start_rest_node_binds_and_serves_health` above.
     std::env::set_var("ZKCOINS_SKIP_BOOTSTRAP_WARMUP", "1");

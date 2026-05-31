@@ -29,9 +29,15 @@ pub struct EsploraConfig {
     pub is_mainnet: bool,
     pub network_name: String,
     /// Esplora WebSocket endpoint consumed by the block-tip scanner
-    /// (`scanner_ws::run_scanner_ws`). `None` falls back to
-    /// `ESPLORA_WS_URL` (defaulting to `wss://mutinynet.com/api/v1/ws`).
-    /// The publisher no longer uses this field — see
+    /// (`scanner_ws::run_scanner_ws`). Sourced from the `ESPLORA_WS_URL`
+    /// env var via `lib::build_network_config_from_env`, which panics
+    /// if it is unset or empty — production callers always observe a
+    /// `Some(...)` here. The `Option` shape is retained to keep this
+    /// struct constructible from test fixtures that do not need a WS
+    /// URL (publisher-only paths) without forcing a placeholder URL
+    /// into the type.
+    ///
+    /// The publisher itself does not use this field — see
     /// `broadcast_inscription_txs` for the direct-broadcast rationale.
     pub ws_url: Option<String>,
 }
