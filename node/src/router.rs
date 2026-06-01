@@ -474,15 +474,32 @@ pub(crate) fn map_history_direction(source: &str) -> Option<&'static str> {
     }
 }
 
-/// Recover the `balance` field out of a bincode-serialised
+/// Recover the usable balance out of a bincode-serialised
 /// [`crate::account_node::Account`] blob. Returns `None` if the bytes
 /// fail to round-trip — defensive, the handler treats a decode failure
 /// as a missing prior balance (so the delta collapses to the absolute
 /// new balance instead of producing a fabricated number).
+///
+/// Mirrors [`crate::account_node::Account::get_balance`]: the settled
+/// `balance` field plus pending receives sitting in `coin_queue`.
+/// Mints and receives push the credited coin into `coin_queue` without
+/// touching `balance` until a subsequent send drains the queue into
+/// `coin_history`; reading only `a.balance` here would report `0` for
+/// the very transactions the history endpoint is meant to surface (the
+/// E2E suite catches this as `amount = 0` on first mint).
+///
+/// `saturating_add` is used because the two summands come out of an
+/// untrusted on-disk blob; in practice overflow is impossible (per-coin
+/// amounts and `Account.balance` are both bounded by the minting
+/// account's supply), but capping at `u64::MAX` is preferable to a
+/// panic on a corrupted row.
 pub(crate) fn balance_from_account_blob(blob: &[u8]) -> Option<u64> {
-    bincode::deserialize::<crate::account_node::Account>(blob)
-        .ok()
-        .map(|a| a.balance)
+    let a = bincode::deserialize::<crate::account_node::Account>(blob).ok()?;
+    let queued: u64 = a
+        .coin_queue
+        .iter()
+        .fold(0u64, |acc, cp| acc.saturating_add(cp.coin.amount));
+    Some(a.balance.saturating_add(queued))
 }
 
 /// Typed mirror of the `pending_inscriptions.status` CHECK constraint

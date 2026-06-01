@@ -6853,6 +6853,14 @@ fn balance_from_account_blob_round_trips() {
     assert!(balance_from_account_blob(&[0u8, 1, 2, 3]).is_none());
 }
 
+/// Covers the **settled-balance** shape of an `Account` blob: a post-send
+/// account whose `coin_queue` has been drained into `coin_history` and
+/// whose remaining funds sit in the `balance` field. The companion
+/// **queue-only** shape (the actual production write produced by
+/// `commit_mint_tx` / `receive_coin` for a credit) requires a real
+/// `CoinProof` and is pinned in
+/// `account_node_tests::history_row_to_item_balance_from_coin_queue_only`
+/// where the prover fixtures live.
 #[test]
 fn history_row_to_item_handles_first_row_with_no_prev_data() {
     let mut a = Account::new();
