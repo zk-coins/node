@@ -790,6 +790,58 @@ impl AccountNode {
             .insert(*zkcoins_program::types::MINTING_ADDRESS, mutated_minting);
     }
 
+    /// Run a synthetic discardable `prove_initial` to wake the Rayon
+    /// worker pool and warm the AOT-compiled Plonky2 evaluator caches.
+    ///
+    /// Called from a background `spawn_blocking` task spawned by
+    /// `runtime::start_rest_node` AFTER `TcpListener::bind` so the
+    /// HTTP listener is already serving traffic while this runs.
+    /// `/health/ready` exposes a `prover` flag that flips to `ready`
+    /// the moment this call returns Ok; load balancers / Kuma can use
+    /// the readiness endpoint to gate traffic during a rolling deploy
+    /// without holding the API itself offline.
+    ///
+    /// Empirical evidence (dfxdev R2 probe, 2026-05-31):
+    /// - `circuit_build_wall_ms = 14214` — `Prover::new()` (paid in
+    ///   `load_from_pg` already, before this call).
+    /// - `prove_cold_wall_ms = 7012` — first prove call after build,
+    ///   which is what this method pays during background warmup.
+    /// - `prove_warm p50 = 4777` — every subsequent prove call,
+    ///   including the first user-facing request once the background
+    ///   task has reported `prover_warm = true`.
+    ///
+    /// A user-facing `/api/mint` or `/api/send` that lands BEFORE the
+    /// background warmup completes still serves correctly, but pays
+    /// the cold-prove tax (~7 s instead of ~5 s). The deferred cost is
+    /// amortised by every subsequent request.
+    ///
+    /// `prove_initial` against a fresh `AccountState` (zero balance,
+    /// dummy pubkey, `ZERO_HASH` history root) is the cheapest valid
+    /// codepath that exercises the full circuit + Rayon spinup; the
+    /// resulting proof is discarded. No state mutation, no on-chain
+    /// side-effect.
+    ///
+    /// The mirrored helper in `node/src/bin/probe_r2.rs` is the
+    /// reference implementation that produced the numbers above; keep
+    /// the witness shape (fresh `AccountState::new(_)` + `ZERO_HASH`) in
+    /// sync if either side changes.
+    pub fn warmup_prover(&self) -> anyhow::Result<()> {
+        // 33-byte well-formed secp256k1-compressed pubkey placeholder.
+        // The circuit does not verify the pubkey is on-curve in
+        // `prove_initial`, only that the witness layout matches; the
+        // same `0x02` + ramp pattern is used by `probe_r2::dummy_pubkey`
+        // and by `script-plonky2::tests::dummy_pubkey`.
+        let mut pk = [0u8; 33];
+        pk[0] = 0x02;
+        for (i, b) in pk.iter_mut().enumerate().skip(1) {
+            *b = (7u8).wrapping_add(i as u8);
+        }
+        let warmup_account_state = AccountState::new(pk);
+        self.prover
+            .prove_initial(&warmup_account_state, ZERO_HASH)?;
+        Ok(())
+    }
+
     /// Read-only handle on the shared [`State`] (SMT + MMR). Exposed so
     /// the startup invariant check in `runtime` can verify
     /// every persisted minting-account pubkey has a corresponding SMT

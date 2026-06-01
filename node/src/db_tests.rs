@@ -1248,3 +1248,145 @@ async fn get_inscription_summary_rejects_invalid_kind_in_row() {
         .expect_err("summary must reject bogus kind");
     assert!(matches!(err, sqlx::Error::Decode(_)));
 }
+
+// ---- list_account_history (issue #153) ------------------------------------
+
+/// Insert a synthetic `account_history` row directly so the test can
+/// pin the timestamp ordering without racing the trigger-driven path.
+async fn plant_history_row(
+    pool: &PgPool,
+    address: &[u8],
+    source: &str,
+    new_balance: u64,
+    seconds_ago: i64,
+) {
+    use crate::account_node::Account;
+    let mut a = Account::new();
+    a.balance = new_balance;
+    let new_data = bincode::serialize(&a).expect("serialize account");
+    sqlx::query(
+        "INSERT INTO account_history \
+         (address, prev_data, new_data, source, changed_at) \
+         VALUES ($1, NULL, $2, $3, NOW() - ($4 || ' seconds')::INTERVAL)",
+    )
+    .bind(address)
+    .bind(&new_data)
+    .bind(source)
+    .bind(seconds_ago.to_string())
+    .execute(pool)
+    .await
+    .expect("insert account_history row");
+}
+
+#[tokio::test]
+async fn list_account_history_empty_returns_zero_total() {
+    let (pool, _c) = setup_pool().await;
+    let address = [0xaau8; 32];
+    let (rows, total) = list_account_history(&pool, &address[..], 50, 0)
+        .await
+        .expect("list returns Ok");
+    assert!(rows.is_empty());
+    assert_eq!(total, 0);
+}
+
+#[tokio::test]
+async fn list_account_history_orders_newest_first_and_paginates() {
+    let (pool, _c) = setup_pool().await;
+    let address = [0xbbu8; 32];
+    // Plant rows at 30 s, 20 s, 10 s ago — list must order
+    // newest-first (10 s, 20 s, 30 s).
+    plant_history_row(&pool, &address[..], "mint", 100, 30).await;
+    plant_history_row(&pool, &address[..], "receive", 200, 20).await;
+    plant_history_row(&pool, &address[..], "send", 150, 10).await;
+
+    let (page, total) = list_account_history(&pool, &address[..], 50, 0)
+        .await
+        .unwrap();
+    assert_eq!(total, 3);
+    assert_eq!(page.len(), 3);
+    assert_eq!(page[0].source, "send", "newest first");
+    assert_eq!(page[1].source, "receive");
+    assert_eq!(page[2].source, "mint");
+
+    // Limit + offset
+    let (page, total) = list_account_history(&pool, &address[..], 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].source, "receive");
+    assert_eq!(total, 3, "total stays consistent across pages");
+
+    // Offset past total
+    let (page, total) = list_account_history(&pool, &address[..], 10, 99)
+        .await
+        .unwrap();
+    assert!(page.is_empty());
+    assert_eq!(
+        total, 3,
+        "empty page still surfaces the real total (no second-query branch needed)"
+    );
+
+    // Other address never appears.
+    let other = [0xccu8; 32];
+    let (page, total) = list_account_history(&pool, &other[..], 10, 0)
+        .await
+        .unwrap();
+    assert!(page.is_empty());
+    assert_eq!(total, 0);
+}
+
+#[tokio::test]
+async fn list_account_history_surfaces_blob_and_metadata() {
+    let (pool, _c) = setup_pool().await;
+    let address = [0xddu8; 32];
+    plant_history_row(&pool, &address[..], "mint", 12_345, 1).await;
+    let (rows, total) = list_account_history(&pool, &address[..], 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(total, 1);
+    let row = &rows[0];
+    assert_eq!(row.source, "mint");
+    assert!(row.prev_data.is_none(), "first INSERT has no prev_data");
+    assert!(row.commit_txid.is_none());
+    assert!(row.block_height.is_none());
+    assert!(row.pending_status.is_none());
+    assert!(row.timestamp_secs > 0, "timestamp epoch derived");
+    // new_data round-trips through bincode -> Account
+    let decoded: crate::account_node::Account =
+        bincode::deserialize(&row.new_data).expect("decode Account");
+    assert_eq!(decoded.balance, 12_345);
+}
+
+#[tokio::test]
+async fn list_account_history_filters_scanner_and_recovery_in_sql() {
+    // Scanner / recovery rows must be filtered in SQL — pushing the
+    // filter into the query is what keeps `total` and the page length
+    // honest (a post-fetch filter on the page would drop rows AFTER the
+    // LIMIT and break pagination math). Issue #153 round-2 review fix.
+    let (pool, _c) = setup_pool().await;
+    let address = [0xeeu8; 32];
+    plant_history_row(&pool, &address[..], "scanner", 50, 50).await;
+    plant_history_row(&pool, &address[..], "mint", 100, 40).await;
+    plant_history_row(&pool, &address[..], "recovery", 110, 30).await;
+    plant_history_row(&pool, &address[..], "send", 90, 20).await;
+    plant_history_row(&pool, &address[..], "receive", 200, 10).await;
+
+    let (rows, total) = list_account_history(&pool, &address[..], 50, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        total, 3,
+        "total = filtered count (mint + send + receive), excludes scanner/recovery"
+    );
+    assert_eq!(rows.len(), 3);
+    let sources: Vec<&str> = rows.iter().map(|r| r.source.as_str()).collect();
+    // Newest-first ordering preserved within the filter.
+    assert_eq!(sources, vec!["receive", "send", "mint"]);
+    assert!(
+        sources
+            .iter()
+            .all(|s| matches!(*s, "mint" | "send" | "receive")),
+        "no scanner / recovery rows leak past the SQL filter"
+    );
+}

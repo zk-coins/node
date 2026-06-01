@@ -14,7 +14,7 @@ use shared::ClientAccount;
 use shared::{Invoice, ProofData};
 use sqlx::PgPool;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tower_http::cors::CorsLayer;
 use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes};
@@ -262,6 +262,23 @@ pub(crate) struct AppState {
     /// clones `NETWORK_CONFIG` into this slot so the runtime
     /// behaviour is unchanged.
     pub(crate) esplora_config: Arc<EsploraConfig>,
+    /// Background-warmup readiness flag. Default `false` at bootstrap
+    /// start; flipped to `true` either (a) once the background
+    /// `spawn_blocking` task in `runtime::start_rest_node` reports that
+    /// `AccountNode::warmup_prover` returned Ok — at which point the
+    /// Rayon worker pool is warm and every subsequent `/api/mint` /
+    /// `/api/send` proof matches the steady-state ~5 s p50 — or (b)
+    /// immediately at bootstrap when `ZKCOINS_SKIP_BOOTSTRAP_WARMUP=1`
+    /// is set (no background task is spawned in that case).
+    ///
+    /// Consumed by `/health/ready`: while `prover_warm == false` the
+    /// handler returns 503 with a `prover: warming` tag so a rolling
+    /// deploy can keep the previous-generation pod taking traffic
+    /// until the new pod's prover is warm. The liveness probe
+    /// `/health` is unaffected — it returns 200 the moment the
+    /// listener binds, so container restart loops keyed on liveness
+    /// are not triggered during the ~21 s warmup window.
+    pub(crate) prover_warm: Arc<AtomicBool>,
     /// Test-only synchronisation primitive used by
     /// `mint_handler_concurrent_mint_during_proof_returns_503`. The
     /// production code path notifies via `notify_one()` after entering
@@ -336,6 +353,267 @@ pub struct BalanceResponse {
 #[derive(Serialize, Deserialize)]
 pub struct AddressesResponse {
     addresses: Vec<String>,
+}
+
+// ----- /api/history (issue #153) ------------------------------------------
+
+/// Default page size when `/api/history?limit` is omitted.
+pub(crate) const HISTORY_DEFAULT_LIMIT: i64 = 50;
+/// Hard cap on `/api/history?limit`. Anything outside `[1, MAX]` is a
+/// 400 — clamping silently was rejected as a footgun (callers that pass
+/// `limit=1000` should learn about the cap, not get an unexplained 200
+/// with 200 rows).
+pub(crate) const HISTORY_MAX_LIMIT: i64 = 200;
+
+/// `?address=&limit=&offset=` query for `GET /api/history`. All three
+/// are parsed via the typed `Query` extractor so axum surfaces a 400 on
+/// a non-integer `limit` / `offset` without the handler having to
+/// re-parse.
+#[derive(Deserialize)]
+pub(crate) struct HistoryQuery {
+    pub address: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// One entry in the `/api/history` response. Field names match the
+/// issue #153 contract verbatim; `null`-able fields use `Option<T>`
+/// with `serialize_with = Some` so the wire shape stays
+/// `"field": null` rather than the field being elided.
+///
+/// Memo / counterparty / block_height stay `null` today: the current
+/// schema does not store the recipient address per-mutation
+/// (`account_history` is keyed on the address that changed, not the
+/// counterparty), no memo column exists, and `triggering_commit_txid`
+/// is unset by every Rust caller — see [`db::AccountHistoryRow::commit_txid`]
+/// for the GUC-plumbing story.
+#[derive(Serialize)]
+pub struct HistoryItem {
+    /// Server-internal monotonic id. Always set — sourced from
+    /// `account_history.id`.
+    pub id: i64,
+    /// Bitcoin txid (lower-case hex, 64 chars) of the commit inscription
+    /// for this state change, once the publisher has broadcast it.
+    /// `null` while no commit_txid is linked to the row.
+    pub txid: Option<String>,
+    /// Unix epoch in seconds of the state change.
+    pub timestamp: i64,
+    /// `"send"`, `"receive"`, or `"mint"`. `scanner` / `recovery`
+    /// `account_history` rows are filtered out before the handler maps
+    /// to this enum.
+    pub direction: &'static str,
+    /// Absolute balance delta in sats (`|new_balance − prev_balance|`).
+    /// For a `receive` / `mint` this is the amount credited; for a
+    /// `send` this is the amount debited.
+    pub amount: u64,
+    /// Counterparty address (lower-case hex, 64 chars). Always `null`
+    /// in the current schema — see the type-level doc-comment.
+    pub counterparty: Option<String>,
+    /// `"pending"`, `"confirmed"`, or `"failed"`. Every persisted
+    /// `account_history` row reflects a state mutation that committed
+    /// in Postgres, so the default is `"confirmed"`; the alternative
+    /// values surface once the `pending_inscriptions` join lights up.
+    pub status: &'static str,
+    /// Bitcoin block height that contains the commit inscription, or
+    /// `null` while the scanner has not integrated it (and while the
+    /// `commit_txid` link is missing).
+    pub block_height: Option<i64>,
+    /// Free-text memo attached to the operation. Always `null` — no
+    /// memo column exists in the current schema.
+    pub memo: Option<String>,
+}
+
+/// Paginated wrapper around [`HistoryItem`]. `total` is the unfiltered
+/// count for the queried address (not the count of returned `items`)
+/// so the caller can drive pagination without a separate query.
+#[derive(Serialize)]
+pub struct HistoryResponse {
+    pub items: Vec<HistoryItem>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// JSON envelope returned by the validation-failure branches of
+/// `get_history_handler`. Distinct from the existing `SendCoinResponse`
+/// shape because `/api/history` is a read endpoint with no `success` /
+/// `proof_id` machinery — a flat `{ "error": "..." }` is the contract
+/// the issue documents.
+#[derive(Serialize)]
+pub struct HistoryErrorResponse {
+    pub error: &'static str,
+}
+
+/// Decode the 64-char (or 64 char + 0x prefix) hex `address` argument
+/// into the raw 32-byte form `account_history.address` is keyed on.
+/// Reuses the exact decode + length rules `get_balance_handler` applies
+/// — `Err` on non-hex characters or a length that does not unpack to
+/// 32 bytes.
+pub(crate) fn decode_history_address(raw: &str) -> Result<[u8; 32], &'static str> {
+    let bytes = hex::decode(raw.trim_start_matches("0x")).map_err(|_| "Invalid address hex")?;
+    if bytes.len() != 32 {
+        return Err("Address must be 32 bytes (64 hex chars)");
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+/// Map an `account_history.source` string into the user-facing
+/// `direction` enum. Returns `None` for the `scanner` and `recovery`
+/// sources, which are internal mutations the user did not initiate and
+/// the handler filters out before serialising.
+pub(crate) fn map_history_direction(source: &str) -> Option<&'static str> {
+    match source {
+        "mint" => Some("mint"),
+        "send" => Some("send"),
+        "receive" => Some("receive"),
+        // `scanner` and `recovery` are internal replays / operator-only
+        // mutations. Surface a `None` so the handler skips them.
+        _ => None,
+    }
+}
+
+/// Recover the `balance` field out of a bincode-serialised
+/// [`crate::account_node::Account`] blob. Returns `None` if the bytes
+/// fail to round-trip — defensive, the handler treats a decode failure
+/// as a missing prior balance (so the delta collapses to the absolute
+/// new balance instead of producing a fabricated number).
+pub(crate) fn balance_from_account_blob(blob: &[u8]) -> Option<u64> {
+    bincode::deserialize::<crate::account_node::Account>(blob)
+        .ok()
+        .map(|a| a.balance)
+}
+
+/// Typed mirror of the `pending_inscriptions.status` CHECK constraint
+/// (migration 0003: `constructed`, `commit_broadcast`, `reveal_broadcast`,
+/// `complete`, `failed`). Parsed via [`PendingInscriptionStatus::from_db_str`]
+/// so the `match` in [`history_row_to_item`] can be exhaustive and a
+/// future schema state addition forces compile-time attention — a plain
+/// `match row.pending_status.as_deref()` on a `String` can't enforce
+/// that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingInscriptionStatus {
+    Constructed,
+    CommitBroadcast,
+    RevealBroadcast,
+    Complete,
+    Failed,
+}
+
+impl PendingInscriptionStatus {
+    /// Map a raw `pending_inscriptions.status` string to the enum.
+    /// Returns `None` for an unrecognised value — Postgres's CHECK
+    /// constraint prevents that in practice, but if it ever leaks the
+    /// handler degrades to `pending` rather than crash.
+    pub(crate) fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "constructed" => Some(Self::Constructed),
+            "commit_broadcast" => Some(Self::CommitBroadcast),
+            "reveal_broadcast" => Some(Self::RevealBroadcast),
+            "complete" => Some(Self::Complete),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// Convert one [`db::AccountHistoryRow`] into a wire [`HistoryItem`].
+/// Returns `None` if the row's source is internal (`scanner` /
+/// `recovery`), if the `new_data` blob fails to decode, or if a
+/// non-null `prev_data` blob fails to decode (treating that as zero
+/// would fabricate a full-balance delta — see the inner `match` for
+/// the warn log).
+pub(crate) fn history_row_to_item(row: &crate::db::AccountHistoryRow) -> Option<HistoryItem> {
+    let direction = map_history_direction(&row.source)?;
+    let new_balance = balance_from_account_blob(&row.new_data)?;
+    // `prev_data` is `None` on the first INSERT for an address — treat
+    // that as a from-zero delta so the very first mint / receive
+    // surfaces the full credit instead of disappearing. A `Some(blob)`
+    // that fails to decode is *not* the same as `None`: silently
+    // collapsing to zero would fabricate the full new balance as the
+    // delta. Drop the row instead and log a warn so an operator can
+    // notice the schema drift.
+    let prev_balance = match row.prev_data.as_deref() {
+        None => 0,
+        Some(blob) => match balance_from_account_blob(blob) {
+            Some(b) => b,
+            None => {
+                let blob_len = blob.len();
+                tracing::warn!(
+                    "history_row_to_item: row id={} address has un-decodable prev_data blob (len={}); dropping row to avoid fabricating a full-balance delta",
+                    row.id,
+                    blob_len,
+                );
+                return None;
+            }
+        },
+    };
+    // Absolute delta — sends are debits (prev > new), mints / receives
+    // are credits (new > prev). The `direction` field already encodes
+    // the sign for the caller.
+    let amount = new_balance.max(prev_balance) - new_balance.min(prev_balance);
+
+    // Wire status derived from `pending_inscriptions.status` (the
+    // authoritative state machine) joined to `observed_inscriptions`
+    // for the post-broadcast on-chain confirmation. A DB-committed
+    // `account_history` row only proves a server-side state change —
+    // *not* an on-chain confirmation — so the default before any
+    // matching inscription row exists is `pending`, not `confirmed`.
+    //
+    // The inner `match pending` is exhaustive over the
+    // [`PendingInscriptionStatus`] enum (which mirrors migration 0003's
+    // CHECK constraint). A future state added to the enum will fail to
+    // compile here — no silent `_ => "pending"` catch-all.
+    //
+    // The unknown-string case is handled separately via
+    // `from_db_str` returning `None`: Postgres's CHECK constraint
+    // already prevents that, but if it ever leaks we warn and degrade
+    // to `pending` rather than crash.
+    let pending_enum = row
+        .pending_status
+        .as_deref()
+        .map(|s| (s, PendingInscriptionStatus::from_db_str(s)));
+    let status = match pending_enum {
+        Some((_, Some(p))) => match p {
+            PendingInscriptionStatus::Complete => "confirmed",
+            PendingInscriptionStatus::Failed => "failed",
+            PendingInscriptionStatus::Constructed
+            | PendingInscriptionStatus::CommitBroadcast
+            | PendingInscriptionStatus::RevealBroadcast => "pending",
+        },
+        Some((raw, None)) => {
+            tracing::warn!(
+                "history_row_to_item: unknown pending_inscriptions.status={:?} (id={}); defaulting to pending",
+                raw,
+                row.id,
+            );
+            "pending"
+        }
+        // No pending_inscriptions row but the scanner has observed the
+        // inscription on-chain — it's confirmed even though we lost the
+        // pending row (the resumer prunes `complete` rows after a
+        // safe-depth threshold).
+        None if row.block_height.is_some() => "confirmed",
+        // Neither pending nor observed — the on-chain side is not yet
+        // known to us; the DB write alone does not warrant `confirmed`.
+        None => "pending",
+    };
+
+    Some(HistoryItem {
+        id: row.id,
+        txid: row.commit_txid.as_deref().map(hex::encode),
+        timestamp: row.timestamp_secs,
+        direction,
+        amount,
+        // TODO(zk-coins/node#160): capture `counterparty_address` per
+        // `account_history` row (schema change) so this stops being
+        // unconditionally null.
+        counterparty: None,
+        status,
+        block_height: row.block_height,
+        memo: None,
+    })
 }
 
 #[derive(Deserialize)]
@@ -786,6 +1064,121 @@ async fn get_balance_handler(
             }),
         )
     }
+}
+
+/// `GET /api/history?address=<hex>&limit=<n>&offset=<n>` — paginated
+/// per-address transaction history. Implements issue #153.
+///
+/// Sort order is fixed `ORDER BY changed_at DESC` (newest first); the
+/// matching test in `router_tests.rs` pins this so a future caller
+/// cannot silently flip the order.
+///
+/// Validation contract (all return HTTP 422 with a
+/// [`HistoryErrorResponse`] — mirrors the `/api/balance` shape so the
+/// whole read surface uses the same status for malformed input):
+///   * `address` missing.
+///   * `address` not valid 32-byte hex.
+///   * `limit` outside `[1, 200]` (the issue's max=200 rule). `limit=0`
+///     is rejected because a successful response with zero items would
+///     be indistinguishable from "no rows", masking the misuse.
+///   * `offset` negative.
+///
+/// A successful response with `offset >= total` returns
+/// `items: [], total: N` so the caller can detect end-of-list without
+/// a second round-trip.
+///
+/// Persistence: pure read from `account_history` (joined with
+/// `observed_inscriptions` + `pending_inscriptions` for the future
+/// txid/block_height/status link — see [`db::AccountHistoryRow`] for
+/// the today-vs-tomorrow story). No new schema work.
+async fn get_history_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<HistoryQuery>,
+) -> impl IntoResponse {
+    // Resolve defaults first so the rest of the validation block can
+    // assume concrete values. `Option::get().copied().unwrap_or(...)`
+    // would also work but the field is already an `Option<i64>` from
+    // the typed extractor — `unwrap_or` is the same shape.
+    let limit = query.limit.unwrap_or(HISTORY_DEFAULT_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+
+    // --- validation ---
+    let address_hex = match query.address.as_deref() {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(HistoryErrorResponse {
+                    error: "Missing required `address` query parameter",
+                }),
+            )
+                .into_response();
+        }
+    };
+    let address_bytes = match decode_history_address(address_hex) {
+        Ok(b) => b,
+        Err(msg) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(HistoryErrorResponse { error: msg }),
+            )
+                .into_response();
+        }
+    };
+    if !(1..=HISTORY_MAX_LIMIT).contains(&limit) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(HistoryErrorResponse {
+                error: "limit must be in [1, 200]",
+            }),
+        )
+            .into_response();
+    }
+    if offset < 0 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(HistoryErrorResponse {
+                error: "offset must be non-negative",
+            }),
+        )
+            .into_response();
+    }
+
+    // --- DB read ---
+    // Single round-trip: page rows + filtered total in one query so the
+    // handler carries a single DB error branch.
+    let (rows, total) =
+        match db::list_account_history(&state.pool, &address_bytes, limit, offset).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("get_history_handler: list query failed: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(HistoryErrorResponse {
+                        error: "Database error while reading history",
+                    }),
+                )
+                    .into_response();
+            }
+        };
+
+    // Defense-in-depth safety net: the SQL already filters to
+    // mint/send/receive, so `filter_map` should never actually drop a
+    // row in normal operation. If it does, that's a schema drift bug —
+    // the post-fetch filter prevents a junk row from reaching the wire
+    // until someone fixes the SQL.
+    let items: Vec<HistoryItem> = rows.iter().filter_map(history_row_to_item).collect();
+
+    (
+        StatusCode::OK,
+        Json(HistoryResponse {
+            items,
+            total,
+            limit,
+            offset,
+        }),
+    )
+        .into_response()
 }
 
 #[cfg(feature = "address-list")]
@@ -1708,12 +2101,29 @@ async fn r2_probe_history_handler(
 
 /// JSON body returned by `GET /health/ready`. `failures` is empty on a
 /// fully ready node; each failing dependency contributes one stable
-/// short tag (`"db"`, `"esplora"`) so a Kuma monitor parses the cause
-/// without having to scrape the status code in isolation.
+/// short tag (`"db"`, `"esplora"`, `"prover"`) so a Kuma monitor parses
+/// the cause without having to scrape the status code in isolation.
+///
+/// `prover` is the background-warmup tag (see `AppState::prover_warm`):
+/// while the bootstrap warmup task is still running, the readiness
+/// probe reports `failures: ["prover"]` with `status: starting` and a
+/// 503 so a load balancer keeps holding traffic on the previous-gen
+/// pod. `/health` (liveness) is unaffected.
 #[derive(Serialize)]
 struct ReadyResponse {
     ready: bool,
     failures: Vec<&'static str>,
+    /// Lifecycle tag. `"starting"` while any failure is present,
+    /// `"ready"` once every dependency probe passes. Distinct from
+    /// `ready: bool` so a parsing consumer can branch on a short
+    /// string without re-deriving it from the bool + failures shape.
+    status: &'static str,
+    /// Background-warmup tag. `"warming"` while
+    /// `AppState::prover_warm == false`, `"ready"` afterwards.
+    /// Emitted on every response (regardless of overall readiness) so
+    /// a deploy dashboard can show the warmup progress separately
+    /// from the DB/Esplora probes.
+    prover: &'static str,
 }
 
 /// Readiness probe (`GET /health/ready`).
@@ -1749,13 +2159,36 @@ async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
         failures.push("esplora");
     }
 
+    // Background-warmup gate. `prover_warm` is flipped to true by the
+    // `spawn_blocking` task that `runtime::start_rest_node` launches
+    // immediately after binding the TCP listener (or directly at boot
+    // when `ZKCOINS_SKIP_BOOTSTRAP_WARMUP=1`). Until then a user
+    // request still succeeds but pays the ~7 s cold-prove tax — for
+    // the rolling-deploy use case the load balancer holds traffic on
+    // the previous-gen pod by treating this readiness probe as the
+    // gate, not the liveness probe.
+    let prover_warm = state.prover_warm.load(Ordering::SeqCst);
+    if !prover_warm {
+        failures.push("prover");
+    }
+
     let ready = failures.is_empty();
     let status = if ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (status, Json(ReadyResponse { ready, failures }))
+    let lifecycle_status = if ready { "ready" } else { "starting" };
+    let prover_status = if prover_warm { "ready" } else { "warming" };
+    (
+        status,
+        Json(ReadyResponse {
+            ready,
+            failures,
+            status: lifecycle_status,
+            prover: prover_status,
+        }),
+    )
 }
 
 /// Ping the configured Esplora endpoint. A successful tip-height fetch
@@ -1851,6 +2284,7 @@ struct RootResponse {
 struct RootEndpoints {
     info: &'static str,
     balance: &'static str,
+    history: &'static str,
     send: &'static str,
     receive: &'static str,
     commit: &'static str,
@@ -1872,6 +2306,7 @@ async fn root_handler() -> impl IntoResponse {
         endpoints: RootEndpoints {
             info: "GET  /api/info",
             balance: "GET  /api/balance?address={hex}",
+            history: "GET  /api/history?address={hex}&limit={n}&offset={n}",
             send: "POST /api/send",
             receive: "POST /api/receive",
             commit: "POST /api/commit",
@@ -2243,6 +2678,7 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/health/publisher", get(publisher_health_handler))
         .route("/api/info", get(info_handler))
         .route("/api/balance", get(get_balance_handler))
+        .route("/api/history", get(get_history_handler))
         .route("/api/send", post(send_coin_handler))
         .route("/api/receive", post(receive_coin_handler))
         .route("/api/proof/:id", get(get_proof_handler))

@@ -1279,6 +1279,160 @@ pub async fn load_root_indices(
     Ok(out)
 }
 
+// ---- Account history listing (issue #153) ---------------------------------
+
+/// One row of the per-account history view returned by
+/// [`list_account_history`]. Mirrors the columns of `account_history`
+/// that the `/api/history` handler surfaces, plus the joined
+/// `block_height` / `status` / `commit_txid` triple from
+/// `observed_inscriptions` and `pending_inscriptions` (currently always
+/// `None` because no code path threads `zkcoins.account_commit_txid`
+/// through the upsert trigger — see the field docs).
+#[derive(Debug, Clone)]
+pub struct AccountHistoryRow {
+    /// `account_history.id` — server-internal monotonic id, always set.
+    /// Stable across restarts; safe to expose as the row identifier.
+    pub id: i64,
+    /// `account_history.changed_at` as a Unix epoch in seconds.
+    pub timestamp_secs: i64,
+    /// `account_history.source` — one of `mint` / `send` / `receive` /
+    /// `scanner` / `recovery`. The handler filters to the user-facing
+    /// trio before mapping to the `direction` enum on the wire.
+    pub source: String,
+    /// `account_history.prev_data` bincode blob, `None` for the first
+    /// row of an address (initial INSERT). Used by the handler to
+    /// compute the balance delta that becomes the `amount` field.
+    pub prev_data: Option<Vec<u8>>,
+    /// `account_history.new_data` bincode blob — never null per schema.
+    pub new_data: Vec<u8>,
+    /// `account_history.triggering_commit_txid` — the on-chain commit
+    /// txid that caused this state change, if known. Currently always
+    /// `None`: the schema + trigger machinery (migration 0009) supports
+    /// it via the `zkcoins.account_commit_txid` GUC but no Rust caller
+    /// sets that GUC today. Surfaced via `pending_inscriptions.commit_txid`
+    /// once a publisher path threads it through.
+    pub commit_txid: Option<Vec<u8>>,
+    /// `observed_inscriptions.block_height` for the matching commit, if
+    /// the scanner has integrated it. `None` while `commit_txid` is also
+    /// `None`.
+    pub block_height: Option<i64>,
+    /// `pending_inscriptions.status` for the matching commit (`pending`,
+    /// `commit_broadcast`, `reveal_broadcast`, `complete`, `failed`).
+    /// `None` while `commit_txid` is `None`.
+    pub pending_status: Option<String>,
+}
+
+/// Fetch the `limit` most recent user-facing `account_history` rows for
+/// `address` (newest first, skipping the first `offset` rows) together
+/// with the filtered `total` row count for pagination. The `address`
+/// argument is the 32-byte raw form (BYTEA) — callers convert the
+/// user-supplied hex via the same path `/api/balance` uses.
+///
+/// Only rows whose `source` is in `('mint','send','receive')` are
+/// counted or returned. `scanner` and `recovery` rows are internal
+/// mutations the user did not initiate and the handler refuses to
+/// surface them; pushing the filter into SQL means the page size and
+/// the `total` agree (a post-fetch filter would drop rows after the
+/// LIMIT and break pagination math).
+///
+/// The two LEFT JOINs surface block_height + status when (and only
+/// when) a future caller populates `account_history.triggering_commit_txid`.
+/// Today both joined columns are always NULL; see
+/// [`AccountHistoryRow::commit_txid`] for the rationale.
+///
+/// `limit` and `offset` are caller-validated `i64`s (the handler clamps
+/// `limit` to `[1, 200]` and rejects negative values upstream); they
+/// bind directly into the query via `$2` / `$3`.
+///
+/// Returns `(rows, total)`. `total` is the filtered count — every row
+/// of `rows` is counted in `total`, and `total >= rows.len()` always.
+/// One round-trip via `COUNT(*) OVER()` so the handler has a single
+/// DB error branch (closes the `list_account_history` dead-arm gap a
+/// two-query layout would leave behind).
+///
+/// TODO(zk-coins/node#159): thread `zkcoins.account_commit_txid`
+/// GUC through the publisher / mint / send paths so
+/// `triggering_commit_txid` lights up here and the LEFT JOINs start
+/// returning data instead of always-NULL.
+pub async fn list_account_history(
+    pool: &PgPool,
+    address: &[u8],
+    limit: i64,
+    offset: i64,
+) -> sqlx::Result<(Vec<AccountHistoryRow>, i64)> {
+    use sqlx::Row;
+    // Single round-trip: a `total` CTE counts the filtered rows, the
+    // `page` CTE selects the LIMIT/OFFSET slice with the joins, and we
+    // cross-join the total onto every row of the page. When the page is
+    // empty (offset past total, or no rows at all) the outer query
+    // returns a single sentinel row with `id = NULL` so the handler
+    // still learns the real total without a second query — no
+    // dead-error-branch problem from a two-query layout.
+    let rows = sqlx::query(
+        "WITH \
+            total AS ( \
+                SELECT COUNT(*)::BIGINT AS n FROM account_history \
+                WHERE address = $1 \
+                  AND source IN ('mint','send','receive') \
+            ), \
+            page AS ( \
+                SELECT ah.id, \
+                       EXTRACT(EPOCH FROM ah.changed_at)::BIGINT AS ts_secs, \
+                       ah.source, ah.prev_data, ah.new_data, \
+                       ah.triggering_commit_txid, \
+                       oi.block_height, \
+                       pi.status AS pending_status \
+                FROM account_history ah \
+                LEFT JOIN observed_inscriptions oi \
+                    ON oi.commit_txid = ah.triggering_commit_txid \
+                LEFT JOIN pending_inscriptions pi \
+                    ON pi.commit_txid = ah.triggering_commit_txid \
+                WHERE ah.address = $1 \
+                  AND ah.source IN ('mint','send','receive') \
+                ORDER BY ah.changed_at DESC, ah.id DESC \
+                LIMIT $2 OFFSET $3 \
+            ) \
+        SELECT p.id, p.ts_secs, p.source, p.prev_data, p.new_data, \
+               p.triggering_commit_txid, p.block_height, p.pending_status, \
+               t.n AS total \
+        FROM total t \
+        LEFT JOIN page p ON TRUE",
+    )
+    .bind(address)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+
+    // `total` is identical on every row (cross-join from the singleton
+    // CTE); read it once. If the page CTE yielded zero rows, the LEFT
+    // JOIN keeps a single sentinel row with `id IS NULL` — skip it when
+    // mapping to `AccountHistoryRow`s but still read `total` off it.
+    let total = rows.first().map(|r| r.get::<i64, _>("total")).unwrap_or(0);
+    let items = rows
+        .into_iter()
+        .filter_map(|r| {
+            // Sentinel-row guard: when the page CTE is empty, the outer
+            // SELECT still returns one row (from the `total` CTE) with
+            // every `p.*` column NULL. `id` is NOT NULL on real rows,
+            // so its absence flags the sentinel.
+            let id: Option<i64> = r.try_get("id").ok().flatten();
+            let id = id?;
+            Some(AccountHistoryRow {
+                id,
+                timestamp_secs: r.get("ts_secs"),
+                source: r.get("source"),
+                prev_data: r.get("prev_data"),
+                new_data: r.get("new_data"),
+                commit_txid: r.get("triggering_commit_txid"),
+                block_height: r.get("block_height"),
+                pending_status: r.get("pending_status"),
+            })
+        })
+        .collect();
+    Ok((items, total))
+}
+
 #[cfg(test)]
 #[path = "db_tests.rs"]
 mod tests;

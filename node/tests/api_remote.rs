@@ -503,6 +503,131 @@ async fn balance_invalid_hex_returns_422() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// /api/history — paginated per-address history (issue #153)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn history_missing_address_returns_422() {
+    let resp = http_client()
+        .get(url("/api/history"))
+        .send()
+        .await
+        .expect("GET /api/history (no params)");
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn history_invalid_hex_returns_422() {
+    let resp = http_client()
+        .get(url("/api/history?address=not_hex"))
+        .send()
+        .await
+        .expect("GET /api/history (bad hex)");
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: Value = resp.json().await.expect("history body JSON");
+    assert!(
+        body["error"].as_str().is_some(),
+        "422 body must carry an `error` string"
+    );
+}
+
+#[tokio::test]
+async fn history_limit_above_max_returns_422() {
+    let address = format!("0x{}", "00".repeat(32));
+    let resp = http_client()
+        .get(url(&format!("/api/history?address={}&limit=201", address)))
+        .send()
+        .await
+        .expect("GET /api/history (oversize limit)");
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn history_unknown_address_returns_empty_page() {
+    let address = format!("0x{}", "11".repeat(32));
+    let resp = http_client()
+        .get(url(&format!("/api/history?address={}", address)))
+        .send()
+        .await
+        .expect("GET /api/history (unknown addr)");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.expect("body JSON");
+    assert_eq!(body["total"], 0);
+    assert_eq!(body["offset"], 0);
+    assert_eq!(body["limit"], 50);
+    assert_eq!(body["items"].as_array().unwrap().len(), 0);
+}
+
+/// Live contract round-trip: mint into a freshly-generated address,
+/// then probe `/api/history` and assert that the credit lands on the
+/// minted account as a `direction: "mint"` row whose `amount` matches
+/// the mint size.
+///
+/// This is the only `/api/history` test that performs a state-mutating
+/// call; the bookkeeping mirrors `mint_roundtrip_lands_balance_and_proof`
+/// so the suite stays race-free against parallel runs.
+#[tokio::test]
+async fn history_after_mint_records_mint_row() {
+    let client = http_client();
+    let alice = TestWallet::new();
+
+    assert_minting_balance_in_bounds(&client).await;
+
+    let mint_resp = client
+        .post(url("/api/mint"))
+        .json(&json!({
+            "account_address": alice.address_hex(),
+            "amount": MINT_AMOUNT,
+        }))
+        .send()
+        .await
+        .expect("POST /api/mint");
+    assert_eq!(mint_resp.status(), StatusCode::OK);
+    let mint_body: Value = mint_resp.json().await.expect("mint body JSON");
+    assert_eq!(mint_body["success"], Value::Bool(true));
+
+    // Wait for the mint credit to land on Alice's balance — same poll
+    // pattern the existing mint roundtrip uses; once balance >= MINT,
+    // the matching account_history row exists.
+    let _observed = poll_balance_at_least(&client, &alice.address_hex(), MINT_AMOUNT).await;
+
+    let history_resp = client
+        .get(url(&format!(
+            "/api/history?address={}",
+            alice.address_hex()
+        )))
+        .send()
+        .await
+        .expect("GET /api/history (post-mint)");
+    assert_eq!(history_resp.status(), StatusCode::OK);
+    let body: Value = history_resp.json().await.expect("history body JSON");
+
+    assert!(
+        body["total"].as_i64().unwrap_or(0) >= 1,
+        "expected at least one history row, got body={}",
+        body
+    );
+    let items = body["items"].as_array().expect("items array");
+    assert!(!items.is_empty(), "items must not be empty");
+    // Newest-first: the latest row is the mint credit we just landed.
+    let head = &items[0];
+    assert_eq!(head["direction"], "mint");
+    assert_eq!(head["amount"], MINT_AMOUNT);
+    // No Rust caller threads `zkcoins.account_commit_txid` through the
+    // mint path today (see the GUC TODO in db.rs::list_account_history),
+    // so `triggering_commit_txid` is NULL, the LEFT JOINs return NULL,
+    // and the on-chain side is not yet observable from `/api/history`:
+    // wire status is `pending`, not `confirmed`. The default flipped
+    // from `confirmed` -> `pending` in round 2 to stop misrepresenting
+    // DB-committed-only rows as on-chain confirmations.
+    assert_eq!(head["status"], "pending");
+    assert!(head["id"].as_i64().is_some(), "id must be set");
+    // Spec contract — these are nullable on the wire.
+    assert!(head["counterparty"].is_null() || head["counterparty"].is_string());
+    assert!(head["memo"].is_null());
+}
+
 #[tokio::test]
 async fn balance_wrong_length_returns_422() {
     // 16 bytes = 32 hex chars, the handler requires exactly 32 bytes
