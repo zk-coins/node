@@ -2,13 +2,26 @@
 
 This guide covers everything you need to develop, test, and deploy the zkCoins backend.
 
-The first section, "Working on the Plonky2 Migration", documents the project invariants, the decision recipe for "should this go in the MVP?", the pre-push checklist, and the known foot-guns. It applies to all work on `develop` after the 2026-05-18 SP1 → Plonky2 cutover. The rest of this file is the dev guide for day-to-day node work.
+## Trust model — node is trusted, wallet is thin
+
+zkCoins is built around a single trust assumption: **the wallet trusts the node it talks to.** The only line the node is not allowed to cross is the wallet's private key — that stays in the wallet. Everything else may be delegated.
+
+This is a hard project rule. It shapes every design and implementation decision:
+
+- **No anti-node logic in the wallet or SDK.** No client-side proof verification, no scan loops, no view-key / spend-key splits, no consistency checks against a second node, no "node integrity" indicators in the UI. If a feature exists to reduce trust in the node, it does not belong in the wallet or SDK.
+- **Self-hosting is the escape hatch.** Users who do not want to trust the public operator run their own node. The wallet must always be able to switch to a different node by changing a single configuration value.
+- **The node is built so that self-hosting is easy.** Single container, documented configuration, deterministic state, no operator-specific dependencies.
+- **The SDK and wallet stay thin.** They expose seed + address + the small set of operations every familiar wallet SDK exposes. Integrators (Cake Wallet, LayerZ, BlueWallet, …) should be able to wire zkCoins up with the same effort as adding a second Bitcoin-family chain.
+
+When in doubt about whether a feature belongs in the wallet, SDK, or node: if it exists to reduce trust in the node, build it node-side, or document self-hosting as the answer. This rule is mirrored verbatim in [`zk-coins/node`](https://github.com/zk-coins/node/blob/develop/CONTRIBUTING.md), [`zk-coins/sdk`](https://github.com/zk-coins/sdk/blob/develop/CONTRIBUTING.md), [`zk-coins/app`](https://github.com/zk-coins/app/blob/develop/CONTRIBUTING.md), and [`zk-coins/docs`](https://github.com/zk-coins/docs/blob/develop/CONTRIBUTING.md).
 
 ---
 
 ## Working on the Plonky2 Migration
 
-Canonical entry point for any session (agent or human) picking up the
+This section documents the project invariants, the decision recipe for "should this go in the MVP?", the pre-push checklist, and the known foot-guns. It applies to all work on `develop` after the 2026-05-18 SP1 → Plonky2 cutover. The rest of this file is the dev guide for day-to-day node work.
+
+It is the canonical entry point for any session (agent or human) picking up the
 codebase without prior context. The Plonky2 migration (PR [#17](https://github.com/zk-coins/node/pull/17))
 merged on 2026-05-18; this section captures the project invariants that
 survive the migration. Read this section, then dive into the linked
