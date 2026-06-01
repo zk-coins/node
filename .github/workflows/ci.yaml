@@ -29,9 +29,10 @@ on:
   # `if:` guard on each job (saves self-hosted-runner time while
   # work is still in progress).
   #
-  # `labeled` / `unlabeled` are added so toggling the `ci:full`
-  # label triggers (or removes) the heavy self-hosted-runner jobs
-  # on demand — see the `node-tests` job below.
+  # `labeled` / `unlabeled` are added so toggling the `ci:full`,
+  # `ci:db`, or `ci:prover` labels triggers (or removes) the
+  # corresponding self-hosted-runner jobs on demand — see the
+  # `test-and-coverage`, `db-tests`, and `prover-tests` jobs below.
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
@@ -69,17 +70,48 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
-# `lint-and-build` catches what GitHub-hosted Linux can cheaply catch:
-# cross-platform compile bitrot and lint regressions.
+# Job topology:
 #
-# `node-tests` + `coverage` are the authoritative test + coverage gate.
-# They run on the m3-ultra self-hosted runner pool (label `m3-ultra`,
-# 6 agents on dfx01) — the documented hardware target (CONTRIBUTING.md
-# § "Working on the Plonky2 Migration"). On `ubuntu-latest` the full
-# suite repeatedly hit the 75-min timeout (issue #30); on the M3 Ultra
-# it is ~60-90 min for a Rust change. Moving the gate into CI rather
-# than the developer's laptop unblocks the developer on push
-# (issue #40).
+# * `lint-and-build` — GitHub-hosted Linux. Catches cross-platform
+#   compile bitrot and lint regressions cheaply. Gates everything
+#   below via `needs:`.
+#
+# * `db-tests` / `prover-tests` — narrow, label-gated subsets on the
+#   m3-ultra pool for fast developer iteration. They run plain
+#   `cargo nextest` (no llvm-cov instrumentation), enforce NO
+#   coverage gate, and only execute the tests relevant to the area
+#   the developer is working on. Two labels:
+#     - `ci:db`     → Postgres / state / coordinator (~15 min)
+#     - `ci:prover` → Plonky2-heavy mint/send/receive (~25 min)
+#   Both are mutually exclusive with `ci:full`: a PR carrying
+#   `ci:full` skips the subset jobs because the heavy gate is a
+#   strict superset (runs every test the subsets do, plus the
+#   coverage gate). See the `if:` guard on each subset job.
+#
+# * `test-and-coverage` — the authoritative test + coverage gate.
+#   Single heavy job (~60-90 min on a self-hosted M3 Ultra runner —
+#   one of 6 agents on dfx01 sharing the host's 96 GB / 28 cores).
+#   Gated behind the `ci:full` label so we don't burn runner time on
+#   every speculative PR — apply the label when the PR is ready for
+#   the authoritative gate. The Release PR (`develop -> main`) gets
+#   the label applied automatically by auto-release-pr.yaml.
+#
+#   Why test + coverage are merged into one job: the previous topology
+#   had a `node-tests` job and a separate `coverage` job, both
+#   running the SAME nextest suite (`coverage` simply wrapped nextest
+#   in `cargo llvm-cov nextest`). That doubled wall-clock and m3-ultra
+#   agent usage on every Release PR for no signal benefit — llvm-cov
+#   under nextest produces both test execution AND coverage data in a
+#   single binary run. Merging them keeps the 100% lines + functions
+#   gate intact (same ignore regex, same `not binary(api_remote)`
+#   exclusion) while running the heavy suite once per PR.
+#
+#   The documented hardware target is the M3 Ultra (CONTRIBUTING.md
+#   § "Working on the Plonky2 Migration"). On `ubuntu-latest` the
+#   full suite repeatedly hit the 75-min timeout (issue #30); on the
+#   M3 Ultra it is ~60-90 min for a Rust change. Moving the gate
+#   into CI rather than the developer's laptop unblocks the developer
+#   on push (issue #40).
 #
 # Runner ops: see scripts/ci-runner/README.md.
 jobs:
@@ -151,20 +183,30 @@ jobs:
       - name: Build node (all features — self-host opt-in build)
         run: cargo build -p node --all-features
 
-  node-tests:
-    name: Node + Shared Tests (M3 Ultra)
-    # Heavy job (~60-90 min on a self-hosted M3 Ultra runner — one of
-    # 6 agents on dfx01 sharing the host's 96 GB / 28 cores). Gated
-    # behind the `ci:full` label so we don't burn runner time on every
-    # speculative PR — apply the label when the PR is ready for the
-    # authoritative test+coverage gate. The Release PR
-    # (`develop -> main`) gets the label applied automatically by
-    # auto-release-pr.yaml. (See `coverage` job below for why the same
-    # guard is repeated there.)
-    if: contains(github.event.pull_request.labels.*.name, 'ci:full')
+  db-tests:
+    name: DB Subset Tests (M3 Ultra)
+    # Narrow label-gated subset for fast developer iteration on
+    # Postgres / state / coordinator changes. Runs ONLY the tests
+    # that touch the storage layer, the coordinator state machine,
+    # the username registry, the audit log, the publisher/runtime
+    # plumbing, and the router job endpoints. Estimated ~15 min on
+    # an M3 Ultra agent.
+    #
+    # Mutually exclusive with `ci:full`: if a PR carries `ci:full`,
+    # the heavy `test-and-coverage` job already runs the entire
+    # suite (including everything below) plus the coverage gate, so
+    # running this subset would just waste an m3-ultra agent slot.
+    # The `&& !contains(... 'ci:full')` clause enforces that.
+    #
+    # Plain `cargo nextest` (no llvm-cov wrapping): subset gates are
+    # for iteration speed; the authoritative 100% coverage gate
+    # stays exclusive to `test-and-coverage` / `ci:full`.
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'ci:db')
+      && !contains(github.event.pull_request.labels.*.name, 'ci:full')
     needs: lint-and-build
     runs-on: [self-hosted, m3-ultra]
-    timeout-minutes: 120
+    timeout-minutes: 45
     env:
       # All three chain-shaping env vars are required by the node
       # bootstrap — no defaults exist (see
@@ -181,73 +223,79 @@ jobs:
       # is irrelevant for the `info_returns_*` assertions (they only
       # check non-empty + shape).
       USERNAME_DOMAIN: test.zkcoins.local
-      # `PUBLISHER_KEY` is required on every network (no default — see
-      # `node/src/lib.rs`). The previous `1234567890abcdef…` fallback
-      # was a publicly-known test key that drainer bots swept within
-      # minutes of any on-chain top-up; the fallback was removed
-      # network-wide in the "require PUBLISHER_KEY on every network"
-      # hardening. The value below is a syntactically valid 32-byte
-      # hex placeholder (`0000…0001`) chosen so a future grep for the
-      # burned `1234…` key returns empty across the repo + CI config;
-      # it is NOT a secret and MUST NEVER be reused on any chain that
-      # holds value. The same value is hard-coded in the test mocks at
-      # `node/src/router_tests.rs` so the wiremock'd publisher address
-      # path matches the lazy_static-derived `PUBLISHER_ADDRESS`.
+      # `PUBLISHER_KEY` is required on every network (no default —
+      # see `node/src/lib.rs`). The previous `1234567890abcdef…`
+      # fallback was a publicly-known test key that drainer bots
+      # swept within minutes of any on-chain top-up; the fallback was
+      # removed network-wide in the "require PUBLISHER_KEY on every
+      # network" hardening. The value below is a syntactically valid
+      # 32-byte hex placeholder (`0000…0001`) chosen so a future grep
+      # for the burned `1234…` key returns empty across the repo +
+      # CI config; it is NOT a secret and MUST NEVER be reused on any
+      # chain that holds value. The same value is hard-coded in the
+      # test mocks at `node/src/router_tests.rs` so the wiremock'd
+      # publisher address path matches the lazy_static-derived
+      # `PUBLISHER_ADDRESS`.
       PUBLISHER_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
-      # `db_tests` use the `testcontainers` crate, which talks to the local
-      # Docker daemon. The self-hosted runner runs Colima (not Docker
-      # Desktop), whose socket lives under the runner user's home
-      # directory. `testcontainers` defaults to `/var/run/docker.sock`,
-      # which does not exist on Colima, so the `Set DOCKER_HOST` step
-      # below points it at the real socket via `$HOME` — same value the
-      # `docker info` step picks up implicitly via the default `docker`
-      # context.
+      # `db_tests` use the `testcontainers` crate, which talks to the
+      # local Docker daemon. The self-hosted runner runs Colima (not
+      # Docker Desktop), whose socket lives under the runner user's
+      # home directory. `testcontainers` defaults to
+      # `/var/run/docker.sock`, which does not exist on Colima, so
+      # the `Set DOCKER_HOST` step below points it at the real
+      # socket via `$HOME` — same value the `docker info` step picks
+      # up implicitly via the default `docker` context.
       # `sccache` wraps `rustc` and caches compiled crates across CI
-      # runs. The M3 Ultra runner agents are self-hosted, so the cache
-      # lives on local disk and survives between jobs — the speedup is
-      # biggest for PR pushes that re-touch the same dependency set.
+      # runs. The M3 Ultra runner agents are self-hosted, so the
+      # cache lives on local disk and survives between jobs — the
+      # speedup is biggest for PR pushes that re-touch the same
+      # dependency set.
       RUSTC_WRAPPER: sccache
       # Bump cache cap above sccache's 10-GiB default. The cache is
-      # user-level (~/Library/Caches/Mozilla.sccache) and shared by every
-      # m3-ultra agent on the host; with 3+ parallel agents the 10-GiB
-      # default thrashed — writes from one agent evicted hits another
-      # had not consumed yet. 50 GiB fits the current working set with
-      # room to grow; the host has >600 GiB free disk. The server only
-      # reads SCCACHE_CACHE_SIZE at start, so the install step below
-      # restarts it when the running cap differs from this value.
+      # user-level (~/Library/Caches/Mozilla.sccache) and shared by
+      # every m3-ultra agent on the host; with 3+ parallel agents
+      # the 10-GiB default thrashed — writes from one agent evicted
+      # hits another had not consumed yet. 50 GiB fits the current
+      # working set with room to grow; the host has >600 GiB free
+      # disk. The server only reads SCCACHE_CACHE_SIZE at start, so
+      # the install step below restarts it when the running cap
+      # differs from this value.
       SCCACHE_CACHE_SIZE: "50G"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       # The launchd-spawned runner agent inherits a minimal PATH that
-      # includes /opt/homebrew/bin (where a stable Rust lives) but not
-      # ~/.cargo/bin (where rustup proxies live). Without this step,
-      # `cargo` resolves to Homebrew's stable cargo, the rust-toolchain
-      # file pinning nightly is ignored, and dependencies that need
-      # `#![feature(...)]` (e.g. plonky2_field) fail to compile. Prepend
-      # ~/.cargo/bin so the rustup proxy is found first and reads the
-      # workspace rust-toolchain.
+      # includes /opt/homebrew/bin (where a stable Rust lives) but
+      # not ~/.cargo/bin (where rustup proxies live). Without this
+      # step, `cargo` resolves to Homebrew's stable cargo, the
+      # rust-toolchain file pinning nightly is ignored, and
+      # dependencies that need `#![feature(...)]` (e.g. plonky2_field)
+      # fail to compile. Prepend ~/.cargo/bin so the rustup proxy is
+      # found first and reads the workspace rust-toolchain.
       - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       # Point `testcontainers` at the Colima socket under the runner
-      # user's home; see the `DOCKER_HOST` comment in the job env block
-      # above. Set in a step (not the static `env:` block) so the path
-      # resolves from `$HOME` at runtime instead of being hard-coded.
+      # user's home; see the `DOCKER_HOST` comment in the job env
+      # block above. Set in a step (not the static `env:` block) so
+      # the path resolves from `$HOME` at runtime instead of being
+      # hard-coded.
       - name: Set DOCKER_HOST for Colima socket
         run: echo "DOCKER_HOST=unix://$HOME/.colima/default/docker.sock" >> "$GITHUB_ENV"
 
-      # `sccache` (compile cache) and `cargo-nextest` (test runner) are
-      # installed once per runner via Homebrew. Re-running on a host
-      # where they already exist is a no-op. Start sccache's server
-      # explicitly so the first compile step has a warm cache daemon
-      # and print stats up-front for visibility in the run log.
+      # `sccache` (compile cache) and `cargo-nextest` (test runner)
+      # are installed once per runner via Homebrew. Re-running on a
+      # host where they already exist is a no-op. Start sccache's
+      # server explicitly so the first compile step has a warm cache
+      # daemon and print stats up-front for visibility in the run
+      # log.
       #
       # If a server is already running with a different cap than the
-      # requested SCCACHE_CACHE_SIZE (e.g. carried over from a previous
-      # workflow version), stop it so the next --start-server picks up
-      # the new env value. The on-disk cache files survive the restart.
+      # requested SCCACHE_CACHE_SIZE (e.g. carried over from a
+      # previous workflow version), stop it so the next
+      # --start-server picks up the new env value. The on-disk cache
+      # files survive the restart.
       - name: Ensure sccache + cargo-nextest are installed
         run: |
           command -v sccache >/dev/null || brew install sccache
@@ -258,80 +306,210 @@ jobs:
           sccache --start-server >/dev/null 2>&1 || true
           sccache --show-stats
 
-      # The `db_tests` added in PR-A1 use testcontainers to spin up a
-      # real Postgres 17 per test. The runner host has Docker (via
-      # Colima) available on PATH; fail fast with a readable error
-      # if it ever goes away, instead of letting the test suite die
-      # 5 minutes into the run with a hard-to-read bollard error.
+      # `db_tests` use testcontainers to spin up a real Postgres 17
+      # per test. The runner host has Docker (via Colima) available
+      # on PATH; fail fast with a readable error if it ever goes
+      # away, instead of letting the test suite die 5 minutes into
+      # the run with a hard-to-read bollard error.
       - name: Verify Docker is reachable (testcontainers dependency)
         run: docker info > /dev/null
 
-      # `cargo nextest` replaces `cargo test`: process-per-test isolation
-      # plus smart scheduling (slow tests start first). `--test-threads 1`
-      # is preserved — the repo invariant is that tests run serially to
-      # avoid testcontainers port races and shared-state pollution.
-      # `api_remote` is the live-DEV-node verification integration test
-      # (node/tests/api_remote.rs). It targets `https://dev-api.zkcoins.app`
-      # by default and is meant to run AFTER a deploy, from the `api-e2e`
-      # job in deploy-dev.yaml — not against whatever DEV currently runs
-      # while a PR is still open. Excluding it here keeps `node-tests`
-      # hermetic: only unit + non-remote integration tests run; remote
-      # verification fires post-deploy as the merge-then-deploy gate.
-      - name: Run node + shared tests (release, all features)
-        run: cargo nextest run -p node -p shared --release --all-features --test-threads 1 -E 'not binary(api_remote)'
+      # Subset filter — DB / state / coordinator paths only.
+      # Module path notes (verified against node/src/ tree on this branch):
+      #   - `<module>_tests.rs` files are mounted via `mod tests;`
+      #     under the owning module (e.g. `db::tests::*`,
+      #     `state::tests::*`).
+      #   - `main_tests.rs` is mounted by `lib.rs` at crate root as
+      #     `mod tests` — so its tests appear as `tests::*` in
+      #     nextest output (NOT `main::tests::*`).
+      #   - `job_store::tests::*` and `router::tests::jobs_*` are
+      #     included for forward compatibility with the jobs-API
+      #     stack landing in app#141 / node#161-#163; if a pattern
+      #     matches no tests today it is a harmless no-op.
+      #   - `shared` crate tests live under `commitment::tests::*`
+      #     and are pulled in by `-p shared`.
+      # `api_remote` is the live-DEV-node integration test
+      # (node/tests/api_remote.rs). It targets
+      # `https://dev-api.zkcoins.app` by default and is meant to run
+      # AFTER a deploy, from the `api-e2e` job in deploy-dev.yaml —
+      # not against whatever DEV currently runs while a PR is still
+      # open. Excluded here for the same reason as in
+      # `test-and-coverage`.
+      - name: Run DB subset (release, plain nextest, no coverage)
+        run: |
+          cargo nextest run -p node -p shared --release --all-features --test-threads 1 \
+            -E 'not binary(api_remote) & (test(/^db::tests::/) + test(/^state::tests::/) + test(/^job_store::tests::/) + test(/^audit::tests::/) + test(/^username::tests::/) + test(/^router::tests::jobs_/) + test(/^r2_probe::tests::/) + test(/^tests::build_network_config_/) + test(/^account_node::tests::test_persist/) + test(/^account_node::tests::test_load/) + test(/^publisher::tests::/) + test(/^runtime::tests::/) + test(/^commitment::tests::/))'
 
       - name: sccache stats (post-build)
         if: always()
         run: sccache --show-stats
 
-  coverage:
-    name: Coverage Gate (100% lines + functions)
-    # Runs in parallel with `node-tests` (not after) — both jobs
-    # exercise the same suite (nextest vs. nextest-under-llvm-cov), so
-    # serializing them only doubled wall-clock on every Release PR.
-    # The `ci:full` label gate is duplicated explicitly here because the
-    # chain through `node-tests` (which carried the guard) is broken.
-    if: contains(github.event.pull_request.labels.*.name, 'ci:full')
+      # Mirror of the `notify-failure` job downstream, scoped to this
+      # subset so the operator sees DB-subset failures too (the
+      # `notify-failure` job only fires when one of its `needs:`
+      # transitions to `failure`, and chaining subset jobs into that
+      # list would make a single subset failure mask the heavy gate's
+      # status under the workflow-level conclusion).
+      - name: Telegram alert on failure
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          TEXT=$'❌ <b>'"${{ github.workflow }}"$' / db-tests</b> failed\n<b>Repo:</b> '"${{ github.repository }}"$'\n<b>Branch:</b> '"${{ github.ref_name }}"$'\n<b>Run:</b> '"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+               --data-urlencode "chat_id=${TG_CHAT}" \
+               --data-urlencode "text=${TEXT}" \
+               -d "parse_mode=HTML" \
+               -d "disable_web_page_preview=true"
+
+  prover-tests:
+    name: Prover Subset Tests (M3 Ultra)
+    # Narrow label-gated subset for fast developer iteration on
+    # Plonky2 prover changes. Runs ONLY the mint / send / receive
+    # flows in `account_node::tests` plus the persist/load roundtrip
+    # (which exercises the wallet end-to-end). Estimated ~25 min on
+    # an M3 Ultra agent.
+    #
+    # Mutually exclusive with `ci:full` — see the matching comment
+    # on `db-tests` above for the rationale.
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'ci:prover')
+      && !contains(github.event.pull_request.labels.*.name, 'ci:full')
     needs: lint-and-build
     runs-on: [self-hosted, m3-ultra]
-    timeout-minutes: 90
+    timeout-minutes: 60
     env:
-      # All three chain-shaping env vars are required by the node
-      # bootstrap (see `lib::build_network_config_from_env`). Mirror
-      # the `node-tests` env block above — `127.0.0.1:1` endpoints
-      # fail fast for any commit-pipeline / scanner-WS path.
+      # Mirror of the `db-tests` env block above — see there for
+      # rationale on each var. The env shape is identical because
+      # both subset jobs share the same bootstrap requirements
+      # (chain-shaping vars are mandatory, the publisher key must
+      # match the wiremock'd mocks in `router_tests.rs`).
       IS_MAINNET: "false"
       ESPLORA_URL: http://127.0.0.1:1/api
       ESPLORA_WS_URL: ws://127.0.0.1:1/api/v1/ws
       USERNAME_DOMAIN: test.zkcoins.local
-      # `PUBLISHER_KEY` is required on every network (no default — see
-      # `node/src/lib.rs`); the value mirrors `node-tests` above and is
-      # a syntactically valid 32-byte hex placeholder, NOT a secret.
-      # MUST match `node/src/router_tests.rs` and the `node-tests` env
-      # block — the test mocks derive the wiremock'd publisher address
-      # from this key.
       PUBLISHER_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
-      # `db_tests` use the `testcontainers` crate; see `node-tests`
-      # above for the rationale. `DOCKER_HOST` is set in a step below
-      # so the Colima socket path resolves from `$HOME` at runtime.
-      # Same sccache wrapper as `node-tests`; reuses the same on-disk
-      # cache populated by the previous job in the same workflow run.
       RUSTC_WRAPPER: sccache
-      # See `node-tests` env block above for the 50-GiB rationale.
+      SCCACHE_CACHE_SIZE: "50G"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Set DOCKER_HOST for Colima socket
+        run: echo "DOCKER_HOST=unix://$HOME/.colima/default/docker.sock" >> "$GITHUB_ENV"
+
+      - name: Ensure sccache + cargo-nextest are installed
+        run: |
+          command -v sccache >/dev/null || brew install sccache
+          command -v cargo-nextest >/dev/null || brew install cargo-nextest
+          if ! sccache --show-stats 2>/dev/null | grep -qE "Max cache size +50 GiB"; then
+            sccache --stop-server >/dev/null 2>&1 || true
+          fi
+          sccache --start-server >/dev/null 2>&1 || true
+          sccache --show-stats
+
+      # The `test_persist_and_load_from_pg_roundtrip` test in this
+      # subset uses testcontainers, so Docker must be reachable.
+      - name: Verify Docker is reachable (testcontainers dependency)
+        run: docker info > /dev/null
+
+      # Subset filter — the full account_node send/mint/receive
+      # surface. Includes both Plonky2-heavy happy paths and pure-Rust
+      # error-path tests (e.g. `test_send_coins_returns_err_for_unknown_account`,
+      # `test_send_coins_rejects_too_many_invoices`), so the gate is
+      # conservative and runs anything touching account-node state
+      # transitions. The `test_persist_and_load_from_pg_roundtrip` test
+      # exercises the wallet end-to-end (build → persist → reload →
+      # reuse), so it lives in BOTH subsets by design; nextest
+      # deduplicates within a single run, this is harmless when both
+      # subsets are run on separate PR labels.
+      - name: Run Prover subset (release, plain nextest, no coverage)
+        run: |
+          cargo nextest run -p node -p shared --release --all-features --test-threads 1 \
+            -E 'not binary(api_remote) & (test(/^account_node::tests::test_mint/) + test(/^account_node::tests::test_send/) + test(/^account_node::tests::test_receive/) + test(/^account_node::tests::test_persist_and_load_from_pg_roundtrip/) + test(/^account_node::tests::test_wallet_operations/))'
+
+      - name: sccache stats (post-build)
+        if: always()
+        run: sccache --show-stats
+
+      # Mirror of the `notify-failure` job downstream — see the
+      # matching comment on `db-tests` for the rationale.
+      - name: Telegram alert on failure
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          TEXT=$'❌ <b>'"${{ github.workflow }}"$' / prover-tests</b> failed\n<b>Repo:</b> '"${{ github.repository }}"$'\n<b>Branch:</b> '"${{ github.ref_name }}"$'\n<b>Run:</b> '"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+               --data-urlencode "chat_id=${TG_CHAT}" \
+               --data-urlencode "text=${TEXT}" \
+               -d "parse_mode=HTML" \
+               -d "disable_web_page_preview=true"
+
+  test-and-coverage:
+    name: Tests + Coverage Gate (M3 Ultra, 100% lines + functions)
+    # Authoritative heavy gate: runs the full nextest suite under
+    # llvm-cov instrumentation, producing both test execution AND
+    # coverage data in a single binary run. Replaces the previous
+    # `node-tests` + `coverage` pair (the two jobs ran the same
+    # nextest suite — see the file header for the merge rationale).
+    #
+    # Gated behind the `ci:full` label so we don't burn runner time
+    # on every speculative PR. The Release PR (`develop -> main`)
+    # gets the label applied automatically by auto-release-pr.yaml.
+    if: contains(github.event.pull_request.labels.*.name, 'ci:full')
+    needs: lint-and-build
+    runs-on: [self-hosted, m3-ultra]
+    timeout-minutes: 120
+    env:
+      # All three chain-shaping env vars are required by the node
+      # bootstrap (see `lib::build_network_config_from_env`). CI uses
+      # `127.0.0.1:1` endpoints so any test that exercises the commit
+      # pipeline / scanner WS fails fast instead of reaching a public
+      # third-party host (a previous Mutinynet-flavoured silent
+      # fallback used to add >60 s per test).
+      IS_MAINNET: "false"
+      ESPLORA_URL: http://127.0.0.1:1/api
+      ESPLORA_WS_URL: ws://127.0.0.1:1/api/v1/ws
+      # `USERNAME_DOMAIN` is required by the node bootstrap (no
+      # default — see node/src/main.rs and issue #95). The test value
+      # is irrelevant for the `info_returns_*` assertions (they only
+      # check non-empty + shape).
+      USERNAME_DOMAIN: test.zkcoins.local
+      # `PUBLISHER_KEY` is required on every network (no default —
+      # see `node/src/lib.rs`); the value mirrors the subset jobs
+      # above and is a syntactically valid 32-byte hex placeholder,
+      # NOT a secret. MUST match `node/src/router_tests.rs` — the
+      # test mocks derive the wiremock'd publisher address from this
+      # key.
+      PUBLISHER_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
+      # `db_tests` use the `testcontainers` crate; see the subset
+      # jobs above for the rationale. `DOCKER_HOST` is set in a step
+      # below so the Colima socket path resolves from `$HOME` at
+      # runtime.
+      # Same sccache wrapper as the subset jobs; reuses the same
+      # on-disk cache populated by previous runs on the same runner.
+      RUSTC_WRAPPER: sccache
+      # See the subset jobs above for the 50-GiB rationale.
       SCCACHE_CACHE_SIZE: "50G"
       # Activate the workspace's `coverage_nightly` cfg gate so the
       # `#[cfg_attr(coverage_nightly, coverage(off))]` annotations
       # (14× repo-wide, plus the platform-detection helpers in
       # `node/src/r2_probe.rs`) actually take effect under
       # `cargo llvm-cov`. cargo-llvm-cov does NOT auto-set this cfg —
-      # without it every `coverage(off)` in the workspace is inert and
-      # llvm-cov counts the excluded fns / lines as uncovered, which
-      # silently broke the 100%-line + 100%-function gate the moment
-      # the first annotation landed in the `node` crate. Set only on
-      # the coverage job: the `lint-and-build` job runs stable 1.81.0
-      # and would reject `feature(coverage_attribute)`, and
-      # `node-tests` doesn't need the cfg (test execution is
-      # orthogonal to the gate).
+      # without it every `coverage(off)` in the workspace is inert
+      # and llvm-cov counts the excluded fns / lines as uncovered,
+      # which silently broke the 100%-line + 100%-function gate the
+      # moment the first annotation landed in the `node` crate. Set
+      # only on this job: the `lint-and-build` job runs stable
+      # 1.81.0 and would reject `feature(coverage_attribute)`, and
+      # the subset jobs run plain nextest (no instrumentation) so
+      # the cfg has no effect there.
       RUSTFLAGS: "--cfg coverage_nightly"
     steps:
       - name: Checkout
@@ -340,14 +518,14 @@ jobs:
       - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      # See `node-tests` job above for the rationale; resolves the
+      # See the subset jobs above for the rationale; resolves the
       # Colima socket path from `$HOME` at runtime.
       - name: Set DOCKER_HOST for Colima socket
         run: echo "DOCKER_HOST=unix://$HOME/.colima/default/docker.sock" >> "$GITHUB_ENV"
 
-      # Same install gate as `node-tests`. Idempotent: no-op on a
-      # warm runner where both tools already exist. See `node-tests`
-      # for why we conditionally restart the sccache server.
+      # Same install gate as the subset jobs. Idempotent: no-op on a
+      # warm runner where both tools already exist. See the subset
+      # jobs for why we conditionally restart the sccache server.
       - name: Ensure sccache + cargo-nextest are installed
         run: |
           command -v sccache >/dev/null || brew install sccache
@@ -358,27 +536,45 @@ jobs:
           sccache --start-server >/dev/null 2>&1 || true
           sccache --show-stats
 
-      # Coverage runs the same `db_tests` as `node-tests` and so
-      # needs Docker reachable for testcontainers. See the matching
-      # check in the `node-tests` job for the rationale.
+      # Same `db_tests` as the subset jobs and so needs Docker
+      # reachable for testcontainers. See the matching check in the
+      # subset jobs for the rationale.
       - name: Verify Docker is reachable (testcontainers dependency)
         run: docker info > /dev/null
 
-      # `cargo llvm-cov nextest` is the nextest-aware coverage subcommand:
-      # collects llvm-cov data while driving the suite through nextest,
-      # so the 100% line/function gate and the test execution share a
-      # single binary run (same as the old `cargo llvm-cov -- ...` form).
+      # `cargo llvm-cov nextest` is the nextest-aware coverage
+      # subcommand: collects llvm-cov data while driving the suite
+      # through nextest, so the 100% line/function gate and the test
+      # execution share a single binary run. This is the merge of
+      # the previous `node-tests` + `coverage` pair — the previous
+      # `node-tests` job ran the same nextest invocation without the
+      # `cargo llvm-cov` wrapper, which produced no extra signal.
+      #
+      # `-p node -p shared --all-features` matches the previous
+      # `node-tests` test set exactly (the previous `coverage` job
+      # was scoped to `-p node` because the coverage GATE is only
+      # measured against the `node` crate; the merge keeps that gate
+      # scope while widening the EXECUTED set to `-p node -p shared`
+      # so the shared crate's `commitment::tests::*` keep running in
+      # the heavy gate — they were part of `node-tests` before).
+      # The `shared/src/commitment.rs` entry in --ignore-filename-regex
+      # keeps the coverage gate strictness identical to the previous
+      # `-p node`-scoped gate: the shared crate's source files are
+      # excluded from the 100% measurement, only the `node` crate is
+      # gated. `--all-features` likewise mirrors the previous
+      # `node-tests` invocation so opt-in feature-gated code paths
+      # still execute.
       #
       # The `api_remote` integration test (node/tests/api_remote.rs)
-      # is excluded for the same reason as in `node-tests` above: it
-      # targets the live DEV node and belongs in the post-deploy
-      # `api-e2e` job, not the hermetic coverage gate. The MVP coverage
-      # scope is measured by the rest of the suite, which covers the
-      # in-process axum handlers via oneshot().
-      - name: Run llvm-cov (MVP scope, 100% line + function gate)
+      # is excluded: it targets the live DEV node and belongs in
+      # the post-deploy `api-e2e` job in deploy-dev.yaml, not the
+      # hermetic gate. The MVP coverage scope is measured by the
+      # rest of the suite, which covers the in-process axum handlers
+      # via oneshot().
+      - name: Run llvm-cov nextest (MVP scope, 100% line + function gate)
         run: |
-          cargo llvm-cov nextest --release -p node --show-missing-lines \
-            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|_tests\.rs$|bin/.*\.rs$' \
+          cargo llvm-cov nextest --release -p node -p shared --all-features --show-missing-lines \
+            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|_tests\.rs$|bin/.*\.rs$|shared/src/.*\.rs$' \
             --fail-under-lines 100 \
             --fail-under-functions 100 \
             --test-threads 1 \
@@ -400,10 +596,10 @@ jobs:
         run: |
           echo "--- llvm-cov report: --show-missing-lines (text) ---"
           cargo llvm-cov report --release --show-missing-lines \
-            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|_tests\.rs$|bin/.*\.rs$' || true
+            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|_tests\.rs$|bin/.*\.rs$|shared/src/.*\.rs$' || true
           echo "--- llvm-cov report: per-file json (filter < 100%) ---"
           cargo llvm-cov report --release --json \
-            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|_tests\.rs$|bin/.*\.rs$' \
+            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|_tests\.rs$|bin/.*\.rs$|shared/src/.*\.rs$' \
             | jq -r '.data[0].files[]
                 | select(.summary.lines.percent < 100 or .summary.functions.percent < 100)
                 | {filename, lines: .summary.lines, functions: .summary.functions}' \
@@ -413,15 +609,19 @@ jobs:
         if: always()
         run: sccache --show-stats
 
-  # Telegram alert on workflow failure. Modelled as a separate job (not
-  # an inline step) so job-level failures — timeout, OOM, runner crash —
-  # still fire the alert. `if: failure()` evaluates against the whole
-  # `needs:` group: any listed job transitioning to `failure` triggers
-  # it, while skipped jobs (node-tests / coverage on a non-ci:full PR,
-  # or all jobs on a draft PR) and manual cancellation stay silent.
+  # Telegram alert on workflow failure for the heavy gate. Modelled
+  # as a separate job (not an inline step) so job-level failures —
+  # timeout, OOM, runner crash — still fire the alert. `if: failure()`
+  # evaluates against the whole `needs:` group: any listed job
+  # transitioning to `failure` triggers it, while skipped jobs
+  # (`test-and-coverage` on a non-ci:full PR, or all jobs on a draft
+  # PR) and manual cancellation stay silent. The subset jobs
+  # (`db-tests` / `prover-tests`) fire their own inline Telegram
+  # alerts so a subset failure does not get masked by the heavy
+  # gate's status under the workflow-level conclusion.
   notify-failure:
     name: Telegram alert on failure
-    needs: [lint-and-build, node-tests, coverage]
+    needs: [lint-and-build, test-and-coverage]
     if: failure()
     runs-on: ubuntu-latest
     steps:
