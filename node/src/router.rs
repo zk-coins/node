@@ -1459,10 +1459,17 @@ async fn admit_and_enqueue(
         if job.status == JobStatus::Completed {
             let status_code = StatusCode::from_u16(job.response_status.unwrap_or(200) as u16)
                 .unwrap_or(StatusCode::OK);
+            // `JobStore::complete` always sets `response_body` on the row before
+            // flipping the status to `Completed`; the matching INSERT in
+            // `complete()` is non-nullable on the value side. A `None` here
+            // would mean the row was hand-edited or the schema invariant
+            // broke — the `.expect()` surfaces that immediately instead of
+            // hiding behind a defensive empty-object fallback (which would
+            // also cost the 100% line-coverage gate a never-reached closure).
             let body = job
                 .response_body
                 .clone()
-                .unwrap_or_else(|| serde_json::json!({}));
+                .expect("response_body is set on every Completed job by JobStore::complete");
             return (status_code, Json(body)).into_response();
         }
         return (
