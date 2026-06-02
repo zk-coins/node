@@ -42,12 +42,37 @@
 //! name, so it lands in whichever schema is first on `search_path`.
 //! New migrations MUST preserve this property.
 //!
+//! ## Cross-process attach-or-create race (issue #181 Opt A)
+//!
+//! `testcontainers` 0.27 does NOT atomicise the lookup-or-create
+//! path behind `with_reuse(ReuseDirective::Always)`. The flow is:
+//! `GET /containers/<name>/json` → on 404, `POST /containers/create`
+//! → `POST /containers/<id>/start`. Two processes racing this
+//! sequence both observe 404, both POST `create`, the Docker daemon
+//! serialises the `create` calls and returns 409 Conflict to every
+//! loser because the second `create` collides on the requested name.
+//! At `--test-threads=1` this is dormant (one process at a time);
+//! at `--test-threads=8` (the post-#181 default) it deterministically
+//! breaks 6+/8 nextest processes on every cold-cache run.
+//!
+//! Workaround: a process-shared exclusive file lock around the
+//! `testcontainers` call in [`init_shared_pg`]. The lock file lives
+//! under `$TMPDIR` (falls back to `/tmp`) so every test process on
+//! the same host serialises through the same inode. The lock is
+//! held only across the attach-or-create call (typically <1 s for
+//! an attach, ~3 s for the one cold create that wins the race) and
+//! released the moment the container handle is in hand. The Drop
+//! impl on `fs2`'s lock guard unlocks automatically; we also `drop`
+//! the file explicitly to make intent obvious.
+//!
 //! ## No polling
 //!
 //! `OnceCell::get_or_init` is event-driven; the first caller spawns
 //! the container, every subsequent caller awaits the same future.
 //! Per the repo's "No polling — events only" rule (CONTRIBUTING.md)
-//! there is no `sleep`-loop fallback path here.
+//! there is no `sleep`-loop fallback path here. The cross-process
+//! file lock above is `flock(2)`-based (blocking on the kernel),
+//! not a poll loop.
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Executor, PgPool};
@@ -208,7 +233,36 @@ pub async fn setup_pool() -> SchemaScope {
 /// `ReuseDirective::Always` + the stable container name make
 /// testcontainers attach to the already-running container instead
 /// of spawning a new one.
+///
+/// The `testcontainers` 0.27 attach-or-create path is NOT atomic
+/// (see module docs); under `--test-threads=8` (issue #181 Opt A),
+/// 8 concurrent test processes all observe "container not present"
+/// and all POST `/containers/create`, with the Docker daemon
+/// returning 409 Conflict to every loser. Wrapping the call in a
+/// process-shared exclusive file lock serialises the
+/// `attach-or-create` so exactly one process creates and the others
+/// attach. The lock file lives in `$TMPDIR` (or `/tmp` fallback)
+/// keyed by a stable name so every test binary on the host
+/// serialises through the same inode.
 async fn init_shared_pg() -> Arc<SharedPg> {
+    // Process-shared exclusive lock around the testcontainers
+    // attach-or-create call. Held only across that call; the
+    // container creation cost (~3 s once per host) amortises
+    // across the whole test run. `fs2`'s `FileExt::lock_exclusive`
+    // blocks on `flock(2)` (POSIX) / `LockFileEx` (Windows) —
+    // event-driven at the kernel level, no busy-wait. The guard is
+    // unlocked on Drop; we also `drop` it explicitly below to make
+    // the critical-section boundary obvious in code.
+    let lock_path = std::env::temp_dir().join("zkcoins-test-pg.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open shared-pg lock file");
+    fs2::FileExt::lock_exclusive(&lock_file).expect("acquire shared-pg lock");
+
     let container = Postgres::default()
         .with_tag("17")
         .with_container_name(SHARED_PG_CONTAINER_NAME)
@@ -225,6 +279,13 @@ async fn init_shared_pg() -> Arc<SharedPg> {
         .await
         .expect("shared postgres get_host_port_ipv4");
     let base_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+    // Explicit drop releases the exclusive lock the moment the
+    // container handle is in hand. The Drop impl on `lock_file`
+    // would do this at function return anyway, but spelling it out
+    // makes the critical-section boundary obvious.
+    drop(lock_file);
+
     Arc::new(SharedPg {
         _container: container,
         base_url,
