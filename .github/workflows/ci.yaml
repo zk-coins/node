@@ -73,8 +73,12 @@ env:
 # Job topology:
 #
 # * `lint-and-build` — GitHub-hosted Linux. Catches cross-platform
-#   compile bitrot and lint regressions cheaply. Gates everything
-#   below via `needs:`.
+#   compile bitrot and lint regressions cheaply. Runs in PARALLEL
+#   with the m3-ultra jobs below — it no longer gates them via
+#   `needs:`. Each job carries its own draft/label `if:` guard, so a
+#   lint failure no longer blocks the heavy tests from starting
+#   (deliberate: parallel feedback. Trade-off: on a lint failure the
+#   m3-ultra runner time is spent regardless).
 #
 # * `db-tests` / `prover-tests` — narrow, label-gated subsets on the
 #   m3-ultra pool for fast developer iteration. They run plain
@@ -117,7 +121,10 @@ env:
 jobs:
   lint-and-build:
     name: Lint & Build
-    # Skip on draft PRs; downstream `needs:` jobs inherit the skip.
+    # Skip on draft PRs. The m3-ultra jobs each carry the same
+    # draft/push guard on their own `if:` (they used to inherit it via
+    # `needs: lint-and-build`, which has been removed so they run in
+    # parallel with this job).
     if: github.event_name == 'push' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -202,9 +209,9 @@ jobs:
     # for iteration speed; the authoritative 100% coverage gate
     # stays exclusive to `test-and-coverage` / `ci:full`.
     if: >-
-      contains(github.event.pull_request.labels.*.name, 'ci:db')
+      (github.event_name == 'push' || github.event.pull_request.draft == false)
+      && contains(github.event.pull_request.labels.*.name, 'ci:db')
       && !contains(github.event.pull_request.labels.*.name, 'ci:full')
-    needs: lint-and-build
     runs-on: [self-hosted, m3-ultra]
     timeout-minutes: 45
     env:
@@ -395,9 +402,9 @@ jobs:
     # Mutually exclusive with `ci:full` — see the matching comment
     # on `db-tests` above for the rationale.
     if: >-
-      contains(github.event.pull_request.labels.*.name, 'ci:prover')
+      (github.event_name == 'push' || github.event.pull_request.draft == false)
+      && contains(github.event.pull_request.labels.*.name, 'ci:prover')
       && !contains(github.event.pull_request.labels.*.name, 'ci:full')
-    needs: lint-and-build
     runs-on: [self-hosted, m3-ultra]
     timeout-minutes: 60
     env:
@@ -493,8 +500,9 @@ jobs:
     # Gated behind the `ci:full` label so we don't burn runner time
     # on every speculative PR. The Release PR (`develop -> main`)
     # gets the label applied automatically by auto-release-pr.yaml.
-    if: contains(github.event.pull_request.labels.*.name, 'ci:full')
-    needs: lint-and-build
+    if: >-
+      (github.event_name == 'push' || github.event.pull_request.draft == false)
+      && contains(github.event.pull_request.labels.*.name, 'ci:full')
     runs-on: [self-hosted, m3-ultra]
     timeout-minutes: 120
     env:
