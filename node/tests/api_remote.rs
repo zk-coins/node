@@ -2167,11 +2167,14 @@ async fn second_send_roundtrip_succeeds_without_prev_commitment_pubkey_field() {
     // leaves the in-process SMT advance to the event-driven scanner, so
     // the prev-commitment lookup can briefly miss until the on-chain
     // inscription is ingested.
-    let _awaiting2 =
+    let (send2_job_id, awaiting2) =
         submit_send_no_prev_until_awaiting(&client, &alice, &bob.address_hex(), SEND_AMOUNT, 1)
             .await;
 
-    // Server-side counter advanced.
+    // Server-side counter advanced. `num_sends` is the server's
+    // authoritative count of *committed* sends; send #2 reaching
+    // `awaiting_signature` (its prove leg done) has already bumped it to
+    // 2, so this holds before the commit below.
     let post_send2 = client
         .get(url(&format!(
             "/api/balance?address={}",
@@ -2186,6 +2189,48 @@ async fn second_send_roundtrip_succeeds_without_prev_commitment_pubkey_field() {
         Some(2),
         "post-send-2 num_sends must report 2"
     );
+
+    // ---- Commit send #2 (REQUIRED, not optional) ----
+    //
+    // The dispatcher is a single inline worker that PARKS in
+    // `wait_for_commit` for up to `awaiting_signature_timeout` (600 s on
+    // DEV) until a commit arrives. Returning here without committing
+    // would pin that worker, starving every test that sorts after this
+    // one in the serial alphabetical run (`cancel` only works while a job
+    // is `queued`, so it cannot release an `awaiting_signature` park).
+    // Committing both releases the worker AND completes the roundtrip.
+    //
+    // The commit's `public_key` must match the key that produced
+    // `signature`, because the node's `commit_flow` verifies the
+    // commitment with a self-contained Schnorr check (`Commitment::verify`
+    // over `public_key`/`signature`/`message`) — it does NOT tie the
+    // commit key to the send's signing key or the account's
+    // `commitment_public_key`. `TestWallet::sign_commit` always signs with
+    // `seckey(0)`, so the matching `public_key` is `pubkey(0)`, exactly as
+    // send #1's commit above (and `send_commit_roundtrip_moves_balance`)
+    // does. The send-#2 *signing* key (`pubkey(1)`) is unrelated here.
+    let send2_proof_id = awaiting2["proof_id"]
+        .as_u64()
+        .expect("send #2 awaiting_signature job carries proof_id");
+    let send2_coin_proof = fetch_coin_proof(&client, send2_proof_id).await;
+    let (ash2_bytes, ocr2_bytes) = ash_ocr_from_send_proof(&send2_coin_proof);
+
+    let mut commit2_msg = Vec::with_capacity(64);
+    commit2_msg.extend_from_slice(&ash2_bytes);
+    commit2_msg.extend_from_slice(&ocr2_bytes);
+    let commit2_sig = alice.sign_commit(&commit2_msg);
+    let commit2_result = commit_send_job(
+        &client,
+        &send2_job_id,
+        &json!({
+            "proof_id": send2_proof_id,
+            "public_key": hex::encode(alice.pubkey(0).serialize()),
+            "signature": commit2_sig,
+            "message": hex::encode(&commit2_msg),
+        }),
+    )
+    .await;
+    assert_eq!(commit2_result["success"], Value::Bool(true));
 }
 
 // ---------------------------------------------------------------------------
@@ -2980,15 +3025,19 @@ fn is_transient_scanner_race(err: &str) -> bool {
 /// commitment's merkle/inclusion proofs until the scanner ingests the
 /// on-chain inscription. A bounded retry tolerates that lag while still
 /// surfacing a genuine regression (any other terminal failure, or never
-/// recovering within the cap, fails the test). Returns the
-/// `awaiting_signature` job body.
+/// recovering within the cap, fails the test). Returns the send job's
+/// `job_id` alongside its `awaiting_signature` body — the caller needs
+/// the `job_id` to drive the commit leg that releases the inline worker
+/// (a job left parked in `awaiting_signature` pins the single dispatcher
+/// worker for the full `awaiting_signature_timeout`, starving every
+/// later test in the serial suite).
 async fn submit_send_no_prev_until_awaiting(
     client: &reqwest::Client,
     wallet: &TestWallet,
     recipient: &str,
     amount: u64,
     signing_idx: u32,
-) -> Value {
+) -> (String, Value) {
     // A more generous budget than a single job's `JOB_POLL_TIMEOUT`:
     // clearing the scanner race can require waiting for the next
     // mutinynet block (~30 s) across one or more re-submits.
@@ -3047,7 +3096,7 @@ async fn submit_send_no_prev_until_awaiting(
 
         let status = terminal_or_awaiting["status"].as_str().unwrap_or("");
         if status == "awaiting_signature" {
-            return terminal_or_awaiting;
+            return (job_id, terminal_or_awaiting);
         }
         // Retry only the known transient scanner race; any other
         // terminal failure is a real regression.
