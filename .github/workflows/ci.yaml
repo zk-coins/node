@@ -340,6 +340,20 @@ jobs:
           cargo nextest run -p node -p shared --release --all-features --test-threads 1 \
             -E 'not binary(api_remote) & (test(/^db::tests::/) + test(/^state::tests::/) + test(/^job_store::tests::/) + test(/^audit::tests::/) + test(/^username::tests::/) + test(/^router::tests::jobs_/) + test(/^r2_probe::tests::/) + test(/^tests::build_network_config_/) + test(/^account_node::tests::test_persist/) + test(/^account_node::tests::test_load/) + test(/^publisher::tests::/) + test(/^runtime::tests::/) + test(/^commitment::tests::/))'
 
+      # Tear down the shared test container created by
+      # `test_db::setup_pool` via testcontainers' `ReuseDirective::
+      # Always` (see `node/src/test_db.rs`). The reuse flag tells
+      # testcontainers NOT to drop the container at process exit so
+      # every `cargo nextest` test process can attach to the same
+      # daemon-side container — but that means nobody removes it
+      # either. Always-on cleanup so a stale container from one PR
+      # run cannot bleed into the next on the same self-hosted
+      # runner (different image hash → reuse-lookup misses → fresh
+      # spawn, but the stale row leaks until manual cleanup).
+      - name: Tear down shared test Postgres container
+        if: always()
+        run: docker rm -f zkcoins-test-shared-pg 2>/dev/null || true
+
       - name: sccache stats (post-build)
         if: always()
         run: sccache --show-stats
@@ -431,6 +445,11 @@ jobs:
         run: |
           cargo nextest run -p node -p shared --release --all-features --test-threads 1 \
             -E 'not binary(api_remote) & (test(/^account_node::tests::test_mint/) + test(/^account_node::tests::test_send/) + test(/^account_node::tests::test_receive/) + test(/^account_node::tests::test_persist_and_load_from_pg_roundtrip/) + test(/^account_node::tests::test_wallet_operations/))'
+
+      # See the matching cleanup step in `db-tests` for the rationale.
+      - name: Tear down shared test Postgres container
+        if: always()
+        run: docker rm -f zkcoins-test-shared-pg 2>/dev/null || true
 
       - name: sccache stats (post-build)
         if: always()
@@ -574,7 +593,7 @@ jobs:
       - name: Run llvm-cov nextest (MVP scope, 100% line + function gate)
         run: |
           cargo llvm-cov nextest --release -p node -p shared --all-features --show-missing-lines \
-            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|flow\.rs|job_dispatcher\.rs|_tests\.rs$|bin/.*\.rs$|shared/src/.*\.rs$' \
+            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|flow\.rs|job_dispatcher\.rs|_tests\.rs$|test_db\.rs$|bin/.*\.rs$|shared/src/.*\.rs$' \
             --fail-under-lines 100 \
             --fail-under-functions 100 \
             --test-threads 1 \
@@ -594,7 +613,7 @@ jobs:
       - name: Show missing coverage on gate failure
         if: failure()
         run: |
-          IGNORE='main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|flow\.rs|job_dispatcher\.rs|_tests\.rs$|bin/.*\.rs$|shared/src/.*\.rs$'
+          IGNORE='main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|flow\.rs|job_dispatcher\.rs|_tests\.rs$|test_db\.rs$|bin/.*\.rs$|shared/src/.*\.rs$'
 
           echo "--- llvm-cov report: --show-missing-lines (text) ---"
           cargo llvm-cov report --release --show-missing-lines \
@@ -638,6 +657,11 @@ jobs:
           path: target/llvm-cov-html
           if-no-files-found: warn
           retention-days: 14
+
+      # See the matching cleanup step in `db-tests` for the rationale.
+      - name: Tear down shared test Postgres container
+        if: always()
+        run: docker rm -f zkcoins-test-shared-pg 2>/dev/null || true
 
       - name: sccache stats (post-build)
         if: always()

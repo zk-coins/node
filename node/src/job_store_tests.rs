@@ -1,8 +1,11 @@
 // JobStore tests against a real Postgres 17 testcontainer.
 //
-// Pattern mirrors `db_tests.rs`: one container per test, migrations
-// applied via `db::connect_and_migrate`, suite runs under
-// `--test-threads=1` like the rest of the node test gate.
+// Pattern mirrors `db_tests.rs`: every test gets its own UUID-named
+// schema inside a shared `postgres:17` container (see
+// `crate::test_db` for the shared-container implementation and
+// issue #181). Migrations are applied per-schema by
+// `crate::test_db::setup_pool`, suite runs under `--test-threads=1`
+// like the rest of the node test gate.
 //
 // Each test asserts a single invariant on the public API surface so
 // the failure mode points at the broken method, not at a composite
@@ -10,24 +13,12 @@
 // `job_dispatcher_tests.rs`.
 
 use super::*;
-use crate::db::connect_and_migrate;
-use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
-use testcontainers_modules::postgres::Postgres;
+use crate::test_db::{setup_pool, SchemaScope};
 
-async fn setup_store() -> (JobStore, ContainerAsync<Postgres>) {
-    let container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("postgres container");
-    let host = container.get_host().await.expect("container host");
-    let port = container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("container port");
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = connect_and_migrate(&url).await.expect("migrate");
-    (JobStore::new(pool), container)
+async fn setup_store() -> (JobStore, SchemaScope) {
+    let scope = setup_pool().await;
+    let store = JobStore::new(scope.pool.clone());
+    (store, scope)
 }
 
 fn account_addr(seed: u8) -> [u8; 32] {

@@ -1,52 +1,23 @@
 // UsernameStore tests for the Postgres-backed `claim` / `load_from_pg`
-// implementation (PR-A3). Mirrors the testcontainer + per-test fresh
-// schema pattern used in `db_tests.rs` and `state_tests.rs` — each
-// test gets its own `postgres:17` container so there is no shared
-// state to clean up between tests.
+// implementation (PR-A3). Uses the shared-container + per-test
+// schema model from `crate::test_db` (issue #181 Optimisation B):
+// every test gets its own UUID-named schema, container boot is
+// amortised across the whole test binary.
 
 use super::*;
-use sqlx::PgPool;
-use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
-use testcontainers_modules::postgres::Postgres;
+use crate::test_db::setup_pool;
 use zkcoins_program::hash::digest_from_bytes;
-
-use crate::db::connect_and_migrate;
 
 /// Test helper: byte literal → Poseidon `HashDigest = HashOut<F>`.
 fn addr(seed: u8) -> Address {
     digest_from_bytes(&[seed; 32])
 }
 
-/// Mirror of `db_tests::setup_pool`: per-test container, isolated
-/// schema, dropped when the container handle drops. The duplication
-/// is intentional — see the comment in `state_tests.rs::setup_pool`
-/// for the rationale (each test module stays independently runnable
-/// and readable).
-async fn setup_pool() -> (PgPool, ContainerAsync<Postgres>) {
-    let container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = container
-        .get_host()
-        .await
-        .expect("failed to get container host");
-    let port = container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("failed to get container port");
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = connect_and_migrate(&url)
-        .await
-        .expect("connect_and_migrate failed");
-    (pool, container)
-}
-
 #[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_and_resolve_persists_via_pg() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let mut store = UsernameStore::new();
     let address = addr(1);
 
@@ -69,7 +40,8 @@ async fn claim_and_resolve_persists_via_pg() {
 #[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn duplicate_username_rejected_with_validation() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let mut store = UsernameStore::new();
     store.claim(&pool, "alice", addr(1)).await.unwrap();
     let err = store
@@ -83,7 +55,8 @@ async fn duplicate_username_rejected_with_validation() {
 #[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn duplicate_address_rejected_with_validation() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let mut store = UsernameStore::new();
     let address = addr(1);
     store.claim(&pool, "alice", address).await.unwrap();
@@ -98,7 +71,8 @@ async fn duplicate_address_rejected_with_validation() {
 #[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn invalid_username_rejected() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let mut store = UsernameStore::new();
     assert!(store.claim(&pool, "", addr(1)).await.is_err());
     assert!(store.claim(&pool, "hello world", addr(2)).await.is_err());
@@ -109,7 +83,8 @@ async fn invalid_username_rejected() {
 #[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn valid_usernames_accepted() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let mut store = UsernameStore::new();
     store.claim(&pool, "alice", addr(1)).await.unwrap();
     store.claim(&pool, "bob-99", addr(2)).await.unwrap();
@@ -124,7 +99,8 @@ async fn valid_usernames_accepted() {
 #[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn resolve_is_case_insensitive() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let mut store = UsernameStore::new();
     let address = addr(5);
     store.claim(&pool, "Alice", address).await.unwrap();
@@ -144,7 +120,8 @@ async fn get_username_returns_none_for_unknown() {
 
 #[tokio::test]
 async fn load_from_pg_returns_empty_initially() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let store = UsernameStore::load_from_pg(&pool).await.expect("load ok");
     assert_eq!(store.resolve("alice"), None);
     assert_eq!(store.get_username(&addr(1)), None);
@@ -158,7 +135,8 @@ async fn load_from_pg_returns_empty_initially() {
 // covered independently of the write path).
 #[tokio::test]
 async fn load_from_pg_returns_seeded_rows() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let raw = [7u8; 32];
     let expected = digest_from_bytes(&raw);
     sqlx::query("INSERT INTO usernames (name, address) VALUES ($1, $2)")
@@ -228,7 +206,8 @@ async fn load_from_pg_rejects_wrong_address_length() {
     // application layer is the authoritative check, so the loader must
     // surface the mismatch as a typed error rather than panic on the
     // try_into.
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     // Drop the 0010 length CHECK so the corrupt-row plant succeeds;
     // the subject of this test is the Rust-side defense in
     // `UsernameStore::load_from_pg`, not the DB-level CHECK.
@@ -275,7 +254,8 @@ fn validation_error_display_passes_through_message() {
 #[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_falls_back_to_validation_when_sql_layer_catches_race() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
 
     // Plant the row directly via SQL so `UsernameStore::new()`'s
     // in-memory map stays empty — the in-memory `contains_key` check

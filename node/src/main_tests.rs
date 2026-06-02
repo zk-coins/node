@@ -3,8 +3,7 @@
 // `persist_state_from_sync_context` bridge).
 
 use super::*;
-use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
-use testcontainers_modules::postgres::Postgres;
+use crate::test_db::setup_pool;
 
 // --- build_network_config_from_env -------------------------------
 //
@@ -202,29 +201,10 @@ fn build_network_config_panics_on_whitespace_esplora_ws_url() {
 // the original form because no integration test ever drove the sync
 // callback through a real multi_thread worker; this test does.
 
-/// Spin up a fresh `postgres:17` container, run all migrations, and
-/// return the live pool. Mirrors `db_tests::setup_pool` but lives in
-/// this file so the `main.rs` test module stays self-contained.
-async fn setup_pool() -> (PgPool, ContainerAsync<Postgres>) {
-    let container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = container
-        .get_host()
-        .await
-        .expect("failed to get container host");
-    let port = container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("failed to get container port");
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = db::connect_and_migrate(&url)
-        .await
-        .expect("connect_and_migrate failed");
-    (pool, container)
-}
+// Shared-container, per-test-schema infra now lives in
+// `crate::test_db::setup_pool` (issue #181 Optimisation B). The
+// previously file-local `setup_pool` is gone in favour of the
+// shared helper.
 
 /// Regression test for the scanner-callback panic.
 ///
@@ -256,7 +236,8 @@ async fn setup_pool() -> (PgPool, ContainerAsync<Postgres>) {
 /// production bootstrap is multi_thread, so this test mirrors it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn persist_state_from_sync_context_works_from_sync_closure_on_multi_thread() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
 
     let smt = vec![0x11u8; 64];
     let mmr = vec![0x22u8; 128];

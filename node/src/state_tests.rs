@@ -1,14 +1,12 @@
 use super::*;
-use crate::db::{connect_and_migrate, insert_root_index, load_root_indices, persist_state_tx};
+use crate::db::{insert_root_index, load_root_indices, persist_state_tx};
+use crate::test_db::setup_pool;
 use bitcoin::bip32::{ChildNumber, Xpub};
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
 use bitcoin::Network;
 use shared::SECP256K1;
-use sqlx::PgPool;
 use std::str::FromStr;
-use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
-use testcontainers_modules::postgres::Postgres;
 use zkcoins_program::circuit::main::MMR_PROOF_PATH_LEN;
 use zkcoins_program::hash::{digest_from_bytes, hash_concat};
 
@@ -21,35 +19,11 @@ fn create_test_commitment(message: &[u8], key_hex: &str) -> Commitment {
     Commitment::new(&secret_key, message.to_vec()).expect("Failed to create commitment")
 }
 
-/// Start a fresh `postgres:17` container and connect a migrated pool
-/// to it. The container handle is returned alongside the pool so the
-/// caller can keep it alive for the duration of the test — dropping
-/// it tears the container down.
-///
-/// This mirrors `db_tests::setup_pool` deliberately rather than
-/// sharing a helper module; both files keep their setups inline so
-/// each is independently runnable / readable. PR-A3 may dedupe into a
-/// `test_db` helper once the PR-A2/A3 churn settles.
-async fn setup_pool() -> (PgPool, ContainerAsync<Postgres>) {
-    let container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = container
-        .get_host()
-        .await
-        .expect("failed to get container host");
-    let port = container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("failed to get container port");
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = connect_and_migrate(&url)
-        .await
-        .expect("connect_and_migrate failed");
-    (pool, container)
-}
+// Shared-Postgres test infrastructure: see `crate::test_db` and
+// issue #181 Optimisation B. Previously this file declared its own
+// `setup_pool` that spun up a `postgres:17` container per test; that
+// model collapses to a single container per test binary, with each
+// test getting an isolated UUID-named schema.
 
 #[tokio::test]
 async fn test_update_with_single_commitment() {
@@ -115,7 +89,8 @@ async fn test_persist_and_load_state_roundtrip() {
     // Roots must round-trip — that is the structural guarantee the
     // file-based pair used to provide, now backed by an atomic
     // BEGIN/COMMIT in Postgres (issue #11 fix).
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
 
     // Create and populate a state
     let mut original_state = State::new();
@@ -150,7 +125,8 @@ async fn test_persist_and_load_state_roundtrip() {
 async fn test_load_from_pg_empty_returns_fresh_state() {
     // No rows in smt_state / mmr_state means a fresh node: both
     // trees must come back empty — equivalent to State::new().
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let loaded = State::load_from_pg(&pool).await.expect("load_from_pg");
     let fresh = State::new();
     assert_eq!(loaded.smt.root(), fresh.smt.root());
@@ -165,7 +141,8 @@ async fn test_load_from_pg_returns_err_on_corrupted_smt_blob() {
     // bytes can never be decoded as a `SparseMerkleTree` and assert
     // the loader surfaces that as `LoadStateError::Deserialize` rather
     // than panicking or silently falling back to `State::new()`.
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     sqlx::query("INSERT INTO smt_state (id, data) VALUES (1, $1)")
         .bind(vec![0xFFu8; 8])
         .execute(&pool)
@@ -191,7 +168,8 @@ async fn test_load_from_pg_returns_err_on_corrupted_mmr_blob() {
     // Same as the SMT corruption test, but for the MMR row.
     // Persist a valid SMT first so we exercise the second
     // deserialize branch.
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let empty_smt = bincode::serialize(&SparseMerkleTree::new()).unwrap();
     sqlx::query("INSERT INTO smt_state (id, data) VALUES (1, $1)")
         .bind(empty_smt)
@@ -250,7 +228,8 @@ async fn test_serialize_for_persist_roundtrip() {
         )])
         .unwrap();
 
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let (smt_bytes, mmr_bytes) = state.serialize_for_persist().unwrap();
     persist_state_tx(&pool, &smt_bytes, &mmr_bytes, &[0u8; 32], None)
         .await
@@ -486,7 +465,8 @@ async fn test_get_commitment_proof_returns_err_when_smt_has_key_but_mmr_empty() 
     // In the Postgres world the equivalent inconsistent state is
     // synthesized by persisting a non-empty SMT alongside an empty
     // MMR directly, then reloading.
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
 
     let mut populated = State::new();
     let commitment = create_test_commitment(
@@ -543,7 +523,8 @@ async fn test_root_indices_persist_and_load_roundtrip() {
     // Drive a handful of updates with per-update persistence, drop the
     // in-memory state, reload via `State::load_from_pg`, and assert
     // that the HashMap content + `prev_mmr_root` round-trip.
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let original = populate_state_with_persistence(&pool, 3).await;
 
     // Sanity: the in-memory map has exactly the number of updates we
@@ -578,7 +559,8 @@ async fn test_load_from_pg_with_empty_root_index_table_yields_empty_map() {
     // Fresh DB: the table exists but has no rows. `load_from_pg` must
     // succeed and leave `root_indices` empty + `prev_mmr_root` at
     // `ZERO_HASH` (matches `State::new`).
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let loaded = State::load_from_pg(&pool).await.expect("load_from_pg");
     assert!(loaded.root_indices.is_empty());
     assert_eq!(loaded.prev_mmr_root, ZERO_HASH);
@@ -598,7 +580,8 @@ async fn test_get_mmr_inclusion_proof_after_restart_succeeds() {
     // tuple on the reloaded state. Belt-and-braces: also verify the
     // returned proof against the post-update MMR root in extended form
     // (matches what a Plonky2 proof commits as `commitment_history_root`).
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
 
     // Capture each pre-update `prev_mmr_root` during the populate run.
     let mut prev_roots: Vec<HashDigest> = Vec::new();
@@ -658,7 +641,8 @@ async fn test_load_root_indices_rejects_short_prev_root_blob() {
     // inserted row whose `prev_mmr_root` BYTEA is not 32 bytes must
     // surface as `sqlx::Error::Decode` rather than panicking on the
     // `try_into::<[u8; 32]>()`.
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     // Drop the 0010 length CHECK so the corrupt-row plant succeeds;
     // subject of this test is the Rust-side defense, not the DB CHECK.
     sqlx::query("ALTER TABLE mmr_root_index DROP CONSTRAINT mmr_root_index_prev_root_length")
@@ -685,7 +669,8 @@ async fn test_load_root_indices_rejects_short_prev_root_blob() {
 #[tokio::test]
 async fn test_load_root_indices_rejects_short_smt_root_blob() {
     // Same defensive branch, for the `smt_root` column.
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     // Drop the 0010 length CHECK so the corrupt-row plant succeeds;
     // subject of this test is the Rust-side defense, not the DB CHECK.
     sqlx::query("ALTER TABLE mmr_root_index DROP CONSTRAINT mmr_root_index_smt_root_length")
@@ -719,7 +704,8 @@ async fn test_load_root_indices_rejects_negative_leaf_index() {
     // path: the error is wrapped in `LoadStateError::Db` because
     // `load_root_indices` returns `sqlx::Error` and the `From` impl on
     // `LoadStateError` re-wraps it.
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     sqlx::query(
         "INSERT INTO mmr_root_index (prev_mmr_root, smt_root, leaf_index) \
          VALUES ($1, $2, $3)",
@@ -752,7 +738,8 @@ async fn test_load_root_indices_rejects_negative_leaf_index() {
 async fn test_insert_root_index_is_idempotent_on_conflict() {
     // Single-row insert is `ON CONFLICT DO NOTHING` — re-issuing the
     // same `prev_mmr_root` must not error and must not duplicate.
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let prev = digest_from_bytes(&[1u8; 32]);
     let smt = digest_from_bytes(&[2u8; 32]);
     insert_root_index(&pool, &prev, &smt, 0)

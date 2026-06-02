@@ -15,10 +15,10 @@ use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
 use bitcoin::{Address, Network, OutPoint, Txid, XOnlyPublicKey};
 use serde_json::json;
 use std::str::FromStr;
-use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
-use testcontainers_modules::postgres::Postgres;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use crate::test_db::{setup_pool, SchemaScope};
 
 /// Test publisher key used to produce deterministic Taproot addresses
 /// and signatures. The production `PUBLISHER_KEY` is now a required env
@@ -532,26 +532,15 @@ async fn create_and_broadcast_inscription_succeeds_end_to_end_with_mocked_esplor
 //        commit already landed on a previous attempt; the resumer
 //        advances and continues with the reveal instead of bailing.
 
-/// Spin up a fresh `postgres:17` container and connect a migrated pool.
-async fn setup_phaseb_pool() -> (PgPool, ContainerAsync<Postgres>) {
-    let container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = container
-        .get_host()
-        .await
-        .expect("failed to get container host");
-    let port = container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("failed to get container port");
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = db::connect_and_migrate(&url)
-        .await
-        .expect("connect_and_migrate failed");
-    (pool, container)
+/// Hand back a migrated pool scoped to a fresh per-test schema inside
+/// the shared `postgres:17` container (issue #181 Opt B). The
+/// `SchemaScope` is returned alongside so the caller keeps it alive
+/// for the duration of the test — its `Drop` cleans up the schema
+/// after the test finishes.
+async fn setup_phaseb_pool() -> (PgPool, SchemaScope) {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    (pool, scope)
 }
 
 /// Read the current status of a pending row by `commit_txid`. Panics if
