@@ -1862,14 +1862,18 @@ pub(crate) fn initial_event_from_job(job: &Job) -> Event {
     } else {
         "phase"
     };
-    // `Event::json_data` cannot fail for a `serde_json::Value` that we
-    // built ourselves above (no custom Serialize impl involved), so the
-    // `Result` is unwrapped against an empty-shaped Event fallback. The
-    // unwrap shape mirrors the upstream axum SSE example.
+    // `Event::json_data` only returns `Err` when its argument has a
+    // custom `Serialize` impl that itself errs (and even then only
+    // when the resulting bytes are not valid UTF-8 — which JSON's
+    // ASCII-superset output can't violate). The `payload` here is a
+    // `serde_json::Value` built inline above with no custom impls,
+    // so the error arm is structurally unreachable. `.expect()`
+    // documents the invariant inline — a failure here would mean
+    // axum/serde-json changed semantics, not a runtime data shape.
     Event::default()
         .event(event_name)
         .json_data(payload)
-        .unwrap_or_else(|_| Event::default().event(event_name).data("{}"))
+        .expect("Event::json_data cannot fail for a freshly built serde_json::Value")
 }
 
 /// SSE event-builder helper: translate a dispatcher-published
@@ -1892,10 +1896,14 @@ pub(crate) fn event_from_phase(event: &JobPhaseEvent) -> Event {
     } else {
         "phase"
     };
+    // Same invariant as `initial_event_from_job`: `payload` is a
+    // freshly built `serde_json::Value` with no custom Serialize
+    // impls, so `Event::json_data` is structurally infallible. See
+    // the longer note in `initial_event_from_job` above.
     Event::default()
         .event(event_name)
         .json_data(payload)
-        .unwrap_or_else(|_| Event::default().event(event_name).data("{}"))
+        .expect("Event::json_data cannot fail for a freshly built serde_json::Value")
 }
 
 /// SSE heartbeat interval. Cloudflare Tunnel — the typical
