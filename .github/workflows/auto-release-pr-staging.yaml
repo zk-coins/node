@@ -64,7 +64,13 @@ jobs:
             "- [ ] Merge to promote staging to develop (deploys to DEV)" \
             > /tmp/pr-body.md
 
+          # Created as DRAFT so the operator's `gh pr ready` is the
+          # explicit gate that fires a `ready_for_review` event and
+          # triggers ci.yaml — PRs opened via GITHUB_TOKEN would
+          # otherwise hit GitHub's anti-recursion policy and skip
+          # downstream workflows entirely.
           gh pr create \
+            --draft \
             --base develop \
             --head staging \
             --title "Promote: staging -> develop" \

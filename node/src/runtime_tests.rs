@@ -102,6 +102,14 @@ async fn start_rest_node_binds_and_serves_health() {
     std::env::set_var("IS_MAINNET", "false");
     std::env::set_var("ESPLORA_URL", "http://127.0.0.1:1/api");
     std::env::set_var("ESPLORA_WS_URL", "ws://127.0.0.1:1/api/v1/ws");
+    // Smoke tests only need the listener to bind and serve `/health`
+    // / `/api/balance`; they MUST NOT pay the ~7 s background warmup
+    // tax (would double pre-push wall and add nothing to the bootstrap
+    // failure-mode coverage this file owns). With this flag set
+    // `prover_warm` is flipped to `true` immediately at bootstrap and
+    // no `spawn_blocking` task is started — same shape these tests
+    // had before the warmup feature landed.
+    std::env::set_var("ZKCOINS_SKIP_BOOTSTRAP_WARMUP", "1");
 
     // PR-A3 moved all sibling-file state (accounts.bin, usernames.bin,
     // minting_num_pubkeys.bin) into Postgres; the bootstrap only needs
@@ -219,6 +227,9 @@ async fn bootstrap_initial_minting_account_balance_is_goldilocks_safe() {
     std::env::set_var("IS_MAINNET", "false");
     std::env::set_var("ESPLORA_URL", "http://127.0.0.1:1/api");
     std::env::set_var("ESPLORA_WS_URL", "ws://127.0.0.1:1/api/v1/ws");
+    // See the sibling smoke test for the rationale — skip the
+    // ~7 s background warmup so pre-push wall stays bounded.
+    std::env::set_var("ZKCOINS_SKIP_BOOTSTRAP_WARMUP", "1");
 
     let tmp = std::env::temp_dir().join(format!(
         "zkcoins-balance-test-{}-{}",

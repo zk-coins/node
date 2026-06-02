@@ -2,13 +2,26 @@
 
 This guide covers everything you need to develop, test, and deploy the zkCoins backend.
 
-The first section, "Working on the Plonky2 Migration", documents the project invariants, the decision recipe for "should this go in the MVP?", the pre-push checklist, and the known foot-guns. It applies to all work on `develop` after the 2026-05-18 SP1 → Plonky2 cutover. The rest of this file is the dev guide for day-to-day node work.
+## Trust model — node is trusted, wallet is thin
+
+zkCoins is built around a single trust assumption: **the wallet trusts the node it talks to.** The only line the node is not allowed to cross is the wallet's private key — that stays in the wallet. Everything else may be delegated.
+
+This is a hard project rule. It shapes every design and implementation decision:
+
+- **No anti-node logic in the wallet or SDK.** No client-side proof verification, no scan loops, no view-key / spend-key splits, no consistency checks against a second node, no "node integrity" indicators in the UI. If a feature exists to reduce trust in the node, it does not belong in the wallet or SDK.
+- **Self-hosting is the escape hatch.** Users who do not want to trust the public operator run their own node. The wallet must always be able to switch to a different node by changing a single configuration value.
+- **The node is built so that self-hosting is easy.** Single container, documented configuration, deterministic state, no operator-specific dependencies.
+- **The SDK and wallet stay thin.** They expose seed + address + the small set of operations every familiar wallet SDK exposes. Integrators (Cake Wallet, LayerZ, BlueWallet, …) should be able to wire zkCoins up with the same effort as adding a second Bitcoin-family chain.
+
+When in doubt about whether a feature belongs in the wallet, SDK, or node: if it exists to reduce trust in the node, build it node-side, or document self-hosting as the answer. This rule is mirrored verbatim in [`zk-coins/node`](https://github.com/zk-coins/node/blob/develop/CONTRIBUTING.md), [`zk-coins/sdk`](https://github.com/zk-coins/sdk/blob/develop/CONTRIBUTING.md), [`zk-coins/app`](https://github.com/zk-coins/app/blob/develop/CONTRIBUTING.md), and [`zk-coins/docs`](https://github.com/zk-coins/docs/blob/develop/CONTRIBUTING.md).
 
 ---
 
 ## Working on the Plonky2 Migration
 
-Canonical entry point for any session (agent or human) picking up the
+This section documents the project invariants, the decision recipe for "should this go in the MVP?", the pre-push checklist, and the known foot-guns. It applies to all work on `develop` after the 2026-05-18 SP1 → Plonky2 cutover. The rest of this file is the dev guide for day-to-day node work.
+
+It is the canonical entry point for any session (agent or human) picking up the
 codebase without prior context. The Plonky2 migration (PR [#17](https://github.com/zk-coins/node/pull/17))
 merged on 2026-05-18; this section captures the project invariants that
 survive the migration. Read this section, then dive into the linked
@@ -529,7 +542,53 @@ on startup if unset — there is no silent fallback.
 | `NETWORK_NAME` | `Mutinynet` / `Mainnet` | Human-readable name returned by `/api/info`. Derived from `IS_MAINNET` if unset. Purely cosmetic — no behavioural effect. |
 | `PROOFS_DIR` | `./proofs` | Directory for per-proof bincode files (see `Persistent State` below). |
 | `SCANNER_INITIAL_SETTLE_TIMEOUT_MS` | (runtime-defined) | Override for the scanner's initial-settle deadline; see `runtime.rs`. |
+| `ZKCOINS_SKIP_BOOTSTRAP_WARMUP` | `false` | When `1`/`true`, skip the background Plonky2 prover warmup task at startup. Sets `prover_warm = true` immediately so `/health/ready` returns 200 the moment the listener binds. Set in the runtime smoke tests so pre-push wall stays bounded; production deploys leave it unset. See **Bootstrap timing** below. |
 | `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`). |
+
+### Bootstrap timing
+
+The node bootstraps the HTTP listener and the Plonky2 prover in a
+specific sequence so the API is reachable as quickly as possible:
+
+1. `~0.1 s` — `TcpListener::bind` returns. `/health` (liveness) is now
+   200. The listener accepts connections and `axum::serve` starts
+   draining them.
+2. `~0.1 s` — `tokio::task::spawn_blocking` is launched with
+   `AccountNode::warmup_prover`, a synthetic discardable
+   `prove_initial` that wakes the Rayon worker pool and the AOT-
+   compiled Plonky2 evaluator caches. The task runs CPU-bound on a
+   blocking-pool thread so the tokio worker that owns `axum::serve` is
+   not starved.
+3. `~21 s` — `warmup_prover` returns Ok. The background task flips
+   `prover_warm = true`. `/health/ready` now returns 200 with
+   `prover: ready`.
+
+While step 3 is in progress, `/health/ready` returns 503 with
+`{"ready":false,"failures":["prover"],"status":"starting","prover":"warming"}`.
+A load balancer (or Kuma monitor) keyed on the readiness endpoint
+keeps traffic on the previous-generation pod through the warmup
+window — the new pod's `/health` still returns 200 so the container
+runtime does not restart it.
+
+A user request that lands BEFORE the warmup completes still serves
+correctly — it just pays the ~7 s cold-prove tax instead of the
+steady-state ~5 s p50. The trade-off vs. the previous synchronous
+shape (PR #147, closed): API offline time per deploy stays ~0.1 s
+instead of ~21 s; the cold-tax shifts from the first
+post-deploy user request to whichever request arrives during the
+warmup window.
+
+Empirical numbers (dfxdev R2 probe, 2026-05-31):
+
+| Stage | Wall (ms) | Notes |
+|---|---|---|
+| `circuit_build_wall_ms` | 14214 | `Prover::new()` — paid by `load_from_pg` BEFORE the listener binds. |
+| `prove_cold_wall_ms`    |  7012 | First prove call after build — what the background warmup pays. |
+| `prove_warm p50`        |  4777 | Steady state — every request after the warmup task flips the flag. |
+
+Set `ZKCOINS_SKIP_BOOTSTRAP_WARMUP=1` to skip the warmup task entirely.
+Used by the runtime smoke tests in `runtime_tests.rs`; production
+deploys leave it unset.
 
 ### Minimal local-dev env
 
