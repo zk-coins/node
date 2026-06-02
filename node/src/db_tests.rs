@@ -54,7 +54,7 @@ async fn connect_and_migrate_creates_all_tables() {
     .await
     .expect("introspection query failed");
     let names: Vec<String> = rows.into_iter().map(|r| r.get::<String, _>(0)).collect();
-    // Full expected schema after all migrations 0001-0010 (alphabetic
+    // Full expected schema after all migrations 0001-0014 (alphabetic
     // by `ORDER BY table_name`). `_sqlx_migrations` is created
     // implicitly by `sqlx::migrate!`. `minting_meta` (0002) is
     // dropped by 0005 (Phase D), absent from the final schema.
@@ -71,6 +71,8 @@ async fn connect_and_migrate_creates_all_tables() {
     //     `information_schema.tables` (with `table_type = 'VIEW'`), so
     //     it shows up here when introspecting without a `table_type`
     //     filter — included at the correct alphabetic position below.)
+    //   * After 0014 (jobs):             23 tables + 1 view (#161
+    //     introduces the async Job-API state table.)
     assert_eq!(
         names,
         vec![
@@ -82,6 +84,7 @@ async fn connect_and_migrate_creates_all_tables() {
             "coin_proof_store".to_string(),
             "error_log".to_string(),
             "esplora_log".to_string(),
+            "jobs".to_string(),
             "latest_block".to_string(),
             "mmr_root_index".to_string(),
             "mmr_state".to_string(),
