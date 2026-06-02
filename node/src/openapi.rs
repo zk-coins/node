@@ -40,11 +40,12 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::Config;
 
 use crate::db::{InscriptionKind, InscriptionSummary};
+use crate::job_store::JobStatus;
 use crate::router::{
     BalanceResponse, Capabilities, CommitRequest, HistoryErrorResponse, HistoryItem,
-    HistoryResponse, InfoResponse, LnurlErrorResponse, MintRequest, PublisherHealthErrorResponse,
-    PublisherHealthResponse, ReadyResponse, RootEndpoints, RootResponse, SendCoinRequest,
-    SendCoinResponse, UsernameResponse,
+    HistoryResponse, InfoResponse, JobErrorResponse, JobStatusResponse, LnurlErrorResponse,
+    MintRequest, PublisherHealthErrorResponse, PublisherHealthResponse, ReadyResponse,
+    RootEndpoints, RootResponse, SendCoinRequest, SendCoinResponse, UsernameResponse,
 };
 
 #[cfg(feature = "address-list")]
@@ -113,10 +114,12 @@ pub const DOCS_HTML: &str = concat!(
         crate::router::info_handler,
         crate::router::get_balance_handler,
         crate::router::get_history_handler,
-        crate::router::send_coin_handler,
+        crate::router::jobs_mint_handler,
+        crate::router::jobs_send_handler,
+        crate::router::jobs_commit_handler,
+        crate::router::jobs_cancel_handler,
+        crate::router::get_job_handler,
         crate::router::receive_coin_handler,
-        crate::router::commit_handler,
-        crate::router::mint_handler,
         crate::router::get_proof_handler,
         crate::router::get_inscription_handler,
         crate::router::resolve_username_handler,
@@ -137,6 +140,9 @@ pub const DOCS_HTML: &str = concat!(
         SendCoinResponse,
         MintRequest,
         CommitRequest,
+        JobStatus,
+        JobStatusResponse,
+        JobErrorResponse,
         UsernameResponse,
         LnurlErrorResponse,
         InscriptionSummary,

@@ -1485,6 +1485,38 @@ cold tax. That trade-off is documented in `CONTRIBUTING.md`
 ("Bootstrap timing") so an operator does not misread the warmup-
 window p50 as a regression.
 
+### 7.27 Job-API admit+poll over synchronous routes — PR1 — **codified**
+
+**Decision (June 2026, PR `feat/jobs-api-core`).** Replace the synchronous `POST /api/mint`, `POST /api/send`, `POST /api/commit` routes with an admit-then-poll Job-API. Wallet POSTs admit a job row and return `202 Accepted` in milliseconds; a single-worker background `Dispatcher` walks each row through `queued → proving → (awaiting_signature) → broadcasting → completed | failed | cancelled`; the wallet polls `GET /api/jobs/:id` every ~2 s until a terminal status appears.
+
+**Three problems the synchronous routes had:**
+
+1. **Three-concurrent-wallet wedge.** Plonky2's Rayon pool fully saturates the M3 Ultra during a prove. Two parallel `/api/send` requests don't double throughput — they halve each prove's wallclock and add cache-thrash overhead. Wallet C, arriving while A and B are mid-prove, blocks on the axum worker until both finish. With ~5 s p50 prove and three users, the third user observes ~15 s before *their* prove even starts. Past three concurrent users the wedge becomes unusable.
+2. **Cloudflare 100 s connection cap.** PRD sits behind Cloudflare; a long mint that holds an HTTP connection past 100 s gets the connection killed with a 524. The wallet retries, the node re-pays the prove cost on the new connection, and the cycle repeats. The closed test env lives behind a self-hosted reverse proxy today, but the moment we expose PRD via Cloudflare the same wall lands on every prove.
+3. **No mid-flight observability.** A wallet polling for status during a 5 s prove has no way to know whether the node is alive, the prove is on-track, or the publisher is hung — there is just a held connection until 200 / 5xx / timeout.
+
+**Why REST + polling instead of WebSocket or SSE:**
+
+The dispatcher publishes status transitions at five known waypoints (`proving`, `awaiting_signature`, `broadcasting`, `completed`, `failed`), not in real time. With ~2 s polls and a typical 5 s prove, the wallet sees at most three intermediate state reads — well under the budget every browser / mobile keep-alive layer already gives a `GET`. SSE would require a long-lived per-wallet TCP connection through Cloudflare (back to the 100 s wall) plus a JavaScript-side event-source plumbing the wallet currently doesn't carry. WebSocket has the same connection-lifetime issue plus a duplex channel we don't need. The cost of polling is one HTTP round-trip every ~2 s; the cost of long-lived push is a new failure-mode (connection drop mid-job → wallet missed the terminal event → has to fall back to polling anyway). Polling is what every long-running operation on Stripe, GitHub, and CI services uses for the same reason.
+
+**Phase 2 (optional, deferred).** A `/api/jobs/:id/events` SSE channel can be added later for the wallet UI to render a real-time progress bar without polling. PR1 ships the poll-based contract because it covers every observable wallet flow; SSE is a UX-only optimization.
+
+**Why no Redis or external queue.** Single-host invariant (`feedback_zkcoins_server_heavy_architecture`): every prove is CPU-bound on the M3 Ultra and cannot be horizontally distributed (the Rayon pool is process-local). Closed test env (`feedback_zkcoins_closed_test_env`): we do not promise durable state across PRD restarts during the internal phase, so Postgres-backed job rows give every property an external queue would (durability against process crash, idempotency via `(account, key)` unique index, atomicity via a single row UPDATE) without adding an operational dependency. The boot-time `runtime::boot_resume_jobs` covers the crash-recovery edge: any row left in `proving` or `broadcasting` is marked `failed` (Plonky2 in-memory state is lost on restart; the signed wallet timestamp window has expired anyway), and any row in `awaiting_signature` gets a fresh `Notify` channel + is handed back to the dispatcher to park on.
+
+**Single dispatcher worker.** Same reasoning as (1) above — running two proves in parallel only thrashes the Rayon pool. The mpsc channel is the queue; channel ordering is the schedule. If we ever scale beyond one node, the dispatcher becomes per-node (each instance owns its own Postgres rows), not a distributed worker pool — but that scaling step is post-MVP.
+
+**Migrations may wipe** (`feedback_zkcoins_migrations_may_wipe`). Migration `0014_jobs.sql` adds the `jobs` table; the closed test env's reset cycle drops it freely. No data-preservation requirement until mainnet.
+
+**Pointers.**
+- `node/migrations/0014_jobs.sql` — schema + indices
+- `node/src/job_store.rs` + `node/src/job_store_tests.rs` — state-layer API (19 testcontainer tests)
+- `node/src/flow.rs` — mint/send/commit bodies extracted from the legacy handlers (coverage-excluded)
+- `node/src/job_dispatcher.rs` — single-worker loop, `Notify`-based commit-leg wake (coverage-excluded)
+- `node/src/router.rs::jobs_*_handler` — admit + poll + cancel routes (100 % covered)
+- `node/src/runtime.rs::boot_resume_jobs` — crash-recovery (coverage-excluded)
+- `SPEC.md §11.2.1` — wire-level endpoint table
+- `CONTRIBUTING.md` § "Job-API lifecycle" — state machine + invariants
+
 ---
 
 ## 8. Local Artifacts

@@ -464,11 +464,54 @@ let block = fetch_block(hash).unwrap();
 ### Request Flow
 
 ```
-Client Request → Axum Router → router.rs (endpoint) → account_node.rs (logic)
-                                                          ├── Prover (Plonky2)
-                                                          ├── State (SMT + MMR)
-                                                          └── Publisher (Bitcoin)
+Client Request → Axum Router → router.rs (endpoint)
+       │
+       ├── reads:   /api/balance, /api/proof/:id, /api/jobs/:id, ...
+       │              → account_node.rs / db.rs lookup → JSON
+       │
+       └── writes:  /api/jobs/mint, /api/jobs/send, /api/jobs/:id/commit
+                      → JobStore::create (admit)
+                      → mpsc::Sender<JobEnvelope> (enqueue)
+                      → 202 Accepted (response returns to wallet)
+
+         ╭─ background ──────────────────────────────────────────╮
+         │ job_dispatcher::spawn (single worker)                  │
+         │  ▸ recv envelope                                       │
+         │  ▸ load Job from JobStore                              │
+         │  ▸ flow::{mint_flow,send_flow,commit_flow}            │
+         │    ├── account_node.rs (prove via spawn_blocking)     │
+         │    ├── state.rs (SMT + MMR)                            │
+         │    └── publisher.rs (Bitcoin broadcast)                │
+         │  ▸ JobStore::{set_status, set_awaiting_signature,     │
+         │               complete, fail}                          │
+         ╰────────────────────────────────────────────────────────╯
 ```
+
+### Job-API lifecycle
+
+Routes that touch the prover or the publisher (`/api/jobs/mint`, `/api/jobs/send`, `/api/jobs/:id/commit`) never run synchronously. The wallet admits a job, polls `GET /api/jobs/:id` until the status transitions to a terminal value, and consumes the cached response body on success.
+
+**States** (CHECK-enforced in `migrations/0014_jobs.sql`):
+
+| Status | Reached by | Next |
+|---|---|---|
+| `queued` | admit handler INSERT | dispatcher recv → `proving` |
+| `proving` | dispatcher pre-flight | mint: `broadcasting`. send: `awaiting_signature` |
+| `awaiting_signature` | dispatcher after prove (send only) | `POST /api/jobs/:id/commit` → `broadcasting`. Timeout (10 min) → `failed` |
+| `broadcasting` | dispatcher post-signature | publisher Ok → `completed`. Err → `failed` |
+| `completed` | dispatcher | terminal — `response_body` + `response_status` cached for idempotent replay |
+| `failed` | dispatcher (any error) | terminal — `error` message surfaced to wallet |
+| `cancelled` | `POST /api/jobs/:id/cancel` while `queued` | terminal |
+
+**Idempotency.** Every admit MUST carry `Idempotency-Key`. The partial unique index `jobs_idempotency_idx` on `(account_address, idempotency_key)` collapses retries onto the original row. If the original row is already `completed`, the second admit replies with the cached body verbatim (Stripe pattern) — no second prove ever runs.
+
+**Polling cadence.** Non-terminal `GET /api/jobs/:id` responses carry `Retry-After: 2`. Wallet should back off to ~2 s polls; faster polling does not deliver results sooner because the dispatcher publishes status transitions at known waypoints, not in real time.
+
+**Crash recovery.** `runtime::boot_resume_jobs` runs before the listener serves. Rows in `queued / proving / broadcasting` are marked `failed` (in-process prove state lost, signed timestamp window expired). Rows in `awaiting_signature` get a fresh `Notify` channel + are handed back to the dispatcher to park on. The wallet's next poll observes the terminal status either way.
+
+**Single dispatcher worker.** Plonky2's Rayon worker pool already saturates every available CPU core during a prove; running two proves in parallel would only thrash cache. The mpsc channel becomes the queue and the natural happens-before of channel ordering becomes the schedule. Queue depth equals user-observable latency.
+
+See also: `node/src/job_store.rs` (state-layer API), `node/src/job_dispatcher.rs` (worker loop), `node/src/flow.rs` (mint/send/commit bodies — coverage-excluded), `MIGRATION_RESEARCH.md` §7.27 (architectural rationale).
 
 ### Key Patterns
 

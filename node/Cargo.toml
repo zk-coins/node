@@ -84,6 +84,14 @@ sqlx = { version = "0.8", default-features = false, features = [
     # to the `request_headers` / `response_headers` JSONB columns without
     # a manual `Encode` shim.
     "json",
+    # `uuid` lets sqlx encode/decode the `jobs.public_id` column
+    # against the `uuid` crate's `Uuid` type directly; without this
+    # feature `jobs.public_id` would have to be bound as `Vec<u8>`
+    # and parsed by hand.
+    "uuid",
+    # `chrono` for `TIMESTAMPTZ` round-trip on the `jobs.created_at`
+    # / `updated_at` / `completed_at` columns.
+    "chrono",
 ] }
 # Structured logging facade. Replaces the legacy `println!` / `eprintln!`
 # calls on the API request path so log lines carry an explicit level
@@ -140,6 +148,25 @@ utoipa = { version = "5.5", features = ["macros"] }
 # swagger-ui-dist inside the crate so the build does not shell out to
 # `curl` and the binary carries no external CDN dependency at runtime.
 utoipa-swagger-ui = { version = "9", default-features = false, features = ["vendored"] }
+# UUID generation + sqlx encoding for the `jobs.public_id` column
+# (PR1 of the Job-API refactor — migration 0014). `v4` for
+# randomly-generated identifiers (no temporal correlation across
+# rows); `serde` so the value round-trips through the
+# `Json<JobStatusResponse>` and path-parameter extractors without a
+# manual encode/decode shim.
+uuid = { version = "1", features = ["v4", "serde"] }
+# Concurrent map keyed by `Uuid` → `Arc<tokio::sync::Notify>`. Each
+# `send` job that reaches `awaiting_signature` registers an entry so
+# the matching `POST /api/jobs/:id/commit` handler can wake the
+# dispatcher with `notify_one()`. `DashMap` is the standard sharded
+# concurrent-hashmap shape; alternatives (`Mutex<HashMap>`) would
+# serialise concurrent notify lookups under one global lock.
+dashmap = "6"
+# `chrono::DateTime<Utc>` for `TIMESTAMPTZ` round-trip on the
+# `jobs.created_at / updated_at / completed_at` columns. The sqlx
+# `chrono` feature wires the encoder; the workspace already pulls
+# chrono in transitively via the bitcoin / tokio paths.
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

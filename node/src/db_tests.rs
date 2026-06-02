@@ -122,6 +122,7 @@ async fn connect_and_migrate_creates_all_tables() {
             "coin_proof_store".to_string(),
             "error_log".to_string(),
             "esplora_log".to_string(),
+            "jobs".to_string(),
             "latest_block".to_string(),
             "mmr_root_index".to_string(),
             "mmr_state".to_string(),
