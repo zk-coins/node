@@ -222,6 +222,17 @@ tempfile = "3"
 # test fixture. Already a transitive dep via tokio/h2/reqwest, but
 # must be declared here to be reachable from test code.
 socket2 = "0.5"
+# Cross-process file locking (POSIX `flock`/Windows `LockFileEx`) for
+# the `init_shared_pg` attach-or-create critical section in
+# `node/src/test_db.rs`. Under `--test-threads=8` (issue #181 Opt A),
+# eight concurrent `cargo nextest` test processes race to look up
+# the named `zkcoins-test-shared-pg` container; testcontainers 0.27
+# does NOT atomicise its attach-or-create path, so all eight see
+# "not present", all POST `/containers/create`, one wins and seven
+# fail with Docker 409 Conflict. The lock serialises the call so the
+# first process pays the ~3 s create cost and every subsequent
+# process attaches. Standard cross-platform Rust file-lock crate.
+fs2 = "0.4"
 # NOTE: `uuid` is also used by `test_db::setup_pool` to namespace
 # each test's isolated Postgres schema with a UUID-v4 suffix
 # (`t_<uuid_simple>`); the workspace pulls it from the main

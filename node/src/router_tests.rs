@@ -47,9 +47,24 @@ fn test_state() -> AppState {
         shared::ClientAccount::new(private_key)
     };
 
+    // Per-test scratch dir for the ProofStore. Issue #181 Opt A flips
+    // the CI to `--test-threads=8`, which means several `test_state()`
+    // callers run concurrently in the same process; the previous
+    // hard-coded `/tmp/zkcoins-test-proofs` had every test share one
+    // directory and one `ProofStore::next_id` AtomicU64 root, so
+    // parallel writers could race on the same proof id. `keep()`
+    // returns the underlying `PathBuf` and disables the auto-cleanup
+    // Drop — we accept the leak (tests are best-effort cleaned up by
+    // the OS / CI runner reboot) so we don't have to thread a
+    // `TempDir` guard through every caller and the `AppState` struct.
+    // The canonical comment lives here; the second call-site below
+    // (the mint helper around line ~2260) just points back.
+    let proofs_dir = tempfile::tempdir().expect("create proofs tempdir").keep();
     AppState {
         account_node: Arc::new(Mutex::new(account_node)),
-        proof_store: Arc::new(ProofStore::new("/tmp/zkcoins-test-proofs")),
+        proof_store: Arc::new(ProofStore::new(
+            proofs_dir.to_str().expect("proofs tempdir utf-8"),
+        )),
         minting_account: Arc::new(Mutex::new(minting_client)),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
         pool: dead_pool(),
@@ -2257,9 +2272,16 @@ fn mint_test_state() -> AppState {
         c
     };
 
+    // Per-test scratch dir for the ProofStore — see the canonical
+    // comment on the first call-site in `test_state()` above for
+    // why we use `tempfile::tempdir().keep()` instead of holding a
+    // `TempDir` guard.
+    let proofs_dir = tempfile::tempdir().expect("create proofs tempdir").keep();
     AppState {
         account_node: Arc::new(Mutex::new(account_node)),
-        proof_store: Arc::new(ProofStore::new("/tmp/zkcoins-mint-test-proofs")),
+        proof_store: Arc::new(ProofStore::new(
+            proofs_dir.to_str().expect("proofs tempdir utf-8"),
+        )),
         minting_account: Arc::new(Mutex::new(minting_client)),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
         pool: dead_pool(),

@@ -336,8 +336,15 @@ jobs:
       # open. Excluded here for the same reason as in
       # `test-and-coverage`.
       - name: Run DB subset (release, plain nextest, no coverage)
+        # `--test-threads=8` (issue #181 Opt A): the M3 Ultra runner
+        # has 24 cores; Plonky2 prove tests are Rayon-bound and pin
+        # every available core internally, so 8 outer nextest threads
+        # leaves enough headroom for the Rayon pool without
+        # over-subscribing. Per-test schema isolation (#182) +
+        # cross-process file lock around the shared container
+        # (`test_db::init_shared_pg`) make the suite parallel-safe.
         run: |
-          cargo nextest run -p node -p shared --release --all-features --test-threads 1 \
+          cargo nextest run -p node -p shared --release --all-features --test-threads 8 \
             -E 'not binary(api_remote) & (test(/^db::tests::/) + test(/^state::tests::/) + test(/^job_store::tests::/) + test(/^audit::tests::/) + test(/^username::tests::/) + test(/^router::tests::jobs_/) + test(/^r2_probe::tests::/) + test(/^tests::build_network_config_/) + test(/^account_node::tests::test_persist/) + test(/^account_node::tests::test_load/) + test(/^publisher::tests::/) + test(/^runtime::tests::/) + test(/^commitment::tests::/))'
 
       # Tear down the shared test container created by
@@ -442,8 +449,13 @@ jobs:
       # deduplicates within a single run, this is harmless when both
       # subsets are run on separate PR labels.
       - name: Run Prover subset (release, plain nextest, no coverage)
+        # `--test-threads=8` (issue #181 Opt A): see the rationale on
+        # the matching `db-tests` step. The prover subset is the
+        # heaviest Rayon consumer in the suite, so 8 outer threads
+        # × Rayon-pinned cores is the headroom budget on the 24-core
+        # M3 Ultra runner.
         run: |
-          cargo nextest run -p node -p shared --release --all-features --test-threads 1 \
+          cargo nextest run -p node -p shared --release --all-features --test-threads 8 \
             -E 'not binary(api_remote) & (test(/^account_node::tests::test_mint/) + test(/^account_node::tests::test_send/) + test(/^account_node::tests::test_receive/) + test(/^account_node::tests::test_persist_and_load_from_pg_roundtrip/) + test(/^account_node::tests::test_wallet_operations/))'
 
       # See the matching cleanup step in `db-tests` for the rationale.
@@ -591,12 +603,20 @@ jobs:
       # rest of the suite, which covers the in-process axum handlers
       # via oneshot().
       - name: Run llvm-cov nextest (MVP scope, 100% line + function gate)
+        # `--test-threads=8` (issue #181 Opt A): the heavy gate is
+        # the largest wall consumer on M3 Ultra (~60-90 min at
+        # --test-threads=1). 8 outer threads × Rayon-pinned cores
+        # exploits the runner's 24 cores without over-subscribing —
+        # Plonky2 prove tests already saturate Rayon internally.
+        # Per-test schema isolation (#182) + cross-process file lock
+        # around the shared container (`test_db::init_shared_pg`)
+        # make the suite parallel-safe under llvm-cov.
         run: |
           cargo llvm-cov nextest --release -p node -p shared --all-features --show-missing-lines \
             --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|flow\.rs|job_dispatcher\.rs|_tests\.rs$|test_db\.rs$|bin/.*\.rs$|shared/src/.*\.rs$' \
             --fail-under-lines 100 \
             --fail-under-functions 100 \
-            --test-threads 1 \
+            --test-threads 8 \
             -E 'not binary(api_remote)'
 
       # On gate failure, re-format the existing llvm-cov data (no

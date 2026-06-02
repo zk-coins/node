@@ -35,6 +35,7 @@ pub async fn start_rest_node(
     username_store: UsernameStore,
     addr: &str,
     pool: Arc<PgPool>,
+    proofs_dir: &str,
 ) -> anyhow::Result<()> {
     let socket_addr = addr
         .parse::<SocketAddr>()
@@ -45,11 +46,14 @@ pub async fn start_rest_node(
     // Proof files keep using a local directory — the proof store is
     // append-only and the proofs themselves are large (bincode-
     // serialized Plonky2 proofs) so a `BYTEA` column would balloon the
-    // Postgres image. `PROOFS_DIR` defaults to `./proofs` for parity
-    // with the pre-PR-A3 layout; the deployment overrides it to the
-    // mounted data volume.
-    let proofs_dir = std::env::var("PROOFS_DIR").unwrap_or_else(|_| "./proofs".to_string());
-    let proof_store = Arc::new(ProofStore::new(&proofs_dir));
+    // Postgres image. The `proofs_dir` arrives as a parameter from the
+    // binary edge (`main.rs` reads the `PROOFS_DIR` env var and passes
+    // the resolved value through) — keeping the env read out of this
+    // function lets parallel test binaries (`runtime_tests.rs` under
+    // issue #181 Opt A's `--test-threads=8`) each pass their own
+    // `tempfile::tempdir()` path instead of racing on a process-wide
+    // env var.
+    let proof_store = Arc::new(ProofStore::new(proofs_dir));
 
     let minting_account = {
         let secret = include_bytes!("../minting_secret.bin");
