@@ -438,20 +438,10 @@ fn test_mint_repro_live_setup() {
 /// `load_from_pg` and assert the imported account survived round-trip.
 #[tokio::test]
 async fn test_persist_and_load_from_pg_roundtrip() {
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
-
-    let container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = container.get_host().await.unwrap();
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = crate::db::connect_and_migrate(&url)
-        .await
-        .expect("connect_and_migrate failed");
+    // Shared Postgres container + per-test schema (issue #181 Opt B);
+    // see `crate::test_db` for the design.
+    let scope = crate::test_db::setup_pool().await;
+    let pool = scope.pool.clone();
 
     let state_arc = Arc::new(Mutex::new(State::new()));
     let mut node = AccountNode::new(Arc::clone(&state_arc));
@@ -512,20 +502,10 @@ fn test_get_account_balance_returns_err_for_unknown_address() {
 /// ::Deserialize` rather than panicking or silently dropping the row.
 #[tokio::test]
 async fn test_load_from_pg_rejects_corrupted_blob() {
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
-
-    let container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = container.get_host().await.unwrap();
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = crate::db::connect_and_migrate(&url)
-        .await
-        .expect("connect_and_migrate failed");
+    // Shared Postgres container + per-test schema (issue #181 Opt B);
+    // see `crate::test_db` for the design.
+    let scope = crate::test_db::setup_pool().await;
+    let pool = scope.pool.clone();
 
     let bad_addr = vec![0xAAu8; 32];
     sqlx::query("INSERT INTO accounts (address, data) VALUES ($1, $2)")
@@ -556,20 +536,10 @@ async fn test_load_from_pg_rejects_corrupted_blob() {
 /// `LoadAccountNodeError::BadAddressLength`.
 #[tokio::test]
 async fn test_load_from_pg_rejects_wrong_address_length() {
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
-
-    let container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = container.get_host().await.unwrap();
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = crate::db::connect_and_migrate(&url)
-        .await
-        .expect("connect_and_migrate failed");
+    // Shared Postgres container + per-test schema (issue #181 Opt B);
+    // see `crate::test_db` for the design.
+    let scope = crate::test_db::setup_pool().await;
+    let pool = scope.pool.clone();
 
     // The 0010 CHECK constraint `accounts_address_length` would
     // otherwise reject the wrong-length row at insert time, masking
