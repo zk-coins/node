@@ -42,9 +42,9 @@ use utoipa_swagger_ui::Config;
 use crate::db::{InscriptionKind, InscriptionSummary};
 use crate::router::{
     BalanceResponse, Capabilities, CommitRequest, HistoryErrorResponse, HistoryItem,
-    HistoryResponse, InfoResponse, LnurlErrorResponse, MintRequest, PublisherHealthResponse,
-    ReadyResponse, RootEndpoints, RootResponse, SendCoinRequest, SendCoinResponse,
-    UsernameResponse,
+    HistoryResponse, InfoResponse, LnurlErrorResponse, MintRequest, PublisherHealthErrorResponse,
+    PublisherHealthResponse, ReadyResponse, RootEndpoints, RootResponse, SendCoinRequest,
+    SendCoinResponse, UsernameResponse,
 };
 
 #[cfg(feature = "address-list")]
@@ -126,6 +126,7 @@ pub const DOCS_HTML: &str = concat!(
         RootEndpoints,
         ReadyResponse,
         PublisherHealthResponse,
+        PublisherHealthErrorResponse,
         InfoResponse,
         Capabilities,
         BalanceResponse,

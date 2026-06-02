@@ -541,8 +541,8 @@ same Rust type drives both `serde` and the schema.
 | `GET  /health/ready` | Health | Readiness probe (DB + Esplora + prover-warm gate). |
 | `GET  /health/publisher` | Health | Publisher UTXO state. |
 | `GET  /api/info` | Node | Network + per-build capability flags. |
-| `GET  /api/balance` | Coins | Balance lookup. |
-| `GET  /api/history` | Coins | Paginated per-address history (issue #153). |
+| `GET  /api/balance` | Accounts | Balance lookup (per-address read). |
+| `GET  /api/history` | Accounts | Paginated per-address history (issue #153). |
 | `POST /api/send` | Coins | Sender-side proof construction. |
 | `POST /api/receive` | Coins | Recipient-side coin acceptance. |
 | `POST /api/commit` | Coins | Broadcast + state advance (post-`/api/send`). |
@@ -550,7 +550,7 @@ same Rust type drives both `serde` and the schema.
 | `GET  /api/proof/{id}` | Coins | Look up a previously generated `CoinProof`. |
 | `GET  /api/inscriptions/{txid}` | Inscriptions | Inscription metadata. |
 | `GET  /api/username/resolve/{username}` | Usernames | Username → address (always-on). |
-| `GET  /api/address` | Addresses | All known addresses. **`address-list` feature.** |
+| `GET  /api/address` | Accounts | All known addresses. **`address-list` feature.** |
 | `POST /api/username/claim` | Usernames | First-claim wins. **`username-claim` feature.** |
 | `GET  /.well-known/lnurlp/{username}` | LNURL | LNURL-pay metadata. **`lnurl` feature.** |
 | `GET  /lnurl/pay/{username}` | LNURL | LNURL-pay callback. **`lnurl` feature.** |
@@ -559,12 +559,19 @@ The spec is served at `GET /openapi.json` and rendered with bundled
 Swagger UI at `GET /docs` (assets vendored into the binary —
 zero-CDN, works behind any reverse proxy that preserves path order).
 
+The following routes are **intentionally excluded** from the spec
+because they document the spec itself or expose operator-only debug
+data: `GET /openapi.json`, `GET /docs`, `GET /docs/{file}`, and
+`GET /api/admin/r2-probe/history`. If you add another admin route
+under `/api/admin/*`, keep it out of `paths(...)` for the same
+reason.
+
 ### Adding a new endpoint
 
 1. **Annotate the handler** in `node/src/router.rs` with
    `#[utoipa::path(...)]`. Set `tag` to the same tag used by sibling
-   endpoints (`Node`, `Health`, `Coins`, `Inscriptions`, `Usernames`,
-   `Addresses`, `LNURL`). Enumerate every status code the handler can
+   endpoints (`Node`, `Health`, `Accounts`, `Coins`, `Inscriptions`,
+   `Usernames`, `LNURL`). Enumerate every status code the handler can
    return and bind it to the matching response schema. Bump the
    handler's visibility to `pub(crate)` — utoipa needs to reference
    it from `openapi.rs`.

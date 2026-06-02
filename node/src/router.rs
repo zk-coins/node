@@ -1184,7 +1184,7 @@ pub(crate) async fn get_balance_handler(
 #[utoipa::path(
     get,
     path = "/api/history",
-    tag = "Coins",
+    tag = "Accounts",
     params(
         ("address" = String, Query,
             description = "Account address (32-byte hex, with or without `0x` prefix)."),
@@ -2459,6 +2459,28 @@ pub struct PublisherHealthResponse {
     total_sats: u64,
 }
 
+/// JSON body returned by the 503 branch of `GET /health/publisher`
+/// when the configured Esplora endpoint fails the UTXO fetch. Kept
+/// distinct from [`PublisherHealthResponse`] so the deploy-dev
+/// preflight can branch on the response shape without parsing the
+/// HTTP status separately. `address` is echoed back so the failure
+/// log still identifies which wallet the operator should top up.
+#[derive(Serialize, ToSchema)]
+pub struct PublisherHealthErrorResponse {
+    /// Short stable failure tag — always `"Esplora-side error fetching
+    /// publisher UTXOs"` for this 503. Distinct field so a future
+    /// expansion (additional 503 causes) can add new tags without
+    /// breaking existing parsers.
+    error: &'static str,
+    /// Free-text error detail surfaced from the underlying Esplora
+    /// client. Useful for human triage; do NOT parse — the upstream
+    /// shape is not stable.
+    detail: String,
+    /// Publisher Taproot bech32 — echoed so the failure log identifies
+    /// which wallet the operator should inspect.
+    address: String,
+}
+
 /// Operational preflight (`GET /health/publisher`).
 ///
 /// Reads the publisher Taproot wallet's UTXO set via the configured
@@ -2477,7 +2499,9 @@ pub struct PublisherHealthResponse {
         (status = 200, description = "Publisher wallet state — address (Taproot bech32), \
             spendable UTXO count, total sats.",
             body = PublisherHealthResponse),
-        (status = 503, description = "Esplora-side error fetching publisher UTXOs."),
+        (status = 503, description = "Esplora-side error fetching publisher UTXOs. \
+            The `detail` field carries the underlying client error string.",
+            body = PublisherHealthErrorResponse),
     ),
 )]
 pub(crate) async fn publisher_health_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -2491,24 +2515,21 @@ pub(crate) async fn publisher_health_handler(State(state): State<AppState>) -> i
             let total_sats: u64 = utxos.iter().map(|(_, sats)| sats).sum();
             (
                 StatusCode::OK,
-                Json(
-                    serde_json::to_value(PublisherHealthResponse {
-                        address: publisher_address.to_string(),
-                        utxo_count,
-                        total_sats,
-                    })
-                    .expect("publisher health response serializes"),
-                ),
+                Json(PublisherHealthResponse {
+                    address: publisher_address.to_string(),
+                    utxo_count,
+                    total_sats,
+                }),
             )
                 .into_response()
         }
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "Esplora-side error fetching publisher UTXOs",
-                "detail": e.to_string(),
-                "address": publisher_address.to_string(),
-            })),
+            Json(PublisherHealthErrorResponse {
+                error: "Esplora-side error fetching publisher UTXOs",
+                detail: e.to_string(),
+                address: publisher_address.to_string(),
+            }),
         )
             .into_response(),
     }
@@ -2568,6 +2589,13 @@ pub struct RootResponse {
     docs: &'static str,
 }
 
+/// Endpoint map advertised by [`root_handler`]. Mirrors every
+/// always-on route — feature-gated routes (address-list, username
+/// claim, LNURL) are intentionally omitted because they are absent
+/// from the default build and from `api.zkcoins.app`'s wire surface.
+/// Meta routes (`/openapi.json`, `/docs`, `/docs/{file}`) and admin
+/// endpoints (`/api/admin/*`) are also omitted — the OpenAPI spec is
+/// the canonical map for those.
 #[derive(Serialize, ToSchema)]
 pub struct RootEndpoints {
     info: &'static str,
@@ -2576,9 +2604,15 @@ pub struct RootEndpoints {
     send: &'static str,
     receive: &'static str,
     commit: &'static str,
+    mint: &'static str,
     proof: &'static str,
     inscription: &'static str,
+    username_resolve: &'static str,
     health: &'static str,
+    health_ready: &'static str,
+    health_publisher: &'static str,
+    openapi: &'static str,
+    docs: &'static str,
 }
 
 /// Root handler — anything hitting `https://api.zkcoins.app/` (browser visit,
@@ -2608,9 +2642,15 @@ pub(crate) async fn root_handler() -> impl IntoResponse {
             send: "POST /api/send",
             receive: "POST /api/receive",
             commit: "POST /api/commit",
+            mint: "POST /api/mint",
             proof: "GET  /api/proof/{id}",
             inscription: "GET  /api/inscriptions/{txid}",
+            username_resolve: "GET  /api/username/resolve/{username}",
             health: "GET  /health",
+            health_ready: "GET  /health/ready",
+            health_publisher: "GET  /health/publisher",
+            openapi: "GET  /openapi.json",
+            docs: "GET  /docs",
         },
         docs: "https://docs.zkcoins.app",
     })
