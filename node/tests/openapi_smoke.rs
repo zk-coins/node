@@ -67,13 +67,19 @@ fn spec_lists_every_always_on_route() {
         .expect("`paths` must be a JSON object");
 
     // Every always-on (non-feature-gated) route on the wire surface
-    // that the wallet app talks to. Feature-gated routes
+    // that the wallet app talks to, plus the operational endpoints
+    // load balancers and Kuma monitors depend on. Feature-gated routes
     // (`/api/address`, `/api/username/claim`, the LNURL pair) are not
     // checked here because the default build does not enable them and
     // the document must reflect the running binary.
     let required = [
+        "/",
+        "/health",
+        "/health/ready",
+        "/health/publisher",
         "/api/info",
         "/api/balance",
+        "/api/history",
         "/api/send",
         "/api/receive",
         "/api/commit",
@@ -116,6 +122,28 @@ fn spec_registers_critical_schemas() {
     assert!(
         schemas.contains_key("SendCoinResponse"),
         "`SendCoinResponse` must be registered under components.schemas"
+    );
+
+    // `HistoryResponse` / `HistoryItem` describe the `/api/history`
+    // page contract (issue #153). The wallet's transaction list reads
+    // this shape directly; a missing schema here means a wallet build
+    // would have no compile-time check against drift.
+    for name in ["HistoryResponse", "HistoryItem", "HistoryErrorResponse"] {
+        assert!(
+            schemas.contains_key(name),
+            "`{name}` must be registered under components.schemas — \
+             `/api/history` clients depend on it"
+        );
+    }
+
+    // `ReadyResponse` is what Kuma + load balancers consume to gate
+    // traffic on `/health/ready`. Missing here means a deploy that
+    // changes the readiness shape ships without anyone noticing the
+    // monitor contract broke.
+    assert!(
+        schemas.contains_key("ReadyResponse"),
+        "`ReadyResponse` must be registered under components.schemas — \
+         readiness probes consume this shape"
     );
 }
 

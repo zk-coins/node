@@ -41,8 +41,10 @@ use utoipa_swagger_ui::Config;
 
 use crate::db::{InscriptionKind, InscriptionSummary};
 use crate::router::{
-    BalanceResponse, Capabilities, CommitRequest, InfoResponse, LnurlErrorResponse, MintRequest,
-    SendCoinRequest, SendCoinResponse, UsernameResponse,
+    BalanceResponse, Capabilities, CommitRequest, HistoryErrorResponse, HistoryItem,
+    HistoryResponse, InfoResponse, LnurlErrorResponse, MintRequest, PublisherHealthResponse,
+    ReadyResponse, RootEndpoints, RootResponse, SendCoinRequest, SendCoinResponse,
+    UsernameResponse,
 };
 
 #[cfg(feature = "address-list")]
@@ -104,8 +106,13 @@ pub const DOCS_HTML: &str = concat!(
     // node automatically advertises its own URL instead of pointing at
     // the hosted DFX deployments.
     paths(
+        crate::router::root_handler,
+        crate::router::health_handler,
+        crate::router::ready_handler,
+        crate::router::publisher_health_handler,
         crate::router::info_handler,
         crate::router::get_balance_handler,
+        crate::router::get_history_handler,
         crate::router::send_coin_handler,
         crate::router::receive_coin_handler,
         crate::router::commit_handler,
@@ -115,9 +122,16 @@ pub const DOCS_HTML: &str = concat!(
         crate::router::resolve_username_handler,
     ),
     components(schemas(
+        RootResponse,
+        RootEndpoints,
+        ReadyResponse,
+        PublisherHealthResponse,
         InfoResponse,
         Capabilities,
         BalanceResponse,
+        HistoryResponse,
+        HistoryItem,
+        HistoryErrorResponse,
         SendCoinRequest,
         SendCoinResponse,
         MintRequest,

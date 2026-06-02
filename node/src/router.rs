@@ -393,7 +393,7 @@ pub(crate) struct HistoryQuery {
 /// counterparty), no memo column exists, and `triggering_commit_txid`
 /// is unset by every Rust caller — see [`db::AccountHistoryRow::commit_txid`]
 /// for the GUC-plumbing story.
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct HistoryItem {
     /// Server-internal monotonic id. Always set — sourced from
     /// `account_history.id`.
@@ -432,7 +432,7 @@ pub struct HistoryItem {
 /// Paginated wrapper around [`HistoryItem`]. `total` is the unfiltered
 /// count for the queried address (not the count of returned `items`)
 /// so the caller can drive pagination without a separate query.
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct HistoryResponse {
     pub items: Vec<HistoryItem>,
     pub total: i64,
@@ -445,7 +445,7 @@ pub struct HistoryResponse {
 /// shape because `/api/history` is a read endpoint with no `success` /
 /// `proof_id` machinery — a flat `{ "error": "..." }` is the contract
 /// the issue documents.
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct HistoryErrorResponse {
     pub error: &'static str,
 }
@@ -1181,7 +1181,29 @@ pub(crate) async fn get_balance_handler(
 /// `observed_inscriptions` + `pending_inscriptions` for the future
 /// txid/block_height/status link — see [`db::AccountHistoryRow`] for
 /// the today-vs-tomorrow story). No new schema work.
-async fn get_history_handler(
+#[utoipa::path(
+    get,
+    path = "/api/history",
+    tag = "Coins",
+    params(
+        ("address" = String, Query,
+            description = "Account address (32-byte hex, with or without `0x` prefix)."),
+        ("limit" = Option<i64>, Query,
+            description = "Page size in `[1, 200]`. Defaults to 50."),
+        ("offset" = Option<i64>, Query,
+            description = "Non-negative pagination offset. Defaults to 0."),
+    ),
+    responses(
+        (status = 200, description = "Paginated newest-first history page.",
+            body = HistoryResponse),
+        (status = 422, description = "Missing/malformed `address`, `limit` outside `[1, 200]`, \
+            or negative `offset`.",
+            body = HistoryErrorResponse),
+        (status = 500, description = "Database error while reading history.",
+            body = HistoryErrorResponse),
+    ),
+)]
+pub(crate) async fn get_history_handler(
     State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<HistoryQuery>,
 ) -> impl IntoResponse {
@@ -2317,8 +2339,8 @@ async fn r2_probe_history_handler(
 /// probe reports `failures: ["prover"]` with `status: starting` and a
 /// 503 so a load balancer keeps holding traffic on the previous-gen
 /// pod. `/health` (liveness) is unaffected.
-#[derive(Serialize)]
-struct ReadyResponse {
+#[derive(Serialize, ToSchema)]
+pub struct ReadyResponse {
     ready: bool,
     failures: Vec<&'static str>,
     /// Lifecycle tag. `"starting"` while any failure is present,
@@ -2356,7 +2378,21 @@ struct ReadyResponse {
 /// No caching: each call issues a fresh DB round-trip plus an Esplora
 /// HEAD-equivalent. Both are sub-100 ms in steady state, and a cached
 /// stale "ready" is worse than a slightly slow honest answer.
-async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
+#[utoipa::path(
+    get,
+    path = "/health/ready",
+    tag = "Health",
+    responses(
+        (status = 200, description = "Node is ready: DB reachable, Esplora reachable, \
+            prover warm. `failures` is empty, `status = \"ready\"`, `prover = \"ready\"`.",
+            body = ReadyResponse),
+        (status = 503, description = "Node is not ready. `failures` carries one or more of \
+            `\"db\"`, `\"esplora\"`, `\"prover\"`. Load balancers / Kuma monitors gate traffic \
+            on this status.",
+            body = ReadyResponse),
+    ),
+)]
+pub(crate) async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
     let mut failures: Vec<&'static str> = Vec::new();
 
     if sqlx::query("SELECT 1").execute(&*state.pool).await.is_err() {
@@ -2416,8 +2452,8 @@ async fn check_esplora(
 /// "should I top up the publisher wallet?" decision without scraping
 /// Esplora directly. `address` is the publisher's Taproot bech32 — log-
 /// only, NOT a secret (the matching key lives in `PUBLISHER_KEY`).
-#[derive(Serialize)]
-struct PublisherHealthResponse {
+#[derive(Serialize, ToSchema)]
+pub struct PublisherHealthResponse {
     address: String,
     utxo_count: u64,
     total_sats: u64,
@@ -2433,7 +2469,18 @@ struct PublisherHealthResponse {
 /// itself silently treated 5xx as a skip. Returning 503 on an
 /// Esplora-side error is intentional: the operator should see the
 /// failure mode, not a fabricated empty response.
-async fn publisher_health_handler(State(state): State<AppState>) -> impl IntoResponse {
+#[utoipa::path(
+    get,
+    path = "/health/publisher",
+    tag = "Health",
+    responses(
+        (status = 200, description = "Publisher wallet state — address (Taproot bech32), \
+            spendable UTXO count, total sats.",
+            body = PublisherHealthResponse),
+        (status = 503, description = "Esplora-side error fetching publisher UTXOs."),
+    ),
+)]
+pub(crate) async fn publisher_health_handler(State(state): State<AppState>) -> impl IntoResponse {
     let publisher_address = crate::PUBLISHER_ADDRESS.clone();
 
     match crate::publisher::get_publisher_utxo(&publisher_address, &state.esplora_config, None)
@@ -2467,6 +2514,29 @@ async fn publisher_health_handler(State(state): State<AppState>) -> impl IntoRes
     }
 }
 
+/// Liveness probe (`GET /health`).
+///
+/// Returns `"ok"` with 200 as soon as the HTTP listener is bound and
+/// the tokio runtime is alive. Deliberately does NOT touch the
+/// database or Esplora — see [`ready_handler`] for the dependency
+/// probe. The Kubernetes-style separation: a liveness blip restarts
+/// the process and loses in-memory state, so liveness must stay cheap
+/// and infallible while readiness gates traffic on the actual
+/// dependencies.
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "Health",
+    responses(
+        (status = 200, description = "HTTP listener is bound and the tokio runtime is alive. \
+            Body is the literal text `ok`.",
+            body = String, content_type = "text/plain"),
+    ),
+)]
+pub(crate) async fn health_handler() -> &'static str {
+    "ok"
+}
+
 #[utoipa::path(
     get,
     path = "/api/info",
@@ -2489,8 +2559,8 @@ pub(crate) async fn info_handler() -> impl IntoResponse {
     })
 }
 
-#[derive(Serialize)]
-struct RootResponse {
+#[derive(Serialize, ToSchema)]
+pub struct RootResponse {
     service: &'static str,
     version: &'static str,
     network: String,
@@ -2498,8 +2568,8 @@ struct RootResponse {
     docs: &'static str,
 }
 
-#[derive(Serialize)]
-struct RootEndpoints {
+#[derive(Serialize, ToSchema)]
+pub struct RootEndpoints {
     info: &'static str,
     balance: &'static str,
     history: &'static str,
@@ -2516,7 +2586,17 @@ struct RootEndpoints {
 /// the package version, the connected network, and pointers to the real
 /// endpoints. Cheaper than serving a static landing page and still answers the
 /// "is this the right host?" question without surfacing a bare 404.
-async fn root_handler() -> impl IntoResponse {
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "Node",
+    responses(
+        (status = 200, description = "Service identification: package name + version, \
+            connected network, public endpoint map, and a pointer to the hosted docs.",
+            body = RootResponse),
+    ),
+)]
+pub(crate) async fn root_handler() -> impl IntoResponse {
     Json(RootResponse {
         service: "zkcoins-node",
         version: env!("CARGO_PKG_VERSION"),
@@ -2949,7 +3029,7 @@ pub(crate) fn create_router(state: AppState) -> Router {
     // MVP routes — always compiled in.
     let app = Router::new()
         .route("/", get(root_handler))
-        .route("/health", get(|| async { "ok" }))
+        .route("/health", get(health_handler))
         .route("/health/ready", get(ready_handler))
         .route("/health/publisher", get(publisher_health_handler))
         .route("/openapi.json", get(crate::openapi::openapi_json_handler))
