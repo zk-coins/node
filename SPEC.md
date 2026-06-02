@@ -388,7 +388,36 @@ For the **initial proof** there is no prior account proof to verify. The circuit
 Given a fresh node response `(proof_id, account_state_hash, output_coins_root)`:
 
 1. Sign `H(account_state_hash || output_coins_root)` with the **current** commitment private key (BIP-32 derivation index = `num_pubkeys - 1` in the reference).
-2. POST `(proof_id, commitment)` to `/api/commit`. The node attaches this commitment to the proof, builds a Taproot commit+reveal tx pair whose commit-tx txid begins with `4242`, and broadcasts.
+2. POST `(proof_id, commitment)` to `/api/jobs/:id/commit` (the path includes the send-job's UUID returned by the original `/api/jobs/send` admit). The node attaches this commitment to the proof, builds a Taproot commit+reveal tx pair whose commit-tx txid begins with `4242`, and broadcasts.
+
+### 11.2.1 Job-API endpoints (PR1 — replacing the legacy synchronous routes)
+
+Wallet flow is now poll-based. The synchronous `/api/mint`, `/api/send`, `/api/commit` routes are removed; every request that touches the prover or the publisher goes through a job row.
+
+| Route | Purpose |
+|---|---|
+| `POST /api/jobs/mint` | Admit a fresh mint job. Body identical to the legacy `/api/mint`. Requires `Idempotency-Key` header. Returns 202 + `{job_id, status: "queued"}` + `Location: /api/jobs/<id>`. |
+| `POST /api/jobs/send` | Admit a fresh send job. Body identical to the legacy `/api/send` (signature + timestamp verified inline before admission). Requires `Idempotency-Key`. Returns 202 + `{job_id, status}`. |
+| `GET /api/jobs/:id` | Poll handler. Non-terminal rows carry `Retry-After: 2`. Body shape: `{job_id, kind, status, phase, progress, proof_id?, result?, error?}`. |
+| `POST /api/jobs/:id/commit` | Attach the wallet-signed commitment to a `send` job in `awaiting_signature`. Body identical to the legacy `/api/commit`. Returns 200 + `{status: "broadcasting"}`. |
+| `POST /api/jobs/:id/cancel` | Cancel a job. Only succeeds while `status = queued`; later states return 409. |
+
+**State machine (per job row, `migrations/0014_jobs.sql`):**
+
+```
+queued
+   ↓  dispatcher pulls from mpsc::Receiver<JobEnvelope>
+proving
+   ↓  mint: → broadcasting → completed
+   ↓  send: → awaiting_signature ─ /jobs/:id/commit → broadcasting → completed
+   ↓  any failure: → failed
+```
+
+**Idempotency.** Every admit carries `Idempotency-Key`. Replays of the same `(account, key)` pair surface the original `job_id` (or the cached response body if `status = completed`) instead of inserting a second row.
+
+**Crash recovery.** The boot-time `runtime::boot_resume_jobs` walks every non-terminal row: rows in `queued / proving / broadcasting` are marked `failed` (the wallet's signed timestamp window has expired and in-process Plonky2 state is lost); rows in `awaiting_signature` get a fresh `Notify` channel and are handed back to the dispatcher so the wallet can still attach the signature.
+
+See `MIGRATION_RESEARCH.md` §7.27 for the architectural rationale (no WebSocket / SSE / Redis in PR1).
 
 ### 11.3 Scanner (`node::scanner`)
 

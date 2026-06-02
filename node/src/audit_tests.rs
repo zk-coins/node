@@ -154,17 +154,18 @@ async fn build_state_with_pool() -> (
     let tmp = tempfile::tempdir().expect("tempdir");
     let proof_dir = tmp.path().to_str().unwrap().to_string();
 
+    let pool_arc = Arc::new(pool);
     let state = AppState {
         account_node: Arc::new(Mutex::new(account_node)),
         proof_store: Arc::new(ProofStore::new(&proof_dir)),
         minting_account: Arc::new(Mutex::new(minting_account)),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
-        pool: Arc::new(pool),
+        pool: Arc::clone(&pool_arc),
         esplora_config: Arc::new(esplora_config),
         prover_warm: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        phase2_reached: Arc::new(tokio::sync::Notify::new()),
-        phase3_release_lock: Arc::new(tokio::sync::Mutex::new(())),
-        state_advance_release_lock: Arc::new(tokio::sync::Mutex::new(())),
+        job_store: Arc::new(crate::job_store::JobStore::new((*pool_arc).clone())),
+        job_tx: tokio::sync::mpsc::channel::<crate::job_dispatcher::JobEnvelope>(8).0,
+        job_notify_map: Arc::new(dashmap::DashMap::new()),
     };
     // tempdir lives until the test ends (Drop on test exit).
     std::mem::forget(tmp);
