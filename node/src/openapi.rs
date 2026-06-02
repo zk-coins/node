@@ -119,6 +119,7 @@ pub const DOCS_HTML: &str = concat!(
         crate::router::jobs_commit_handler,
         crate::router::jobs_cancel_handler,
         crate::router::get_job_handler,
+        crate::router::stream_job_handler,
         crate::router::receive_coin_handler,
         crate::router::get_proof_handler,
         crate::router::get_inscription_handler,

@@ -83,6 +83,7 @@ fn spec_lists_every_always_on_route() {
         "/api/jobs/mint",
         "/api/jobs/send",
         "/api/jobs/{job_id}",
+        "/api/jobs/{job_id}/stream",
         "/api/jobs/{job_id}/commit",
         "/api/jobs/{job_id}/cancel",
         "/api/receive",

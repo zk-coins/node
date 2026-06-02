@@ -1936,7 +1936,30 @@ const SSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 /// proxy stripping `text/event-stream`), the wallet falls back to
 /// `GET /api/jobs/:id` polling — the poll contract from PR1 is
 /// unchanged.
-async fn stream_job_handler(
+#[utoipa::path(
+    get,
+    path = "/api/jobs/{job_id}/stream",
+    tag = "Jobs",
+    params(
+        ("job_id" = String, Path, description = "Job UUID returned by the matching admit handler."),
+    ),
+    responses(
+        (status = 200,
+            description = "SSE stream. Frames are `event: phase` (intermediate transitions) and \
+                `event: complete` (terminal). The wire body of each frame is a JSON-encoded \
+                `JobStatusResponse` snapshot. Streams close after the first `event: complete`. \
+                A `: heartbeat` SSE comment is emitted on a fixed interval so reverse proxies \
+                (Cloudflare Tunnel, nginx) do not idle-kill the connection.",
+            content_type = "text/event-stream"),
+        (status = 404, description = "No job exists for this id. Returned as a JSON body \
+            rather than an immediately-closed stream so the polling fallback can branch \
+            on a plain HTTP error.",
+            body = JobErrorResponse),
+        (status = 500, description = "Database error loading the job row.",
+            body = JobErrorResponse),
+    ),
+)]
+pub(crate) async fn stream_job_handler(
     Path(id): Path<Uuid>,
     State(state): State<AppState>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
