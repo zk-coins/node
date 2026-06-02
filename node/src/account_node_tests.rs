@@ -1389,3 +1389,105 @@ fn warmup_prover_completes_successfully() {
     node.warmup_prover()
         .expect("warmup_prover must succeed on a fresh AccountNode");
 }
+
+/// Pins the **queue-only** shape produced by the production mint /
+/// receive paths: the credited coin lives in `Account.coin_queue` while
+/// `Account.balance` remains `0` until a subsequent send drains the
+/// queue. `router::balance_from_account_blob` must mirror
+/// `Account::get_balance()` and surface the sum, otherwise the
+/// `/api/history` row for a first mint reports `amount = 0` (the bug
+/// the `history_after_mint_records_mint_row` E2E flagged on PR #166).
+///
+/// Lives in `account_node_tests` because constructing a realistic
+/// `CoinProof` requires the full prover + state fixtures — the lighter
+/// settled-balance shape (`balance > 0, coin_queue == []`) is still
+/// covered in `router_tests::history_row_to_item_handles_first_row_with_no_prev_data`.
+#[test]
+fn history_row_to_item_balance_from_coin_queue_only() {
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    let mut node = AccountNode::new(Arc::clone(&state_arc));
+
+    let mut minting = TestAccountData::new_minting_account();
+    node.import_account(
+        minting.address,
+        Account {
+            proof: None,
+            coin_queue: vec![],
+            coin_history: SparseMerkleTree::new(),
+            balance: 1_000_000,
+            num_sends: 0,
+            commitment_public_key: None,
+        },
+    );
+
+    let recipient = TestAccountData::new_generic(&[42u8; 32], Network::Signet);
+    const MINT_AMOUNT: u64 = 50_000;
+
+    // Mint flow: the minting account sends MINT_AMOUNT to a fresh
+    // recipient. `receive_coin` then pushes the resulting `CoinProof`
+    // into the recipient's `coin_queue` without touching `balance` —
+    // this is the exact write `commit_mint_tx` produces for a real
+    // first-mint history row.
+    let mut coin_proofs = minting
+        .execute_send_coins(
+            &mut node,
+            vec![Invoice::new(MINT_AMOUNT, recipient.address)],
+        )
+        .expect("mint send_coins");
+    state_arc
+        .lock()
+        .unwrap()
+        .update(
+            &coin_proofs
+                .iter()
+                .map(|x| x.commitment.clone().unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .expect("state.update");
+    node.receive_coin(coin_proofs.pop().expect("at least one coin"))
+        .expect("recipient receive_coin");
+
+    let recipient_account = node
+        .accounts
+        .get(&recipient.address)
+        .expect("recipient account present after receive_coin");
+    assert_eq!(
+        recipient_account.balance, 0,
+        "settled balance is still 0 — the credit sits in coin_queue"
+    );
+    assert_eq!(
+        recipient_account.coin_queue.len(),
+        1,
+        "exactly one queued coin"
+    );
+    assert_eq!(recipient_account.coin_queue[0].coin.amount, MINT_AMOUNT);
+
+    // Direct helper assertion: balance_from_account_blob must include
+    // the queue contribution.
+    let new_data = bincode::serialize(recipient_account).expect("bincode serialize");
+    assert_eq!(
+        crate::router::balance_from_account_blob(&new_data),
+        Some(MINT_AMOUNT),
+        "balance_from_account_blob must sum balance + coin_queue (mirrors Account::get_balance)"
+    );
+
+    // End-to-end through history_row_to_item: a first mint row
+    // (prev_data = None) must surface `amount = MINT_AMOUNT`.
+    let row = crate::db::AccountHistoryRow {
+        id: 7,
+        timestamp_secs: 1_700_000_000,
+        source: "mint".to_string(),
+        prev_data: None,
+        new_data,
+        commit_txid: None,
+        block_height: None,
+        pending_status: None,
+    };
+    let item = crate::router::history_row_to_item(&row).expect("item produced");
+    assert_eq!(item.id, 7);
+    assert_eq!(item.direction, "mint");
+    assert_eq!(
+        item.amount, MINT_AMOUNT,
+        "first mint must surface the full credit (regression: was 0 when balance_from_account_blob read only Account.balance)"
+    );
+}

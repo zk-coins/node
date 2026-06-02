@@ -68,7 +68,13 @@ jobs:
             --description "Run heavy M3 Ultra test + coverage jobs on this PR" \
             2>/dev/null || true
 
+          # Created as DRAFT — same rationale as auto-release-pr-staging.yaml:
+          # the operator's explicit `gh pr ready` toggle fires the
+          # `ready_for_review` event that triggers ci.yaml. The `ci:full`
+          # label is still applied at creation so the heavy M3 Ultra
+          # tests + Coverage Gate run as soon as the PR is marked ready.
           gh pr create \
+            --draft \
             --base main \
             --head develop \
             --title "Release: develop -> main" \
