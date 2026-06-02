@@ -47,9 +47,12 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use shared::commitment::Commitment;
+use shared::ProofData;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS;
 use zkcoins_program::hash::digest_to_bytes;
 use zkcoins_program::types::MINTING_ADDRESS;
+use zkcoins_program::F;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -142,8 +145,9 @@ macro_rules! feature_skip {
 // ---------------------------------------------------------------------------
 // Capability detection
 //
-// Mint (`/api/mint`) and username *resolve* (`/api/username/resolve/:u`)
-// are permanent MVP endpoints — always registered, never gated. They
+// Mint (`/api/jobs/mint`) and username *resolve*
+// (`/api/username/resolve/:u`) are permanent MVP endpoints — always
+// registered, never gated. They
 // have no capability bit on `/api/info` (only opt-in features do), so
 // tests against those routes do not consult `fetch_capabilities`.
 //
@@ -545,7 +549,12 @@ async fn history_limit_above_max_returns_422() {
 
 #[tokio::test]
 async fn history_unknown_address_returns_empty_page() {
-    let address = format!("0x{}", "11".repeat(32));
+    // DEV is a persistent, shared closed-env DB (no reset on develop
+    // push), so a hardcoded address accumulates history rows across runs
+    // and `total == 0` stops holding. A freshly-generated keypair's
+    // address has provably never been touched, so "unknown" is
+    // guaranteed regardless of prior suite runs.
+    let address = TestWallet::new().address_hex();
     let resp = http_client()
         .get(url(&format!("/api/history?address={}", address)))
         .send()
@@ -574,18 +583,10 @@ async fn history_after_mint_records_mint_row() {
 
     assert_minting_balance_in_bounds(&client).await;
 
-    let mint_resp = client
-        .post(url("/api/mint"))
-        .json(&json!({
-            "account_address": alice.address_hex(),
-            "amount": MINT_AMOUNT,
-        }))
-        .send()
-        .await
-        .expect("POST /api/mint");
-    assert_eq!(mint_resp.status(), StatusCode::OK);
-    let mint_body: Value = mint_resp.json().await.expect("mint body JSON");
-    assert_eq!(mint_body["success"], Value::Bool(true));
+    // Mint via the async Job-API; `mint_via_job` returns the legacy
+    // mint response body (the job `result`) on completion.
+    let mint_result = mint_via_job(&client, &alice.address_hex(), MINT_AMOUNT).await;
+    assert_eq!(mint_result["success"], Value::Bool(true));
 
     // Wait for the mint credit to land on Alice's balance — same poll
     // pattern the existing mint roundtrip uses; once balance >= MINT,
@@ -757,34 +758,44 @@ async fn fallback_unknown_route_returns_404() {
 
 #[tokio::test]
 async fn mint_empty_body_returns_422() {
+    // The `Json<MintRequest>` extractor deserialises before the
+    // Idempotency-Key header gate, so an empty body 422s regardless of
+    // the header — supply one anyway to keep the request well-formed.
     let resp = http_client()
-        .post(url("/api/mint"))
+        .post(url("/api/jobs/mint"))
+        .header("Idempotency-Key", random_idempotency_key())
         .json(&json!({}))
         .send()
         .await
-        .expect("POST /api/mint {}");
+        .expect("POST /api/jobs/mint {}");
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]
 async fn mint_invalid_hex_address_returns_422() {
     let resp = http_client()
-        .post(url("/api/mint"))
+        .post(url("/api/jobs/mint"))
+        .header("Idempotency-Key", random_idempotency_key())
         .json(&json!({"account_address": "not_hex", "amount": 100}))
         .send()
         .await
-        .expect("POST /api/mint bad hex");
+        .expect("POST /api/jobs/mint bad hex");
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    // The mint handler uses `handler_error_response` for both hex/
-    // length failures, so the body is a `SendCoinResponse` envelope
-    // with `success: false` and a specific `error` string. Asserting
-    // the EXACT string keeps the lockstep contract honest — the app's
-    // `KNOWN_SERVER_ERRORS` uses a generic `"Invalid hex"` placeholder
-    // but the server emits the more-specific `"account_address is not
-    // valid hex"`. The lockstep inventory test below documents this
-    // mismatch.
+    // The Job-API admit handler validates the body INLINE via
+    // `flow::validate_mint_request` and reports failures with the
+    // `JobErrorResponse` envelope — `{error: "..."}` only, no
+    // `success` field (that was the legacy `SendCoinResponse` shape).
+    // Asserting the EXACT string keeps the lockstep contract honest —
+    // the app's `KNOWN_SERVER_ERRORS` uses a generic `"Invalid hex"`
+    // placeholder but the server emits the more-specific
+    // `"account_address is not valid hex"`. The lockstep inventory
+    // test below documents this mismatch.
     let body: Value = resp.json().await.expect("mint 422 body JSON");
-    assert_eq!(body["success"], Value::Bool(false));
+    assert!(
+        body.get("success").is_none(),
+        "Job-API error envelope must not carry `success` (got {:?})",
+        body.get("success")
+    );
     assert_eq!(body["error"], "account_address is not valid hex");
 }
 
@@ -793,19 +804,24 @@ async fn mint_wrong_address_length_returns_422() {
     // 16 bytes = 32 hex chars — short of the required 32 bytes
     let short_addr = format!("0x{}", "ab".repeat(16));
     let resp = http_client()
-        .post(url("/api/mint"))
+        .post(url("/api/jobs/mint"))
+        .header("Idempotency-Key", random_idempotency_key())
         .json(&json!({"account_address": short_addr, "amount": 100}))
         .send()
         .await
-        .expect("POST /api/mint short addr");
+        .expect("POST /api/jobs/mint short addr");
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    // Same envelope as the invalid-hex branch — but with the address-
-    // length-specific message. The app's `KNOWN_SERVER_ERRORS` lists
-    // `"Invalid address length"` as a placeholder; the server emits
-    // `"account_address must be 32 bytes (64 hex chars)"`. See the
-    // lockstep inventory test below.
+    // Same `JobErrorResponse` envelope as the invalid-hex branch — but
+    // with the address-length-specific message. The app's
+    // `KNOWN_SERVER_ERRORS` lists `"Invalid address length"` as a
+    // placeholder; the server emits `"account_address must be 32 bytes
+    // (64 hex chars)"`. See the lockstep inventory test below.
     let body: Value = resp.json().await.expect("mint 422 body JSON");
-    assert_eq!(body["success"], Value::Bool(false));
+    assert!(
+        body.get("success").is_none(),
+        "Job-API error envelope must not carry `success` (got {:?})",
+        body.get("success")
+    );
     assert_eq!(
         body["error"],
         "account_address must be 32 bytes (64 hex chars)"
@@ -814,12 +830,15 @@ async fn mint_wrong_address_length_returns_422() {
 
 #[tokio::test]
 async fn send_empty_body_returns_422() {
+    // `Json<SendCoinRequest>` deserialisation fails before the
+    // Idempotency-Key gate, so an empty body 422s regardless.
     let resp = http_client()
-        .post(url("/api/send"))
+        .post(url("/api/jobs/send"))
+        .header("Idempotency-Key", random_idempotency_key())
         .json(&json!({}))
         .send()
         .await
-        .expect("POST /api/send {}");
+        .expect("POST /api/jobs/send {}");
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
@@ -845,27 +864,42 @@ async fn send_bad_address_hex_returns_422() {
         "signature": Some(signature),
         "timestamp": Some(ts),
     });
+    // Inline `validate_send_request` runs the sig + timestamp gates
+    // first (both pass here), then the per-field hex decode fails →
+    // synchronous 422 from `POST /api/jobs/send`, no job admitted.
     let resp = http_client()
-        .post(url("/api/send"))
+        .post(url("/api/jobs/send"))
+        .header("Idempotency-Key", random_idempotency_key())
         .json(&body)
         .send()
         .await
-        .expect("POST /api/send bad hex");
+        .expect("POST /api/jobs/send bad hex");
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    // Body contract: same `SendCoinResponse` envelope as the mint 422
-    // branches. The string is specific (per-field), not the generic
-    // `"Invalid hex"` listed in the app's `KNOWN_SERVER_ERRORS` — the
-    // lockstep inventory below tracks the mismatch.
+    // Body contract: `JobErrorResponse` envelope (`{error}` only). The
+    // string is specific (per-field), not the generic `"Invalid hex"`
+    // listed in the app's `KNOWN_SERVER_ERRORS` — the lockstep
+    // inventory below tracks the mismatch.
     let body: Value = resp.json().await.expect("send 422 body JSON");
-    assert_eq!(body["success"], Value::Bool(false));
+    assert!(
+        body.get("success").is_none(),
+        "Job-API error envelope must not carry `success` (got {:?})",
+        body.get("success")
+    );
     assert_eq!(body["error"], "account_address is not valid hex");
 }
 
 #[tokio::test]
 async fn send_unknown_account_returns_404() {
     // Well-formed body, valid signatures, but the sender account has
-    // no balance / state on the node, so `send_coins` returns
-    // "Unknown account address" → 404.
+    // no balance / state on the node. The signature + timestamp gates
+    // pass inline so the send job is ADMITTED (202); the
+    // "Unknown account address" rejection comes from `send_coins`,
+    // which runs in the dispatcher's prove leg — so it surfaces as an
+    // async terminal `failed` status, NOT a synchronous 404. The
+    // FlowError carrying the 404 status maps the message into the
+    // job's `error` field; the status code itself is not exposed on
+    // the poll response.
+    let client = http_client();
     let alice = TestWallet::new();
     let bob = TestWallet::new();
     let amount: u64 = 1;
@@ -882,21 +916,26 @@ async fn send_unknown_account_returns_404() {
         "signature": Some(signature),
         "timestamp": Some(ts),
     });
-    let resp = http_client()
-        .post(url("/api/send"))
-        .json(&body)
-        .send()
-        .await
-        .expect("POST /api/send unknown account");
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    // Body contract: 404 here is the canonical "Unknown account address"
-    // path from `map_send_coins_error` in `router.rs`. This is the
-    // value-bearing half of the lockstep check — the app's
+    let (job_id, status, _admit) = submit_send_job(&client, &body).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "unknown-account send passes inline validation and is admitted"
+    );
+    let job_id = job_id.expect("admitted send job carries a job_id");
+
+    // Poll to the terminal `failed` state and assert the canonical
+    // "Unknown account address" string from `map_send_coins_error`.
+    // This is the value-bearing half of the lockstep check — the app's
     // `KNOWN_SERVER_ERRORS` list is asserted against the live server
     // here so a server-side rename surfaces immediately.
-    let body: Value = resp.json().await.expect("send 404 body JSON");
-    assert_eq!(body["success"], Value::Bool(false));
-    assert_eq!(body["error"], "Unknown account address");
+    let terminal = poll_job_until_terminal(&client, &job_id).await;
+    assert_eq!(
+        terminal["status"], "failed",
+        "unknown-account send job must fail, got {}",
+        terminal
+    );
+    assert_eq!(terminal["error"], "Unknown account address");
 }
 
 #[tokio::test]
@@ -913,18 +952,26 @@ async fn send_bad_signature_returns_401() {
         "signature": Some("00".repeat(64)),
         "timestamp": Some(unix_now()),
     });
+    // The signature gate runs inline in `validate_send_request`, so a
+    // bad signature is rejected synchronously by `POST /api/jobs/send`.
     let resp = http_client()
-        .post(url("/api/send"))
+        .post(url("/api/jobs/send"))
+        .header("Idempotency-Key", random_idempotency_key())
         .json(&body)
         .send()
         .await
-        .expect("POST /api/send bad sig");
+        .expect("POST /api/jobs/send bad sig");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    // Body contract: `"Signature verification failed"` is one of the
-    // app's `KNOWN_SERVER_ERRORS` and the live server must emit the
-    // exact same string.
+    // Body contract: `JobErrorResponse` (`{error}`).
+    // `"Signature verification failed"` is one of the app's
+    // `KNOWN_SERVER_ERRORS` and the live server must emit the exact
+    // same string.
     let body: Value = resp.json().await.expect("send 401 body JSON");
-    assert_eq!(body["success"], Value::Bool(false));
+    assert!(
+        body.get("success").is_none(),
+        "Job-API error envelope must not carry `success` (got {:?})",
+        body.get("success")
+    );
     assert_eq!(body["error"], "Signature verification failed");
 }
 
@@ -946,18 +993,26 @@ async fn send_stale_timestamp_returns_401() {
         "signature": Some(signature),
         "timestamp": Some(stale_ts),
     });
+    // The timestamp-window gate runs inline in `validate_send_request`,
+    // so a stale timestamp is rejected synchronously.
     let resp = http_client()
-        .post(url("/api/send"))
+        .post(url("/api/jobs/send"))
+        .header("Idempotency-Key", random_idempotency_key())
         .json(&body)
         .send()
         .await
-        .expect("POST /api/send stale ts");
+        .expect("POST /api/jobs/send stale ts");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    // Body contract: `"Request timestamp too old or in the future"`
-    // is one of the app's `KNOWN_SERVER_ERRORS` and the live server
-    // must emit the exact same string.
+    // Body contract: `JobErrorResponse` (`{error}`).
+    // `"Request timestamp too old or in the future"` is one of the
+    // app's `KNOWN_SERVER_ERRORS` and the live server must emit the
+    // exact same string.
     let body: Value = resp.json().await.expect("send 401 body JSON");
-    assert_eq!(body["success"], Value::Bool(false));
+    assert!(
+        body.get("success").is_none(),
+        "Job-API error envelope must not carry `success` (got {:?})",
+        body.get("success")
+    );
     assert_eq!(body["error"], "Request timestamp too old or in the future");
 }
 
@@ -991,9 +1046,13 @@ async fn receive_garbage_body_returns_default_failure() {
 
 #[tokio::test]
 async fn commit_unknown_proof_id_returns_404() {
+    // Job-API: commit is keyed by JOB id, not proof_id. The proof_id
+    // now lives inside the commit body and is only validated by
+    // `commit_flow` once a real `awaiting_signature` job is resumed.
+    // The synchronous negative path is "no job for this id" → 404
+    // `{error: "Job not found"}`. A random UUID is guaranteed to miss.
     let alice = TestWallet::new();
-    // The handler validates the proof_id BEFORE hex decoding, so any
-    // syntactically valid body works as long as proof_id is unknown.
+    let unknown_job = uuid_v4_like();
     let body = json!({
         "proof_id": u64::MAX,
         "public_key": hex::encode(alice.pubkey(0).serialize()),
@@ -1001,21 +1060,28 @@ async fn commit_unknown_proof_id_returns_404() {
         "message": "00".repeat(64),
     });
     let resp = http_client()
-        .post(url("/api/commit"))
+        .post(url(&format!("/api/jobs/{}/commit", unknown_job)))
         .json(&body)
         .send()
         .await
-        .expect("POST /api/commit unknown id");
+        .expect("POST /api/jobs/:id/commit unknown id");
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body: Value = resp.json().await.expect("commit 404 body JSON");
+    assert_eq!(body["error"], "Job not found");
 }
 
 #[tokio::test]
-async fn commit_bad_message_hex_returns_422_or_404() {
+async fn commit_bad_message_hex_returns_404_for_unknown_job() {
+    // Job-API: a malformed `message` hex is validated by `commit_flow`
+    // in the dispatcher, reachable only after a real
+    // `awaiting_signature` job. From a black-box client with no such
+    // job, the commit endpoint short-circuits on the unknown job id at
+    // 404 before any payload validation runs — so a bad-message body
+    // against an unknown job is still a clean 404. (The async
+    // bad-message rejection is covered by the deterministic unit tests
+    // in `flow`/`router_tests`.)
     let alice = TestWallet::new();
-    // proof_id=1 may or may not exist on the node. If it exists, the
-    // handler reaches the hex-decode step and returns 422. If not, the
-    // proof-store miss short-circuits at 404. Both are acceptable for
-    // this negative-path coverage.
+    let unknown_job = uuid_v4_like();
     let body = json!({
         "proof_id": 1u64,
         "public_key": hex::encode(alice.pubkey(0).serialize()),
@@ -1023,17 +1089,14 @@ async fn commit_bad_message_hex_returns_422_or_404() {
         "message": "not_valid_hex_zzz",
     });
     let resp = http_client()
-        .post(url("/api/commit"))
+        .post(url(&format!("/api/jobs/{}/commit", unknown_job)))
         .json(&body)
         .send()
         .await
-        .expect("POST /api/commit bad message");
-    let status = resp.status();
-    assert!(
-        status == StatusCode::UNPROCESSABLE_ENTITY || status == StatusCode::NOT_FOUND,
-        "expected 422 or 404, got {}",
-        status
-    );
+        .expect("POST /api/jobs/:id/commit bad message");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body: Value = resp.json().await.expect("commit 404 body JSON");
+    assert_eq!(body["error"], "Job not found");
 }
 
 #[tokio::test]
@@ -1144,25 +1207,17 @@ async fn mint_roundtrip_lands_balance_and_proof() {
     // DB wipe). See `assert_minting_balance_in_bounds` for details.
     assert_minting_balance_in_bounds(&client).await;
 
-    let mint_resp = client
-        .post(url("/api/mint"))
-        .json(&json!({
-            "account_address": alice.address_hex(),
-            "amount": MINT_AMOUNT,
-        }))
-        .send()
-        .await
-        .expect("POST /api/mint");
-    let mint_status = mint_resp.status();
-    assert_eq!(mint_status, StatusCode::OK, "unexpected mint status");
-    let mint_body: Value = mint_resp.json().await.expect("mint body JSON");
+    // Mint through the async Job-API. `mint_via_job` admits the job
+    // (202), polls to `completed`, and returns the job `result` —
+    // which is the legacy mint response body.
+    let mint_result = mint_via_job(&client, &alice.address_hex(), MINT_AMOUNT).await;
     assert_eq!(
-        mint_body["success"],
+        mint_result["success"],
         Value::Bool(true),
         "mint not successful: {}",
-        mint_body
+        mint_result
     );
-    let proof_id = mint_body["proof_id"].as_u64().expect("proof_id present");
+    let proof_id = mint_result["proof_id"].as_u64().expect("proof_id present");
 
     // Poll the balance endpoint until the credit shows up.
     let observed = poll_balance_at_least(&client, &alice.address_hex(), MINT_AMOUNT).await;
@@ -1172,15 +1227,7 @@ async fn mint_roundtrip_lands_balance_and_proof() {
     );
 
     // Verify the proof file is fetchable + bincode-decodable.
-    let proof_resp = client
-        .get(url(&format!("/api/proof/{}", proof_id)))
-        .send()
-        .await
-        .expect("GET /api/proof");
-    assert_eq!(proof_resp.status(), StatusCode::OK);
-    let proof_bytes = proof_resp.bytes().await.expect("proof bytes");
-    let coin_proof: CoinProof =
-        bincode::deserialize(&proof_bytes).expect("decode CoinProof bincode");
+    let coin_proof = fetch_coin_proof(&client, proof_id).await;
     assert!(
         coin_proof.commitment.is_some(),
         "mint coin proof should carry a node-signed commitment"
@@ -1213,33 +1260,14 @@ async fn send_commit_roundtrip_moves_balance() {
 
     // ---- Mint ----
     // Post-#87 the scanner is event-driven (Esplora WS subscription),
-    // so by the time `mint_roundtrip_lands_balance_and_proof` returns
-    // 200 and writes alice-1's balance, the prior commitment is
-    // already at-most-one-block away from being indexed in the SMT.
-    // A `422 Unable to get merkle proofs` here is therefore a real
-    // scanner-side regression, not a benign timing flake — the
-    // previous PR-83-era retry loop is gone. Asserting `== 200`
-    // surfaces it.
-    let mint_resp = client
-        .post(url("/api/mint"))
-        .json(&json!({
-            "account_address": alice.address_hex(),
-            "amount": MINT_AMOUNT,
-        }))
-        .send()
-        .await
-        .expect("POST /api/mint");
-    let mint_status = mint_resp.status();
-    let mint_body_text = mint_resp.text().await.unwrap_or_default();
-    assert_eq!(
-        mint_status,
-        StatusCode::OK,
-        "mint failed: {} body={}",
-        mint_status,
-        mint_body_text
-    );
-    let mint_body: Value = serde_json::from_str(&mint_body_text).expect("mint body JSON");
-    let mint_proof_id = mint_body["proof_id"].as_u64().expect("proof_id");
+    // so by the time the mint job completes and writes alice-1's
+    // balance, the prior commitment is already at-most-one-block away
+    // from being indexed in the SMT. A `422 Unable to get merkle
+    // proofs` send failure later would therefore be a real scanner-side
+    // regression, not a benign timing flake.
+    let mint_result = mint_via_job(&client, &alice.address_hex(), MINT_AMOUNT).await;
+    assert_eq!(mint_result["success"], Value::Bool(true), "mint failed");
+    let mint_proof_id = mint_result["proof_id"].as_u64().expect("proof_id");
 
     // Wait for the balance to settle so send_coins has something to spend.
     let balance_before = poll_balance_at_least(&client, &alice.address_hex(), MINT_AMOUNT).await;
@@ -1251,27 +1279,14 @@ async fn send_commit_roundtrip_moves_balance() {
     );
 
     // ---- Fetch the mint's CoinProof to discover prev_commitment_pubkey ----
-    let proof_resp = client
-        .get(url(&format!("/api/proof/{}", mint_proof_id)))
-        .send()
-        .await
-        .expect("GET mint proof");
-    assert_eq!(proof_resp.status(), StatusCode::OK);
-    let proof_bytes = proof_resp.bytes().await.expect("mint proof bytes");
-    let mint_coin_proof: CoinProof = bincode::deserialize(&proof_bytes).expect("decode CoinProof");
+    let mint_coin_proof = fetch_coin_proof(&client, mint_proof_id).await;
     let prev_pk = mint_coin_proof
         .commitment
         .as_ref()
         .expect("mint coin proof has commitment")
         .public_key;
 
-    // (No second poll needed — `poll_balance_at_least` above already
-    // observed alice.balance >= MINT_AMOUNT; the inscription is therefore
-    // on-chain and the scanner has ingested it. Removing the redundant
-    // 15-s wait shaves test runtime without losing signal — if the
-    // scanner regresses, the FIRST wait will fail.)
-
-    // ---- Send ----
+    // ---- Send (phase 1: admit + prove → awaiting_signature) ----
     let amount = SEND_AMOUNT;
     let ts = unix_now();
     let signature = alice.sign_send(&alice.address_hex(), &bob.address_hex(), amount, ts);
@@ -1285,52 +1300,40 @@ async fn send_commit_roundtrip_moves_balance() {
         "signature": signature,
         "timestamp": ts,
     });
-    let send_resp = client
-        .post(url("/api/send"))
-        .json(&send_body)
-        .send()
-        .await
-        .expect("POST /api/send");
-    let send_status = send_resp.status();
-    let send_body_text = send_resp.text().await.unwrap_or_default();
+    let (send_job_id, send_status, _admit) = submit_send_job(&client, &send_body).await;
     assert_eq!(
         send_status,
-        StatusCode::OK,
-        "send failed: {} body={}",
-        send_status,
-        send_body_text
+        StatusCode::ACCEPTED,
+        "send job must be admitted with 202"
     );
-    let send_body: Value = serde_json::from_str(&send_body_text).expect("send body JSON");
-    assert_eq!(send_body["success"], Value::Bool(true));
-    let send_proof_id = send_body["proof_id"].as_u64().expect("send proof_id");
+    let send_job_id = send_job_id.expect("admitted send job carries a job_id");
 
-    // Value-bearing assertions on the response payload: each hash
-    // field must decode to exactly 32 bytes and be non-zero. A
-    // shape-only `.is_some()` check was masking node bugs that
-    // returned a placeholder zero-hash or a truncated hex string.
-    let ash_hex = send_body["account_state_hash"]
-        .as_str()
-        .expect("account_state_hash present")
-        .to_string();
-    let ash_bytes = hex::decode(&ash_hex).expect("ash is hex");
+    // Poll to `awaiting_signature`; the body carries the send `proof_id`.
+    let awaiting = poll_job_until_status(&client, &send_job_id, "awaiting_signature").await;
+    let send_proof_id = awaiting["proof_id"]
+        .as_u64()
+        .expect("awaiting_signature job carries proof_id");
+    assert!(send_proof_id > 0, "proof_id must be a positive u64");
+
+    // ---- Derive ash || ocr from the send proof's public inputs ----
+    // The send proof's `.commitment` is None here; ash/ocr live in the
+    // Plonky2 proof public inputs. Value-bearing assertions: each hash
+    // must be exactly 32 bytes and non-zero. A shape-only check would
+    // mask a node bug that emitted a placeholder zero-hash.
+    let send_coin_proof = fetch_coin_proof(&client, send_proof_id).await;
+    let (ash_bytes, ocr_bytes) = ash_ocr_from_send_proof(&send_coin_proof);
     assert_eq!(ash_bytes.len(), 32, "account_state_hash must be 32 bytes");
     assert!(
         ash_bytes.iter().any(|&b| b != 0),
         "account_state_hash must be non-zero"
     );
-    let ocr_hex = send_body["output_coins_root"]
-        .as_str()
-        .expect("output_coins_root present")
-        .to_string();
-    let ocr_bytes = hex::decode(&ocr_hex).expect("ocr is hex");
     assert_eq!(ocr_bytes.len(), 32, "output_coins_root must be 32 bytes");
     assert!(
         ocr_bytes.iter().any(|&b| b != 0),
         "output_coins_root must be non-zero"
     );
-    assert!(send_proof_id > 0, "proof_id must be a positive u64");
 
-    // ---- Commit ----
+    // ---- Commit (phase 2: sign ash || ocr, attach, broadcast) ----
     let mut commit_message = Vec::with_capacity(64);
     commit_message.extend_from_slice(&ash_bytes);
     commit_message.extend_from_slice(&ocr_bytes);
@@ -1342,21 +1345,10 @@ async fn send_commit_roundtrip_moves_balance() {
         "signature": commit_sig,
         "message": hex::encode(&commit_message),
     });
-    let commit_resp = client
-        .post(url("/api/commit"))
-        .json(&commit_body)
-        .send()
-        .await
-        .expect("POST /api/commit");
-    let commit_status = commit_resp.status();
-    assert_eq!(
-        commit_status,
-        StatusCode::OK,
-        "commit failed: {}",
-        commit_status
-    );
-    let commit_body_resp: Value = commit_resp.json().await.expect("commit body");
-    assert_eq!(commit_body_resp["success"], Value::Bool(true));
+    // `commit_send_job` posts the commit (200 {status:"broadcasting"}),
+    // polls to `completed`, and returns the legacy commit body.
+    let commit_result = commit_send_job(&client, &send_job_id, &commit_body).await;
+    assert_eq!(commit_result["success"], Value::Bool(true));
 
     // ---- Balance decreased ----
     let final_balance =
@@ -1482,20 +1474,16 @@ async fn username_claim_resolve_lnurlp_roundtrip() {
 /// **Contract expectation.** The wallet app needs the same SMT-root
 /// pair from the mint response that the send response already carries,
 /// so its local account snapshot can advance without a second round
-/// trip. Mirror of the strong-assertion block in
-/// `send_commit_roundtrip_moves_balance:1090-1109`: each hash field
-/// MUST be present, decode to exactly 32 bytes of hex, and be non-zero.
-/// A shape-only `.is_some()` check would mask a server bug that
-/// returned a placeholder zero-hash or a truncated hex string.
+/// trip. Each hash field MUST be present, decode to exactly 32 bytes of
+/// hex, and be non-zero. A shape-only `.is_some()` check would mask a
+/// server bug that returned a placeholder zero-hash or a truncated hex
+/// string.
 ///
-/// **Today the mint handler ships these fields as `None`** (see
-/// `router::mint_handler`'s tail and the matching `None`s in
-/// `runtime::broadcast_commit_and_deliver`), and the response struct
-/// serialises them with `skip_serializing_if = Option::is_none`. The
-/// test therefore fails against the current server — it is written
-/// against the expected contract, not the current implementation, so
-/// CI surfaces the gap until the server is updated to populate the
-/// fields. See the task brief for the lockstep rationale.
+/// Under the async Job-API the mint `result` object (the job's
+/// completed body, surfaced by `mint_via_job`) is built by
+/// `flow::mint_flow`, which populates `account_state_hash` /
+/// `output_coins_root` from the final coin proof's public inputs — so
+/// the pair is present on every successful mint.
 #[tokio::test]
 async fn mint_response_carries_state_hash_and_coins_root() {
     let client = http_client();
@@ -1503,17 +1491,7 @@ async fn mint_response_carries_state_hash_and_coins_root() {
 
     assert_minting_balance_in_bounds(&client).await;
 
-    let mint_resp = client
-        .post(url("/api/mint"))
-        .json(&json!({
-            "account_address": alice.address_hex(),
-            "amount": MINT_AMOUNT,
-        }))
-        .send()
-        .await
-        .expect("POST /api/mint");
-    assert_eq!(mint_resp.status(), StatusCode::OK, "mint must succeed");
-    let body: Value = mint_resp.json().await.expect("mint body JSON");
+    let body = mint_via_job(&client, &alice.address_hex(), MINT_AMOUNT).await;
 
     assert_eq!(
         body["success"],
@@ -1585,11 +1563,10 @@ async fn mint_response_carries_state_hash_and_coins_root() {
 /// non-zero. The full mint → send → commit pipeline is exercised
 /// because the commit step is otherwise unreachable.
 ///
-/// **Today the commit handler ships these fields as `None`** (see
-/// `runtime::broadcast_commit_and_deliver`'s tail). The test is
-/// written against the expected contract and fails against the
-/// current server until the runtime is updated to populate the
-/// fields.
+/// Under the async Job-API the commit `result` object is built by
+/// `flow::commit_flow`, which populates the SMT-root pair from the
+/// committed proof's public inputs — so the pair is present on every
+/// successful commit.
 #[tokio::test]
 async fn commit_response_carries_state_hash_and_coins_root() {
     let client = http_client();
@@ -1599,43 +1576,26 @@ async fn commit_response_carries_state_hash_and_coins_root() {
     assert_minting_balance_in_bounds(&client).await;
 
     // ---- Mint ----
-    let mint_resp = client
-        .post(url("/api/mint"))
-        .json(&json!({
-            "account_address": alice.address_hex(),
-            "amount": MINT_AMOUNT,
-        }))
-        .send()
-        .await
-        .expect("POST /api/mint");
-    assert_eq!(mint_resp.status(), StatusCode::OK, "mint must succeed");
-    let mint_body: Value = mint_resp.json().await.expect("mint body JSON");
-    let mint_proof_id = mint_body["proof_id"].as_u64().expect("mint proof_id");
+    let mint_result = mint_via_job(&client, &alice.address_hex(), MINT_AMOUNT).await;
+    let mint_proof_id = mint_result["proof_id"].as_u64().expect("mint proof_id");
 
     let _ = poll_balance_at_least(&client, &alice.address_hex(), MINT_AMOUNT).await;
 
     // ---- Fetch the mint proof for prev_commitment_pubkey ----
-    let proof_resp = client
-        .get(url(&format!("/api/proof/{}", mint_proof_id)))
-        .send()
-        .await
-        .expect("GET mint proof");
-    assert_eq!(proof_resp.status(), StatusCode::OK);
-    let proof_bytes = proof_resp.bytes().await.expect("mint proof bytes");
-    let mint_coin_proof: CoinProof = bincode::deserialize(&proof_bytes).expect("decode CoinProof");
+    let mint_coin_proof = fetch_coin_proof(&client, mint_proof_id).await;
     let prev_pk = mint_coin_proof
         .commitment
         .as_ref()
         .expect("mint coin proof has commitment")
         .public_key;
 
-    // ---- Send ----
+    // ---- Send (phase 1 → awaiting_signature) ----
     let amount = SEND_AMOUNT;
     let ts = unix_now();
     let signature = alice.sign_send(&alice.address_hex(), &bob.address_hex(), amount, ts);
-    let send_resp = client
-        .post(url("/api/send"))
-        .json(&json!({
+    let (send_job_id, send_status, _admit) = submit_send_job(
+        &client,
+        &json!({
             "account_address": alice.address_hex(),
             "recipient": bob.address_hex(),
             "amount": amount,
@@ -1644,42 +1604,34 @@ async fn commit_response_carries_state_hash_and_coins_root() {
             "prev_commitment_pubkey": hex::encode(prev_pk.serialize()),
             "signature": signature,
             "timestamp": ts,
-        }))
-        .send()
-        .await
-        .expect("POST /api/send");
-    assert_eq!(send_resp.status(), StatusCode::OK, "send must succeed");
-    let send_body: Value = send_resp.json().await.expect("send body JSON");
-    let send_proof_id = send_body["proof_id"].as_u64().expect("send proof_id");
-    let ash_hex = send_body["account_state_hash"]
-        .as_str()
-        .expect("send body carries account_state_hash")
-        .to_string();
-    let ocr_hex = send_body["output_coins_root"]
-        .as_str()
-        .expect("send body carries output_coins_root")
-        .to_string();
-    let ash_bytes = hex::decode(&ash_hex).expect("ash hex");
-    let ocr_bytes = hex::decode(&ocr_hex).expect("ocr hex");
+        }),
+    )
+    .await;
+    assert_eq!(send_status, StatusCode::ACCEPTED, "send must be admitted");
+    let send_job_id = send_job_id.expect("send job_id");
+    let awaiting = poll_job_until_status(&client, &send_job_id, "awaiting_signature").await;
+    let send_proof_id = awaiting["proof_id"].as_u64().expect("send proof_id");
 
-    // ---- Commit ----
+    // ---- Derive ash || ocr from the send proof ----
+    let send_coin_proof = fetch_coin_proof(&client, send_proof_id).await;
+    let (ash_bytes, ocr_bytes) = ash_ocr_from_send_proof(&send_coin_proof);
+
+    // ---- Commit (phase 2 → completed) ----
     let mut commit_message = Vec::with_capacity(64);
     commit_message.extend_from_slice(&ash_bytes);
     commit_message.extend_from_slice(&ocr_bytes);
     let commit_sig = alice.sign_commit(&commit_message);
-    let commit_resp = client
-        .post(url("/api/commit"))
-        .json(&json!({
+    let commit_body = commit_send_job(
+        &client,
+        &send_job_id,
+        &json!({
             "proof_id": send_proof_id,
             "public_key": hex::encode(alice.pubkey(0).serialize()),
             "signature": commit_sig,
             "message": hex::encode(&commit_message),
-        }))
-        .send()
-        .await
-        .expect("POST /api/commit");
-    assert_eq!(commit_resp.status(), StatusCode::OK, "commit must succeed");
-    let commit_body: Value = commit_resp.json().await.expect("commit body JSON");
+        }),
+    )
+    .await;
 
     assert_eq!(
         commit_body["success"],
@@ -1922,18 +1874,8 @@ async fn balance_response_num_sends_starts_zero_and_bumps_on_send() {
     // via `receive_coin`; it does NOT touch `account.proof`. So
     // `num_sends` must still be 0 after the mint settles.
     assert_minting_balance_in_bounds(&client).await;
-    let mint_resp = client
-        .post(url("/api/mint"))
-        .json(&json!({
-            "account_address": alice.address_hex(),
-            "amount": MINT_AMOUNT,
-        }))
-        .send()
-        .await
-        .expect("POST /api/mint");
-    assert_eq!(mint_resp.status(), StatusCode::OK, "mint must succeed");
-    let mint_body: Value = mint_resp.json().await.expect("mint body JSON");
-    let mint_proof_id = mint_body["proof_id"].as_u64().expect("proof_id");
+    let mint_result = mint_via_job(&client, &alice.address_hex(), MINT_AMOUNT).await;
+    let mint_proof_id = mint_result["proof_id"].as_u64().expect("proof_id");
     let _ = poll_balance_at_least(&client, &alice.address_hex(), MINT_AMOUNT).await;
 
     let post_mint = client
@@ -1957,14 +1899,7 @@ async fn balance_response_num_sends_starts_zero_and_bumps_on_send() {
     // Now drive Alice through a full send+commit round-trip. The
     // shape mirrors `send_commit_roundtrip_moves_balance` — fetch
     // the mint's coin proof for the prev pubkey, sign, send, commit.
-    let proof_resp = client
-        .get(url(&format!("/api/proof/{}", mint_proof_id)))
-        .send()
-        .await
-        .expect("GET mint proof");
-    assert_eq!(proof_resp.status(), StatusCode::OK);
-    let proof_bytes = proof_resp.bytes().await.expect("mint proof bytes");
-    let mint_coin_proof: CoinProof = bincode::deserialize(&proof_bytes).expect("decode CoinProof");
+    let mint_coin_proof = fetch_coin_proof(&client, mint_proof_id).await;
     let prev_pk = mint_coin_proof
         .commitment
         .as_ref()
@@ -1974,9 +1909,9 @@ async fn balance_response_num_sends_starts_zero_and_bumps_on_send() {
     let amount = SEND_AMOUNT;
     let ts = unix_now();
     let signature = alice.sign_send(&alice.address_hex(), &bob.address_hex(), amount, ts);
-    let send_resp = client
-        .post(url("/api/send"))
-        .json(&json!({
+    let (send_job_id, send_status, _admit) = submit_send_job(
+        &client,
+        &json!({
             "account_address": alice.address_hex(),
             "recipient": bob.address_hex(),
             "amount": amount,
@@ -1985,30 +1920,26 @@ async fn balance_response_num_sends_starts_zero_and_bumps_on_send() {
             "prev_commitment_pubkey": hex::encode(prev_pk.serialize()),
             "signature": signature,
             "timestamp": ts,
-        }))
-        .send()
-        .await
-        .expect("POST /api/send");
-    assert_eq!(send_resp.status(), StatusCode::OK, "send must succeed");
-    let send_body: Value = send_resp.json().await.expect("send body JSON");
-    let send_proof_id = send_body["proof_id"].as_u64().expect("send proof_id");
-    let ash_hex = send_body["account_state_hash"]
-        .as_str()
-        .expect("account_state_hash present")
-        .to_string();
-    let ocr_hex = send_body["output_coins_root"]
-        .as_str()
-        .expect("output_coins_root present")
-        .to_string();
-    let ash_bytes = hex::decode(&ash_hex).expect("ash is hex");
-    let ocr_bytes = hex::decode(&ocr_hex).expect("ocr is hex");
+        }),
+    )
+    .await;
+    assert_eq!(send_status, StatusCode::ACCEPTED, "send must be admitted");
+    let send_job_id = send_job_id.expect("send job_id");
+    // The send job's prove leg runs `send_flow`, which bumps
+    // `account.num_sends` and persists `account.proof = Some(...)`
+    // before the job parks in `awaiting_signature`. So once the job
+    // reaches `awaiting_signature` the counter is already 1.
+    let awaiting = poll_job_until_status(&client, &send_job_id, "awaiting_signature").await;
+    let send_proof_id = awaiting["proof_id"].as_u64().expect("send proof_id");
+    let send_coin_proof = fetch_coin_proof(&client, send_proof_id).await;
+    let (ash_bytes, ocr_bytes) = ash_ocr_from_send_proof(&send_coin_proof);
 
-    // After `/api/send` Ok the server has already bumped
-    // `account.num_sends` (atomically with `account.proof = Some(...)`
-    // inside `send_coins_inner`), so the very next balance read MUST
-    // report `1` — independent of whether the user later succeeds in
-    // the commit phase. (The commit only advances the SMT; the
-    // per-account counter advances on the proof itself.)
+    // After the send job reaches `awaiting_signature` the server has
+    // already bumped `account.num_sends` (atomically with
+    // `account.proof = Some(...)` inside `send_coins_inner`), so the
+    // balance read MUST report `1` — independent of whether the user
+    // later succeeds in the commit phase. (The commit only advances
+    // the SMT; the per-account counter advances on the proof itself.)
     let post_send = client
         .get(url(&format!(
             "/api/balance?address={}",
@@ -2033,18 +1964,17 @@ async fn balance_response_num_sends_starts_zero_and_bumps_on_send() {
     commit_message.extend_from_slice(&ash_bytes);
     commit_message.extend_from_slice(&ocr_bytes);
     let commit_sig = alice.sign_commit(&commit_message);
-    let commit_resp = client
-        .post(url("/api/commit"))
-        .json(&json!({
+    let _commit_result = commit_send_job(
+        &client,
+        &send_job_id,
+        &json!({
             "proof_id": send_proof_id,
             "public_key": hex::encode(alice.pubkey(0).serialize()),
             "signature": commit_sig,
             "message": hex::encode(&commit_message),
-        }))
-        .send()
-        .await
-        .expect("POST /api/commit");
-    assert_eq!(commit_resp.status(), StatusCode::OK, "commit must succeed");
+        }),
+    )
+    .await;
 
     // num_sends survives the commit (commit doesn't mutate the
     // counter — it only advances the SMT and Bob's coin_queue).
@@ -2094,18 +2024,8 @@ async fn second_send_roundtrip_succeeds_without_prev_commitment_pubkey_field() {
     assert_minting_balance_in_bounds(&client).await;
 
     // ---- Mint ----
-    let mint_resp = client
-        .post(url("/api/mint"))
-        .json(&json!({
-            "account_address": alice.address_hex(),
-            "amount": MINT_AMOUNT,
-        }))
-        .send()
-        .await
-        .expect("POST /api/mint");
-    assert_eq!(mint_resp.status(), StatusCode::OK, "mint must succeed");
-    let mint_body: Value = mint_resp.json().await.expect("mint body JSON");
-    let mint_proof_id = mint_body["proof_id"].as_u64().expect("mint proof_id");
+    let mint_result = mint_via_job(&client, &alice.address_hex(), MINT_AMOUNT).await;
+    let mint_proof_id = mint_result["proof_id"].as_u64().expect("mint proof_id");
 
     let _ = poll_balance_at_least(&client, &alice.address_hex(), MINT_AMOUNT).await;
 
@@ -2113,13 +2033,7 @@ async fn second_send_roundtrip_succeeds_without_prev_commitment_pubkey_field() {
     // FIRST send's `prev_commitment_pubkey`. (The first send hits the
     // `prove_initial` branch and ignores the field, but we pass it
     // anyway to mirror the "what an old wallet would send" shape.)
-    let proof_resp = client
-        .get(url(&format!("/api/proof/{}", mint_proof_id)))
-        .send()
-        .await
-        .expect("GET mint proof");
-    let proof_bytes = proof_resp.bytes().await.expect("mint proof bytes");
-    let mint_coin_proof: CoinProof = bincode::deserialize(&proof_bytes).expect("decode CoinProof");
+    let mint_coin_proof = fetch_coin_proof(&client, mint_proof_id).await;
     let prev_pk_minting = mint_coin_proof
         .commitment
         .as_ref()
@@ -2129,9 +2043,9 @@ async fn second_send_roundtrip_succeeds_without_prev_commitment_pubkey_field() {
     // ---- First send (proves initial, sets account.proof = Some + commitment_public_key = pubkey_0) ----
     let ts1 = unix_now();
     let sig1 = alice.sign_send(&alice.address_hex(), &bob.address_hex(), SEND_AMOUNT, ts1);
-    let send1_resp = client
-        .post(url("/api/send"))
-        .json(&json!({
+    let (send1_job_id, send1_status, _admit1) = submit_send_job(
+        &client,
+        &json!({
             "account_address": alice.address_hex(),
             "recipient": bob.address_hex(),
             "amount": SEND_AMOUNT,
@@ -2140,48 +2054,37 @@ async fn second_send_roundtrip_succeeds_without_prev_commitment_pubkey_field() {
             "prev_commitment_pubkey": hex::encode(prev_pk_minting.serialize()),
             "signature": sig1,
             "timestamp": ts1,
-        }))
-        .send()
-        .await
-        .expect("POST /api/send #1");
+        }),
+    )
+    .await;
     assert_eq!(
-        send1_resp.status(),
-        StatusCode::OK,
-        "first send must succeed"
+        send1_status,
+        StatusCode::ACCEPTED,
+        "first send must be admitted"
     );
-    let send1_body: Value = send1_resp.json().await.expect("send #1 body JSON");
-    let send1_proof_id = send1_body["proof_id"].as_u64().expect("send #1 proof_id");
-    let ash1_hex = send1_body["account_state_hash"]
-        .as_str()
-        .expect("send #1 account_state_hash")
-        .to_string();
-    let ocr1_hex = send1_body["output_coins_root"]
-        .as_str()
-        .expect("send #1 output_coins_root")
-        .to_string();
+    let send1_job_id = send1_job_id.expect("send #1 job_id");
+    let awaiting1 = poll_job_until_status(&client, &send1_job_id, "awaiting_signature").await;
+    let send1_proof_id = awaiting1["proof_id"].as_u64().expect("send #1 proof_id");
+    let send1_coin_proof = fetch_coin_proof(&client, send1_proof_id).await;
+    let (ash1_bytes, ocr1_bytes) = ash_ocr_from_send_proof(&send1_coin_proof);
 
     // Commit the first send so its commitment lands in the SMT —
     // the second send's prev-commitment lookup needs it indexed.
     let mut commit1_msg = Vec::with_capacity(64);
-    commit1_msg.extend_from_slice(&hex::decode(&ash1_hex).expect("ash1 hex"));
-    commit1_msg.extend_from_slice(&hex::decode(&ocr1_hex).expect("ocr1 hex"));
+    commit1_msg.extend_from_slice(&ash1_bytes);
+    commit1_msg.extend_from_slice(&ocr1_bytes);
     let commit1_sig = alice.sign_commit(&commit1_msg);
-    let commit1_resp = client
-        .post(url("/api/commit"))
-        .json(&json!({
+    let _commit1_result = commit_send_job(
+        &client,
+        &send1_job_id,
+        &json!({
             "proof_id": send1_proof_id,
             "public_key": hex::encode(alice.pubkey(0).serialize()),
             "signature": commit1_sig,
             "message": hex::encode(&commit1_msg),
-        }))
-        .send()
-        .await
-        .expect("POST /api/commit #1");
-    assert_eq!(
-        commit1_resp.status(),
-        StatusCode::OK,
-        "commit #1 must succeed"
-    );
+        }),
+    )
+    .await;
 
     // Verify the server bumped `num_sends` to 1 (the wallet would
     // sync this on its next balance tick to choose `pubkey(1)` as
@@ -2201,25 +2104,41 @@ async fn second_send_roundtrip_succeeds_without_prev_commitment_pubkey_field() {
         "post-send-1 num_sends must report 1"
     );
 
-    // Mint a second time into Alice so she has balance for send #2
-    // (after send #1, alice's balance is `MINT_AMOUNT - SEND_AMOUNT`,
-    // which is still enough for another SEND_AMOUNT — but minting
-    // again keeps the test symmetric with `send_commit_roundtrip`).
-    let _ = client
-        .post(url("/api/mint"))
-        .json(&json!({
-            "account_address": alice.address_hex(),
-            "amount": MINT_AMOUNT,
-        }))
-        .send()
-        .await
-        .expect("POST /api/mint #2");
-    let _ = poll_balance_at_least(
-        &client,
-        &alice.address_hex(),
-        MINT_AMOUNT - SEND_AMOUNT + MINT_AMOUNT,
-    )
-    .await;
+    // Wait until the scanner has ingested send #1's committed
+    // commitment into the SMT before issuing send #2. The legacy
+    // synchronous `/api/commit` advanced the in-process SMT before
+    // returning 200; the async `commit_flow` only broadcasts +
+    // `receive_coin`s, leaving the SMT advance to the event-driven
+    // scanner. Send #2's prev-commitment lookup needs send #1's
+    // commitment indexed, so without this wait the prove leg fails
+    // with "Unable to get merkle proofs for provided public key".
+    // Alice's balance dropping to `MINT_AMOUNT - SEND_AMOUNT` is the
+    // observable signal that the spend (hence the commitment) has been
+    // scanned.
+    let _ = poll_balance_at_most(&client, &alice.address_hex(), MINT_AMOUNT - SEND_AMOUNT).await;
+
+    // Send #2 spends Alice's send-#1 *change* directly. After send #1
+    // committed, `coin_queue.clear()` ran and the unspent remainder
+    // (`MINT_AMOUNT - SEND_AMOUNT`) lives in `account.balance`, NOT as a
+    // queued coin — `commit_flow` only `receive_coin`s the recipient's
+    // out-coin, never a change coin back to the sender. So Alice's
+    // `coin_queue` is empty and `MINT_AMOUNT - SEND_AMOUNT` (= 40_000)
+    // still covers another `SEND_AMOUNT`.
+    //
+    // We deliberately do NOT mint a second time into Alice here. A
+    // second mint pushes a fresh coin into Alice's `coin_queue`, which
+    // forces send #2 through `send_coins_inner`'s in-coin loop. That
+    // loop inserts each spent coin's id into `account.coin_history`
+    // BEFORE the prove, and the prove leg has no rollback on failure:
+    // a single transient prove failure (the genuine
+    // "Unable to get merkle proofs for provided public key" scanner
+    // race) then leaves the coin in BOTH `coin_queue` and
+    // `coin_history`, so every subsequent retry fails deterministically
+    // and permanently with "Should provide an inclusion proof" — the
+    // retry budget can never clear it. Spending the change from
+    // `account.balance` with an empty queue skips the in-coin loop
+    // entirely, keeping retries idempotent and isolating the assertion
+    // to its actual subject: the omitted `prev_commitment_pubkey`.
 
     // ---- Second send WITHOUT `prev_commitment_pubkey`. ----
     //
@@ -2231,46 +2150,31 @@ async fn second_send_roundtrip_succeeds_without_prev_commitment_pubkey_field() {
     // `"prev_commitment_pubkey required for account update"`.
     //
     // The wallet's signing key for this send is `pubkey(1)` because
-    // `num_sends == 1` (the server's authoritative counter); the
-    // `public_key` field on the request reflects that.
-    let ts2 = unix_now();
-    let sig2 = alice.sign_send_at(
-        &alice.address_hex(),
-        &bob.address_hex(),
-        SEND_AMOUNT,
-        ts2,
-        1,
-    );
-    let send2_body = json!({
-        "account_address": alice.address_hex(),
-        "recipient": bob.address_hex(),
-        "amount": SEND_AMOUNT,
-        "public_key": hex::encode(alice.pubkey(1).serialize()),
-        "next_public_key": hex::encode(alice.pubkey(2).serialize()),
-        // NOTE: `prev_commitment_pubkey` deliberately omitted from
-        // the payload. With the refactor this must NOT 400.
-        "signature": sig2,
-        "timestamp": ts2,
-    });
-    let send2_resp = client
-        .post(url("/api/send"))
-        .json(&send2_body)
-        .send()
-        .await
-        .expect("POST /api/send #2 (no prev_commitment_pubkey)");
-    let send2_status = send2_resp.status();
-    let send2_body_text = send2_resp.text().await.unwrap_or_default();
-    assert_eq!(
-        send2_status,
-        StatusCode::OK,
-        "second send WITHOUT prev_commitment_pubkey must succeed \
-         (refactor: server reads its own stored commitment_public_key); \
-         got {} body={}",
-        send2_status,
-        send2_body_text
-    );
+    // `num_sends == 1` (the server's authoritative counter).
+    //
+    // The prove leg is where the AccountUpdate branch reads
+    // `account.commitment_public_key` from its own state (set
+    // atomically with `proof` by send #1 above) — so reaching
+    // `awaiting_signature` is the success signal. Pre-refactor the
+    // prove leg failed with `"prev_commitment_pubkey required for
+    // account update"` (a non-retryable terminal failure the helper
+    // would surface immediately).
+    //
+    // `submit_send_no_prev_until_awaiting` re-signs + resubmits on the
+    // transient `"Unable to get merkle proofs for provided public key"`
+    // scanner race: send #1's commitment was committed via the async
+    // `commit_flow`, which (unlike the legacy synchronous `/api/commit`)
+    // leaves the in-process SMT advance to the event-driven scanner, so
+    // the prev-commitment lookup can briefly miss until the on-chain
+    // inscription is ingested.
+    let (send2_job_id, awaiting2) =
+        submit_send_no_prev_until_awaiting(&client, &alice, &bob.address_hex(), SEND_AMOUNT, 1)
+            .await;
 
-    // Server-side counter advanced.
+    // Server-side counter advanced. `num_sends` is the server's
+    // authoritative count of *committed* sends; send #2 reaching
+    // `awaiting_signature` (its prove leg done) has already bumped it to
+    // 2, so this holds before the commit below.
     let post_send2 = client
         .get(url(&format!(
             "/api/balance?address={}",
@@ -2285,41 +2189,90 @@ async fn second_send_roundtrip_succeeds_without_prev_commitment_pubkey_field() {
         Some(2),
         "post-send-2 num_sends must report 2"
     );
+
+    // ---- Commit send #2 (REQUIRED, not optional) ----
+    //
+    // The dispatcher is a single inline worker that PARKS in
+    // `wait_for_commit` for up to `awaiting_signature_timeout` (600 s on
+    // DEV) until a commit arrives. Returning here without committing
+    // would pin that worker, starving every test that sorts after this
+    // one in the serial alphabetical run (`cancel` only works while a job
+    // is `queued`, so it cannot release an `awaiting_signature` park).
+    // Committing both releases the worker AND completes the roundtrip.
+    //
+    // The commit's `public_key` must match the key that produced
+    // `signature`, because the node's `commit_flow` verifies the
+    // commitment with a self-contained Schnorr check (`Commitment::verify`
+    // over `public_key`/`signature`/`message`) — it does NOT tie the
+    // commit key to the send's signing key or the account's
+    // `commitment_public_key`. `TestWallet::sign_commit` always signs with
+    // `seckey(0)`, so the matching `public_key` is `pubkey(0)`, exactly as
+    // send #1's commit above (and `send_commit_roundtrip_moves_balance`)
+    // does. The send-#2 *signing* key (`pubkey(1)`) is unrelated here.
+    let send2_proof_id = awaiting2["proof_id"]
+        .as_u64()
+        .expect("send #2 awaiting_signature job carries proof_id");
+    let send2_coin_proof = fetch_coin_proof(&client, send2_proof_id).await;
+    let (ash2_bytes, ocr2_bytes) = ash_ocr_from_send_proof(&send2_coin_proof);
+
+    let mut commit2_msg = Vec::with_capacity(64);
+    commit2_msg.extend_from_slice(&ash2_bytes);
+    commit2_msg.extend_from_slice(&ocr2_bytes);
+    let commit2_sig = alice.sign_commit(&commit2_msg);
+    let commit2_result = commit_send_job(
+        &client,
+        &send2_job_id,
+        &json!({
+            "proof_id": send2_proof_id,
+            "public_key": hex::encode(alice.pubkey(0).serialize()),
+            "signature": commit2_sig,
+            "message": hex::encode(&commit2_msg),
+        }),
+    )
+    .await;
+    assert_eq!(commit2_result["success"], Value::Bool(true));
 }
 
 // ---------------------------------------------------------------------------
-// Section 5 — error-envelope contract
+// Section 5 — error contract
 //
-// Every non-2xx response the wallet app cares about MUST deserialise
-// as `{ success: false, error: <non-empty string> }`. The error string
-// is the lockstep anchor against `app/src/lib/api/errorMessages.ts ::
-// KNOWN_SERVER_ERRORS` — if the server renames a string without
-// updating the app's mapping, the user-facing message degrades to
-// `Serverfehler <status>: <raw>`.
+// The error string the wallet app reads is the lockstep anchor against
+// `app/src/lib/api/errorMessages.ts :: KNOWN_SERVER_ERRORS` — if the
+// node renames a string without updating the app's mapping, the
+// user-facing message degrades to `Serverfehler <status>: <raw>`.
+//
+// Under the async Job-API the error surfaces in two distinct shapes:
+//   - inline validation failures (`POST /api/jobs/send` 401/422) carry
+//     the `JobErrorResponse` envelope `{error: "..."}` (no `success`);
+//   - `send_coins` business failures (unknown account, insufficient
+//     funds) admit a job (202) that transitions to a terminal `failed`
+//     status, with the message surfaced in the job's `error` field.
+// The lockstep `error` *string* is identical across both — the tests
+// assert on it directly.
 // ---------------------------------------------------------------------------
 
-/// Error contract #6 — every 4xx send body is a structured envelope.
+/// Error contract #6 — the async send-failure path surfaces a clear,
+/// non-empty error string.
 ///
-/// Asserts only the SHAPE of the body (`success: false`, `error`
-/// non-empty string). The exact string is covered per-error by the
-/// extended negative-path tests above and by the lockstep inventory
-/// test below.
+/// Asserts only the SHAPE of the failure (terminal `failed` status,
+/// `error` a non-empty string). The exact string is covered per-error
+/// by the extended negative-path tests above and by the lockstep
+/// inventory test below.
 #[tokio::test]
 async fn send_returns_structured_error_envelope() {
     // Use the "unknown account" path: a well-formed body with a
-    // freshly-generated wallet that has never minted. Picked because
-    // it is the cheapest provocation that exercises the
-    // `send_coins_error_response` branch (the 422 invalid-hex paths
-    // go through `handler_error_response`, which has its own envelope
-    // shape — both are checked by the per-string assertions).
+    // freshly-generated wallet that has never minted. The inline
+    // validation gates pass, so the job is admitted and the failure
+    // surfaces asynchronously in the job's terminal `error` field.
+    let client = http_client();
     let alice = TestWallet::new();
     let bob = TestWallet::new();
     let amount: u64 = 1;
     let ts = unix_now();
     let signature = alice.sign_send(&alice.address_hex(), &bob.address_hex(), amount, ts);
-    let resp = http_client()
-        .post(url("/api/send"))
-        .json(&json!({
+    let (job_id, status, admit) = submit_send_job(
+        &client,
+        &json!({
             "account_address": alice.address_hex(),
             "recipient": bob.address_hex(),
             "amount": amount,
@@ -2328,23 +2281,28 @@ async fn send_returns_structured_error_envelope() {
             "prev_commitment_pubkey": Option::<String>::None,
             "signature": Some(signature),
             "timestamp": Some(ts),
-        }))
-        .send()
-        .await
-        .expect("POST /api/send envelope check");
-    let status = resp.status();
-    assert!(status.is_client_error(), "expected 4xx, got {}", status);
-    let body: Value = resp.json().await.expect("envelope body must be JSON");
+        }),
+    )
+    .await;
     assert_eq!(
-        body["success"],
-        Value::Bool(false),
-        "envelope must carry success=false, got {:?}",
-        body["success"]
+        status,
+        StatusCode::ACCEPTED,
+        "unknown-account send is admitted (inline gates pass); got {} body={}",
+        status,
+        admit
     );
-    let error = body["error"]
+    let job_id = job_id.expect("admitted send job carries a job_id");
+
+    let terminal = poll_job_until_terminal(&client, &job_id).await;
+    assert_eq!(
+        terminal["status"], "failed",
+        "unknown-account send job must fail, got {}",
+        terminal
+    );
+    let error = terminal["error"]
         .as_str()
-        .expect("envelope must carry an `error` string");
-    assert!(!error.is_empty(), "envelope `error` must be non-empty");
+        .expect("failed job must carry an `error` string");
+    assert!(!error.is_empty(), "job `error` must be non-empty");
 }
 
 /// The exact set of `error` strings the wallet app's
@@ -2402,15 +2360,17 @@ async fn error_strings_match_known_app_mapping() {
 
     // ---- Strings reachable WITHOUT a prior mint -----------------
 
-    // "Unknown account address" — fresh wallet send.
+    // "Unknown account address" — fresh wallet send. Inline gates pass,
+    // so the job is admitted and the rejection surfaces async as a
+    // terminal `failed` status carrying the lockstep string.
     {
         let alice = TestWallet::new();
         let bob = TestWallet::new();
         let ts = unix_now();
         let signature = alice.sign_send(&alice.address_hex(), &bob.address_hex(), 1, ts);
-        let resp = client
-            .post(url("/api/send"))
-            .json(&json!({
+        let (job_id, status, _admit) = submit_send_job(
+            &client,
+            &json!({
                 "account_address": alice.address_hex(),
                 "recipient": bob.address_hex(),
                 "amount": 1u64,
@@ -2419,21 +2379,25 @@ async fn error_strings_match_known_app_mapping() {
                 "prev_commitment_pubkey": Option::<String>::None,
                 "signature": Some(signature),
                 "timestamp": Some(ts),
-            }))
-            .send()
-            .await
-            .expect("send unknown account");
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        let body: Value = resp.json().await.expect("body JSON");
-        assert_eq!(body["error"], "Unknown account address");
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let job_id = job_id.expect("send job_id");
+        let terminal = poll_job_until_terminal(&client, &job_id).await;
+        assert_eq!(terminal["status"], "failed");
+        assert_eq!(terminal["error"], "Unknown account address");
     }
 
     // "Signature verification failed" — 64 zero bytes as signature.
+    // The signature gate runs inline, so this is rejected synchronously
+    // with the `JobErrorResponse` envelope (`{error}`).
     {
         let alice = TestWallet::new();
         let bob = TestWallet::new();
         let resp = client
-            .post(url("/api/send"))
+            .post(url("/api/jobs/send"))
+            .header("Idempotency-Key", random_idempotency_key())
             .json(&json!({
                 "account_address": alice.address_hex(),
                 "recipient": bob.address_hex(),
@@ -2452,14 +2416,16 @@ async fn error_strings_match_known_app_mapping() {
         assert_eq!(body["error"], "Signature verification failed");
     }
 
-    // "Request timestamp too old or in the future" — stale timestamp.
+    // "Request timestamp too old or in the future" — stale timestamp
+    // (inline gate → synchronous 401).
     {
         let alice = TestWallet::new();
         let bob = TestWallet::new();
         let stale_ts = unix_now().saturating_sub(600);
         let signature = alice.sign_send(&alice.address_hex(), &bob.address_hex(), 1, stale_ts);
         let resp = client
-            .post(url("/api/send"))
+            .post(url("/api/jobs/send"))
+            .header("Idempotency-Key", random_idempotency_key())
             .json(&json!({
                 "account_address": alice.address_hex(),
                 "recipient": bob.address_hex(),
@@ -2479,12 +2445,10 @@ async fn error_strings_match_known_app_mapping() {
     }
 
     // "Missing signature" — well-formed send body but signature: null.
-    // The signed handlers (`send_handler`, `claim_username_handler`)
-    // reject absent `signature` fields with 401 BEFORE crypto
-    // verification runs. The matching `"Missing timestamp"` 401 covers
-    // an absent `timestamp` field. Both gates land before
-    // `verify_send_signature` so a clock-skew or empty-credential
-    // misconfiguration surfaces distinctly instead of collapsing into
+    // `validate_send_request` rejects an absent `signature` (or
+    // `timestamp`) field with 401 inline BEFORE crypto verification
+    // runs, so a clock-skew or empty-credential misconfiguration
+    // surfaces distinctly instead of collapsing into
     // `"Signature verification failed"`.
     {
         let alice = TestWallet::new();
@@ -2499,7 +2463,8 @@ async fn error_strings_match_known_app_mapping() {
             // signature deliberately omitted
         });
         let resp = http_client()
-            .post(url("/api/send"))
+            .post(url("/api/jobs/send"))
+            .header("Idempotency-Key", random_idempotency_key())
             .json(&body)
             .send()
             .await
@@ -2512,10 +2477,12 @@ async fn error_strings_match_known_app_mapping() {
     // ---- Mismatches: app uses a generic placeholder, server emits a
     //      more-specific string. Document each here. -----------------
 
-    // app `"Invalid hex"` vs. server emit (mint hex path).
+    // app `"Invalid hex"` vs. server emit (mint hex path). Validated
+    // inline in `flow::validate_mint_request` → synchronous 422.
     {
         let resp = client
-            .post(url("/api/mint"))
+            .post(url("/api/jobs/mint"))
+            .header("Idempotency-Key", random_idempotency_key())
             .json(&json!({"account_address": "not_hex", "amount": 100u64}))
             .send()
             .await
@@ -2534,7 +2501,8 @@ async fn error_strings_match_known_app_mapping() {
     {
         let short_addr = format!("0x{}", "ab".repeat(16));
         let resp = client
-            .post(url("/api/mint"))
+            .post(url("/api/jobs/mint"))
+            .header("Idempotency-Key", random_idempotency_key())
             .json(&json!({"account_address": short_addr, "amount": 100u64}))
             .send()
             .await
@@ -2561,36 +2529,15 @@ async fn error_strings_match_known_app_mapping() {
 
     assert_minting_balance_in_bounds(&client).await;
 
-    let mint_resp = client
-        .post(url("/api/mint"))
-        .json(&json!({
-            "account_address": alice.address_hex(),
-            "amount": MINT_AMOUNT,
-        }))
-        .send()
-        .await
-        .expect("POST /api/mint for lockstep block");
-    assert_eq!(
-        mint_resp.status(),
-        StatusCode::OK,
-        "mint must succeed for the post-mint lockstep block"
-    );
-    let mint_body: Value = mint_resp.json().await.expect("mint body JSON");
-    let mint_proof_id = mint_body["proof_id"].as_u64().expect("mint proof_id");
+    let mint_result = mint_via_job(&client, &alice.address_hex(), MINT_AMOUNT).await;
+    let mint_proof_id = mint_result["proof_id"].as_u64().expect("mint proof_id");
     let _ = poll_balance_at_least(&client, &alice.address_hex(), MINT_AMOUNT).await;
 
     // Fetch the mint commitment so we have a valid `prev_commitment_pubkey`
     // to pass on the happy-path replay below — and a clear omission to
     // trigger the `"prev_commitment_pubkey required for account update"`
     // branch.
-    let proof_resp = client
-        .get(url(&format!("/api/proof/{}", mint_proof_id)))
-        .send()
-        .await
-        .expect("GET mint proof");
-    assert_eq!(proof_resp.status(), StatusCode::OK);
-    let proof_bytes = proof_resp.bytes().await.expect("mint proof bytes");
-    let mint_coin_proof: CoinProof = bincode::deserialize(&proof_bytes).expect("decode CoinProof");
+    let mint_coin_proof = fetch_coin_proof(&client, mint_proof_id).await;
     let prev_pk = mint_coin_proof
         .commitment
         .as_ref()
@@ -2609,13 +2556,18 @@ async fn error_strings_match_known_app_mapping() {
     // value of duplicating coverage that the unit tests already give.
 
     // "Insufficient funds" — send MINT_AMOUNT + 1 (one sat over balance).
+    // This is a `send_coins` business error, so the job is admitted
+    // (inline gates pass) and the rejection surfaces async as a
+    // terminal `failed` status carrying the lockstep string. (The
+    // legacy 422 status now lives in the job's stored response_status,
+    // not on the poll response.)
     {
         let amount: u64 = MINT_AMOUNT + 1;
         let ts = unix_now();
         let signature = alice.sign_send(&alice.address_hex(), &bob.address_hex(), amount, ts);
-        let resp = client
-            .post(url("/api/send"))
-            .json(&json!({
+        let (job_id, status, _admit) = submit_send_job(
+            &client,
+            &json!({
                 "account_address": alice.address_hex(),
                 "recipient": bob.address_hex(),
                 "amount": amount,
@@ -2624,17 +2576,18 @@ async fn error_strings_match_known_app_mapping() {
                 "prev_commitment_pubkey": hex::encode(prev_pk.serialize()),
                 "signature": Some(signature),
                 "timestamp": Some(ts),
-            }))
-            .send()
-            .await
-            .expect("send insufficient funds");
+            }),
+        )
+        .await;
         assert_eq!(
-            resp.status(),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Insufficient funds must be 422"
+            status,
+            StatusCode::ACCEPTED,
+            "insufficient-funds send is admitted (inline gates pass)"
         );
-        let body: Value = resp.json().await.expect("body JSON");
-        assert_eq!(body["error"], "Insufficient funds");
+        let job_id = job_id.expect("send job_id");
+        let terminal = poll_job_until_terminal(&client, &job_id).await;
+        assert_eq!(terminal["status"], "failed");
+        assert_eq!(terminal["error"], "Insufficient funds");
     }
 
     // ---- Strings NOT deterministically reachable from a black-box
@@ -2833,4 +2786,406 @@ fn random_suffix() -> String {
     let mut bytes = [0u8; 8];
     rand::thread_rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Async Job-API helpers
+//
+// PR #161 removed the synchronous `/api/mint`, `/api/send`, `/api/commit`
+// routes and replaced them with the async Job-API: clients POST to
+// `/api/jobs/{mint,send}` (with an `Idempotency-Key` header), receive a
+// `202 {job_id, status}`, then poll `GET /api/jobs/:id` for state
+// transitions (`queued → proving → [awaiting_signature] → broadcasting
+// → completed`). Send is two-phase: the wallet signs the proof's
+// `ash || ocr` and attaches it via `POST /api/jobs/:id/commit`.
+//
+// The node is the source of truth — these helpers map the legacy
+// 200-body assertions onto the job `result` object and surface async
+// terminal failures (`failed`/`cancelled`) so a regression is never
+// masked by a poll timeout.
+// ---------------------------------------------------------------------------
+
+/// Poll budget for one job's full lifecycle. Must absorb three
+/// independent latencies on the shared DEV node:
+///
+/// - cold-start prover warm-up (~30 s before the first `proving` tick),
+/// - the prove + broadcast legs themselves (several seconds each),
+/// - and time spent `queued` behind the single-threaded dispatcher when
+///   the suite (or a concurrent workflow on the shared DEV node) has
+///   other jobs in flight — a fresh job can sit in `queued` for a while
+///   before the dispatcher picks it up.
+///
+/// 180 s keeps the suite from flaking on a busy dispatcher while still
+/// failing fast on a genuinely stuck job.
+const JOB_POLL_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Wait between scanner-race retries in
+/// [`submit_send_no_prev_until_awaiting`] — roughly one mutinynet block,
+/// so a re-submit only happens after the scanner has had real time to
+/// index the prior commitment (avoids a back-to-back prove storm on the
+/// single-threaded dispatcher).
+const SCANNER_SETTLE_INTERVAL: Duration = Duration::from_secs(20);
+
+/// A fresh, unique `Idempotency-Key` for an admit request. Each test
+/// mints/sends into freshly-generated wallets, so a random key per
+/// call guarantees no accidental idempotent-replay across the suite.
+fn random_idempotency_key() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    format!("e2e-{}", hex::encode(bytes))
+}
+
+/// A syntactically valid, random UUID-v4 string. The `GET/POST
+/// /api/jobs/:id` routes use axum's `Path<Uuid>` extractor, which
+/// rejects non-UUID paths with 400 — so the negative-path "no such
+/// job" tests must pass a well-formed (but unallocated) UUID to reach
+/// the handler's 404 branch. Built by hand to avoid taking a `uuid`
+/// dev-dependency just for the test suite.
+fn uuid_v4_like() -> String {
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    // Set the version (4) and variant (RFC 4122) nibbles.
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h = hex::encode(b);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
+}
+
+/// Poll `GET /api/jobs/:id` until the job reaches a terminal status
+/// (`completed | failed | cancelled`) or [`JOB_POLL_TIMEOUT`] elapses.
+/// Returns the full terminal `JobStatusResponse` body. Panics with a
+/// clear message on timeout (never silently returns a non-terminal
+/// snapshot) so a stuck job surfaces as a test failure, not a flake.
+async fn poll_job_until_terminal(client: &reqwest::Client, job_id: &str) -> Value {
+    let deadline = std::time::Instant::now() + JOB_POLL_TIMEOUT;
+    loop {
+        let resp = client
+            .get(url(&format!("/api/jobs/{}", job_id)))
+            .send()
+            .await
+            .expect("GET /api/jobs/:id");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET /api/jobs/{} must answer 200 while polling",
+            job_id
+        );
+        let body: Value = resp.json().await.expect("job status body is JSON");
+        let status = body["status"].as_str().unwrap_or("").to_string();
+        if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+            return body;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "job {} never reached a terminal status within {:?}; last body={}",
+                job_id, JOB_POLL_TIMEOUT, body
+            );
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Poll `GET /api/jobs/:id` until the job reports `status == want`, or
+/// until it reaches a *different* terminal status (in which case the
+/// helper panics, surfacing the failure rather than spinning until the
+/// timeout). Returns the matching `JobStatusResponse` body.
+async fn poll_job_until_status(client: &reqwest::Client, job_id: &str, want: &str) -> Value {
+    let deadline = std::time::Instant::now() + JOB_POLL_TIMEOUT;
+    loop {
+        let resp = client
+            .get(url(&format!("/api/jobs/{}", job_id)))
+            .send()
+            .await
+            .expect("GET /api/jobs/:id");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET /api/jobs/{} must answer 200 while polling",
+            job_id
+        );
+        let body: Value = resp.json().await.expect("job status body is JSON");
+        let status = body["status"].as_str().unwrap_or("").to_string();
+        if status == want {
+            return body;
+        }
+        // Any terminal status other than the one we wanted is a hard
+        // failure — break out instead of waiting for the deadline.
+        if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+            panic!(
+                "job {} reached terminal status `{}` while waiting for `{}`; body={}",
+                job_id, status, want, body
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "job {} never reached status `{}` within {:?}; last body={}",
+                job_id, want, JOB_POLL_TIMEOUT, body
+            );
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Run a full mint job to completion and return its `result` object —
+/// the legacy `/api/mint` 200 body (`{success, proof_id,
+/// account_state_hash, output_coins_root}`). Asserts the admit returns
+/// `202` and the job completes (not fails).
+async fn mint_via_job(client: &reqwest::Client, address: &str, amount: u64) -> Value {
+    let resp = client
+        .post(url("/api/jobs/mint"))
+        .header("Idempotency-Key", random_idempotency_key())
+        .json(&json!({ "account_address": address, "amount": amount }))
+        .send()
+        .await
+        .expect("POST /api/jobs/mint");
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "mint job must be admitted with 202"
+    );
+    let accepted: Value = resp.json().await.expect("mint admit body JSON");
+    let job_id = accepted["job_id"]
+        .as_str()
+        .expect("mint admit body carries job_id")
+        .to_string();
+    assert_eq!(accepted["status"], "queued", "fresh mint job is queued");
+
+    let terminal = poll_job_until_terminal(client, &job_id).await;
+    assert_eq!(
+        terminal["status"], "completed",
+        "mint job must complete, got terminal body {}",
+        terminal
+    );
+    terminal["result"].clone()
+}
+
+/// Submit a `send` job and return `(job_id, admit_status, admit_body)`.
+///
+/// The signature + timestamp + hex gates run INLINE before admission,
+/// so malformed requests surface their 401 / 422 here synchronously.
+/// `send_coins` business failures (unknown account, insufficient
+/// funds) instead admit a job (`202`) that later transitions to
+/// `failed` — the caller polls for those.
+async fn submit_send_job(
+    client: &reqwest::Client,
+    body: &Value,
+) -> (Option<String>, StatusCode, Value) {
+    let resp = client
+        .post(url("/api/jobs/send"))
+        .header("Idempotency-Key", random_idempotency_key())
+        .json(body)
+        .send()
+        .await
+        .expect("POST /api/jobs/send");
+    let status = resp.status();
+    let parsed: Value = resp.json().await.unwrap_or(Value::Null);
+    let job_id = parsed["job_id"].as_str().map(|s| s.to_string());
+    (job_id, status, parsed)
+}
+
+/// Node prove-time errors that all mean the same thing in the
+/// send→commit→send sequence: the *previous* send's commitment has been
+/// broadcast but the scanner has not yet fully indexed it into the
+/// in-process SMT / history MMR, so the next send's prove cannot find
+/// the prev commitment's merkle/inclusion proofs (see
+/// `account_node::get_merkle_proofs` / `prepare_send_coins`). On the
+/// async Job-API this is a transient, retryable scanner-indexing race —
+/// the legacy synchronous `/api/commit` masked it by advancing the
+/// in-process SMT before returning. Depending on exactly how far the
+/// scanner has progressed, the prove leg surfaces one of these:
+const TRANSIENT_SCANNER_RACE_ERRS: &[&str] = &[
+    "Unable to get merkle proofs for provided public key",
+    "Should provide an inclusion proof",
+    "Source commitment not present in history MMR",
+    "In-coin not present in source's output_coins_root",
+];
+
+/// `true` if `err` is one of the transient scanner-indexing-race
+/// substrings the second-send retry loop tolerates.
+fn is_transient_scanner_race(err: &str) -> bool {
+    TRANSIENT_SCANNER_RACE_ERRS
+        .iter()
+        .any(|needle| err.contains(needle))
+}
+
+/// Submit a send job WITHOUT `prev_commitment_pubkey`, re-signing with a
+/// fresh timestamp on each attempt, and poll to `awaiting_signature`.
+///
+/// Retries only the transient scanner-indexing race (see
+/// [`is_transient_scanner_race`]): when a prior send's commitment was
+/// committed via the async `commit_flow` (which does NOT advance the
+/// in-process SMT), the next send's prove can't find the prev
+/// commitment's merkle/inclusion proofs until the scanner ingests the
+/// on-chain inscription. A bounded retry tolerates that lag while still
+/// surfacing a genuine regression (any other terminal failure, or never
+/// recovering within the cap, fails the test). Returns the send job's
+/// `job_id` alongside its `awaiting_signature` body — the caller needs
+/// the `job_id` to drive the commit leg that releases the inline worker
+/// (a job left parked in `awaiting_signature` pins the single dispatcher
+/// worker for the full `awaiting_signature_timeout`, starving every
+/// later test in the serial suite).
+async fn submit_send_no_prev_until_awaiting(
+    client: &reqwest::Client,
+    wallet: &TestWallet,
+    recipient: &str,
+    amount: u64,
+    signing_idx: u32,
+) -> (String, Value) {
+    // A more generous budget than a single job's `JOB_POLL_TIMEOUT`:
+    // clearing the scanner race can require waiting for the next
+    // mutinynet block (~30 s) across one or more re-submits.
+    let deadline = std::time::Instant::now() + Duration::from_secs(240);
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let ts = unix_now();
+        let sig = wallet.sign_send_at(&wallet.address_hex(), recipient, amount, ts, signing_idx);
+        let body = json!({
+            "account_address": wallet.address_hex(),
+            "recipient": recipient,
+            "amount": amount,
+            "public_key": hex::encode(wallet.pubkey(signing_idx).serialize()),
+            "next_public_key": hex::encode(wallet.pubkey(signing_idx + 1).serialize()),
+            // `prev_commitment_pubkey` deliberately omitted.
+            "signature": sig,
+            "timestamp": ts,
+        });
+        let (job_id, status, admit) = submit_send_job(client, &body).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "send without prev_commitment_pubkey must be admitted; got {} body={}",
+            status,
+            admit
+        );
+        let job_id = job_id.expect("admitted send job carries a job_id");
+
+        // Poll this job to a terminal/awaiting state inline (cannot use
+        // `poll_job_until_status`, which panics on a `failed` we want to
+        // retry on).
+        let terminal_or_awaiting = loop {
+            let resp = client
+                .get(url(&format!("/api/jobs/{}", job_id)))
+                .send()
+                .await
+                .expect("GET /api/jobs/:id");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body: Value = resp.json().await.expect("job status body is JSON");
+            let status = body["status"].as_str().unwrap_or("").to_string();
+            if status == "awaiting_signature"
+                || matches!(status.as_str(), "completed" | "failed" | "cancelled")
+            {
+                break body;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "send job {} stuck in `{}` past the retry budget; body={}",
+                job_id,
+                status,
+                body
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        };
+
+        let status = terminal_or_awaiting["status"].as_str().unwrap_or("");
+        if status == "awaiting_signature" {
+            return (job_id, terminal_or_awaiting);
+        }
+        // Retry only the known transient scanner race; any other
+        // terminal failure is a real regression.
+        let err = terminal_or_awaiting["error"].as_str().unwrap_or("");
+        let transient = status == "failed" && is_transient_scanner_race(err);
+        assert!(
+            transient,
+            "second send job ended in non-retryable terminal state: {}",
+            terminal_or_awaiting
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "second send never reached awaiting_signature within the retry \
+             budget (transient scanner race `{}` did not clear after {} attempts)",
+            err,
+            attempt
+        );
+        // Back off a full scanner-settle interval (≈ one mutinynet block)
+        // before re-signing + resubmitting, so we give the scanner real
+        // time to index the prior commitment instead of hammering the
+        // dispatcher with back-to-back prove attempts.
+        tokio::time::sleep(SCANNER_SETTLE_INTERVAL).await;
+    }
+}
+
+/// Decode `(ash, ocr)` from a send job's `CoinProof`. The send proof's
+/// `.commitment` is `None`; the account-state-hash / output-coins-root
+/// pair lives in the Plonky2 proof public inputs. Decode exactly like
+/// `account_node_tests.rs` and `flow.rs` (the first
+/// `N_PROOF_DATA_PUBLIC_INPUTS` field elements reconstruct `ProofData`).
+fn ash_ocr_from_send_proof(coin_proof: &CoinProof) -> ([u8; 32], [u8; 32]) {
+    let pis: [F; N_PROOF_DATA_PUBLIC_INPUTS] = coin_proof.proof.public_inputs
+        [..N_PROOF_DATA_PUBLIC_INPUTS]
+        .try_into()
+        .expect("send proof emits N_PROOF_DATA_PUBLIC_INPUTS field elements");
+    let proof_data = ProofData::from_field_elements(&pis);
+    let ash = digest_to_bytes(&proof_data.account_state_hash);
+    let ocr = digest_to_bytes(&proof_data.output_coins_root);
+    (ash, ocr)
+}
+
+/// Drive a send job that is `awaiting_signature` through the commit
+/// leg: attach the wallet-signed commitment via `POST /api/jobs/:id/commit`
+/// (which answers `200 {status:"broadcasting"}`), then poll to
+/// `completed` and return the `result` object (the legacy `/api/commit`
+/// body: `{success, proof_id, account_state_hash, output_coins_root}`).
+async fn commit_send_job(client: &reqwest::Client, job_id: &str, commit_body: &Value) -> Value {
+    let resp = client
+        .post(url(&format!("/api/jobs/{}/commit", job_id)))
+        .json(commit_body)
+        .send()
+        .await
+        .expect("POST /api/jobs/:id/commit");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "commit must be accepted with 200"
+    );
+    let body: Value = resp.json().await.expect("commit accept body JSON");
+    assert_eq!(
+        body["status"], "broadcasting",
+        "commit accept body must report broadcasting, got {}",
+        body
+    );
+
+    let terminal = poll_job_until_terminal(client, job_id).await;
+    assert_eq!(
+        terminal["status"], "completed",
+        "send job must complete after commit, got terminal body {}",
+        terminal
+    );
+    terminal["result"].clone()
+}
+
+/// Fetch + bincode-decode a `CoinProof` by proof_id. Shared by the
+/// roundtrip tests that need the mint proof (for `prev_commitment_pubkey`)
+/// or the send proof (for `ash || ocr`).
+async fn fetch_coin_proof(client: &reqwest::Client, proof_id: u64) -> CoinProof {
+    let resp = client
+        .get(url(&format!("/api/proof/{}", proof_id)))
+        .send()
+        .await
+        .expect("GET /api/proof/:id");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "GET /api/proof/{} must answer 200",
+        proof_id
+    );
+    let bytes = resp.bytes().await.expect("proof bytes");
+    bincode::deserialize(&bytes).expect("decode CoinProof bincode")
 }
