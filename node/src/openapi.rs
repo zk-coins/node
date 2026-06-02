@@ -238,16 +238,28 @@ pub(crate) fn swagger_ui_config() -> Arc<Config<'static>> {
 /// `GET /docs/{file}` — serve a single Swagger UI asset (CSS, JS, font,
 /// map) bundled into the binary by the `utoipa-swagger-ui` `vendored`
 /// feature. Returns 404 for unknown files.
+///
+/// `utoipa_swagger_ui::serve` returns `Err` in two situations
+/// (see `utoipa-swagger-ui-9.0.2/src/lib.rs::serve`): when the
+/// `swagger-initializer.js` bundle is not valid UTF-8, and when the
+/// oauth config formatter fails. The first is impossible because the
+/// `vendored` feature bakes in a known-good UTF-8 bundle at compile
+/// time, and the second is impossible because [`swagger_ui_config`]
+/// builds a [`Config`] without an oauth section. `expect()` is
+/// therefore correct here: a panic would only fire if either
+/// invariant were violated by a future upstream change, and the
+/// readiness probe would surface that within minutes.
 pub async fn swagger_asset_handler(Path(file): Path<String>) -> Response {
-    match utoipa_swagger_ui::serve(&file, swagger_ui_config()) {
-        Ok(Some(asset)) => (
+    match utoipa_swagger_ui::serve(&file, swagger_ui_config())
+        .expect("utoipa-swagger-ui::serve cannot error for our bundled, no-oauth config")
+    {
+        Some(asset) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, asset.content_type)],
             asset.bytes.to_vec(),
         )
             .into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 

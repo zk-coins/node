@@ -79,7 +79,7 @@ async fn docs_handler_returns_html_with_correct_content_type() {
 
 /// The bundled CSS asset must be served as `200 OK` with a non-empty
 /// body and a content-type header set by `utoipa_swagger_ui::serve`.
-/// Drives the `Ok(Some(asset))` arm of `swagger_asset_handler`.
+/// Drives the `Some(asset)` arm of `swagger_asset_handler`.
 #[tokio::test]
 async fn swagger_asset_handler_serves_bundled_css() {
     let response = swagger_asset_handler(axum::extract::Path("swagger-ui.css".to_string())).await;
@@ -124,7 +124,7 @@ async fn swagger_asset_handler_serves_bundled_js_bundle() {
 }
 
 /// Unknown asset names must produce a `404 Not Found`, not a `500`.
-/// Drives the `Ok(None)` arm of `swagger_asset_handler`.
+/// Drives the `None` arm of `swagger_asset_handler`.
 #[tokio::test]
 async fn swagger_asset_handler_returns_404_for_unknown_file() {
     let response =
