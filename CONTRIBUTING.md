@@ -365,7 +365,8 @@ node/
 ├── node/                  # Axum REST API
 │   └── src/
 │       ├── main.rs        # Entry point, chain scanner, bind address
-│       ├── router.rs      # REST endpoints (mint, send, balance, proof)
+│       ├── router.rs      # REST endpoints (mint, send, balance, proof) + utoipa annotations
+│       ├── openapi.rs     # OpenAPI 3.x spec assembly + /docs Swagger UI handlers
 │       ├── account_node.rs  # Account management, coin proofs, prover calls
 │       ├── state.rs       # Sparse Merkle Tree + Merkle Mountain Range
 │       ├── scanner.rs     # Bitcoin block scanner (Taproot Inscriptions)
@@ -521,6 +522,97 @@ identifier derivation, pubkey rotation) lives in `circuit/main.rs`.
 [`MIGRATION_RESEARCH.md` §7.22](./MIGRATION_RESEARCH.md#722-stage-5d-next-5-source-side-verification-via-aggregator-pattern--codified-resolves-721)
 for the architecture writeup and `program-plonky2/SESSION_STATE.md`
 for the historical pickup record.
+
+## REST API & OpenAPI
+
+The HTTP surface is documented by an OpenAPI 3.x spec **generated at
+compile time** from `#[utoipa::path]` annotations on the handlers and
+`#[derive(ToSchema)]` impls on the request / response types. There is
+no separately maintained YAML or JSON — drift between the wire
+contract and the documentation is structurally impossible because the
+same Rust type drives both `serde` and the schema.
+
+### Exposed routes
+
+| Route | Tag | Notes |
+|---|---|---|
+| `GET  /` | Node | Service identification + endpoint map. |
+| `GET  /health` | Health | Liveness probe (`"ok"` plain text). |
+| `GET  /health/ready` | Health | Readiness probe (DB + Esplora + prover-warm gate). |
+| `GET  /health/publisher` | Health | Publisher UTXO state. |
+| `GET  /api/info` | Node | Network + per-build capability flags. |
+| `GET  /api/balance` | Accounts | Balance lookup (per-address read). |
+| `GET  /api/history` | Accounts | Paginated per-address history (issue #153). |
+| `POST /api/send` | Coins | Sender-side proof construction. |
+| `POST /api/receive` | Coins | Recipient-side coin acceptance. |
+| `POST /api/commit` | Coins | Broadcast + state advance (post-`/api/send`). |
+| `POST /api/mint` | Coins | Mint inscription (operator-funded). |
+| `GET  /api/proof/{id}` | Coins | Look up a previously generated `CoinProof`. |
+| `GET  /api/inscriptions/{txid}` | Inscriptions | Inscription metadata. |
+| `GET  /api/username/resolve/{username}` | Usernames | Username → address (always-on). |
+| `GET  /api/address` | Accounts | All known addresses. **`address-list` feature.** |
+| `POST /api/username/claim` | Usernames | First-claim wins. **`username-claim` feature.** |
+| `GET  /.well-known/lnurlp/{username}` | LNURL | LNURL-pay metadata. **`lnurl` feature.** |
+| `GET  /lnurl/pay/{username}` | LNURL | LNURL-pay callback. **`lnurl` feature.** |
+
+The spec is served at `GET /openapi.json` and rendered with bundled
+Swagger UI at `GET /docs` (assets vendored into the binary —
+zero-CDN, works behind any reverse proxy that preserves path order).
+
+The following routes are **intentionally excluded** from the spec
+because they document the spec itself or expose operator-only debug
+data: `GET /openapi.json`, `GET /docs`, `GET /docs/{file}`, and
+`GET /api/admin/r2-probe/history`. If you add another admin route
+under `/api/admin/*`, keep it out of `paths(...)` for the same
+reason.
+
+### Adding a new endpoint
+
+1. **Annotate the handler** in `node/src/router.rs` with
+   `#[utoipa::path(...)]`. Set `tag` to the same tag used by sibling
+   endpoints (`Node`, `Health`, `Accounts`, `Coins`, `Inscriptions`,
+   `Usernames`, `LNURL`). Enumerate every status code the handler can
+   return and bind it to the matching response schema. Bump the
+   handler's visibility to `pub(crate)` — utoipa needs to reference
+   it from `openapi.rs`.
+
+2. **Derive `ToSchema`** on every request / response struct the
+   handler exposes:
+   ```rust
+   #[derive(Serialize, ToSchema)]
+   pub struct MyResponse { … }
+   ```
+   Foreign types like `bitcoin::secp256k1::PublicKey` cannot derive
+   `ToSchema` (orphan rule); override the schema at the use site with
+   `#[schema(value_type = String, example = "02a34b…")]` so the spec
+   describes the hex-encoded wire form.
+
+3. **Register** the handler under `paths(...)` and every new schema
+   under `components(schemas(...))` in `node/src/openapi.rs`. For
+   feature-gated handlers, use the conditional sub-doc pattern
+   (`AddressListDoc`, `UsernameClaimDoc`, `LnurlDoc`) so the spec
+   describes exactly the routes the running binary exposes.
+
+4. **Extend the smoke test.** Add the new path to
+   `spec_lists_every_always_on_route` in
+   `node/tests/openapi_smoke.rs`, and any wire-critical schema to
+   `spec_registers_critical_schemas`. The smoke suite is
+   network-free (it calls `openapi_json()` directly) and runs on
+   every PR CI job — drift on the wire contract fails fast.
+
+5. **Update this table** so contributors discover the endpoint
+   without scraping `router.rs`.
+
+### Drift guards
+
+- `info_response_carries_username_domain` — the field that motivated
+  the move off the previous Zod-driven mirror; a regression here
+  would resurface that exact incident.
+- `spec_has_no_hardcoded_servers_block` — the spec must apply to the
+  host that served it, so each self-hoster's node advertises its own
+  URL instead of pointing every wallet at the hosted DFX deployments.
+- `docs_html_*` — the bundled Swagger UI must load only same-origin
+  `/docs/...` assets and never reach for an external CDN.
 
 ## Environment Variables
 

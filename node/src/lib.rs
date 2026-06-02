@@ -36,6 +36,7 @@
 pub mod account_node;
 pub mod audit;
 pub mod db;
+pub mod openapi;
 pub mod publisher;
 pub mod r2_probe;
 pub mod router;
