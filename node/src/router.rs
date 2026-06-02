@@ -1982,6 +1982,17 @@ pub(crate) async fn stream_job_handler(
     //    queue. The `or_insert_with` arm handles the (uncommon) case
     //    where the dispatcher has not yet created the notifier
     //    (e.g. the row is still `queued` waiting to be picked up).
+    //
+    //    Cleanup race: the dispatcher's terminal-publish path runs
+    //    `notify_map.remove(id)` AFTER pushing the final event onto
+    //    the broadcast channel. A fresh subscriber that opens between
+    //    publish and remove would `or_insert_with` a brand-new
+    //    notifier, replacing the just-dropped one. That is safe
+    //    because the initial-state read above already reflects the
+    //    terminal row (the dispatcher persisted before publishing),
+    //    so `initial_event_from_job` emits the `complete` / `fail`
+    //    frame and the stream returns end-of-stream on the next poll
+    //    without ever depending on the now-orphaned subscriber.
     let notifier = state
         .job_notify_map
         .entry(id)
