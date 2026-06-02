@@ -153,7 +153,9 @@ utoipa-swagger-ui = { version = "9", default-features = false, features = ["vend
 # randomly-generated identifiers (no temporal correlation across
 # rows); `serde` so the value round-trips through the
 # `Json<JobStatusResponse>` and path-parameter extractors without a
-# manual encode/decode shim.
+# manual encode/decode shim. Also used by `test_db::setup_pool`
+# (dev-only) to namespace each test's isolated Postgres schema with
+# a UUID-v4 suffix (`t_<uuid_simple>`).
 uuid = { version = "1", features = ["v4", "serde"] }
 # Concurrent map keyed by `Uuid` → `Arc<tokio::sync::Notify>`. Each
 # `send` job that reaches `awaiting_signature` registers an entry so
@@ -186,10 +188,16 @@ http-body-util = "0.1"
 # readiness probe so the tests never hit the real
 # `https://mutinynet.com/api` from CI.
 wiremock = "0.6"
-# Used by `db_tests` to spin up a real Postgres 17 per test run.
-# The legacy `clients::Cli` of v0.14/0.15 was replaced by a global
-# `runner()` — see `db_tests::setup_pool` for the shape we use.
-testcontainers = "0.27"
+# Shared Postgres 17 container for the test suite. The
+# `reusable-containers` feature is load-bearing: it enables
+# `with_reuse(ReuseDirective::Always)` so every `cargo nextest`
+# test process attaches to the same long-lived container (looked
+# up on the daemon by the stable name `zkcoins-test-shared-pg`)
+# instead of spawning a fresh one. Without the feature each test
+# process spawns its own container (~3 s wall × 220+ tests) and
+# the suite regresses to the pre-#181 wall. See
+# `node/src/test_db.rs` for the call-site.
+testcontainers = { version = "0.27", features = ["reusable-containers"] }
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 # HTTP client for the `api_remote` integration test, which exercises
 # the deployed DEV node end-to-end. rustls (not native-tls) to keep
@@ -214,6 +222,22 @@ tempfile = "3"
 # test fixture. Already a transitive dep via tokio/h2/reqwest, but
 # must be declared here to be reachable from test code.
 socket2 = "0.5"
+# Cross-process file locking (POSIX `flock`/Windows `LockFileEx`) for
+# the `init_shared_pg` attach-or-create critical section in
+# `node/src/test_db.rs`. Under `--test-threads=8` (issue #181 Opt A),
+# eight concurrent `cargo nextest` test processes race to look up
+# the named `zkcoins-test-shared-pg` container; testcontainers 0.27
+# does NOT atomicise its attach-or-create path, so all eight see
+# "not present", all POST `/containers/create`, one wins and seven
+# fail with Docker 409 Conflict. The lock serialises the call so the
+# first process pays the ~3 s create cost and every subsequent
+# process attaches. Standard cross-platform Rust file-lock crate.
+fs2 = "0.4"
+# NOTE: `uuid` is also used by `test_db::setup_pool` to namespace
+# each test's isolated Postgres schema with a UUID-v4 suffix
+# (`t_<uuid_simple>`); the workspace pulls it from the main
+# `[dependencies]` block above (where the `v4` + `serde` features
+# are already enabled), so no separate dev-dep entry is needed.
 
 [features]
 # All non-MVP features are off by default. When a feature is not enabled, the

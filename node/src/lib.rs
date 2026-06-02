@@ -261,3 +261,9 @@ pub fn persist_state_from_sync_context(
 #[cfg(test)]
 #[path = "main_tests.rs"]
 mod tests;
+
+// Shared-Postgres test infrastructure (issue #181 Optimisation B):
+// one container per test binary, per-test schema isolation. Internal
+// to the test layer; module docs in `test_db.rs` explain the design.
+#[cfg(test)]
+pub(crate) mod test_db;

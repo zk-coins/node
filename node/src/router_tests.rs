@@ -47,9 +47,24 @@ fn test_state() -> AppState {
         shared::ClientAccount::new(private_key)
     };
 
+    // Per-test scratch dir for the ProofStore. Issue #181 Opt A flips
+    // the CI to `--test-threads=8`, which means several `test_state()`
+    // callers run concurrently in the same process; the previous
+    // hard-coded `/tmp/zkcoins-test-proofs` had every test share one
+    // directory and one `ProofStore::next_id` AtomicU64 root, so
+    // parallel writers could race on the same proof id. `keep()`
+    // returns the underlying `PathBuf` and disables the auto-cleanup
+    // Drop — we accept the leak (tests are best-effort cleaned up by
+    // the OS / CI runner reboot) so we don't have to thread a
+    // `TempDir` guard through every caller and the `AppState` struct.
+    // The canonical comment lives here; the second call-site below
+    // (the mint helper around line ~2260) just points back.
+    let proofs_dir = tempfile::tempdir().expect("create proofs tempdir").keep();
     AppState {
         account_node: Arc::new(Mutex::new(account_node)),
-        proof_store: Arc::new(ProofStore::new("/tmp/zkcoins-test-proofs")),
+        proof_store: Arc::new(ProofStore::new(
+            proofs_dir.to_str().expect("proofs tempdir utf-8"),
+        )),
         minting_account: Arc::new(Mutex::new(minting_client)),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
         pool: dead_pool(),
@@ -852,34 +867,17 @@ fn send_signature_rejects_wrong_signature() {
 #[tokio::test]
 async fn claim_username_with_valid_signature() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
 
     // The `claim_username_handler` hard-fails with 503 if persistence
     // fails — unlike the other handlers whose DB upserts are
     // log-and-continue. So this happy-path test cannot use the lazy
-    // `dead_pool`; it boots a real Postgres 17 container, mirroring
-    // the per-test isolation pattern from `db_tests::setup_pool` /
-    // `username_tests::setup_pool` / `runtime_tests::setup_pool`.
-    let pg_container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = pg_container
-        .get_host()
-        .await
-        .expect("failed to get container host");
-    let port = pg_container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("failed to get container port");
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(
-        crate::db::connect_and_migrate(&url)
-            .await
-            .expect("connect_and_migrate failed"),
-    );
+    // `dead_pool`; it gets a real Postgres 17 pool via the shared
+    // `postgres:17` container + per-test schema (issue #181 Opt B;
+    // see `crate::test_db`). The `pg_container` binding holds the
+    // `SchemaScope` that keeps the per-test schema alive for the
+    // duration of the test; its `Drop` cleans the schema async.
+    let pg_container = crate::test_db::setup_pool().await;
+    let pool = Arc::new(pg_container.pool.clone());
 
     let secp = secp::Secp256k1::new();
     let secret = SecretKey::from_slice(&[7u8; 32]).unwrap();
@@ -952,28 +950,11 @@ async fn claim_username_with_valid_signature() {
 #[tokio::test]
 async fn claim_username_mixed_case_input_normalised_before_hashing() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
 
-    let pg_container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = pg_container
-        .get_host()
-        .await
-        .expect("failed to get container host");
-    let port = pg_container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("failed to get container port");
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(
-        crate::db::connect_and_migrate(&url)
-            .await
-            .expect("connect_and_migrate failed"),
-    );
+    // Shared `postgres:17` container + per-test schema (issue #181
+    // Opt B; see `crate::test_db`).
+    let pg_container = crate::test_db::setup_pool().await;
+    let pool = Arc::new(pg_container.pool.clone());
 
     let secp = secp::Secp256k1::new();
     let secret = SecretKey::from_slice(&[9u8; 32]).unwrap();
@@ -1524,28 +1505,11 @@ async fn claim_username_db_error_returns_503() {
 #[tokio::test]
 async fn claim_username_sql_race_returns_409() {
     use bitcoin::secp256k1::{Keypair, SecretKey};
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
 
-    let pg_container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = pg_container
-        .get_host()
-        .await
-        .expect("failed to get container host");
-    let port = pg_container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("failed to get container port");
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(
-        crate::db::connect_and_migrate(&url)
-            .await
-            .expect("connect_and_migrate failed"),
-    );
+    // Shared `postgres:17` container + per-test schema (issue #181
+    // Opt B; see `crate::test_db`).
+    let pg_container = crate::test_db::setup_pool().await;
+    let pool = Arc::new(pg_container.pool.clone());
 
     // Plant the username row bound to a different address, without
     // touching the in-memory mirror — so `precheck` passes and
@@ -1988,39 +1952,17 @@ fn map_send_coins_error_unknown_string_is_500_internal_error() {
 // existing `dead_pool` / live-testcontainer helpers; the Esplora side
 // uses a per-test `wiremock::MockServer` so no real network is hit.
 
-/// Spin up a Postgres 17 testcontainer and return a migrated pool —
-/// the live half of the readiness happy path (and the db-ok side of
-/// the esplora-fails test).
-async fn ready_live_pool() -> (
-    Arc<sqlx::PgPool>,
-    testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
-) {
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
-
-    let pg_container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = pg_container
-        .get_host()
-        .await
-        .expect("failed to get container host");
-    let port = pg_container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("failed to get container port");
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(
-        crate::db::connect_and_migrate(&url)
-            .await
-            .expect("connect_and_migrate failed"),
-    );
-    // The container handle MUST outlive the pool: `testcontainers`
-    // tears the container down on `Drop`, which would close the
-    // backing Postgres before the test finishes querying.
-    (pool, pg_container)
+/// Hand back a migrated pool scoped to a fresh per-test schema in
+/// the shared `postgres:17` container (issue #181 Opt B; see
+/// `crate::test_db`) — the live half of the readiness happy path
+/// (and the db-ok side of the esplora-fails test). The
+/// `SchemaScope` is returned alongside so the caller keeps it alive
+/// for the duration of the test; its `Drop` cleans up the schema
+/// after the test finishes.
+async fn ready_live_pool() -> (Arc<sqlx::PgPool>, crate::test_db::SchemaScope) {
+    let scope = crate::test_db::setup_pool().await;
+    let pool = Arc::new(scope.pool.clone());
+    (pool, scope)
 }
 
 /// Build an `AppState` whose `esplora_config` points at the supplied
@@ -2330,9 +2272,16 @@ fn mint_test_state() -> AppState {
         c
     };
 
+    // Per-test scratch dir for the ProofStore — see the canonical
+    // comment on the first call-site in `test_state()` above for
+    // why we use `tempfile::tempdir().keep()` instead of holding a
+    // `TempDir` guard.
+    let proofs_dir = tempfile::tempdir().expect("create proofs tempdir").keep();
     AppState {
         account_node: Arc::new(Mutex::new(account_node)),
-        proof_store: Arc::new(ProofStore::new("/tmp/zkcoins-mint-test-proofs")),
+        proof_store: Arc::new(ProofStore::new(
+            proofs_dir.to_str().expect("proofs tempdir utf-8"),
+        )),
         minting_account: Arc::new(Mutex::new(minting_client)),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
         pool: dead_pool(),
@@ -2363,32 +2312,21 @@ fn mint_test_state() -> AppState {
 
 mod jobs_endpoint_tests {
     use super::*;
-    use crate::db::connect_and_migrate;
     use crate::router::create_router;
     use std::sync::Arc;
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
 
     /// Build an `AppState` whose `job_store` is wired to a fresh
-    /// testcontainers Postgres pool (with migration 0014 applied),
+    /// per-test schema in the shared `postgres:17` container (issue
+    /// #181 Opt B; see `crate::test_db`) with migration 0014 applied,
     /// `job_tx` to a never-recv'd channel (the dispatcher is not
     /// running in this test), `job_notify_map` to an empty DashMap.
     /// Mirrors the production wiring closely enough that the admit
-    /// handlers exercise their Ok / Err arms verbatim.
-    async fn jobs_test_state() -> (
-        AppState,
-        Arc<sqlx::PgPool>,
-        testcontainers::ContainerAsync<Postgres>,
-    ) {
-        let container = Postgres::default()
-            .with_tag("17")
-            .start()
-            .await
-            .expect("postgres container");
-        let host = container.get_host().await.unwrap();
-        let port = container.get_host_port_ipv4(5432).await.unwrap();
-        let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-        let pool = Arc::new(connect_and_migrate(&url).await.expect("migrate"));
+    /// handlers exercise their Ok / Err arms verbatim. The returned
+    /// `SchemaScope` must outlive the state — its `Drop` cleans up
+    /// the per-test schema asynchronously.
+    async fn jobs_test_state() -> (AppState, Arc<sqlx::PgPool>, crate::test_db::SchemaScope) {
+        let scope = crate::test_db::setup_pool().await;
+        let pool = Arc::new(scope.pool.clone());
 
         let mut state = mint_test_state();
         state.pool = Arc::clone(&pool);
@@ -2402,7 +2340,7 @@ mod jobs_endpoint_tests {
         // Leak the rx so it does not drop while the test runs.
         std::mem::forget(rx);
         state.job_notify_map = Arc::new(dashmap::DashMap::new());
-        (state, pool, container)
+        (state, pool, scope)
     }
 
     /// Helper: drive a request through the live router built off
@@ -3139,19 +3077,13 @@ mod jobs_endpoint_tests {
         // a closed-channel error.
         //
         // Setup mirrors `jobs_test_state` so the admit-then-enqueue
-        // sequence reaches the channel send: live testcontainer
-        // Postgres for the `JobStore::create` happy path, then a
-        // freshly-created channel whose rx is dropped before the
-        // request is dispatched.
-        let container = Postgres::default()
-            .with_tag("17")
-            .start()
-            .await
-            .expect("postgres container");
-        let host = container.get_host().await.unwrap();
-        let port = container.get_host_port_ipv4(5432).await.unwrap();
-        let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-        let pool = Arc::new(connect_and_migrate(&url).await.expect("migrate"));
+        // sequence reaches the channel send: shared `postgres:17`
+        // container + per-test schema (issue #181 Opt B; see
+        // `crate::test_db`) for the `JobStore::create` happy path,
+        // then a freshly-created channel whose rx is dropped before
+        // the request is dispatched.
+        let _scope = crate::test_db::setup_pool().await;
+        let pool = Arc::new(_scope.pool.clone());
 
         let mut state = mint_test_state();
         state.pool = Arc::clone(&pool);
@@ -3192,15 +3124,12 @@ mod jobs_endpoint_tests {
         // row exists — NOT VALID skips existing rows, so the row
         // stays readable, but any subsequent UPDATE has to satisfy
         // the constraint and fails with a constraint violation.
-        let container = Postgres::default()
-            .with_tag("17")
-            .start()
-            .await
-            .expect("postgres container");
-        let host = container.get_host().await.unwrap();
-        let port = container.get_host_port_ipv4(5432).await.unwrap();
-        let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-        let pool = Arc::new(connect_and_migrate(&url).await.expect("migrate"));
+        //
+        // Shared `postgres:17` container + per-test schema (issue
+        // #181 Opt B; see `crate::test_db`). The schema scope must
+        // outlive the test so the schema is not dropped mid-run.
+        let _scope = crate::test_db::setup_pool().await;
+        let pool = Arc::new(_scope.pool.clone());
 
         let mut state = mint_test_state();
         state.pool = Arc::clone(&pool);
@@ -3855,28 +3784,18 @@ fn verify_send_signature_pub_returns_missing_signature_when_absent() {
 
 mod inscriptions_endpoint_tests {
     use super::*;
-    use crate::db::{connect_and_migrate, insert_pending_inscription, InscriptionKind};
+    use crate::db::{insert_pending_inscription, InscriptionKind};
     use crate::router::create_router;
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
 
-    async fn live_pool_router() -> (
-        Router,
-        Arc<sqlx::PgPool>,
-        testcontainers::ContainerAsync<Postgres>,
-    ) {
-        let container = Postgres::default()
-            .with_tag("17")
-            .start()
-            .await
-            .expect("postgres container");
-        let host = container.get_host().await.unwrap();
-        let port = container.get_host_port_ipv4(5432).await.unwrap();
-        let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-        let pool = Arc::new(connect_and_migrate(&url).await.expect("migrate"));
+    async fn live_pool_router() -> (Router, Arc<sqlx::PgPool>, crate::test_db::SchemaScope) {
+        // Shared `postgres:17` container + per-test schema (issue
+        // #181 Opt B; see `crate::test_db`). The returned scope
+        // must outlive the router for the duration of the test.
+        let scope = crate::test_db::setup_pool().await;
+        let pool = Arc::new(scope.pool.clone());
         let state = live_test_state(pool.clone());
         let app = create_router(state);
-        (app, pool, container)
+        (app, pool, scope)
     }
 
     #[tokio::test]
@@ -3978,19 +3897,11 @@ mod inscriptions_endpoint_tests {
 #[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_precheck_reject_persists_log_row() {
-    use crate::db::connect_and_migrate;
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
-
-    let container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("postgres container");
-    let host = container.get_host().await.unwrap();
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(connect_and_migrate(&url).await.expect("migrate"));
+    // Shared `postgres:17` container + per-test schema (issue #181
+    // Opt B; see `crate::test_db`). `_scope` keeps the schema alive
+    // for the duration of the test.
+    let _scope = crate::test_db::setup_pool().await;
+    let pool = Arc::new(_scope.pool.clone());
     let state = live_test_state(pool.clone());
 
     // Pre-populate the in-memory UsernameStore with a conflicting name
@@ -4064,19 +3975,10 @@ async fn claim_username_precheck_reject_persists_log_row() {
 #[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_log_spawn_handles_insert_error() {
-    use crate::db::connect_and_migrate;
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
-
-    let container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("postgres container");
-    let host = container.get_host().await.unwrap();
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(connect_and_migrate(&url).await.expect("migrate"));
+    // Shared `postgres:17` container + per-test schema (issue #181
+    // Opt B; see `crate::test_db`).
+    let _scope = crate::test_db::setup_pool().await;
+    let pool = Arc::new(_scope.pool.clone());
     let state = live_test_state(pool.clone());
 
     // Pre-stake a conflicting username so the handler hits the
@@ -4184,22 +4086,10 @@ async fn r2_probe_history_db_error_returns_500() {
 
 #[tokio::test]
 async fn r2_probe_history_empty_returns_empty_array() {
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
-
-    let pg_container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = pg_container.get_host().await.expect("host");
-    let port = pg_container.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(
-        crate::db::connect_and_migrate(&url)
-            .await
-            .expect("connect_and_migrate failed"),
-    );
+    // Shared `postgres:17` container + per-test schema (issue #181
+    // Opt B; see `crate::test_db`).
+    let pg_container = crate::test_db::setup_pool().await;
+    let pool = Arc::new(pg_container.pool.clone());
 
     let state = live_test_state(pool);
     let req = Request::get("/api/admin/r2-probe/history")
@@ -4213,22 +4103,10 @@ async fn r2_probe_history_empty_returns_empty_array() {
 
 #[tokio::test]
 async fn r2_probe_history_returns_rows_with_pass_flags() {
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
-
-    let pg_container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = pg_container.get_host().await.expect("host");
-    let port = pg_container.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(
-        crate::db::connect_and_migrate(&url)
-            .await
-            .expect("connect_and_migrate failed"),
-    );
+    // Shared `postgres:17` container + per-test schema (issue #181
+    // Opt B; see `crate::test_db`).
+    let pg_container = crate::test_db::setup_pool().await;
+    let pool = Arc::new(pg_container.pool.clone());
 
     // Seed two runs: one within budget, one over warm budget.
     let host_info = crate::r2_probe::HostInfo {
@@ -4303,22 +4181,10 @@ async fn r2_probe_history_returns_rows_with_pass_flags() {
 
 #[tokio::test]
 async fn r2_probe_history_limit_clamped_to_max() {
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
-
-    let pg_container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = pg_container.get_host().await.expect("host");
-    let port = pg_container.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(
-        crate::db::connect_and_migrate(&url)
-            .await
-            .expect("connect_and_migrate failed"),
-    );
+    // Shared `postgres:17` container + per-test schema (issue #181
+    // Opt B; see `crate::test_db`).
+    let pg_container = crate::test_db::setup_pool().await;
+    let pool = Arc::new(pg_container.pool.clone());
 
     let state = live_test_state(pool);
     // Caller asks for 10_000 — the clamp keeps us at 200. With zero
@@ -4365,37 +4231,15 @@ async fn r2_probe_history_limit_clamped_to_max() {
 // trigger fills the history rows).
 // =======================================================================
 
-/// Spin up a Postgres 17 testcontainer and return a migrated pool —
-/// shared shape with the readiness / r2-probe live tests above. The
-/// container handle must outlive the pool (testcontainers tears the
-/// container down on `Drop`).
-async fn history_live_pool() -> (
-    Arc<sqlx::PgPool>,
-    testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
-) {
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
-
-    let pg_container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = pg_container
-        .get_host()
-        .await
-        .expect("failed to get container host");
-    let port = pg_container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("failed to get container port");
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(
-        crate::db::connect_and_migrate(&url)
-            .await
-            .expect("connect_and_migrate failed"),
-    );
-    (pool, pg_container)
+/// Hand back a migrated pool scoped to a fresh per-test schema in
+/// the shared `postgres:17` container (issue #181 Opt B; see
+/// `crate::test_db`) — shared shape with the readiness / r2-probe
+/// live tests above. The `SchemaScope` is returned alongside so the
+/// caller keeps it alive for the duration of the test.
+async fn history_live_pool() -> (Arc<sqlx::PgPool>, crate::test_db::SchemaScope) {
+    let scope = crate::test_db::setup_pool().await;
+    let pool = Arc::new(scope.pool.clone());
+    (pool, scope)
 }
 
 /// Seed an `Account { balance, .. }` row for `address` via the

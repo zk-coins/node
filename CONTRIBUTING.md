@@ -143,8 +143,11 @@ The five constraints below are decided and apply across every PR on
    ≤ 30 s, memory peak < 64 GB.
 4. **MVP = minimal feature surface + 100% test coverage.** Simultaneous,
    not alternative. "Minimal" reduces the surface; "100%" keeps what
-   remains clean. Gate: `cargo llvm-cov --fail-under-lines 100 -- --test-threads=1`
-   from inside the affected crate. Current state on `program-plonky2`:
+   remains clean. Gate: `cargo llvm-cov --fail-under-lines 100 -- --test-threads=8`
+   from inside the affected crate (the `node`-crate gate runs at
+   `--test-threads=8` after issue #181 Opt A + Opt B — per-test
+   Postgres-schema isolation + a cross-process attach-or-create file
+   lock around the shared container make the suite parallel-safe). Current state on `program-plonky2`:
    100% lines / functions / regions, 115 default-run tests (+ 2
    `#[ignore]`d `recursion_shape_probe` diagnostics). The authoritative
    coverage gate for `node` runs in CI on the self-hosted M3 Ultra
@@ -294,11 +297,21 @@ cd node
 sqlx migrate run
 ```
 
-Run the `db_tests` (Docker required, runs `postgres:17` per test):
+Run the `db_tests` (Docker required, one long-lived `postgres:17`
+container is reused across the whole run via testcontainers
+`ReuseDirective::Always` — see `node/src/test_db.rs`):
 
 ```bash
-cargo test -p node db -- --test-threads=1
+cargo test -p node db -- --test-threads=8
 ```
+
+Each test gets its own UUID-named Postgres schema inside the shared
+container, and a cross-process file lock around the
+attach-or-create call serialises the testcontainers daemon round-
+trip across parallel `cargo nextest` test binaries (issue #181
+Opt A + Opt B). The shared container survives the run; tear it
+down explicitly with `docker rm -f zkcoins-test-shared-pg` if you
+need a clean slate.
 
 The schema lives in `node/migrations/0001_initial.sql`. After
 changing it, drop the local database (`docker rm -f zkcoins-pg`) and
@@ -808,7 +821,7 @@ See [docs.zkcoins.app/infrastructure/backend](https://docs.zkcoins.app/infrastru
 | Workflow | Trigger | Action |
 |---|---|---|
 | `ci.yaml` (Lint & Build) | Ready PR → develop, push to develop | `cargo fmt --check`, clippy (MVP + all-features + program lib), build (MVP + all-features) on `ubuntu-latest`. |
-| `ci.yaml` (Node + Shared Tests) | Ready PR → develop with `ci:full` label, push to develop | `cargo nextest run -p node -p shared --release --all-features --test-threads 1 -E 'not binary(api_remote)'` on the self-hosted M3 Ultra runner pool (issue #40). |
+| `ci.yaml` (Node + Shared Tests) | Ready PR → develop with `ci:full` label, push to develop | `cargo nextest run -p node -p shared --release --all-features --test-threads 8 -E 'not binary(api_remote)'` on the self-hosted M3 Ultra runner pool (issue #40). Parallel after #181 Opt A + Opt B (per-test Postgres-schema isolation + cross-process file lock around the shared `postgres:17` container in `node/src/test_db.rs`). |
 | `ci.yaml` (Coverage Gate) | Ready PR → develop with `ci:full` label, push to develop | `cargo llvm-cov nextest` with the 100% line + function gate, MVP scope, on the same runner pool. |
 | `deploy-dev.yaml` | Push to develop | Docker build (ARM64) → push `zkcoins/node:beta` → deploy to DEV |
 | `deploy-prd.yaml` | Push to main | Docker build (ARM64) → push `zkcoins/node:latest` → deploy to PRD |

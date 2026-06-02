@@ -26,53 +26,68 @@
 //! shape; once a third bootstrap test lands the duplicated setup is
 //! worth extracting into a helper.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use sqlx::PgPool;
-use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
-use testcontainers_modules::postgres::Postgres;
-
 use crate::account_node::AccountNode;
-use crate::db::connect_and_migrate;
 use crate::runtime::start_rest_node;
 use crate::state::State;
+use crate::test_db::setup_pool;
 use crate::username::UsernameStore;
 use zkcoins_program::hash::digest_to_bytes;
 use zkcoins_program::types::MINTING_ADDRESS;
 
-/// Boot a fresh `postgres:17` container, run the node migrations
-/// against it, and return the live pool plus the container handle.
-/// Dropping the container handle tears the container down, so the
-/// caller keeps it alive for the duration of the test.
+// Shared-Postgres test infra (issue #181 Optimisation B): see
+// `crate::test_db`. The previous file-local `setup_pool` is gone
+// in favour of the shared helper; callers now keep the
+// `SchemaScope` alive for the test's lifetime so its `Drop` can
+// clean up the per-test schema after teardown.
+
+/// Initialise the process-wide env vars the bootstrap reads through
+/// `lazy_static` cells (`NETWORK_CONFIG`, `USERNAME_DOMAIN`) and the
+/// `ZKCOINS_SKIP_BOOTSTRAP_WARMUP` opt-out exactly once per test
+/// binary. The lazy_static cells freeze the values they observe on
+/// first touch, so racing two `set_var` callers from different tests
+/// is a use-after-free in spirit — issue #181 Opt A flips
+/// `--test-threads=8`, which makes that race deterministic.
 ///
-/// Each test gets its own container — the same isolation model as
-/// `db_tests::setup_pool`. The shape is duplicated here rather than
-/// re-exported across modules to keep `db_tests` and
-/// `runtime_tests` independently runnable (a shared helper
-/// would have to live in a `pub(crate)` module guarded with `#[cfg
-/// (test)]` and pulled in by both test files via `#[path = ...]`,
-/// which is heavier than the few lines below). The PR-A3 cleanup may
-/// dedupe both into a `test_db` helper module.
-async fn setup_pool() -> (Arc<PgPool>, ContainerAsync<Postgres>) {
-    let container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = container
-        .get_host()
-        .await
-        .expect("failed to get container host");
-    let port = container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("failed to get container port");
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = connect_and_migrate(&url)
-        .await
-        .expect("connect_and_migrate failed");
-    (Arc::new(pool), container)
+/// `OnceLock` gives a single "happens-before" barrier: the first
+/// caller through here runs the `set_var` block, every subsequent
+/// caller observes the initialised cell and returns immediately
+/// without touching env. The `set_var` calls themselves are
+/// idempotent — they only set if currently unset — so a host that
+/// exports these via the pre-push hook keeps its own values.
+///
+/// `PROOFS_DIR` is intentionally NOT set here. Each test passes its
+/// own `tempfile::tempdir()` path into `start_rest_node` as a
+/// parameter so parallel tests cannot trample each other's proof
+/// store. The env-read used to live inside `runtime::start_rest_node`;
+/// it now lives at the binary edge in `main.rs` only.
+fn ensure_test_env() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        // Set each var only if currently unset — preserves whatever
+        // the pre-push hook / CI workflow exported.
+        let defaults: &[(&str, &str)] = &[
+            ("USERNAME_DOMAIN", "test.zkcoins.local"),
+            ("IS_MAINNET", "false"),
+            ("ESPLORA_URL", "http://127.0.0.1:1/api"),
+            ("ESPLORA_WS_URL", "ws://127.0.0.1:1/api/v1/ws"),
+            // Smoke tests only need the listener to bind and serve
+            // `/health` / `/api/balance`; they MUST NOT pay the
+            // ~7 s background warmup tax (would double pre-push
+            // wall and add nothing to the bootstrap failure-mode
+            // coverage this file owns). With this flag set,
+            // `prover_warm` is flipped to `true` immediately at
+            // bootstrap and no `spawn_blocking` task is started.
+            ("ZKCOINS_SKIP_BOOTSTRAP_WARMUP", "1"),
+        ];
+        for (k, v) in defaults {
+            if std::env::var_os(k).is_none() {
+                std::env::set_var(k, v);
+            }
+        }
+    });
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -89,41 +104,18 @@ async fn start_rest_node_binds_and_serves_health() {
     drop(probe);
     let addr = format!("127.0.0.1:{}", port);
 
-    // The lazy_static reads of `NETWORK_CONFIG` and `USERNAME_DOMAIN`
-    // happen on first access in this test binary. The pre-push hook
-    // exports both of these already; setting them here defensively
-    // makes the test runnable in any environment.
-    // `NETWORK_CONFIG` is a process-wide `lazy_static` cell — the first
-    // test in this binary that touches it freezes the values for the
-    // rest of the run. All three chain-shaping env vars are required
-    // (see `lib::build_network_config_from_env`), so set them
-    // defensively here even though pre-push exports them too.
-    std::env::set_var("USERNAME_DOMAIN", "test.zkcoins.local");
-    std::env::set_var("IS_MAINNET", "false");
-    std::env::set_var("ESPLORA_URL", "http://127.0.0.1:1/api");
-    std::env::set_var("ESPLORA_WS_URL", "ws://127.0.0.1:1/api/v1/ws");
-    // Smoke tests only need the listener to bind and serve `/health`
-    // / `/api/balance`; they MUST NOT pay the ~7 s background warmup
-    // tax (would double pre-push wall and add nothing to the bootstrap
-    // failure-mode coverage this file owns). With this flag set
-    // `prover_warm` is flipped to `true` immediately at bootstrap and
-    // no `spawn_blocking` task is started — same shape these tests
-    // had before the warmup feature landed.
-    std::env::set_var("ZKCOINS_SKIP_BOOTSTRAP_WARMUP", "1");
+    // Process-wide env init (idempotent + once-only). Replaces the
+    // earlier per-test `std::env::set_var` block — under
+    // `--test-threads=8` (issue #181 Opt A) two concurrent tests
+    // would race on the lazy_static-frozen NETWORK_CONFIG values.
+    ensure_test_env();
 
-    // PR-A3 moved all sibling-file state (accounts.bin, usernames.bin,
-    // minting_num_pubkeys.bin) into Postgres; the bootstrap only needs
-    // a proofs directory now, which is configured via the `PROOFS_DIR`
-    // env var read inside `start_rest_node`. PID + port keeps the
-    // tempdir unique across parallel runs even though pre-push uses
-    // --test-threads=1.
-    let tmp = std::env::temp_dir().join(format!(
-        "zkcoins-startup-test-{}-{}",
-        std::process::id(),
-        port
-    ));
-    std::fs::create_dir_all(&tmp).expect("create tempdir");
-    std::env::set_var("PROOFS_DIR", tmp.to_string_lossy().into_owned());
+    // Per-test proofs dir — passed as a parameter to `start_rest_node`
+    // so it does NOT touch process-wide env. `tempfile::tempdir`
+    // removes the directory on Drop even when the test panics, so no
+    // /tmp/zkcoins-* tree leaks on failure.
+    let tmp = tempfile::tempdir().expect("create proofs tempdir");
+    let proofs_dir = tmp.path().to_string_lossy().into_owned();
 
     // Mimic main.rs wiring: fresh State and empty AccountNode /
     // UsernameStore, so the bootstrap exercises the "no saved state"
@@ -132,12 +124,12 @@ async fn start_rest_node_binds_and_serves_health() {
     let account_node = AccountNode::new(Arc::clone(&state));
     let username_store = UsernameStore::new();
 
-    let (pool, _pg_container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = Arc::new(scope.pool.clone());
 
-    let handle =
-        tokio::spawn(
-            async move { start_rest_node(account_node, username_store, &addr, pool).await },
-        );
+    let handle = tokio::spawn(async move {
+        start_rest_node(account_node, username_store, &addr, pool, &proofs_dir).await
+    });
 
     // Wait for the listener to come up. axum binds within ~hundreds of
     // ms on a warm cargo cache; cap the wait at 5 s so a regression
@@ -156,7 +148,8 @@ async fn start_rest_node_binds_and_serves_health() {
                 let n = stream.read(&mut buf).await.unwrap_or(0);
                 let resp = String::from_utf8_lossy(&buf[..n]).into_owned();
                 handle.abort();
-                std::fs::remove_dir_all(&tmp).ok();
+                // `tmp` (a `TempDir`) cleans itself up on Drop at
+                // function return — no explicit `remove_dir_all`.
                 assert!(
                     resp.starts_with("HTTP/1.1 200"),
                     "expected 200 on /health, got: {}",
@@ -185,7 +178,6 @@ async fn start_rest_node_binds_and_serves_health() {
         }
     }
     handle.abort();
-    std::fs::remove_dir_all(&tmp).ok();
     panic!(
         "start_rest_node never bound on 127.0.0.1:{} within 5 s; last connect error: {:?}",
         port, last_err
@@ -218,37 +210,24 @@ async fn bootstrap_initial_minting_account_balance_is_goldilocks_safe() {
     drop(probe);
     let addr = format!("127.0.0.1:{}", port);
 
-    // `NETWORK_CONFIG` is a process-wide `lazy_static` cell — the first
-    // test in this binary that touches it freezes the values for the
-    // rest of the run. All three chain-shaping env vars are required
-    // (see `lib::build_network_config_from_env`), so set them
-    // defensively here even though pre-push exports them too.
-    std::env::set_var("USERNAME_DOMAIN", "test.zkcoins.local");
-    std::env::set_var("IS_MAINNET", "false");
-    std::env::set_var("ESPLORA_URL", "http://127.0.0.1:1/api");
-    std::env::set_var("ESPLORA_WS_URL", "ws://127.0.0.1:1/api/v1/ws");
-    // See the sibling smoke test for the rationale — skip the
-    // ~7 s background warmup so pre-push wall stays bounded.
-    std::env::set_var("ZKCOINS_SKIP_BOOTSTRAP_WARMUP", "1");
+    // Process-wide env init — see the sibling smoke test for the
+    // rationale (idempotent + once-only to keep `--test-threads=8`
+    // parallel-safe).
+    ensure_test_env();
 
-    let tmp = std::env::temp_dir().join(format!(
-        "zkcoins-balance-test-{}-{}",
-        std::process::id(),
-        port
-    ));
-    std::fs::create_dir_all(&tmp).expect("create tempdir");
-    std::env::set_var("PROOFS_DIR", tmp.to_string_lossy().into_owned());
+    let tmp = tempfile::tempdir().expect("create proofs tempdir");
+    let proofs_dir = tmp.path().to_string_lossy().into_owned();
 
     let state = Arc::new(Mutex::new(State::new()));
     let account_node = AccountNode::new(Arc::clone(&state));
     let username_store = UsernameStore::new();
 
-    let (pool, _pg_container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = Arc::new(scope.pool.clone());
 
-    let handle =
-        tokio::spawn(
-            async move { start_rest_node(account_node, username_store, &addr, pool).await },
-        );
+    let handle = tokio::spawn(async move {
+        start_rest_node(account_node, username_store, &addr, pool, &proofs_dir).await
+    });
 
     let minting_hex = hex::encode(digest_to_bytes(&MINTING_ADDRESS));
     let request = format!(
@@ -269,7 +248,7 @@ async fn bootstrap_initial_minting_account_balance_is_goldilocks_safe() {
                 let mut buf = Vec::with_capacity(2048);
                 stream.read_to_end(&mut buf).await.expect("read response");
                 handle.abort();
-                std::fs::remove_dir_all(&tmp).ok();
+                // `tmp` (a `TempDir`) cleans itself up on Drop.
                 let resp = String::from_utf8_lossy(&buf).into_owned();
                 assert!(
                     resp.starts_with("HTTP/1.1 200"),
@@ -306,7 +285,6 @@ async fn bootstrap_initial_minting_account_balance_is_goldilocks_safe() {
         }
     }
     handle.abort();
-    std::fs::remove_dir_all(&tmp).ok();
     panic!(
         "start_rest_node never bound on 127.0.0.1:{} within 5 s; last connect error: {:?}",
         port, last_err
