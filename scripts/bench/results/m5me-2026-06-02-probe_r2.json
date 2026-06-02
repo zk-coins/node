@@ -1,0 +1,43 @@
+{
+  "allocator": "mimalloc",
+  "budgets": {
+    "cold_start_ms_max": 30000,
+    "peak_rss_kb_max": 67108864,
+    "warm_prove_ms_max": 5000
+  },
+  "build_profile": "release",
+  "circuit_build_wall_ms": 8245,
+  "git_sha": "6e8b7ab04d051bc53d4a12fc1f6f19914b4707e2",
+  "inner_pad_bits": 15,
+  "max_in_coins": 8,
+  "max_out_coins": 8,
+  "notes": "M5 Max 18C (6S+12P) 128GB native cargo --release, first probe",
+  "peak_rss_kb": 3937504,
+  "platform": {
+    "arch": "aarch64",
+    "cpu_brand": "Apple M5 Max",
+    "cpu_cores": 18,
+    "hostname": "M5ME.local",
+    "os": "macos",
+    "total_ram_gb": 128
+  },
+  "prove_cold_wall_ms": 6129,
+  "prove_warm_p50_ms": 4350,
+  "prove_warm_p90_ms": 4409,
+  "prove_warm_p99_ms": 4409,
+  "prove_warm_wall_ms": [
+    4265,
+    4320,
+    4350,
+    4357,
+    4409
+  ],
+  "rss_unit_note": "macOS reports ru_maxrss in bytes; Linux reports KB. This tool normalises to KB.",
+  "rustc_version": "rustc 1.98.0-nightly (6bdf43094 2026-06-01)",
+  "tags": [
+    "m5-max",
+    "native"
+  ],
+  "verify_wall_ms": 2,
+  "warm_calls_requested": 5
+}
