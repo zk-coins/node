@@ -499,6 +499,38 @@ async fn lnurlp_known_address_returns_pay_request() {
     assert!(resp.metadata.contains("zkCoins"));
 }
 
+#[cfg(feature = "lnurl")]
+#[tokio::test]
+async fn lnurlp_localhost_host_returns_http_callback() {
+    // Pins the `host.contains("localhost")` branch of `lnurlp_handler`'s
+    // scheme selection: when the request's Host header points at a local
+    // dev instance, the LNURL callback URL must be served back as `http://`
+    // so wallets following the redirect don't hit a TLS error against
+    // the dev node. The api.zkcoins.app path (covered by
+    // `lnurlp_known_address_returns_pay_request`) already pins the
+    // `https://` arm.
+    let full_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(
+        &zkcoins_program::types::MINTING_ADDRESS,
+    ));
+    let prefix = &full_hex[..8];
+
+    let uri = format!("/.well-known/lnurlp/{}", prefix);
+    let req = Request::get(&uri)
+        .header("host", "localhost:8080")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request(req).await;
+
+    assert_eq!(status, StatusCode::OK);
+
+    let resp: LnurlpResponse = serde_json::from_str(&body).expect("valid JSON");
+    assert!(
+        resp.callback.starts_with("http://localhost:8080/"),
+        "callback should use http://localhost:8080 — got {}",
+        resp.callback
+    );
+}
+
 // --- GET /lnurl/pay/{username} ---
 
 #[cfg(feature = "lnurl")]
