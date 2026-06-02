@@ -2,20 +2,25 @@ use axum::{
     body::Bytes,
     extract::{Json, Path, State},
     http::{header, HeaderMap, Method, StatusCode},
-    response::IntoResponse,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
     routing::{get, post},
     Router,
 };
 use bitcoin::secp256k1::{self as secp, schnorr::Signature as SchnorrSignature, Message};
-use dashmap::DashMap;
+use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shared::ClientAccount;
 use sqlx::PgPool;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use tokio::sync::{mpsc, Notify};
+use std::time::Duration;
+use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -26,8 +31,8 @@ use crate::account_node::{AccountNode, CoinProof};
 use crate::db;
 use crate::db::InscriptionSummary;
 use crate::flow;
-use crate::job_dispatcher::JobEnvelope;
-use crate::job_store::{CreateResult, JobKind, JobStatus, JobStore};
+use crate::job_dispatcher::{JobEnvelope, JobNotifier, JobNotifyMap, JobPhaseEvent};
+use crate::job_store::{CreateResult, Job, JobKind, JobStatus, JobStore};
 use crate::publisher::EsploraConfig;
 use crate::username::UsernameStore;
 use crate::{NETWORK_CONFIG, USERNAME_DOMAIN};
@@ -155,13 +160,19 @@ pub struct AppState {
     /// dropping the last `AppState`) shuts the dispatcher's recv
     /// loop down cleanly.
     pub(crate) job_tx: mpsc::Sender<JobEnvelope>,
-    /// Per-job `Notify` channels populated by the dispatcher when a
-    /// send-job reaches `awaiting_signature` and drained by the
-    /// matching `POST /api/jobs/:id/commit` handler. `DashMap`
-    /// (rather than `Mutex<HashMap>`) so concurrent inserts /
-    /// removes / lookups stay lock-free on the typical access
-    /// pattern (one wallet per job).
-    pub(crate) job_notify_map: Arc<DashMap<Uuid, Arc<Notify>>>,
+    /// Per-job `JobNotifier` channels populated by the dispatcher (a)
+    /// when a send-job reaches `awaiting_signature` (the commit
+    /// handler drains its `commit_wake` Notify) and (b) when a SSE
+    /// stream subscribes to a non-terminal job (it holds a
+    /// `phase_tx.subscribe()` receiver). `DashMap` (rather than
+    /// `Mutex<HashMap>`) so concurrent inserts / removes / lookups
+    /// stay lock-free on the typical access pattern (one wallet per
+    /// job + at most a handful of SSE streams).
+    ///
+    /// See [`JobNotifier`] for the two coordination primitives the
+    /// dispatcher and the SSE handler share via this map; see
+    /// [`stream_job_handler`] for the subscriber-side wiring.
+    pub(crate) job_notify_map: JobNotifyMap,
 }
 
 // Response types for our API
@@ -1712,10 +1723,10 @@ pub(crate) async fn jobs_commit_handler(
     // exists in the notify_map the dispatcher already gave up
     // (e.g. timed out and removed the entry); surface 409 so the
     // wallet does not silently spin.
-    let notify = state.job_notify_map.get(&id).map(|e| e.value().clone());
-    match notify {
+    let notifier = state.job_notify_map.get(&id).map(|e| e.value().clone());
+    match notifier {
         Some(n) => {
-            n.notify_one();
+            n.commit_wake.notify_one();
             (
                 StatusCode::OK,
                 Json(serde_json::json!({"status": "broadcasting"})),
@@ -1759,11 +1770,32 @@ pub(crate) async fn jobs_cancel_handler(
     Path(id): Path<Uuid>,
 ) -> axum::response::Response {
     match state.job_store.cancel(id).await {
-        Ok(true) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "cancelled"})),
-        )
-            .into_response(),
+        Ok(true) => {
+            // Publish the terminal `cancelled` event to any attached
+            // SSE listener BEFORE the dispatcher's notify-map entry
+            // drops (it won't drop until the next admit, but the
+            // explicit publish here guarantees a listener that was
+            // attached before cancel sees the event without waiting
+            // on the dispatcher's terminal-cleanup path — cancel
+            // succeeds only while `status = queued`, before the
+            // dispatcher ever picks the row up).
+            crate::job_dispatcher::publish_phase(
+                &state.job_notify_map,
+                id,
+                JobPhaseEvent {
+                    status: JobStatus::Cancelled,
+                    phase: "cancelled".to_string(),
+                    proof_id: None,
+                    result: None,
+                    error: None,
+                },
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "cancelled"})),
+            )
+                .into_response()
+        }
         Ok(false) => (
             StatusCode::CONFLICT,
             Json(JobErrorResponse {
@@ -1780,6 +1812,251 @@ pub(crate) async fn jobs_cancel_handler(
                 }),
             )
                 .into_response()
+        }
+    }
+}
+
+// =======================================================================
+// SSE push channel (PR2 — `/api/jobs/:id/stream`).
+// =======================================================================
+//
+// The poll-based contract from PR1 stays in place; SSE is an additive
+// channel for wallets that want push updates without the ~2 s poll tax.
+// Layered on top of the dispatcher's per-job
+// `tokio::sync::broadcast::Sender<JobPhaseEvent>` (see
+// `JobNotifier::phase_tx`) so the stream handler does not have to know
+// anything about the dispatcher's internal state machine — it just
+// subscribes, forwards events as SSE frames, and closes on the
+// first terminal event.
+
+/// SSE event-builder helper: emit the current job snapshot as the
+/// first frame of a freshly-opened stream. Mirrors the wire-shape the
+/// `GET /api/jobs/:id` handler returns so the SSE consumer's parse
+/// path is identical to the existing poll parse path.
+///
+/// Pure (no I/O, no async) so the function-level coverage gate can hit
+/// every arm — split into a free function rather than baked into the
+/// stream future so the test suite can drive each branch directly.
+pub(crate) fn initial_event_from_job(job: &Job) -> Event {
+    let payload = serde_json::json!({
+        "status": job.status.as_str(),
+        "phase": job.phase,
+        "proof_id": if job.status == JobStatus::AwaitingSignature {
+            job.proof_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
+        },
+        "result": if job.status == JobStatus::Completed {
+            job.response_body.clone().unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
+        },
+        "error": if job.status == JobStatus::Failed {
+            job.error.clone().map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
+        },
+    });
+    let event_name = if job.status.is_terminal() {
+        "complete"
+    } else {
+        "phase"
+    };
+    // `Event::json_data` only returns `Err` when its argument has a
+    // custom `Serialize` impl that itself errs (and even then only
+    // when the resulting bytes are not valid UTF-8 — which JSON's
+    // ASCII-superset output can't violate). The `payload` here is a
+    // `serde_json::Value` built inline above with no custom impls,
+    // so the error arm is structurally unreachable. `.expect()`
+    // documents the invariant inline — a failure here would mean
+    // axum/serde-json changed semantics, not a runtime data shape.
+    Event::default()
+        .event(event_name)
+        .json_data(payload)
+        .expect("Event::json_data cannot fail for a freshly built serde_json::Value")
+}
+
+/// SSE event-builder helper: translate a dispatcher-published
+/// [`JobPhaseEvent`] into an SSE frame. Terminal statuses emit
+/// `event: complete`; everything else emits `event: phase`.
+///
+/// Mirrors `initial_event_from_job` shape so the wallet's
+/// `EventSource.addEventListener('phase' | 'complete', …)` parse path
+/// handles both the initial frame and subsequent updates uniformly.
+pub(crate) fn event_from_phase(event: &JobPhaseEvent) -> Event {
+    let payload = serde_json::json!({
+        "status": event.status.as_str(),
+        "phase": event.phase,
+        "proof_id": event.proof_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+        "result": event.result.clone().unwrap_or(serde_json::Value::Null),
+        "error": event.error.clone().map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+    });
+    let event_name = if event.status.is_terminal() {
+        "complete"
+    } else {
+        "phase"
+    };
+    // Same invariant as `initial_event_from_job`: `payload` is a
+    // freshly built `serde_json::Value` with no custom Serialize
+    // impls, so `Event::json_data` is structurally infallible. See
+    // the longer note in `initial_event_from_job` above.
+    Event::default()
+        .event(event_name)
+        .json_data(payload)
+        .expect("Event::json_data cannot fail for a freshly built serde_json::Value")
+}
+
+/// SSE heartbeat interval. Cloudflare Tunnel — the typical
+/// PRD-fronting reverse proxy — drops idle HTTP streams after ~100 s
+/// of silence. 25 s is the standard reverse-proxy-friendly cadence
+/// (Stripe, GitHub, axum's own keep-alive default all sit in the
+/// 15-30 s band) and keeps the stream alive through any single
+/// dropped heartbeat without doubling the bandwidth cost.
+const SSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
+
+/// `GET /api/jobs/:id/stream` — open an SSE channel that pushes phase
+/// transitions to the wallet without polling.
+///
+/// Wire shape:
+///
+/// ```text
+/// event: phase
+/// data: {"status":"proving","phase":"proving","proof_id":null,"result":null,"error":null}
+///
+/// event: phase
+/// data: {"status":"awaiting_signature","phase":"awaiting_signature","proof_id":17,...}
+///
+/// event: complete
+/// data: {"status":"completed","phase":"completed","proof_id":null,"result":{...},"error":null}
+/// ```
+///
+/// Plus a `: heartbeat` SSE comment every [`SSE_HEARTBEAT_INTERVAL`]
+/// so Cloudflare Tunnel does not idle-kill the connection.
+///
+/// Initial frame: the handler IMMEDIATELY pushes the current job
+/// state on open, so the wallet learns the latest state without
+/// waiting for the dispatcher's next transition (matters most when
+/// the wallet re-attaches mid-flight after a network blip).
+///
+/// Closes the stream after the first `event: complete` frame.
+///
+/// Fallback semantics: when SSE is not available (e.g. corporate
+/// proxy stripping `text/event-stream`), the wallet falls back to
+/// `GET /api/jobs/:id` polling — the poll contract from PR1 is
+/// unchanged.
+#[utoipa::path(
+    get,
+    path = "/api/jobs/{job_id}/stream",
+    tag = "Jobs",
+    params(
+        ("job_id" = String, Path, description = "Job UUID returned by the matching admit handler."),
+    ),
+    responses(
+        (status = 200,
+            description = "SSE stream. Frames are `event: phase` (intermediate transitions) and \
+                `event: complete` (terminal). The wire body of each frame is a JSON-encoded \
+                `JobStatusResponse` snapshot. Streams close after the first `event: complete`. \
+                A `: heartbeat` SSE comment is emitted on a fixed interval so reverse proxies \
+                (Cloudflare Tunnel, nginx) do not idle-kill the connection.",
+            content_type = "text/event-stream"),
+        (status = 404, description = "No job exists for this id. Returned as a JSON body \
+            rather than an immediately-closed stream so the polling fallback can branch \
+            on a plain HTTP error.",
+            body = JobErrorResponse),
+        (status = 500, description = "Database error loading the job row.",
+            body = JobErrorResponse),
+    ),
+)]
+pub(crate) async fn stream_job_handler(
+    Path(id): Path<Uuid>,
+    State(state): State<AppState>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    // 1. Load the row up-front so a 404 surfaces with the standard
+    //    JSON shape (not as an immediately-closed SSE stream — the
+    //    wallet's polling fallback expects a non-stream error
+    //    response for unknown IDs).
+    let job = match state.job_store.load(id).await {
+        Ok(Some(j)) => j,
+        Ok(None) => return Err(StatusCode::NOT_FOUND),
+        Err(e) => {
+            tracing::error!("JobStore::load failed in stream handler: {}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
+    // 2. Subscribe to the per-job broadcast channel BEFORE sending
+    //    the initial event so any event that lands between "build
+    //    initial" and "spawn stream loop" lands in the receiver
+    //    queue. The `or_insert_with` arm handles the (uncommon) case
+    //    where the dispatcher has not yet created the notifier
+    //    (e.g. the row is still `queued` waiting to be picked up).
+    //
+    //    Cleanup race: the dispatcher's terminal-publish path runs
+    //    `notify_map.remove(id)` AFTER pushing the final event onto
+    //    the broadcast channel. A fresh subscriber that opens between
+    //    publish and remove would `or_insert_with` a brand-new
+    //    notifier, replacing the just-dropped one. That is safe
+    //    because the initial-state read above already reflects the
+    //    terminal row (the dispatcher persisted before publishing),
+    //    so `initial_event_from_job` emits the `complete` / `fail`
+    //    frame and the stream returns end-of-stream on the next poll
+    //    without ever depending on the now-orphaned subscriber.
+    let notifier = state
+        .job_notify_map
+        .entry(id)
+        .or_insert_with(|| Arc::new(JobNotifier::new()))
+        .clone();
+    let rx = notifier.phase_tx.subscribe();
+
+    let stream = build_phase_stream(job, rx);
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(SSE_HEARTBEAT_INTERVAL)))
+}
+
+/// Build the long-lived SSE stream that fans out phase events to the
+/// wallet.
+///
+/// Coverage: the per-event loop is driven by tokio time + the
+/// broadcast channel, neither of which the deterministic test harness
+/// can exhaustively cover without a real wall-clock advance. The
+/// initial-state emission and the terminal-job-early-close path stay
+/// pure (covered by [`initial_event_from_job`]); the loop itself is
+/// annotated `coverage(off)` so the 100% line/function gate doesn't
+/// trip on the inner `tokio::select!` arms. Same shape as
+/// `scanner_ws::run_subscription_loop` — see CI workflow's
+/// `--ignore-filename-regex` and the `coverage_nightly` cfg in
+/// `Cargo.toml` for the project-wide pattern.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn build_phase_stream(
+    job: Job,
+    mut rx: tokio::sync::broadcast::Receiver<JobPhaseEvent>,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    async_stream::stream! {
+        // 1. Initial event with the current state. If terminal,
+        //    close immediately — the wallet only needs the snapshot.
+        let initial = initial_event_from_job(&job);
+        let is_terminal = job.status.is_terminal();
+        yield Ok(initial);
+        if is_terminal {
+            return;
+        }
+
+        // 2. Forward every event published by the dispatcher. Close
+        //    the stream on the first terminal event so the wallet's
+        //    EventSource fires its `complete`-listener and detaches.
+        //    `Lagged` is treated the same as channel-closed — the
+        //    fallback polling path will surface the eventual terminal
+        //    state, so the stream does not need to recover.
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    let is_terminal = event.status.is_terminal();
+                    yield Ok(event_from_phase(&event));
+                    if is_terminal {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
         }
     }
 }
@@ -2199,6 +2476,7 @@ pub struct RootEndpoints {
     admit_mint: &'static str,
     admit_send: &'static str,
     get_job: &'static str,
+    stream_job: &'static str,
     commit: &'static str,
     cancel: &'static str,
     proof: &'static str,
@@ -2239,6 +2517,7 @@ pub(crate) async fn root_handler() -> impl IntoResponse {
             admit_mint: "POST /api/jobs/mint",
             admit_send: "POST /api/jobs/send",
             get_job: "GET  /api/jobs/{job_id}",
+            stream_job: "GET  /api/jobs/{job_id}/stream",
             commit: "POST /api/jobs/{job_id}/commit",
             cancel: "POST /api/jobs/{job_id}/cancel",
             proof: "GET  /api/proof/{id}",
@@ -2685,6 +2964,7 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/api/jobs/mint", post(jobs_mint_handler))
         .route("/api/jobs/send", post(jobs_send_handler))
         .route("/api/jobs/:id", get(get_job_handler))
+        .route("/api/jobs/:id/stream", get(stream_job_handler))
         .route("/api/jobs/:id/commit", post(jobs_commit_handler))
         .route("/api/jobs/:id/cancel", post(jobs_cancel_handler))
         .route("/api/inscriptions/:txid", get(get_inscription_handler))

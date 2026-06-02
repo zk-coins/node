@@ -1517,6 +1517,36 @@ The dispatcher publishes status transitions at five known waypoints (`proving`, 
 - `SPEC.md §11.2.1` — wire-level endpoint table
 - `CONTRIBUTING.md` § "Job-API lifecycle" — state machine + invariants
 
+### 7.28 Job-API SSE push channel — PR2 — **codified**
+
+**Decision (June 2026, PR `feat/jobs-api-sse`, stacked on PR1).** Add an additive `GET /api/jobs/:id/stream` SSE endpoint so wallets that want push updates do not have to pay the ~2 s poll tax. The endpoint emits an initial phase event with the current job snapshot on open, forwards every dispatcher phase transition, and closes with a single terminal event. Polling stays the contract; SSE is a UX-only optimisation.
+
+**What changed mechanically.**
+
+1. The `DashMap<Uuid, Arc<Notify>>` from PR1 became `DashMap<Uuid, Arc<JobNotifier>>` where `JobNotifier { commit_wake: Arc<Notify>, phase_tx: broadcast::Sender<JobPhaseEvent> }`. The commit-wake path is unchanged (`POST /api/jobs/:id/commit` still calls `notifier.commit_wake.notify_one()`); the new `phase_tx` field carries fan-out subscriptions for SSE listeners.
+2. Every dispatcher status-persistence site (`set_status`, `set_awaiting_signature`, `complete`, `fail`) is followed by a `publish_phase(...)` call that pushes a `JobPhaseEvent` into the broadcast channel. The `.send().ok()` swallow covers the no-subscribers arm (broadcast's "no active receivers" error). The cancel handler also publishes a terminal `cancelled` event so an SSE subscriber attached before cancel observes the close.
+3. The SSE handler (`router::stream_job_handler`) loads the row up-front (404 surfaces with the standard JSON shape, not as an empty stream), subscribes a fresh `broadcast::Receiver` from the per-job notifier, emits an initial event with the current snapshot (`event: phase` for non-terminal, `event: complete` for terminal), and either closes immediately (terminal) or runs the broadcast forwarding loop wrapped by axum's built-in `KeepAlive::new().interval(25 s)` heartbeat.
+
+**Why broadcast and not watch.** `tokio::sync::watch` only keeps the latest value, so a fast-moving job (`proving → awaiting_signature → broadcasting` within milliseconds) would have the intermediate `proving` event collapsed before the subscriber sees it. `broadcast(32)` keeps a per-subscriber lossless queue and only drops events when a subscriber lags by >32 — which cannot realistically happen for a job that only emits 3-5 events total. `Lagged` is treated as "end of stream" by the handler so a wedged subscriber does not pin the broadcast buffer.
+
+**Heartbeat (25 s).** Cloudflare Tunnel drops idle HTTP streams after ~100 s; the typical reverse-proxy-friendly heartbeat cadence is 15-30 s (Stripe, GitHub, axum's `KeepAlive::default()`). 25 s is the middle of that band and survives a single dropped heartbeat without doubling bandwidth.
+
+**Fallback semantics.** When SSE is unavailable (corporate proxy strips `text/event-stream`, sandbox without `EventSource`, network blip mid-stream) the wallet falls back to the existing 2 s poll. The poll contract from PR1 is byte-identical; SSE adds zero new failure modes for clients that do not use it.
+
+The wallet's `EventSource` performs its own built-in reconnect on transport errors. The WHATWG HTML spec defines a UA-implemented reconnection time, settable per-stream via the `retry:` field; in practice Firefox and Chrome ramp from ~3 s. So the first remediation on `Lagged → end-of-stream` is the browser automatically reopening the channel — at which point the initial-frame snapshot reflects the current row and the wallet observes either the latest non-terminal phase or the terminal frame directly. Only after `EventSource` exhausts its retry budget does the explicit poll fallback kick in.
+
+**Concurrent-connection bound.** No per-node cap on simultaneous SSE streams is enforced today. The hosted MVP is sized for the closed-test wallet population (low single-digit concurrent connections per dev box), so the work-in-flight is bounded by the prove queue, not by HTTP connection state. A future "self-host with N>100 wallets" deployment would need either (a) a per-node `max_sse_streams` config knob backed by a `Semaphore`, or (b) a reverse-proxy-side concurrent-connection limit. Deferred until that population materialises — capturing here so it does not get lost in the post-MVP backlog.
+
+**Why not WebSocket.** SSE is a one-way push (server → client), which is exactly what the wallet needs — the wallet's commit signature still goes back via `POST /api/jobs/:id/commit`, not over the stream. WebSocket would buy us duplex bandwidth we do not use, plus a `Sec-WebSocket-Accept` handshake step Cloudflare Tunnel handles less gracefully than chunked-text SSE. SSE also reuses the wallet's existing `fetch`/`EventSource` plumbing — no new client-side library.
+
+**Coverage.** The pure helpers (`initial_event_from_job`, `event_from_phase`) are covered by 10 unit tests. The handler's load + subscribe path is covered by 4 integration tests against a testcontainers Postgres (404, 500-on-db-error, terminal-job-immediate-close, fan-out from dispatcher publishes). The stream's inner forwarding loop (`build_phase_stream`) is annotated `#[cfg_attr(coverage_nightly, coverage(off))]` because its `tokio::select!` arms depend on real-time broadcast deliveries the deterministic harness cannot fully cover — same pattern as `scanner_ws::run_subscription_loop`.
+
+**Pointers.**
+- `node/src/job_dispatcher.rs::{JobNotifier, JobPhaseEvent, JobNotifyMap, publish_phase}` — broadcast plumbing
+- `node/src/router.rs::stream_job_handler` + helpers — SSE handler
+- `SPEC.md §11.2.1` — wire-level event-shape examples
+- `CONTRIBUTING.md` § "Job-API lifecycle" — SSE fallback semantics
+
 ---
 
 ## 8. Local Artifacts

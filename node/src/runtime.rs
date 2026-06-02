@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
 use crate::account_node::persist_account;
-use crate::job_dispatcher::{self, DEFAULT_AWAITING_SIGNATURE_TIMEOUT};
+use crate::job_dispatcher::{self, JobNotifier, DEFAULT_AWAITING_SIGNATURE_TIMEOUT};
 use crate::job_store::{JobStatus, JobStore};
 use crate::publisher::resume_pending_inscriptions;
 use crate::NETWORK_CONFIG;
@@ -378,7 +378,7 @@ pub async fn start_rest_node(
 ///   the same way it did pre-restart.
 async fn boot_resume_jobs(
     job_store: &Arc<JobStore>,
-    job_notify_map: &Arc<DashMap<uuid::Uuid, Arc<tokio::sync::Notify>>>,
+    job_notify_map: &Arc<DashMap<uuid::Uuid, Arc<JobNotifier>>>,
     job_tx: &tokio::sync::mpsc::Sender<crate::job_dispatcher::JobEnvelope>,
 ) -> anyhow::Result<()> {
     // Interrupted in-flight rows: mark each failed so the wallet
@@ -424,8 +424,8 @@ async fn boot_resume_jobs(
                 }
             }
             JobStatus::AwaitingSignature => {
-                let notify = Arc::new(tokio::sync::Notify::new());
-                job_notify_map.insert(job.public_id, notify);
+                let notifier = Arc::new(JobNotifier::new());
+                job_notify_map.insert(job.public_id, notifier);
                 if let Err(e) = job_tx
                     .send(crate::job_dispatcher::JobEnvelope {
                         public_id: job.public_id,

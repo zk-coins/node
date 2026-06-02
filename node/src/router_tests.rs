@@ -127,6 +127,10 @@ async fn root_returns_service_metadata() {
     assert_eq!(json["endpoints"]["admit_send"], "POST /api/jobs/send");
     assert_eq!(json["endpoints"]["get_job"], "GET  /api/jobs/{job_id}");
     assert_eq!(
+        json["endpoints"]["stream_job"],
+        "GET  /api/jobs/{job_id}/stream"
+    );
+    assert_eq!(
         json["endpoints"]["commit"],
         "POST /api/jobs/{job_id}/commit"
     );
@@ -2960,8 +2964,9 @@ mod jobs_endpoint_tests {
             .set_awaiting_signature(job_id, 7)
             .await
             .expect("aw sig");
-        let notify = Arc::new(tokio::sync::Notify::new());
-        state.job_notify_map.insert(job_id, notify.clone());
+        let notifier = Arc::new(crate::job_dispatcher::JobNotifier::new());
+        let commit_wake = notifier.commit_wake.clone();
+        state.job_notify_map.insert(job_id, notifier);
 
         let commit_body = serde_json::json!({
             "proof_id": 7u64,
@@ -2977,10 +2982,10 @@ mod jobs_endpoint_tests {
         assert_eq!(status, StatusCode::OK, "body: {}", body);
         let v: serde_json::Value = serde_json::from_str(&body).expect("json");
         assert_eq!(v["status"], "broadcasting");
-        // The handler signals the notify; verifying that requires
-        // observing the wake-up. We assert that .notified() resolves
-        // immediately afterwards.
-        tokio::time::timeout(std::time::Duration::from_secs(1), notify.notified())
+        // The handler signals the notifier's commit_wake; verifying
+        // that requires observing the wake-up. We assert that
+        // .notified() resolves immediately afterwards.
+        tokio::time::timeout(std::time::Duration::from_secs(1), commit_wake.notified())
             .await
             .expect("notify_one must have been called");
     }
@@ -3227,8 +3232,8 @@ mod jobs_endpoint_tests {
             .set_awaiting_signature(job_id, 7)
             .await
             .expect("aw sig");
-        let notify = Arc::new(tokio::sync::Notify::new());
-        state.job_notify_map.insert(job_id, notify);
+        let notifier = Arc::new(crate::job_dispatcher::JobNotifier::new());
+        state.job_notify_map.insert(job_id, notifier);
 
         // Install a CHECK constraint that no future UPDATE can
         // satisfy. NOT VALID lets the existing (already-stored) row
@@ -3254,6 +3259,560 @@ mod jobs_endpoint_tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         let v: serde_json::Value = serde_json::from_str(&body).expect("json");
         assert_eq!(v["error"], "Failed to persist commit payload");
+    }
+
+    // =======================================================================
+    // SSE push channel coverage — `GET /api/jobs/:id/stream` (PR2).
+    // =======================================================================
+    //
+    // The handler entry point + helper functions
+    // (`initial_event_from_job`, `event_from_phase`) stay covered
+    // here. The long-lived stream loop in `build_phase_stream` is
+    // marked `#[cfg_attr(coverage_nightly, coverage(off))]` because
+    // its inner `tokio::select!` arms depend on real-time
+    // broadcast-channel deliveries that can't be deterministically
+    // covered without a wall-clock advance — same exclusion pattern
+    // as `scanner_ws::run_subscription_loop`.
+
+    use crate::job_dispatcher::{JobNotifier, JobPhaseEvent};
+    use crate::job_store::{Job, JobKind, JobStatus};
+
+    /// Decode an SSE-formatted body chunk into `(event, data)` pairs.
+    /// The body is the raw bytes that flow through the wire — each
+    /// event is delimited by a blank line; comments (`: heartbeat`)
+    /// are skipped.
+    fn parse_sse_events(body: &str) -> Vec<(String, String)> {
+        let mut events = Vec::new();
+        for block in body.split("\n\n") {
+            let mut event_name = String::from("message");
+            let mut data = String::new();
+            for line in block.lines() {
+                if let Some(rest) = line.strip_prefix("event:") {
+                    event_name = rest.trim().to_string();
+                } else if let Some(rest) = line.strip_prefix("data:") {
+                    if !data.is_empty() {
+                        data.push('\n');
+                    }
+                    data.push_str(rest.trim());
+                }
+                // Comments (lines starting with ':' but no second
+                // ':') and other fields are ignored.
+            }
+            if !data.is_empty() {
+                events.push((event_name, data));
+            }
+        }
+        events
+    }
+
+    /// Drain the response body to a String. Caps at ~64 KiB so a
+    /// runaway stream cannot wedge the test indefinitely.
+    async fn collect_body_string(resp: axum::response::Response) -> String {
+        let bytes = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .expect("collect")
+            .to_bytes();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    // ---- `initial_event_from_job` pure-helper coverage ----
+
+    /// Helper: build a `Job` row directly (no DB) so the pure helpers
+    /// can be exercised without a testcontainer.
+    fn make_job(
+        status: JobStatus,
+        proof_id: Option<i64>,
+        response_body: Option<serde_json::Value>,
+        error: Option<String>,
+    ) -> Job {
+        Job {
+            id: 1,
+            public_id: uuid::Uuid::new_v4(),
+            kind: JobKind::Mint,
+            status,
+            phase: status.as_str().to_string(),
+            account_address: [0u8; 32],
+            idempotency_key: None,
+            request_body: serde_json::json!({}),
+            response_body,
+            response_status: None,
+            proof_id,
+            error,
+            progress: 0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn initial_event_proving_serialises_as_phase() {
+        let job = make_job(JobStatus::Proving, None, None, None);
+        let event = crate::router::initial_event_from_job(&job);
+        let wire = format!("{:?}", event);
+        // The Event Debug impl renders the assembled SSE frame; we
+        // assert on the event name field rather than the entire
+        // formatted output.
+        assert!(wire.contains("phase"), "wire: {}", wire);
+    }
+
+    #[test]
+    fn initial_event_awaiting_signature_includes_proof_id() {
+        let job = make_job(JobStatus::AwaitingSignature, Some(42), None, None);
+        let event = crate::router::initial_event_from_job(&job);
+        // Re-serialise to check the payload contents.
+        let wire = format!("{:?}", event);
+        assert!(wire.contains("phase"), "wire: {}", wire);
+        assert!(
+            wire.contains("42"),
+            "proof_id 42 must surface; wire: {}",
+            wire
+        );
+    }
+
+    #[test]
+    fn initial_event_completed_emits_complete_event() {
+        let job = make_job(
+            JobStatus::Completed,
+            None,
+            Some(serde_json::json!({"success": true})),
+            None,
+        );
+        let event = crate::router::initial_event_from_job(&job);
+        let wire = format!("{:?}", event);
+        assert!(wire.contains("complete"), "wire: {}", wire);
+        assert!(
+            wire.contains("success"),
+            "result body must surface; wire: {}",
+            wire
+        );
+    }
+
+    #[test]
+    fn initial_event_failed_emits_complete_event_with_error() {
+        let job = make_job(JobStatus::Failed, None, None, Some("boom".to_string()));
+        let event = crate::router::initial_event_from_job(&job);
+        let wire = format!("{:?}", event);
+        assert!(wire.contains("complete"), "wire: {}", wire);
+        assert!(wire.contains("boom"), "wire: {}", wire);
+    }
+
+    #[test]
+    fn initial_event_cancelled_emits_complete_event() {
+        let job = make_job(JobStatus::Cancelled, None, None, None);
+        let event = crate::router::initial_event_from_job(&job);
+        let wire = format!("{:?}", event);
+        assert!(wire.contains("complete"), "wire: {}", wire);
+    }
+
+    // ---- `event_from_phase` pure-helper coverage ----
+
+    #[test]
+    fn event_from_phase_proving_emits_phase_event() {
+        let ev = JobPhaseEvent {
+            status: JobStatus::Proving,
+            phase: "proving".to_string(),
+            proof_id: None,
+            result: None,
+            error: None,
+        };
+        let frame = crate::router::event_from_phase(&ev);
+        let wire = format!("{:?}", frame);
+        assert!(wire.contains("phase"), "wire: {}", wire);
+    }
+
+    #[test]
+    fn event_from_phase_awaiting_signature_includes_proof_id() {
+        let ev = JobPhaseEvent {
+            status: JobStatus::AwaitingSignature,
+            phase: "awaiting_signature".to_string(),
+            proof_id: Some(17),
+            result: None,
+            error: None,
+        };
+        let frame = crate::router::event_from_phase(&ev);
+        let wire = format!("{:?}", frame);
+        assert!(wire.contains("phase"), "wire: {}", wire);
+        assert!(wire.contains("17"), "wire: {}", wire);
+    }
+
+    #[test]
+    fn event_from_phase_completed_emits_complete_event() {
+        let ev = JobPhaseEvent {
+            status: JobStatus::Completed,
+            phase: "completed".to_string(),
+            proof_id: None,
+            result: Some(serde_json::json!({"ok": 1})),
+            error: None,
+        };
+        let frame = crate::router::event_from_phase(&ev);
+        let wire = format!("{:?}", frame);
+        assert!(wire.contains("complete"), "wire: {}", wire);
+    }
+
+    #[test]
+    fn event_from_phase_failed_emits_complete_event() {
+        let ev = JobPhaseEvent {
+            status: JobStatus::Failed,
+            phase: "failed".to_string(),
+            proof_id: None,
+            result: None,
+            error: Some("err".to_string()),
+        };
+        let frame = crate::router::event_from_phase(&ev);
+        let wire = format!("{:?}", frame);
+        assert!(wire.contains("complete"), "wire: {}", wire);
+    }
+
+    #[test]
+    fn event_from_phase_cancelled_emits_complete_event() {
+        let ev = JobPhaseEvent {
+            status: JobStatus::Cancelled,
+            phase: "cancelled".to_string(),
+            proof_id: None,
+            result: None,
+            error: None,
+        };
+        let frame = crate::router::event_from_phase(&ev);
+        let wire = format!("{:?}", frame);
+        assert!(wire.contains("complete"), "wire: {}", wire);
+    }
+
+    // ---- `stream_job_handler` route-level coverage ----
+
+    #[tokio::test]
+    async fn jobs_stream_404_for_unknown_id() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let id = uuid::Uuid::new_v4();
+        let req = Request::get(format!("/api/jobs/{}/stream", id))
+            .body(Body::empty())
+            .unwrap();
+        let app = create_router(state);
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn jobs_stream_returns_500_when_db_unavailable() {
+        // Targets the `JobStore::load` Err arm in
+        // `stream_job_handler` — same shape as the GET 500 test.
+        let state = jobs_test_state_dead_db();
+        let id = uuid::Uuid::new_v4();
+        let req = Request::get(format!("/api/jobs/{}/stream", id))
+            .body(Body::empty())
+            .unwrap();
+        let app = create_router(state);
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn jobs_stream_closes_immediately_for_terminal_job() {
+        // Completed jobs surface the cached body as a single
+        // `event: complete` frame and the stream closes — no
+        // subscription needed.
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                JobKind::Mint,
+                &[20u8; 32],
+                Some("k-stream-done"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        state
+            .job_store
+            .complete(
+                job_id,
+                serde_json::json!({"success": true, "proof_id": 5u64}),
+                200,
+            )
+            .await
+            .expect("complete");
+
+        let req = Request::get(format!("/api/jobs/{}/stream", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let app = create_router(state);
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "content-type was {}",
+            content_type
+        );
+        let body = collect_body_string(resp).await;
+        let events = parse_sse_events(&body);
+        // First event must be `complete` (terminal job).
+        assert!(
+            !events.is_empty(),
+            "expected at least one event; body={}",
+            body
+        );
+        let (first_name, first_data) = &events[0];
+        assert_eq!(first_name, "complete");
+        let v: serde_json::Value = serde_json::from_str(first_data).expect("first event JSON");
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["result"]["proof_id"], 5u64);
+    }
+
+    #[tokio::test]
+    async fn jobs_stream_failed_terminal_closes_with_complete_and_error() {
+        // Failed jobs surface the error string as a single
+        // `event: complete` and close.
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                JobKind::Mint,
+                &[21u8; 32],
+                Some("k-stream-fail"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        state
+            .job_store
+            .fail(job_id, "synthetic fail")
+            .await
+            .expect("fail");
+
+        let req = Request::get(format!("/api/jobs/{}/stream", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let app = create_router(state);
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = collect_body_string(resp).await;
+        let events = parse_sse_events(&body);
+        assert!(!events.is_empty(), "body={}", body);
+        let (name, data) = &events[0];
+        assert_eq!(name, "complete");
+        let v: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["error"], "synthetic fail");
+    }
+
+    #[tokio::test]
+    async fn jobs_stream_emits_initial_phase_for_non_terminal_job() {
+        // Queued (non-terminal) jobs emit an initial `event: phase`
+        // and then stay open waiting for transitions. We close the
+        // stream by flipping the job to a terminal state and reading
+        // the second event.
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                JobKind::Mint,
+                &[22u8; 32],
+                Some("k-stream-queued"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+
+        // Pre-arm the notifier so the dispatcher's not-yet-running
+        // race condition does not lose the phase event we push below.
+        let notifier = Arc::new(JobNotifier::new());
+        state.job_notify_map.insert(job_id, notifier.clone());
+
+        let req = Request::get(format!("/api/jobs/{}/stream", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let app = create_router(state.clone());
+
+        // Drive the request in the background so we can publish a
+        // phase event into the broadcast channel while the stream
+        // is still open. The handler subscribes BEFORE yielding the
+        // first initial event, so any event published during the
+        // handler's setup window also lands in the receiver queue.
+        let request_task = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+
+        // Give the handler a beat to subscribe; then publish a
+        // terminal event so the stream closes promptly.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        crate::job_dispatcher::publish_phase(
+            &state.job_notify_map,
+            job_id,
+            JobPhaseEvent {
+                status: JobStatus::Completed,
+                phase: "completed".to_string(),
+                proof_id: None,
+                result: Some(serde_json::json!({"ok": true})),
+                error: None,
+            },
+        );
+
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), request_task)
+            .await
+            .expect("request did not complete in time")
+            .expect("join");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = collect_body_string(resp).await;
+        let events = parse_sse_events(&body);
+        assert!(
+            events.len() >= 2,
+            "expected initial phase + complete; body={}",
+            body
+        );
+        let (first_name, first_data) = &events[0];
+        assert_eq!(first_name, "phase", "first event must be phase");
+        let v: serde_json::Value = serde_json::from_str(first_data).unwrap();
+        assert_eq!(v["status"], "queued");
+        // The last event is the complete one we published.
+        let (last_name, last_data) = events.last().unwrap();
+        assert_eq!(last_name, "complete");
+        let v: serde_json::Value = serde_json::from_str(last_data).unwrap();
+        assert_eq!(v["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn jobs_stream_forwards_dispatcher_phase_transition() {
+        // Drive a full happy-path sequence:
+        //   initial (queued) → proving (published) → completed (published)
+        // through the handler and verify all three frames land in
+        // the wallet-visible body.
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                JobKind::Send,
+                &[23u8; 32],
+                Some("k-stream-transitions"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+
+        // Pre-arm the notifier; the dispatcher would normally do
+        // this when it picks the row off the channel.
+        let notifier = Arc::new(JobNotifier::new());
+        state.job_notify_map.insert(job_id, notifier);
+
+        let req = Request::get(format!("/api/jobs/{}/stream", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let app = create_router(state.clone());
+        let request_task = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        crate::job_dispatcher::publish_phase(
+            &state.job_notify_map,
+            job_id,
+            JobPhaseEvent {
+                status: JobStatus::Proving,
+                phase: "proving".to_string(),
+                proof_id: None,
+                result: None,
+                error: None,
+            },
+        );
+        // Small spacer so the proving event lands before the close.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        crate::job_dispatcher::publish_phase(
+            &state.job_notify_map,
+            job_id,
+            JobPhaseEvent {
+                status: JobStatus::Completed,
+                phase: "completed".to_string(),
+                proof_id: None,
+                result: Some(serde_json::json!({"done": true})),
+                error: None,
+            },
+        );
+
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), request_task)
+            .await
+            .expect("request stalled")
+            .expect("join");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = collect_body_string(resp).await;
+        let events = parse_sse_events(&body);
+        // initial phase + proving + complete = 3 events, possibly
+        // interleaved with heartbeat comments (which `parse_sse_events`
+        // strips).
+        let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"phase"),
+            "expected `phase` event; got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"complete"),
+            "expected `complete` event; got {:?}",
+            names
+        );
+        // Verify proving payload arrived.
+        let has_proving = events
+            .iter()
+            .filter(|(n, _)| n == "phase")
+            .any(|(_, d)| d.contains("\"proving\""));
+        assert!(has_proving, "proving phase event missing; body={}", body);
+    }
+
+    // ---- Cancel → SSE complete event smoke test ----
+
+    #[tokio::test]
+    async fn jobs_cancel_publishes_phase_to_sse() {
+        // Cancel-handler publishes a `cancelled` event so a subscriber
+        // attached BEFORE the cancel observes the terminal frame.
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                JobKind::Mint,
+                &[24u8; 32],
+                Some("k-stream-cancel"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        let notifier = Arc::new(JobNotifier::new());
+        let mut rx = notifier.phase_tx.subscribe();
+        state.job_notify_map.insert(job_id, notifier);
+
+        // Run the cancel via the router so the publish path runs end-to-end.
+        let req = Request::post(format!("/api/jobs/{}/cancel", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let app = create_router(state);
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("event in 10s")
+            .expect("ok");
+        assert_eq!(ev.status, JobStatus::Cancelled);
+        assert_eq!(ev.phase, "cancelled");
     }
 }
 

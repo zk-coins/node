@@ -399,6 +399,7 @@ Wallet flow is now poll-based. The synchronous `/api/mint`, `/api/send`, `/api/c
 | `POST /api/jobs/mint` | Admit a fresh mint job. Body identical to the legacy `/api/mint`. Requires `Idempotency-Key` header. Returns 202 + `{job_id, status: "queued"}` + `Location: /api/jobs/<id>`. |
 | `POST /api/jobs/send` | Admit a fresh send job. Body identical to the legacy `/api/send` (signature + timestamp verified inline before admission). Requires `Idempotency-Key`. Returns 202 + `{job_id, status}`. |
 | `GET /api/jobs/:id` | Poll handler. Non-terminal rows carry `Retry-After: 2`. Body shape: `{job_id, kind, status, phase, progress, proof_id?, result?, error?}`. |
+| `GET /api/jobs/:id/stream` | **SSE push channel** (PR2). Server-Sent Events stream that emits an initial `event: phase` (or `event: complete` for terminal jobs) with the current snapshot, then forwards every dispatcher phase transition as `event: phase`, and closes with `event: complete` once the job reaches a terminal status. `: heartbeat` comment every 25 s so Cloudflare Tunnel's ~100 s idle drop does not kill the stream. Polling (`GET /api/jobs/:id`) remains the fallback when SSE is unavailable. |
 | `POST /api/jobs/:id/commit` | Attach the wallet-signed commitment to a `send` job in `awaiting_signature`. Body identical to the legacy `/api/commit`. Returns 200 + `{status: "broadcasting"}`. |
 | `POST /api/jobs/:id/cancel` | Cancel a job. Only succeeds while `status = queued`; later states return 409. |
 
@@ -417,7 +418,25 @@ proving
 
 **Crash recovery.** The boot-time `runtime::boot_resume_jobs` walks every non-terminal row: rows in `queued / proving / broadcasting` are marked `failed` (the wallet's signed timestamp window has expired and in-process Plonky2 state is lost); rows in `awaiting_signature` get a fresh `Notify` channel and are handed back to the dispatcher so the wallet can still attach the signature.
 
-See `MIGRATION_RESEARCH.md` §7.27 for the architectural rationale (no WebSocket / SSE / Redis in PR1).
+See `MIGRATION_RESEARCH.md` §7.27 for the architectural rationale of the poll-based contract; §7.28 for the SSE push channel added on top (PR2).
+
+**SSE event shape** (`/api/jobs/:id/stream`):
+
+```
+event: phase
+data: {"status":"proving","phase":"proving","proof_id":null,"result":null,"error":null}
+
+event: phase
+data: {"status":"awaiting_signature","phase":"awaiting_signature","proof_id":17,"result":null,"error":null}
+
+event: phase
+data: {"status":"broadcasting","phase":"broadcasting","proof_id":null,"result":null,"error":null}
+
+event: complete
+data: {"status":"completed","phase":"completed","proof_id":null,"result":{<same shape as GET 200 response>},"error":null}
+```
+
+Failure / cancel variants emit `event: complete` with `status = failed` (plus `error`) or `status = cancelled`. The stream closes after the first `event: complete` frame.
 
 ### 11.3 Scanner (`node::scanner`)
 
