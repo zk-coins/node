@@ -136,12 +136,19 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // alerting fires on the loop, matching the panic-hook behaviour
     // above (zk-coins/node#89 round-2 MAJOR 2).
     let pool_for_rest = Arc::clone(&pool);
+    // Read `PROOFS_DIR` at the binary edge and pass it through —
+    // `start_rest_node` no longer touches `std::env` so the runtime
+    // tests can each pass their own `tempfile::tempdir()` path
+    // instead of racing on the process-wide env var under
+    // `--test-threads=8` (issue #181 Opt A).
+    let proofs_dir = std::env::var("PROOFS_DIR").unwrap_or_else(|_| "./proofs".to_string());
     tokio::spawn(async move {
         if let Err(e) = start_rest_node(
             account_node,
             username_store,
             ACCOUNT_NODE_ADDR,
             pool_for_rest,
+            &proofs_dir,
         )
         .await
         {

@@ -17,9 +17,9 @@ use axum::routing::post;
 use axum::Router;
 use tower::ServiceExt;
 
-use crate::db::connect_and_migrate;
 use crate::publisher::EsploraConfig;
 use crate::router::{AppState, ProofStore};
+use crate::test_db::{setup_pool, SchemaScope};
 use bitcoin::bip32::Xpriv;
 use bitcoin::Network;
 use std::sync::{Arc, Mutex};
@@ -115,27 +115,16 @@ async fn buffer_body_returns_empty_on_collect_error() {
     assert_eq!(buffered.len(), 0);
 }
 
-/// Build an `AppState` that points at a fresh testcontainers Postgres
-/// pool. Everything else (account_node, proof_store, minting_account,
-/// username_store, esplora_config) is filled with a smallest-possible
-/// dummy because the audit middleware never reads them.
-async fn build_state_with_pool() -> (
-    AppState,
-    testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
-) {
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
-    let container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("postgres container");
-    let host = container.get_host().await.unwrap();
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = connect_and_migrate(&url)
-        .await
-        .expect("connect_and_migrate");
+/// Build an `AppState` that points at a per-test schema inside the
+/// shared `postgres:17` container (issue #181 Opt B; see
+/// `crate::test_db`). Everything else (account_node, proof_store,
+/// minting_account, username_store, esplora_config) is filled with a
+/// smallest-possible dummy because the audit middleware never reads
+/// them. Returns the `SchemaScope` alongside the state so the caller
+/// keeps the schema alive for the duration of the test.
+async fn build_state_with_pool() -> (AppState, SchemaScope) {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
 
     // Minting account: any deterministic Xpriv works; the audit
     // middleware never reads it.
@@ -154,21 +143,25 @@ async fn build_state_with_pool() -> (
     let tmp = tempfile::tempdir().expect("tempdir");
     let proof_dir = tmp.path().to_str().unwrap().to_string();
 
+    let pool_arc = Arc::new(pool);
     let state = AppState {
         account_node: Arc::new(Mutex::new(account_node)),
         proof_store: Arc::new(ProofStore::new(&proof_dir)),
         minting_account: Arc::new(Mutex::new(minting_account)),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
-        pool: Arc::new(pool),
+        pool: pool_arc.clone(),
         esplora_config: Arc::new(esplora_config),
         prover_warm: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        phase2_reached: Arc::new(tokio::sync::Notify::new()),
-        phase3_release_lock: Arc::new(tokio::sync::Mutex::new(())),
-        state_advance_release_lock: Arc::new(tokio::sync::Mutex::new(())),
+        // Job-API wiring (jobs PR #161): the audit middleware never
+        // touches these slots, but `AppState` requires them. Use a
+        // never-recv'd mpsc + empty notify map for shape parity.
+        job_store: Arc::new(crate::job_store::JobStore::new((*pool_arc).clone())),
+        job_tx: tokio::sync::mpsc::channel::<crate::job_dispatcher::JobEnvelope>(8).0,
+        job_notify_map: Arc::new(dashmap::DashMap::new()),
     };
     // tempdir lives until the test ends (Drop on test exit).
     std::mem::forget(tmp);
-    (state, container)
+    (state, scope)
 }
 
 /// Drive the middleware end-to-end: a small handler that echoes the
@@ -178,7 +171,7 @@ async fn build_state_with_pool() -> (
 /// insert land.
 #[tokio::test]
 async fn audit_middleware_persists_request_response_pair() {
-    let (state, _container) = build_state_with_pool().await;
+    let (state, _scope) = build_state_with_pool().await;
     let pool = state.pool.clone();
 
     async fn echo_handler(body: Body) -> impl IntoResponse {
@@ -259,7 +252,7 @@ async fn audit_middleware_persists_request_response_pair() {
 /// absent. Multi-value `XFF` collapses to its first segment.
 #[tokio::test]
 async fn audit_middleware_falls_back_to_x_forwarded_for() {
-    let (state, _container) = build_state_with_pool().await;
+    let (state, _scope) = build_state_with_pool().await;
     let pool = state.pool.clone();
 
     async fn ok_handler() -> impl IntoResponse {

@@ -143,8 +143,11 @@ The five constraints below are decided and apply across every PR on
    ≤ 30 s, memory peak < 64 GB.
 4. **MVP = minimal feature surface + 100% test coverage.** Simultaneous,
    not alternative. "Minimal" reduces the surface; "100%" keeps what
-   remains clean. Gate: `cargo llvm-cov --fail-under-lines 100 -- --test-threads=1`
-   from inside the affected crate. Current state on `program-plonky2`:
+   remains clean. Gate: `cargo llvm-cov --fail-under-lines 100 -- --test-threads=8`
+   from inside the affected crate (the `node`-crate gate runs at
+   `--test-threads=8` after issue #181 Opt A + Opt B — per-test
+   Postgres-schema isolation + a cross-process attach-or-create file
+   lock around the shared container make the suite parallel-safe). Current state on `program-plonky2`:
    100% lines / functions / regions, 115 default-run tests (+ 2
    `#[ignore]`d `recursion_shape_probe` diagnostics). The authoritative
    coverage gate for `node` runs in CI on the self-hosted M3 Ultra
@@ -294,11 +297,21 @@ cd node
 sqlx migrate run
 ```
 
-Run the `db_tests` (Docker required, runs `postgres:17` per test):
+Run the `db_tests` (Docker required, one long-lived `postgres:17`
+container is reused across the whole run via testcontainers
+`ReuseDirective::Always` — see `node/src/test_db.rs`):
 
 ```bash
-cargo test -p node db -- --test-threads=1
+cargo test -p node db -- --test-threads=8
 ```
+
+Each test gets its own UUID-named Postgres schema inside the shared
+container, and a cross-process file lock around the
+attach-or-create call serialises the testcontainers daemon round-
+trip across parallel `cargo nextest` test binaries (issue #181
+Opt A + Opt B). The shared container survives the run; tear it
+down explicitly with `docker rm -f zkcoins-test-shared-pg` if you
+need a clean slate.
 
 The schema lives in `node/migrations/0001_initial.sql`. After
 changing it, drop the local database (`docker rm -f zkcoins-pg`) and
@@ -365,7 +378,8 @@ node/
 ├── node/                  # Axum REST API
 │   └── src/
 │       ├── main.rs        # Entry point, chain scanner, bind address
-│       ├── router.rs      # REST endpoints (mint, send, balance, proof)
+│       ├── router.rs      # REST endpoints (mint, send, balance, proof) + utoipa annotations
+│       ├── openapi.rs     # OpenAPI 3.x spec assembly + /docs Swagger UI handlers
 │       ├── account_node.rs  # Account management, coin proofs, prover calls
 │       ├── state.rs       # Sparse Merkle Tree + Merkle Mountain Range
 │       ├── scanner.rs     # Bitcoin block scanner (Taproot Inscriptions)
@@ -463,11 +477,56 @@ let block = fetch_block(hash).unwrap();
 ### Request Flow
 
 ```
-Client Request → Axum Router → router.rs (endpoint) → account_node.rs (logic)
-                                                          ├── Prover (Plonky2)
-                                                          ├── State (SMT + MMR)
-                                                          └── Publisher (Bitcoin)
+Client Request → Axum Router → router.rs (endpoint)
+       │
+       ├── reads:   /api/balance, /api/proof/:id, /api/jobs/:id, ...
+       │              → account_node.rs / db.rs lookup → JSON
+       │
+       └── writes:  /api/jobs/mint, /api/jobs/send, /api/jobs/:id/commit
+                      → JobStore::create (admit)
+                      → mpsc::Sender<JobEnvelope> (enqueue)
+                      → 202 Accepted (response returns to wallet)
+
+         ╭─ background ──────────────────────────────────────────╮
+         │ job_dispatcher::spawn (single worker)                  │
+         │  ▸ recv envelope                                       │
+         │  ▸ load Job from JobStore                              │
+         │  ▸ flow::{mint_flow,send_flow,commit_flow}            │
+         │    ├── account_node.rs (prove via spawn_blocking)     │
+         │    ├── state.rs (SMT + MMR)                            │
+         │    └── publisher.rs (Bitcoin broadcast)                │
+         │  ▸ JobStore::{set_status, set_awaiting_signature,     │
+         │               complete, fail}                          │
+         ╰────────────────────────────────────────────────────────╯
 ```
+
+### Job-API lifecycle
+
+Routes that touch the prover or the publisher (`/api/jobs/mint`, `/api/jobs/send`, `/api/jobs/:id/commit`) never run synchronously. The wallet admits a job, polls `GET /api/jobs/:id` until the status transitions to a terminal value, and consumes the cached response body on success.
+
+**States** (CHECK-enforced in `migrations/0014_jobs.sql`):
+
+| Status | Reached by | Next |
+|---|---|---|
+| `queued` | admit handler INSERT | dispatcher recv → `proving` |
+| `proving` | dispatcher pre-flight | mint: `broadcasting`. send: `awaiting_signature` |
+| `awaiting_signature` | dispatcher after prove (send only) | `POST /api/jobs/:id/commit` → `broadcasting`. Timeout (10 min) → `failed` |
+| `broadcasting` | dispatcher post-signature | publisher Ok → `completed`. Err → `failed` |
+| `completed` | dispatcher | terminal — `response_body` + `response_status` cached for idempotent replay |
+| `failed` | dispatcher (any error) | terminal — `error` message surfaced to wallet |
+| `cancelled` | `POST /api/jobs/:id/cancel` while `queued` | terminal |
+
+**Idempotency.** Every admit MUST carry `Idempotency-Key`. The partial unique index `jobs_idempotency_idx` on `(account_address, idempotency_key)` collapses retries onto the original row. If the original row is already `completed`, the second admit replies with the cached body verbatim (Stripe pattern) — no second prove ever runs.
+
+**Polling cadence.** Non-terminal `GET /api/jobs/:id` responses carry `Retry-After: 2`. Wallet should back off to ~2 s polls; faster polling does not deliver results sooner because the dispatcher publishes status transitions at known waypoints, not in real time.
+
+**SSE push channel (PR2).** Wallets that want push updates without the ~2 s poll tax open `GET /api/jobs/:id/stream`. The server emits an initial `event: phase` (or `event: complete` for already-terminal jobs) with the current snapshot, then forwards every dispatcher phase transition as `event: phase` until a terminal status fires `event: complete` and closes the stream. A `: heartbeat` SSE comment every 25 s keeps the stream alive through Cloudflare Tunnel's ~100 s idle drop. SSE is additive: when the wallet cannot open the stream (corporate proxy stripping `text/event-stream`, sandbox without `EventSource`, …) it falls back to the existing 2 s poll. Internally the dispatcher publishes events on a per-job `tokio::sync::broadcast::Sender` held inside the `JobNotifier` entry of `job_notify_map`; the SSE handler subscribes a fresh `broadcast::Receiver` per open stream.
+
+**Crash recovery.** `runtime::boot_resume_jobs` runs before the listener serves. Rows in `queued / proving / broadcasting` are marked `failed` (in-process prove state lost, signed timestamp window expired). Rows in `awaiting_signature` get a fresh `Notify` channel + are handed back to the dispatcher to park on. The wallet's next poll observes the terminal status either way.
+
+**Single dispatcher worker.** Plonky2's Rayon worker pool already saturates every available CPU core during a prove; running two proves in parallel would only thrash cache. The mpsc channel becomes the queue and the natural happens-before of channel ordering becomes the schedule. Queue depth equals user-observable latency.
+
+See also: `node/src/job_store.rs` (state-layer API), `node/src/job_dispatcher.rs` (worker loop), `node/src/flow.rs` (mint/send/commit bodies — coverage-excluded), `MIGRATION_RESEARCH.md` §7.27 (architectural rationale).
 
 ### Key Patterns
 
@@ -521,6 +580,97 @@ identifier derivation, pubkey rotation) lives in `circuit/main.rs`.
 [`MIGRATION_RESEARCH.md` §7.22](./MIGRATION_RESEARCH.md#722-stage-5d-next-5-source-side-verification-via-aggregator-pattern--codified-resolves-721)
 for the architecture writeup and `program-plonky2/SESSION_STATE.md`
 for the historical pickup record.
+
+## REST API & OpenAPI
+
+The HTTP surface is documented by an OpenAPI 3.x spec **generated at
+compile time** from `#[utoipa::path]` annotations on the handlers and
+`#[derive(ToSchema)]` impls on the request / response types. There is
+no separately maintained YAML or JSON — drift between the wire
+contract and the documentation is structurally impossible because the
+same Rust type drives both `serde` and the schema.
+
+### Exposed routes
+
+| Route | Tag | Notes |
+|---|---|---|
+| `GET  /` | Node | Service identification + endpoint map. |
+| `GET  /health` | Health | Liveness probe (`"ok"` plain text). |
+| `GET  /health/ready` | Health | Readiness probe (DB + Esplora + prover-warm gate). |
+| `GET  /health/publisher` | Health | Publisher UTXO state. |
+| `GET  /api/info` | Node | Network + per-build capability flags. |
+| `GET  /api/balance` | Accounts | Balance lookup (per-address read). |
+| `GET  /api/history` | Accounts | Paginated per-address history (issue #153). |
+| `POST /api/send` | Coins | Sender-side proof construction. |
+| `POST /api/receive` | Coins | Recipient-side coin acceptance. |
+| `POST /api/commit` | Coins | Broadcast + state advance (post-`/api/send`). |
+| `POST /api/mint` | Coins | Mint inscription (operator-funded). |
+| `GET  /api/proof/{id}` | Coins | Look up a previously generated `CoinProof`. |
+| `GET  /api/inscriptions/{txid}` | Inscriptions | Inscription metadata. |
+| `GET  /api/username/resolve/{username}` | Usernames | Username → address (always-on). |
+| `GET  /api/address` | Accounts | All known addresses. **`address-list` feature.** |
+| `POST /api/username/claim` | Usernames | First-claim wins. **`username-claim` feature.** |
+| `GET  /.well-known/lnurlp/{username}` | LNURL | LNURL-pay metadata. **`lnurl` feature.** |
+| `GET  /lnurl/pay/{username}` | LNURL | LNURL-pay callback. **`lnurl` feature.** |
+
+The spec is served at `GET /openapi.json` and rendered with bundled
+Swagger UI at `GET /docs` (assets vendored into the binary —
+zero-CDN, works behind any reverse proxy that preserves path order).
+
+The following routes are **intentionally excluded** from the spec
+because they document the spec itself or expose operator-only debug
+data: `GET /openapi.json`, `GET /docs`, `GET /docs/{file}`, and
+`GET /api/admin/r2-probe/history`. If you add another admin route
+under `/api/admin/*`, keep it out of `paths(...)` for the same
+reason.
+
+### Adding a new endpoint
+
+1. **Annotate the handler** in `node/src/router.rs` with
+   `#[utoipa::path(...)]`. Set `tag` to the same tag used by sibling
+   endpoints (`Node`, `Health`, `Accounts`, `Coins`, `Inscriptions`,
+   `Usernames`, `LNURL`). Enumerate every status code the handler can
+   return and bind it to the matching response schema. Bump the
+   handler's visibility to `pub(crate)` — utoipa needs to reference
+   it from `openapi.rs`.
+
+2. **Derive `ToSchema`** on every request / response struct the
+   handler exposes:
+   ```rust
+   #[derive(Serialize, ToSchema)]
+   pub struct MyResponse { … }
+   ```
+   Foreign types like `bitcoin::secp256k1::PublicKey` cannot derive
+   `ToSchema` (orphan rule); override the schema at the use site with
+   `#[schema(value_type = String, example = "02a34b…")]` so the spec
+   describes the hex-encoded wire form.
+
+3. **Register** the handler under `paths(...)` and every new schema
+   under `components(schemas(...))` in `node/src/openapi.rs`. For
+   feature-gated handlers, use the conditional sub-doc pattern
+   (`AddressListDoc`, `UsernameClaimDoc`, `LnurlDoc`) so the spec
+   describes exactly the routes the running binary exposes.
+
+4. **Extend the smoke test.** Add the new path to
+   `spec_lists_every_always_on_route` in
+   `node/tests/openapi_smoke.rs`, and any wire-critical schema to
+   `spec_registers_critical_schemas`. The smoke suite is
+   network-free (it calls `openapi_json()` directly) and runs on
+   every PR CI job — drift on the wire contract fails fast.
+
+5. **Update this table** so contributors discover the endpoint
+   without scraping `router.rs`.
+
+### Drift guards
+
+- `info_response_carries_username_domain` — the field that motivated
+  the move off the previous Zod-driven mirror; a regression here
+  would resurface that exact incident.
+- `spec_has_no_hardcoded_servers_block` — the spec must apply to the
+  host that served it, so each self-hoster's node advertises its own
+  URL instead of pointing every wallet at the hosted DFX deployments.
+- `docs_html_*` — the bundled Swagger UI must load only same-origin
+  `/docs/...` assets and never reach for an external CDN.
 
 ## Environment Variables
 
@@ -671,7 +821,7 @@ See [docs.zkcoins.app/infrastructure/backend](https://docs.zkcoins.app/infrastru
 | Workflow | Trigger | Action |
 |---|---|---|
 | `ci.yaml` (Lint & Build) | Ready PR → develop, push to develop | `cargo fmt --check`, clippy (MVP + all-features + program lib), build (MVP + all-features) on `ubuntu-latest`. |
-| `ci.yaml` (Node + Shared Tests) | Ready PR → develop with `ci:full` label, push to develop | `cargo nextest run -p node -p shared --release --all-features --test-threads 1 -E 'not binary(api_remote)'` on the self-hosted M3 Ultra runner pool (issue #40). |
+| `ci.yaml` (Node + Shared Tests) | Ready PR → develop with `ci:full` label, push to develop | `cargo nextest run -p node -p shared --release --all-features --test-threads 8 -E 'not binary(api_remote)'` on the self-hosted M3 Ultra runner pool (issue #40). Parallel after #181 Opt A + Opt B (per-test Postgres-schema isolation + cross-process file lock around the shared `postgres:17` container in `node/src/test_db.rs`). |
 | `ci.yaml` (Coverage Gate) | Ready PR → develop with `ci:full` label, push to develop | `cargo llvm-cov nextest` with the 100% line + function gate, MVP scope, on the same runner pool. |
 | `deploy-dev.yaml` | Push to develop | Docker build (ARM64) → push `zkcoins/node:beta` → deploy to DEV |
 | `deploy-prd.yaml` | Push to main | Docker build (ARM64) → push `zkcoins/node:latest` → deploy to PRD |

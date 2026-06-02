@@ -1,62 +1,60 @@
 // Postgres state-layer tests for `db.rs`.
 //
-// Strategy: every test gets its own Postgres 17 container via
-// `testcontainers_modules::postgres::Postgres`. Per-test isolation is
-// the simplest model — no shared state, no `truncate_all` ordering,
-// no risk of cross-test contamination. The container boot is ~3-5 s
-// each and the suite runs single-threaded under
-// `--test-threads=1` (mirrors the rest of the node test gate), so
-// the total wall time stays comfortably below a minute even with the
-// per-test container.
+// Strategy: every test gets its own UUID-named schema inside a
+// shared `postgres:17` container (one per test binary). Per-test
+// isolation is preserved — no shared state, no `truncate_all`
+// ordering, no risk of cross-test contamination — but the ~3 s
+// container-boot cost is paid once per binary instead of once per
+// test. See `crate::test_db` for the implementation and the link
+// to issue #181.
 //
-// Migrations are applied via `db::connect_and_migrate`, the same code
-// path the production bootstrap will exercise in PR-A2.
+// Migrations are applied inside the per-test schema via
+// `sqlx::migrate!` driven by `test_db::setup_pool`, mirroring the
+// schema the production `db::connect_and_migrate` produces.
 
 use super::*;
+use crate::test_db::setup_pool;
 use sqlx::Row;
-use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
-use testcontainers_modules::postgres::Postgres;
-
-/// Start a fresh `postgres:17` container and connect a migrated pool
-/// to it. The container handle is returned alongside the pool so the
-/// caller can keep it alive for the duration of the test — dropping
-/// it tears the container down.
-async fn setup_pool() -> (PgPool, ContainerAsync<Postgres>) {
-    let container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = container
-        .get_host()
-        .await
-        .expect("failed to get container host");
-    let port = container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("failed to get container port");
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = connect_and_migrate(&url)
-        .await
-        .expect("connect_and_migrate failed");
-    (pool, container)
-}
 
 #[tokio::test]
 async fn connect_and_migrate_creates_all_tables() {
-    let (pool, _container) = setup_pool().await;
+    // Route the test through `db::connect_and_migrate` so its
+    // success path (`Ok(pool)` return) stays covered under the
+    // shared-container model. We still want per-test schema
+    // isolation, so we take a `SchemaScope` from `setup_pool()`
+    // and feed `connect_and_migrate` the shared base URL with an
+    // `options=-c search_path=<schema>` libpq parameter — the
+    // same pattern `connect_and_migrate_propagates_migration_failure`
+    // already uses to land sqlx migrations inside the per-test
+    // schema. The migrations are idempotent: `setup_pool` ran
+    // them once during scope creation, and the second pass through
+    // `connect_and_migrate` is a no-op via `_sqlx_migrations`
+    // bookkeeping while still exercising the full success path.
+    let scope = setup_pool().await;
+    let url = format!(
+        "{}?options=-c%20search_path%3D{}",
+        scope.base_url(),
+        scope.schema(),
+    );
+    let pool = connect_and_migrate(&url)
+        .await
+        .expect("connect_and_migrate ok");
     // Introspect via `information_schema.tables` — works on any
-    // Postgres 9+ and avoids hard-coding pg_catalog quirks.
+    // Postgres 9+ and avoids hard-coding pg_catalog quirks. Scoped
+    // to the per-test schema (issue #181 Opt B): under the shared-
+    // container model migrations run inside `<scope.schema()>`,
+    // not `public`.
     let rows = sqlx::query(
         "SELECT table_name FROM information_schema.tables \
-         WHERE table_schema = 'public' \
+         WHERE table_schema = $1 \
          ORDER BY table_name",
     )
+    .bind(scope.schema())
     .fetch_all(&pool)
     .await
     .expect("introspection query failed");
     let names: Vec<String> = rows.into_iter().map(|r| r.get::<String, _>(0)).collect();
-    // Full expected schema after all migrations 0001-0010 (alphabetic
+    // Full expected schema after all migrations 0001-0014 (alphabetic
     // by `ORDER BY table_name`). `_sqlx_migrations` is created
     // implicitly by `sqlx::migrate!`. `minting_meta` (0002) is
     // dropped by 0005 (Phase D), absent from the final schema.
@@ -73,6 +71,8 @@ async fn connect_and_migrate_creates_all_tables() {
     //     `information_schema.tables` (with `table_type = 'VIEW'`), so
     //     it shows up here when introspecting without a `table_type`
     //     filter — included at the correct alphabetic position below.)
+    //   * After 0014 (jobs):             23 tables + 1 view (#161
+    //     introduces the async Job-API state table.)
     assert_eq!(
         names,
         vec![
@@ -84,6 +84,7 @@ async fn connect_and_migrate_creates_all_tables() {
             "coin_proof_store".to_string(),
             "error_log".to_string(),
             "esplora_log".to_string(),
+            "jobs".to_string(),
             "latest_block".to_string(),
             "mmr_root_index".to_string(),
             "mmr_state".to_string(),
@@ -105,19 +106,22 @@ async fn connect_and_migrate_creates_all_tables() {
 
 #[tokio::test]
 async fn load_smt_returns_none_initially() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     assert!(load_smt(&pool).await.expect("load_smt failed").is_none());
 }
 
 #[tokio::test]
 async fn load_mmr_returns_none_initially() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     assert!(load_mmr(&pool).await.expect("load_mmr failed").is_none());
 }
 
 #[tokio::test]
 async fn load_latest_block_returns_none_initially() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     assert!(load_latest_block(&pool)
         .await
         .expect("load_latest_block failed")
@@ -126,7 +130,8 @@ async fn load_latest_block_returns_none_initially() {
 
 #[tokio::test]
 async fn persist_state_tx_writes_smt_mmr_block_atomically() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let smt = vec![0xAAu8; 64];
     let mmr = vec![0xBBu8; 128];
     let block = [0xCCu8; 32];
@@ -141,7 +146,8 @@ async fn persist_state_tx_writes_smt_mmr_block_atomically() {
 
 #[tokio::test]
 async fn persist_state_tx_is_idempotent_on_conflict() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let smt1 = vec![1u8; 16];
     let mmr1 = vec![2u8; 16];
     let block1 = [3u8; 32];
@@ -169,7 +175,8 @@ async fn persist_state_tx_writes_root_index_in_same_transaction() {
     // and the standalone INSERT is the whole point — see the
     // doc-comment on `persist_state_tx` for the heal-on-restart
     // story. This test asserts all four landed from one call.
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let smt = vec![0xAAu8; 64];
     let mmr = vec![0xBBu8; 128];
     let block = [0xCCu8; 32];
@@ -197,7 +204,8 @@ async fn persist_state_tx_root_index_on_conflict_does_nothing() {
     // second call's `smt_root` differs to prove that the conflict
     // branch genuinely takes the DO NOTHING path (otherwise the row
     // would be silently mutated).
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let smt = vec![1u8; 16];
     let mmr = vec![2u8; 16];
     let block = [3u8; 32];
@@ -239,7 +247,8 @@ async fn load_latest_block_rejects_wrong_length() {
     // any length. Insert a deliberately wrong-length row directly
     // and assert the loader returns an `sqlx::Error::Decode` rather
     // than panicking or silently truncating.
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     // Drop the 0010 length CHECK so the corrupt-row plant succeeds;
     // the subject of this test is the Rust-side defense in
     // `load_latest_block`, not the DB-level CHECK.
@@ -264,14 +273,16 @@ async fn load_latest_block_rejects_wrong_length() {
 
 #[tokio::test]
 async fn load_all_accounts_returns_empty_initially() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let rows = load_all_accounts(&pool).await.unwrap();
     assert!(rows.is_empty());
 }
 
 #[tokio::test]
 async fn upsert_account_inserts_then_updates() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let addr = vec![0xAAu8; 32];
     upsert_account(&pool, &addr, b"first").await.unwrap();
     let rows = load_all_accounts(&pool).await.unwrap();
@@ -284,7 +295,8 @@ async fn upsert_account_inserts_then_updates() {
 
 #[tokio::test]
 async fn load_all_accounts_returns_all_inserted() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let a1 = vec![0x01u8; 32];
     let a2 = vec![0x02u8; 32];
     let a3 = vec![0x03u8; 32];
@@ -305,7 +317,8 @@ async fn load_all_accounts_returns_all_inserted() {
 
 #[tokio::test]
 async fn load_all_usernames_returns_empty_initially() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let rows = load_all_usernames(&pool).await.unwrap();
     assert!(rows.is_empty());
 }
@@ -313,7 +326,8 @@ async fn load_all_usernames_returns_empty_initially() {
 #[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_returns_true_on_new() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let addr = vec![0xAAu8; 32];
     let ok = claim_username(&pool, "alice", &addr).await.unwrap();
     assert!(ok);
@@ -324,7 +338,8 @@ async fn claim_username_returns_true_on_new() {
 #[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn claim_username_returns_false_on_conflict() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let addr1 = vec![0xAAu8; 32];
     let addr2 = vec![0xBBu8; 32];
     assert!(claim_username(&pool, "alice", &addr1).await.unwrap());
@@ -342,7 +357,8 @@ async fn claim_username_returns_false_on_conflict() {
 #[cfg(feature = "username-claim")]
 #[tokio::test]
 async fn resolve_username_returns_address_for_claimed_name() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let addr = vec![0xABu8; 32];
     claim_username(&pool, "bob", &addr).await.unwrap();
     let resolved = resolve_username(&pool, "bob").await.unwrap();
@@ -351,7 +367,8 @@ async fn resolve_username_returns_address_for_claimed_name() {
 
 #[tokio::test]
 async fn resolve_username_returns_none_for_unknown() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let resolved = resolve_username(&pool, "nobody").await.unwrap();
     assert!(resolved.is_none());
 }
@@ -380,7 +397,8 @@ async fn connect_and_migrate_propagates_connect_failure() {
 /// fixture never visited.
 #[tokio::test]
 async fn commit_mint_tx_upserts_every_account_atomically() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let addr_a = [0xAAu8; 32];
     let data_a = vec![0xA1u8; 8];
     let addr_b = [0xBBu8; 32];
@@ -408,7 +426,8 @@ async fn commit_mint_tx_upserts_every_account_atomically() {
 /// with the latest serialized Account on the next mint).
 #[tokio::test]
 async fn commit_mint_tx_is_idempotent_on_conflict() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let addr = [0xCCu8; 32];
     let first = vec![0x01u8; 16];
     let second = vec![0x02u8; 24];
@@ -429,7 +448,8 @@ async fn commit_mint_tx_is_idempotent_on_conflict() {
 /// a panic or error surfaces here rather than at a live caller.
 #[tokio::test]
 async fn commit_mint_tx_with_empty_accounts_is_noop() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     commit_mint_tx(&pool, &[])
         .await
         .expect("empty commit must succeed");
@@ -445,15 +465,26 @@ async fn connect_and_migrate_propagates_migration_failure() {
     // This is the only sqlx-native way to force a deterministic
     // migration error without writing a second `.sql` file solely
     // for the test (which would itself drift from the real schema).
-    let (pool, container) = setup_pool().await;
+    //
+    // Under the shared-container model (issue #181 Opt B) the
+    // per-test isolated schema lives inside the shared container.
+    // To make `db::connect_and_migrate` (which knows nothing about
+    // our `SchemaScope`) target that same schema, we feed it the
+    // shared base URL with an `options=-c search_path=<schema>`
+    // libpq parameter so the migration runner lands inside the
+    // poisoned `_sqlx_migrations` table.
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     sqlx::query("UPDATE _sqlx_migrations SET checksum = $1")
         .bind(vec![0u8; 32])
         .execute(&pool)
         .await
         .unwrap();
-    let host = container.get_host().await.unwrap();
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let url = format!(
+        "{}?options=-c%20search_path%3D{}",
+        scope.base_url(),
+        scope.schema()
+    );
     let err = connect_and_migrate(&url)
         .await
         .expect_err("expected migration failure");
@@ -473,7 +504,8 @@ async fn pending_inscription_status_by_commit_txid_returns_none_for_unknown_txid
     // `pending_inscriptions` row. The helper must return `None` so the
     // scanner falls through to its normal state.update path instead of
     // short-circuiting.
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let status = pending_inscription_status_by_commit_txid(&pool, &[0xABu8; 32])
         .await
         .expect("lookup must not error on missing row");
@@ -482,7 +514,8 @@ async fn pending_inscription_status_by_commit_txid_returns_none_for_unknown_txid
 
 #[tokio::test]
 async fn pending_inscription_status_by_commit_txid_returns_current_status() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let commit_txid = [0xCDu8; 32];
     let reveal_txid = [0xCEu8; 32];
     let commitment = b"test-commitment";
@@ -559,7 +592,8 @@ async fn persist_state_and_mark_complete_tx_writes_state_and_advances_row() {
     // The atomic Phase-E helper writes SMT/MMR/root_index AND marks the
     // pending row `complete` in one transaction. `latest_block` is left
     // untouched (the scanner is the only legitimate writer).
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let commit_txid = [0x55u8; 32];
     seed_pending_row(&pool, &commit_txid, PENDING_STATUS_REVEAL_BROADCAST).await;
 
@@ -598,7 +632,8 @@ async fn persist_state_and_mark_complete_tx_preserves_existing_latest_block() {
     // ran. The mint flow's atomic persist call must NOT rewind that
     // pointer back to the genesis fallback — the helper is responsible
     // for SMT/MMR/root_index/pending_inscriptions only.
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let scanner_block = [0x77u8; 32];
     persist_state_tx(&pool, b"old-smt", b"old-mmr", &scanner_block, None)
         .await
@@ -631,7 +666,8 @@ async fn persist_state_and_mark_complete_tx_accepts_no_root_index() {
     // Mirror the `persist_state_tx` no-root-index branch: a call with
     // `None` writes SMT + MMR + the row advance only. The
     // mmr_root_index table stays empty, no error, latest_block untouched.
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let commit_txid = [0x88u8; 32];
     seed_pending_row(&pool, &commit_txid, PENDING_STATUS_REVEAL_BROADCAST).await;
 
@@ -672,7 +708,8 @@ async fn persist_state_and_mark_complete_tx_rollback_on_failure_leaves_state_unt
     // between the seed and the call so the UPDATE inside the tx
     // surfaces a sqlx::Error and the BEGIN/COMMIT envelope rolls
     // SMT/MMR back.
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let commit_txid = [0x99u8; 32];
     seed_pending_row(&pool, &commit_txid, PENDING_STATUS_REVEAL_BROADCAST).await;
 
@@ -741,7 +778,8 @@ async fn persist_state_and_mark_complete_tx_idempotent_on_already_complete_row()
     // row. This matters for the audit log on scanner-replay edge
     // cases where the mint flow's tx committed but a transient client
     // error caused the caller to retry.
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let commit_txid = [0xAAu8; 32];
     seed_pending_row(&pool, &commit_txid, PENDING_STATUS_REVEAL_BROADCAST).await;
 
@@ -809,7 +847,8 @@ fn inscription_kind_from_db_str_returns_none_for_invalid() {
 
 #[tokio::test]
 async fn insert_request_log_writes_row() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let entry = RequestLogEntry {
         method: "POST".into(),
         path: "/api/mint".into(),
@@ -834,7 +873,8 @@ async fn insert_request_log_writes_row() {
 
 #[tokio::test]
 async fn insert_esplora_log_writes_row() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let entry = EsploraLogEntry {
         direction: "outbound_http",
         method: Some("POST".into()),
@@ -856,7 +896,8 @@ async fn insert_esplora_log_writes_row() {
 
 #[tokio::test]
 async fn insert_error_log_writes_row() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let entry = ErrorLogEntry {
         severity: "error",
         source: "publisher::broadcast".into(),
@@ -874,7 +915,8 @@ async fn insert_error_log_writes_row() {
 
 #[tokio::test]
 async fn insert_block_log_writes_row_and_is_idempotent() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let entry = BlockLogEntry {
         block_hash: vec![0x11; 32],
         block_height: Some(7),
@@ -893,7 +935,8 @@ async fn insert_block_log_writes_row_and_is_idempotent() {
 
 #[tokio::test]
 async fn insert_observed_inscription_and_mark_integrated() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let commit_txid = vec![0x22; 32];
     let entry = ObservedInscriptionEntry {
         commit_txid: commit_txid.clone(),
@@ -941,7 +984,8 @@ async fn insert_observed_inscription_and_mark_integrated() {
 
 #[tokio::test]
 async fn insert_state_update_log_writes_row() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let entry = StateUpdateLogEntry {
         trigger_source: "mint",
         commit_txid: Some(vec![0x44; 32]),
@@ -961,7 +1005,8 @@ async fn insert_state_update_log_writes_row() {
 
 #[tokio::test]
 async fn insert_account_history_writes_row_directly() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let entry = AccountHistoryEntry {
         address: vec![0x99; 32],
         prev_data: None,
@@ -980,7 +1025,8 @@ async fn insert_account_history_writes_row_directly() {
 
 #[tokio::test]
 async fn insert_username_claim_log_writes_row() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let entry = UsernameClaimLogEntry {
         requested_username: "Alice".into(),
         normalized_username: "alice".into(),
@@ -1000,7 +1046,8 @@ async fn insert_username_claim_log_writes_row() {
 
 #[tokio::test]
 async fn insert_tx_mining_log_writes_row() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     // The 0010 FK from `tx_mining_log.commit_txid` to
     // `pending_inscriptions(commit_txid)` requires the parent row first.
     let commit_txid = [0xCC; 32];
@@ -1036,7 +1083,8 @@ async fn insert_tx_mining_log_writes_row() {
 
 #[tokio::test]
 async fn insert_boot_log_writes_row() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let entry = BootLogEntry {
         event_type: "startup".into(),
         message: "node started".into(),
@@ -1052,7 +1100,8 @@ async fn insert_boot_log_writes_row() {
 
 #[tokio::test]
 async fn update_pending_failure_reason_records_error_without_changing_status() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let commit_txid = [0x77; 32];
     let reveal_txid = [0x78; 32];
     insert_pending_inscription(
@@ -1088,7 +1137,8 @@ async fn update_pending_failure_reason_records_error_without_changing_status() {
 
 #[tokio::test]
 async fn upsert_account_with_source_tags_history_via_trigger() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let address = vec![0x10; 32];
     upsert_account_with_source(&pool, &address, b"v1", "mint")
         .await
@@ -1121,7 +1171,8 @@ async fn upsert_account_with_source_tags_history_via_trigger() {
 
 #[tokio::test]
 async fn get_inscription_summary_returns_none_for_unknown_txid() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let res = get_inscription_summary_by_commit_txid(&pool, &[0xFE; 32])
         .await
         .unwrap();
@@ -1130,7 +1181,8 @@ async fn get_inscription_summary_returns_none_for_unknown_txid() {
 
 #[tokio::test]
 async fn get_inscription_summary_returns_full_row() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let commit_txid = [0x12; 32];
     let reveal_txid = [0x34; 32];
     insert_pending_inscription(
@@ -1182,7 +1234,8 @@ async fn load_pending_in_progress_rejects_invalid_kind_in_row() {
     // a `kind` value outside the CHECK enum. Drop the CHECK first
     // so we can plant a corrupt row, then assert the loader surfaces
     // `sqlx::Error::Decode`.
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     sqlx::query(
         "ALTER TABLE pending_inscriptions DROP CONSTRAINT pending_inscriptions_status_check",
     )
@@ -1217,7 +1270,8 @@ async fn load_pending_in_progress_rejects_invalid_kind_in_row() {
 async fn get_inscription_summary_rejects_invalid_kind_in_row() {
     // Same defensive branch but inside the single-row lookup used by
     // the `GET /api/inscriptions/:txid` handler.
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     sqlx::query(
         "ALTER TABLE pending_inscriptions DROP CONSTRAINT pending_inscriptions_status_check",
     )
@@ -1280,7 +1334,8 @@ async fn plant_history_row(
 
 #[tokio::test]
 async fn list_account_history_empty_returns_zero_total() {
-    let (pool, _c) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let address = [0xaau8; 32];
     let (rows, total) = list_account_history(&pool, &address[..], 50, 0)
         .await
@@ -1291,7 +1346,8 @@ async fn list_account_history_empty_returns_zero_total() {
 
 #[tokio::test]
 async fn list_account_history_orders_newest_first_and_paginates() {
-    let (pool, _c) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let address = [0xbbu8; 32];
     // Plant rows at 30 s, 20 s, 10 s ago — list must order
     // newest-first (10 s, 20 s, 30 s).
@@ -1337,7 +1393,8 @@ async fn list_account_history_orders_newest_first_and_paginates() {
 
 #[tokio::test]
 async fn list_account_history_surfaces_blob_and_metadata() {
-    let (pool, _c) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let address = [0xddu8; 32];
     plant_history_row(&pool, &address[..], "mint", 12_345, 1).await;
     let (rows, total) = list_account_history(&pool, &address[..], 10, 0)
@@ -1364,7 +1421,8 @@ async fn list_account_history_filters_scanner_and_recovery_in_sql() {
     // filter into the query is what keeps `total` and the page length
     // honest (a post-fetch filter on the page would drop rows AFTER the
     // LIMIT and break pagination math). Issue #153 round-2 review fix.
-    let (pool, _c) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let address = [0xeeu8; 32];
     plant_history_row(&pool, &address[..], "scanner", 50, 50).await;
     plant_history_row(&pool, &address[..], "mint", 100, 40).await;

@@ -1,42 +1,14 @@
 // Tests for the R2-probe persistence layer.
 //
-// Strategy mirrors `db_tests`: every test boots its own Postgres 17
-// testcontainer via `testcontainers_modules::postgres::Postgres`. The
-// per-test isolation removes any cross-test ordering risk and the
-// node test gate already runs single-threaded
-// (`--test-threads=1`), so the per-container boot cost is amortised
-// across the whole suite.
+// Strategy mirrors `db_tests`: every test gets its own UUID-named
+// schema inside a `postgres:17` container shared per test binary
+// (issue #181 Optimisation B). The per-test isolation removes any
+// cross-test ordering risk; the container-boot cost is paid once
+// per binary instead of once per test.
 
 use super::*;
+use crate::test_db::setup_pool;
 use sqlx::Row;
-use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
-use testcontainers_modules::postgres::Postgres;
-
-use crate::db::connect_and_migrate;
-
-/// Start a fresh `postgres:17` container with the full migration set
-/// applied. The container handle is returned alongside the pool so
-/// the caller can keep it alive for the duration of the test.
-async fn setup_pool() -> (PgPool, ContainerAsync<Postgres>) {
-    let container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = container
-        .get_host()
-        .await
-        .expect("failed to get container host");
-    let port = container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("failed to get container port");
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = connect_and_migrate(&url)
-        .await
-        .expect("connect_and_migrate failed");
-    (pool, container)
-}
 
 fn sample_host(suffix: &str) -> HostInfo {
     HostInfo {
@@ -170,7 +142,8 @@ fn detect_impl_uses_inputs_when_provided() {
 
 #[tokio::test]
 async fn upsert_host_returns_same_id_on_natural_key_match() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let host = sample_host("alpha");
     let id1 = upsert_host(&pool, &host).await.expect("first upsert");
     let id2 = upsert_host(&pool, &host).await.expect("second upsert");
@@ -186,7 +159,8 @@ async fn upsert_host_returns_same_id_on_natural_key_match() {
 
 #[tokio::test]
 async fn upsert_host_updates_payload_fields_on_conflict() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let mut host = sample_host("beta");
     host.cpu_cores = 16;
     host.total_ram_gb = Some(64);
@@ -211,7 +185,8 @@ async fn upsert_host_updates_payload_fields_on_conflict() {
 
 #[tokio::test]
 async fn upsert_host_distinguishes_different_natural_keys() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let host_a = sample_host("alpha");
     let mut host_b = sample_host("alpha");
     host_b.cpu_brand = "Intel Xeon Platinum 8488C".to_string();
@@ -225,7 +200,8 @@ async fn upsert_host_distinguishes_different_natural_keys() {
 async fn upsert_host_accepts_null_total_ram() {
     // The probe falls back to None on platforms it can't introspect;
     // the row must still land.
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let mut host = sample_host("ramless");
     host.total_ram_gb = None;
     let id = upsert_host(&pool, &host).await.expect("upsert");
@@ -240,7 +216,8 @@ async fn upsert_host_accepts_null_total_ram() {
 
 #[tokio::test]
 async fn insert_run_writes_full_row() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let host_id = upsert_host(&pool, &sample_host("ins")).await.expect("host");
     let run_id = insert_run(&pool, &sample_run(host_id))
         .await
@@ -270,7 +247,8 @@ async fn insert_run_writes_full_row() {
 
 #[tokio::test]
 async fn insert_run_handles_failure_row() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let host_id = upsert_host(&pool, &sample_host("fail"))
         .await
         .expect("host");
@@ -300,7 +278,8 @@ async fn insert_run_handles_failure_row() {
 
 #[tokio::test]
 async fn insert_warm_calls_empty_is_noop() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let host_id = upsert_host(&pool, &sample_host("empty"))
         .await
         .expect("host");
@@ -319,7 +298,8 @@ async fn insert_warm_calls_empty_is_noop() {
 
 #[tokio::test]
 async fn insert_warm_calls_writes_indexed_rows() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let host_id = upsert_host(&pool, &sample_host("warm"))
         .await
         .expect("host");
@@ -348,7 +328,8 @@ async fn insert_warm_calls_writes_indexed_rows() {
 
 #[tokio::test]
 async fn cascade_delete_drops_warm_calls() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let host_id = upsert_host(&pool, &sample_host("cascade"))
         .await
         .expect("host");
@@ -374,7 +355,8 @@ async fn cascade_delete_drops_warm_calls() {
 
 #[tokio::test]
 async fn fetch_recent_summary_returns_desc_with_budget_pass() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let host_id = upsert_host(&pool, &sample_host("sum")).await.expect("host");
 
     // Two runs that pass every budget.
@@ -416,7 +398,8 @@ async fn fetch_recent_summary_returns_desc_with_budget_pass() {
 
 #[tokio::test]
 async fn fetch_recent_summary_respects_limit() {
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let host_id = upsert_host(&pool, &sample_host("lim")).await.expect("host");
     for _ in 0..4 {
         insert_run(&pool, &sample_run(host_id)).await.expect("run");
@@ -435,7 +418,8 @@ async fn fetch_recent_summary_cold_budget_covers_build_plus_prove() {
     // long build + over-budget total slip through with `r2_cold_pass
     // = true`. Run B below picks exactly that edge case so a
     // regression would flip its expected `false` back to `true`.
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let host_id = upsert_host(&pool, &sample_host("coldsum"))
         .await
         .expect("host");
@@ -478,7 +462,8 @@ async fn fetch_recent_summary_cold_budget_covers_build_plus_prove() {
 async fn fetch_recent_summary_null_warm_marks_warm_fail() {
     // A run with no warm samples must NOT silently pass the warm
     // budget — the view checks `IS NOT NULL` first.
-    let (pool, _container) = setup_pool().await;
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
     let host_id = upsert_host(&pool, &sample_host("nullwarm"))
         .await
         .expect("host");

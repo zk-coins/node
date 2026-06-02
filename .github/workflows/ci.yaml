@@ -73,8 +73,12 @@ env:
 # Job topology:
 #
 # * `lint-and-build` — GitHub-hosted Linux. Catches cross-platform
-#   compile bitrot and lint regressions cheaply. Gates everything
-#   below via `needs:`.
+#   compile bitrot and lint regressions cheaply. Runs in PARALLEL
+#   with the m3-ultra jobs below — it no longer gates them via
+#   `needs:`. Each job carries its own draft/label `if:` guard, so a
+#   lint failure no longer blocks the heavy tests from starting
+#   (deliberate: parallel feedback. Trade-off: on a lint failure the
+#   m3-ultra runner time is spent regardless).
 #
 # * `db-tests` / `prover-tests` — narrow, label-gated subsets on the
 #   m3-ultra pool for fast developer iteration. They run plain
@@ -117,7 +121,10 @@ env:
 jobs:
   lint-and-build:
     name: Lint & Build
-    # Skip on draft PRs; downstream `needs:` jobs inherit the skip.
+    # Skip on draft PRs. The m3-ultra jobs each carry the same
+    # draft/push guard on their own `if:` (they used to inherit it via
+    # `needs: lint-and-build`, which has been removed so they run in
+    # parallel with this job).
     if: github.event_name == 'push' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -202,9 +209,9 @@ jobs:
     # for iteration speed; the authoritative 100% coverage gate
     # stays exclusive to `test-and-coverage` / `ci:full`.
     if: >-
-      contains(github.event.pull_request.labels.*.name, 'ci:db')
+      (github.event_name == 'push' || github.event.pull_request.draft == false)
+      && contains(github.event.pull_request.labels.*.name, 'ci:db')
       && !contains(github.event.pull_request.labels.*.name, 'ci:full')
-    needs: lint-and-build
     runs-on: [self-hosted, m3-ultra]
     timeout-minutes: 45
     env:
@@ -336,9 +343,30 @@ jobs:
       # open. Excluded here for the same reason as in
       # `test-and-coverage`.
       - name: Run DB subset (release, plain nextest, no coverage)
+        # `--test-threads=8` (issue #181 Opt A): the M3 Ultra runner
+        # has 24 cores; Plonky2 prove tests are Rayon-bound and pin
+        # every available core internally, so 8 outer nextest threads
+        # leaves enough headroom for the Rayon pool without
+        # over-subscribing. Per-test schema isolation (#182) +
+        # cross-process file lock around the shared container
+        # (`test_db::init_shared_pg`) make the suite parallel-safe.
         run: |
-          cargo nextest run -p node -p shared --release --all-features --test-threads 1 \
+          cargo nextest run -p node -p shared --release --all-features --test-threads 8 \
             -E 'not binary(api_remote) & (test(/^db::tests::/) + test(/^state::tests::/) + test(/^job_store::tests::/) + test(/^audit::tests::/) + test(/^username::tests::/) + test(/^router::tests::jobs_/) + test(/^r2_probe::tests::/) + test(/^tests::build_network_config_/) + test(/^account_node::tests::test_persist/) + test(/^account_node::tests::test_load/) + test(/^publisher::tests::/) + test(/^runtime::tests::/) + test(/^commitment::tests::/))'
+
+      # Tear down the shared test container created by
+      # `test_db::setup_pool` via testcontainers' `ReuseDirective::
+      # Always` (see `node/src/test_db.rs`). The reuse flag tells
+      # testcontainers NOT to drop the container at process exit so
+      # every `cargo nextest` test process can attach to the same
+      # daemon-side container — but that means nobody removes it
+      # either. Always-on cleanup so a stale container from one PR
+      # run cannot bleed into the next on the same self-hosted
+      # runner (different image hash → reuse-lookup misses → fresh
+      # spawn, but the stale row leaks until manual cleanup).
+      - name: Tear down shared test Postgres container
+        if: always()
+        run: docker rm -f zkcoins-test-shared-pg 2>/dev/null || true
 
       - name: sccache stats (post-build)
         if: always()
@@ -374,9 +402,9 @@ jobs:
     # Mutually exclusive with `ci:full` — see the matching comment
     # on `db-tests` above for the rationale.
     if: >-
-      contains(github.event.pull_request.labels.*.name, 'ci:prover')
+      (github.event_name == 'push' || github.event.pull_request.draft == false)
+      && contains(github.event.pull_request.labels.*.name, 'ci:prover')
       && !contains(github.event.pull_request.labels.*.name, 'ci:full')
-    needs: lint-and-build
     runs-on: [self-hosted, m3-ultra]
     timeout-minutes: 60
     env:
@@ -428,9 +456,19 @@ jobs:
       # deduplicates within a single run, this is harmless when both
       # subsets are run on separate PR labels.
       - name: Run Prover subset (release, plain nextest, no coverage)
+        # `--test-threads=8` (issue #181 Opt A): see the rationale on
+        # the matching `db-tests` step. The prover subset is the
+        # heaviest Rayon consumer in the suite, so 8 outer threads
+        # × Rayon-pinned cores is the headroom budget on the 24-core
+        # M3 Ultra runner.
         run: |
-          cargo nextest run -p node -p shared --release --all-features --test-threads 1 \
+          cargo nextest run -p node -p shared --release --all-features --test-threads 8 \
             -E 'not binary(api_remote) & (test(/^account_node::tests::test_mint/) + test(/^account_node::tests::test_send/) + test(/^account_node::tests::test_receive/) + test(/^account_node::tests::test_persist_and_load_from_pg_roundtrip/) + test(/^account_node::tests::test_wallet_operations/))'
+
+      # See the matching cleanup step in `db-tests` for the rationale.
+      - name: Tear down shared test Postgres container
+        if: always()
+        run: docker rm -f zkcoins-test-shared-pg 2>/dev/null || true
 
       - name: sccache stats (post-build)
         if: always()
@@ -462,8 +500,9 @@ jobs:
     # Gated behind the `ci:full` label so we don't burn runner time
     # on every speculative PR. The Release PR (`develop -> main`)
     # gets the label applied automatically by auto-release-pr.yaml.
-    if: contains(github.event.pull_request.labels.*.name, 'ci:full')
-    needs: lint-and-build
+    if: >-
+      (github.event_name == 'push' || github.event.pull_request.draft == false)
+      && contains(github.event.pull_request.labels.*.name, 'ci:full')
     runs-on: [self-hosted, m3-ultra]
     timeout-minutes: 120
     env:
@@ -572,12 +611,20 @@ jobs:
       # rest of the suite, which covers the in-process axum handlers
       # via oneshot().
       - name: Run llvm-cov nextest (MVP scope, 100% line + function gate)
+        # `--test-threads=8` (issue #181 Opt A): the heavy gate is
+        # the largest wall consumer on M3 Ultra (~60-90 min at
+        # --test-threads=1). 8 outer threads × Rayon-pinned cores
+        # exploits the runner's 24 cores without over-subscribing —
+        # Plonky2 prove tests already saturate Rayon internally.
+        # Per-test schema isolation (#182) + cross-process file lock
+        # around the shared container (`test_db::init_shared_pg`)
+        # make the suite parallel-safe under llvm-cov.
         run: |
           cargo llvm-cov nextest --release -p node -p shared --all-features --show-missing-lines \
-            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|_tests\.rs$|bin/.*\.rs$|shared/src/.*\.rs$' \
+            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|flow\.rs|job_dispatcher\.rs|_tests\.rs$|test_db\.rs$|bin/.*\.rs$|shared/src/.*\.rs$' \
             --fail-under-lines 100 \
             --fail-under-functions 100 \
-            --test-threads 1 \
+            --test-threads 8 \
             -E 'not binary(api_remote)'
 
       # On gate failure, re-format the existing llvm-cov data (no
@@ -594,16 +641,55 @@ jobs:
       - name: Show missing coverage on gate failure
         if: failure()
         run: |
+          IGNORE='main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|flow\.rs|job_dispatcher\.rs|_tests\.rs$|test_db\.rs$|bin/.*\.rs$|shared/src/.*\.rs$'
+
           echo "--- llvm-cov report: --show-missing-lines (text) ---"
           cargo llvm-cov report --release --show-missing-lines \
-            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|_tests\.rs$|bin/.*\.rs$|shared/src/.*\.rs$' || true
+            --ignore-filename-regex "$IGNORE" || true
+
           echo "--- llvm-cov report: per-file json (filter < 100%) ---"
           cargo llvm-cov report --release --json \
-            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|_tests\.rs$|bin/.*\.rs$|shared/src/.*\.rs$' \
+            --ignore-filename-regex "$IGNORE" \
             | jq -r '.data[0].files[]
                 | select(.summary.lines.percent < 100 or .summary.functions.percent < 100)
                 | {filename, lines: .summary.lines, functions: .summary.functions}' \
-          || echo "(jq not available or json parse failed)"
+            || echo "(jq not available or json parse failed)"
+
+          # Per-function coverage list: emits one line per uncovered
+          # function with file + name + line so the operator sees the
+          # exact `pub fn foo at router.rs:1234` without having to
+          # cross-reference the line ranges manually.
+          echo "--- llvm-cov report: uncovered functions (per-symbol) ---"
+          cargo llvm-cov report --release --json \
+            --ignore-filename-regex "$IGNORE" \
+            | jq -r '.data[0].functions[]
+                | select(.count == 0)
+                | "\(.filenames[0]):\(.regions[0][0])\t\(.name)"' \
+            | sort -u || echo "(per-function extraction failed)"
+
+          # Full HTML report — uploaded as an artifact below so the
+          # operator can browse the per-line coverage in a browser
+          # without re-running llvm-cov locally (heavy gate is
+          # ~50 min on M3 Ultra).
+          echo "--- llvm-cov report: generating HTML for artifact ---"
+          cargo llvm-cov report --release --html \
+            --output-dir target/llvm-cov-html \
+            --ignore-filename-regex "$IGNORE" \
+            || echo "(HTML generation failed)"
+
+      - name: Upload coverage HTML report on gate failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-cov-html-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/llvm-cov-html
+          if-no-files-found: warn
+          retention-days: 14
+
+      # See the matching cleanup step in `db-tests` for the rationale.
+      - name: Tear down shared test Postgres container
+        if: always()
+        run: docker rm -f zkcoins-test-shared-pg 2>/dev/null || true
 
       - name: sccache stats (post-build)
         if: always()

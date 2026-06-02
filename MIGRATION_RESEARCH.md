@@ -1485,6 +1485,68 @@ cold tax. That trade-off is documented in `CONTRIBUTING.md`
 ("Bootstrap timing") so an operator does not misread the warmup-
 window p50 as a regression.
 
+### 7.27 Job-API admit+poll over synchronous routes — PR1 — **codified**
+
+**Decision (June 2026, PR `feat/jobs-api-core`).** Replace the synchronous `POST /api/mint`, `POST /api/send`, `POST /api/commit` routes with an admit-then-poll Job-API. Wallet POSTs admit a job row and return `202 Accepted` in milliseconds; a single-worker background `Dispatcher` walks each row through `queued → proving → (awaiting_signature) → broadcasting → completed | failed | cancelled`; the wallet polls `GET /api/jobs/:id` every ~2 s until a terminal status appears.
+
+**Three problems the synchronous routes had:**
+
+1. **Three-concurrent-wallet wedge.** Plonky2's Rayon pool fully saturates the M3 Ultra during a prove. Two parallel `/api/send` requests don't double throughput — they halve each prove's wallclock and add cache-thrash overhead. Wallet C, arriving while A and B are mid-prove, blocks on the axum worker until both finish. With ~5 s p50 prove and three users, the third user observes ~15 s before *their* prove even starts. Past three concurrent users the wedge becomes unusable.
+2. **Cloudflare 100 s connection cap.** PRD sits behind Cloudflare; a long mint that holds an HTTP connection past 100 s gets the connection killed with a 524. The wallet retries, the node re-pays the prove cost on the new connection, and the cycle repeats. The closed test env lives behind a self-hosted reverse proxy today, but the moment we expose PRD via Cloudflare the same wall lands on every prove.
+3. **No mid-flight observability.** A wallet polling for status during a 5 s prove has no way to know whether the node is alive, the prove is on-track, or the publisher is hung — there is just a held connection until 200 / 5xx / timeout.
+
+**Why REST + polling instead of WebSocket or SSE:**
+
+The dispatcher publishes status transitions at five known waypoints (`proving`, `awaiting_signature`, `broadcasting`, `completed`, `failed`), not in real time. With ~2 s polls and a typical 5 s prove, the wallet sees at most three intermediate state reads — well under the budget every browser / mobile keep-alive layer already gives a `GET`. SSE would require a long-lived per-wallet TCP connection through Cloudflare (back to the 100 s wall) plus a JavaScript-side event-source plumbing the wallet currently doesn't carry. WebSocket has the same connection-lifetime issue plus a duplex channel we don't need. The cost of polling is one HTTP round-trip every ~2 s; the cost of long-lived push is a new failure-mode (connection drop mid-job → wallet missed the terminal event → has to fall back to polling anyway). Polling is what every long-running operation on Stripe, GitHub, and CI services uses for the same reason.
+
+**Phase 2 (optional, deferred).** A `/api/jobs/:id/events` SSE channel can be added later for the wallet UI to render a real-time progress bar without polling. PR1 ships the poll-based contract because it covers every observable wallet flow; SSE is a UX-only optimization.
+
+**Why no Redis or external queue.** Single-host invariant (`feedback_zkcoins_server_heavy_architecture`): every prove is CPU-bound on the M3 Ultra and cannot be horizontally distributed (the Rayon pool is process-local). Closed test env (`feedback_zkcoins_closed_test_env`): we do not promise durable state across PRD restarts during the internal phase, so Postgres-backed job rows give every property an external queue would (durability against process crash, idempotency via `(account, key)` unique index, atomicity via a single row UPDATE) without adding an operational dependency. The boot-time `runtime::boot_resume_jobs` covers the crash-recovery edge: any row left in `proving` or `broadcasting` is marked `failed` (Plonky2 in-memory state is lost on restart; the signed wallet timestamp window has expired anyway), and any row in `awaiting_signature` gets a fresh `Notify` channel + is handed back to the dispatcher to park on.
+
+**Single dispatcher worker.** Same reasoning as (1) above — running two proves in parallel only thrashes the Rayon pool. The mpsc channel is the queue; channel ordering is the schedule. If we ever scale beyond one node, the dispatcher becomes per-node (each instance owns its own Postgres rows), not a distributed worker pool — but that scaling step is post-MVP.
+
+**Migrations may wipe** (`feedback_zkcoins_migrations_may_wipe`). Migration `0014_jobs.sql` adds the `jobs` table; the closed test env's reset cycle drops it freely. No data-preservation requirement until mainnet.
+
+**Pointers.**
+- `node/migrations/0014_jobs.sql` — schema + indices
+- `node/src/job_store.rs` + `node/src/job_store_tests.rs` — state-layer API (19 testcontainer tests)
+- `node/src/flow.rs` — mint/send/commit bodies extracted from the legacy handlers (coverage-excluded)
+- `node/src/job_dispatcher.rs` — single-worker loop, `Notify`-based commit-leg wake (coverage-excluded)
+- `node/src/router.rs::jobs_*_handler` — admit + poll + cancel routes (100 % covered)
+- `node/src/runtime.rs::boot_resume_jobs` — crash-recovery (coverage-excluded)
+- `SPEC.md §11.2.1` — wire-level endpoint table
+- `CONTRIBUTING.md` § "Job-API lifecycle" — state machine + invariants
+
+### 7.28 Job-API SSE push channel — PR2 — **codified**
+
+**Decision (June 2026, PR `feat/jobs-api-sse`, stacked on PR1).** Add an additive `GET /api/jobs/:id/stream` SSE endpoint so wallets that want push updates do not have to pay the ~2 s poll tax. The endpoint emits an initial phase event with the current job snapshot on open, forwards every dispatcher phase transition, and closes with a single terminal event. Polling stays the contract; SSE is a UX-only optimisation.
+
+**What changed mechanically.**
+
+1. The `DashMap<Uuid, Arc<Notify>>` from PR1 became `DashMap<Uuid, Arc<JobNotifier>>` where `JobNotifier { commit_wake: Arc<Notify>, phase_tx: broadcast::Sender<JobPhaseEvent> }`. The commit-wake path is unchanged (`POST /api/jobs/:id/commit` still calls `notifier.commit_wake.notify_one()`); the new `phase_tx` field carries fan-out subscriptions for SSE listeners.
+2. Every dispatcher status-persistence site (`set_status`, `set_awaiting_signature`, `complete`, `fail`) is followed by a `publish_phase(...)` call that pushes a `JobPhaseEvent` into the broadcast channel. The `.send().ok()` swallow covers the no-subscribers arm (broadcast's "no active receivers" error). The cancel handler also publishes a terminal `cancelled` event so an SSE subscriber attached before cancel observes the close.
+3. The SSE handler (`router::stream_job_handler`) loads the row up-front (404 surfaces with the standard JSON shape, not as an empty stream), subscribes a fresh `broadcast::Receiver` from the per-job notifier, emits an initial event with the current snapshot (`event: phase` for non-terminal, `event: complete` for terminal), and either closes immediately (terminal) or runs the broadcast forwarding loop wrapped by axum's built-in `KeepAlive::new().interval(25 s)` heartbeat.
+
+**Why broadcast and not watch.** `tokio::sync::watch` only keeps the latest value, so a fast-moving job (`proving → awaiting_signature → broadcasting` within milliseconds) would have the intermediate `proving` event collapsed before the subscriber sees it. `broadcast(32)` keeps a per-subscriber lossless queue and only drops events when a subscriber lags by >32 — which cannot realistically happen for a job that only emits 3-5 events total. `Lagged` is treated as "end of stream" by the handler so a wedged subscriber does not pin the broadcast buffer.
+
+**Heartbeat (25 s).** Cloudflare Tunnel drops idle HTTP streams after ~100 s; the typical reverse-proxy-friendly heartbeat cadence is 15-30 s (Stripe, GitHub, axum's `KeepAlive::default()`). 25 s is the middle of that band and survives a single dropped heartbeat without doubling bandwidth.
+
+**Fallback semantics.** When SSE is unavailable (corporate proxy strips `text/event-stream`, sandbox without `EventSource`, network blip mid-stream) the wallet falls back to the existing 2 s poll. The poll contract from PR1 is byte-identical; SSE adds zero new failure modes for clients that do not use it.
+
+The wallet's `EventSource` performs its own built-in reconnect on transport errors. The WHATWG HTML spec defines a UA-implemented reconnection time, settable per-stream via the `retry:` field; in practice Firefox and Chrome ramp from ~3 s. So the first remediation on `Lagged → end-of-stream` is the browser automatically reopening the channel — at which point the initial-frame snapshot reflects the current row and the wallet observes either the latest non-terminal phase or the terminal frame directly. Only after `EventSource` exhausts its retry budget does the explicit poll fallback kick in.
+
+**Concurrent-connection bound.** No per-node cap on simultaneous SSE streams is enforced today. The hosted MVP is sized for the closed-test wallet population (low single-digit concurrent connections per dev box), so the work-in-flight is bounded by the prove queue, not by HTTP connection state. A future "self-host with N>100 wallets" deployment would need either (a) a per-node `max_sse_streams` config knob backed by a `Semaphore`, or (b) a reverse-proxy-side concurrent-connection limit. Deferred until that population materialises — capturing here so it does not get lost in the post-MVP backlog.
+
+**Why not WebSocket.** SSE is a one-way push (server → client), which is exactly what the wallet needs — the wallet's commit signature still goes back via `POST /api/jobs/:id/commit`, not over the stream. WebSocket would buy us duplex bandwidth we do not use, plus a `Sec-WebSocket-Accept` handshake step Cloudflare Tunnel handles less gracefully than chunked-text SSE. SSE also reuses the wallet's existing `fetch`/`EventSource` plumbing — no new client-side library.
+
+**Coverage.** The pure helpers (`initial_event_from_job`, `event_from_phase`) are covered by 10 unit tests. The handler's load + subscribe path is covered by 4 integration tests against a testcontainers Postgres (404, 500-on-db-error, terminal-job-immediate-close, fan-out from dispatcher publishes). The stream's inner forwarding loop (`build_phase_stream`) is annotated `#[cfg_attr(coverage_nightly, coverage(off))]` because its `tokio::select!` arms depend on real-time broadcast deliveries the deterministic harness cannot fully cover — same pattern as `scanner_ws::run_subscription_loop`.
+
+**Pointers.**
+- `node/src/job_dispatcher.rs::{JobNotifier, JobPhaseEvent, JobNotifyMap, publish_phase}` — broadcast plumbing
+- `node/src/router.rs::stream_job_handler` + helpers — SSE handler
+- `SPEC.md §11.2.1` — wire-level event-shape examples
+- `CONTRIBUTING.md` § "Job-API lifecycle" — SSE fallback semantics
+
 ---
 
 ## 8. Local Artifacts

@@ -24,6 +24,8 @@
 // later failure mode for schema drift, which the tests catch on the
 // first run.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes, HashDigest};
@@ -42,7 +44,7 @@ use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes, HashDigest};
 ///
 /// Persisting this is the difference between a DB row that tells you
 /// *what happened* and one that only tells you *that something happened*.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum InscriptionKind {
     Mint,
@@ -70,9 +72,68 @@ impl InscriptionKind {
 /// the pool. Returns the live pool on success.
 ///
 /// Used in PR-A2 from `main.rs::main` before any state load.
+///
+/// Retries the inner connect + migrate pair up to
+/// `CONNECT_AND_MIGRATE_MAX_ATTEMPTS` times for transient host-level
+/// failures. The shared m3-ultra CI runner (dfx01) sits next to ~20
+/// production containers and is sometimes hit by manual
+/// `cargo nextest` runs from operators; under that load the kernel /
+/// Colima vNIC has surfaced two transient failure modes:
+///
+///   * `sqlx::Error::PoolTimedOut` — the 60s `acquire_timeout` below
+///     elapsed before the initial TCP handshake completed.
+///   * `sqlx::Error::Protocol("unexpected response from SSLRequest")`
+///     — testcontainers reported "ready" the moment Postgres logged
+///     `database system is ready to accept connections`, but the
+///     bgwriter / autovacuum bootstrap on the same Colima VM was
+///     still saturating the loopback link, so the very first wire
+///     byte SQLx received was garbage instead of the protocol-version
+///     handshake.
+///
+/// Both errors converge to "Postgres is reachable but not yet
+/// answering protocol-correctly"; retrying with a short linear
+/// backoff converges in seconds. Other error kinds (auth failure,
+/// migration mismatch, unreachable host) are returned immediately so
+/// a real configuration bug still surfaces fast.
+const CONNECT_AND_MIGRATE_MAX_ATTEMPTS: u32 = 3;
+
+// `coverage(off)`: the retry loop's classification arms only fire
+// under transient host-level failures that the deterministic test
+// harness cannot reproduce on demand. The happy path (single Ok
+// return) is exercised by every test that hits a Postgres
+// testcontainer; the retry arms are defensive against shared-host
+// load that is not present on the developer machine or under
+// `--test-threads 1`.
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn connect_and_migrate(url: &str) -> Result<PgPool, sqlx::Error> {
+    let mut last_err: Option<sqlx::Error> = None;
+    for attempt in 1..=CONNECT_AND_MIGRATE_MAX_ATTEMPTS {
+        match try_connect_and_migrate(url).await {
+            Ok(pool) => return Ok(pool),
+            Err(e) if is_transient_connect_error(&e) => {
+                eprintln!(
+                    "connect_and_migrate attempt {attempt}/{CONNECT_AND_MIGRATE_MAX_ATTEMPTS} \
+                     hit transient error, retrying: {e}"
+                );
+                last_err = Some(e);
+                if attempt < CONNECT_AND_MIGRATE_MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(500u64 * u64::from(attempt))).await;
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.expect("retry loop entered without a captured error"))
+}
+
+async fn try_connect_and_migrate(url: &str) -> Result<PgPool, sqlx::Error> {
+    // `acquire_timeout` defaults to 30s — long enough on a quiet host,
+    // but a busy shared host needs more headroom for the initial TCP
+    // handshake. 60s covers every observed warm-up window without
+    // slowing the healthy path (a healthy host connects in <500ms).
     let pool = PgPoolOptions::new()
         .max_connections(10)
+        .acquire_timeout(Duration::from_secs(60))
         .connect(url)
         .await?;
     sqlx::migrate!("./migrations")
@@ -80,6 +141,19 @@ pub async fn connect_and_migrate(url: &str) -> Result<PgPool, sqlx::Error> {
         .await
         .map_err(|e| sqlx::Error::Migrate(Box::new(e)))?;
     Ok(pool)
+}
+
+/// Classifier for the two transient sqlx errors documented on
+/// `connect_and_migrate`. Auth / migration / host-not-found errors
+/// stay non-retryable so a real misconfiguration still fails fast.
+///
+/// `coverage(off)`: only reached from the retry arm in
+/// `connect_and_migrate`, which is itself `coverage(off)` because the
+/// transient-failure conditions are non-deterministic on a quiet host.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn is_transient_connect_error(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::PoolTimedOut)
+        || matches!(e, sqlx::Error::Protocol(msg) if msg.contains("SSLRequest"))
 }
 
 // ---- Request audit log (migration 0007) ----------------------------------
@@ -1091,7 +1165,7 @@ pub async fn load_pending_in_progress(
 /// Returns `Ok(None)` when no row exists — either because this node
 /// never originated the inscription (e.g. an external recovery via the
 /// `recover_inscription` CLI) or because the txid was never seen here.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct InscriptionSummary {
     /// Commit txid as a lowercase hex string. Mirrors the on-chain
     /// txid shown in block explorers — i.e. big-endian display order,

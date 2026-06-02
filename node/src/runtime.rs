@@ -10,26 +10,18 @@
 //! router construction in `create_router`) stays in `router.rs` and
 //! is measured normally.
 
+use dashmap::DashMap;
+use sqlx::PgPool;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-
-use axum::http::StatusCode;
-use axum::Json;
-use shared::commitment::Commitment;
-use sqlx::PgPool;
 use tokio::net::TcpListener;
 
-use crate::account_node::{persist_account, CoinProof};
-use crate::db;
-use crate::publisher::{create_and_broadcast_inscription, resume_pending_inscriptions};
-use crate::router::{
-    apply_commit_and_persist_phase_e, handler_error_response, lock_or_recover, PhaseEFailure,
-    SendCoinResponse,
-};
+use crate::account_node::persist_account;
+use crate::job_dispatcher::{self, JobNotifier, DEFAULT_AWAITING_SIGNATURE_TIMEOUT};
+use crate::job_store::{JobStatus, JobStore};
+use crate::publisher::resume_pending_inscriptions;
 use crate::NETWORK_CONFIG;
-use shared::ProofData;
-use zkcoins_program::hash::digest_to_bytes;
 
 use bitcoin::bip32::Xpriv;
 use shared::ClientAccount;
@@ -43,6 +35,7 @@ pub async fn start_rest_node(
     username_store: UsernameStore,
     addr: &str,
     pool: Arc<PgPool>,
+    proofs_dir: &str,
 ) -> anyhow::Result<()> {
     let socket_addr = addr
         .parse::<SocketAddr>()
@@ -53,11 +46,14 @@ pub async fn start_rest_node(
     // Proof files keep using a local directory — the proof store is
     // append-only and the proofs themselves are large (bincode-
     // serialized Plonky2 proofs) so a `BYTEA` column would balloon the
-    // Postgres image. `PROOFS_DIR` defaults to `./proofs` for parity
-    // with the pre-PR-A3 layout; the deployment overrides it to the
-    // mounted data volume.
-    let proofs_dir = std::env::var("PROOFS_DIR").unwrap_or_else(|_| "./proofs".to_string());
-    let proof_store = Arc::new(ProofStore::new(&proofs_dir));
+    // Postgres image. The `proofs_dir` arrives as a parameter from the
+    // binary edge (`main.rs` reads the `PROOFS_DIR` env var and passes
+    // the resolved value through) — keeping the env read out of this
+    // function lets parallel test binaries (`runtime_tests.rs` under
+    // issue #181 Opt A's `--test-threads=8`) each pass their own
+    // `tempfile::tempdir()` path instead of racing on a process-wide
+    // env var.
+    let proof_store = Arc::new(ProofStore::new(proofs_dir));
 
     let minting_account = {
         let secret = include_bytes!("../minting_secret.bin");
@@ -103,6 +99,15 @@ pub async fn start_rest_node(
     // `/health/ready`; see the field doc on `AppState::prover_warm`.
     let prover_warm = Arc::new(AtomicBool::new(false));
 
+    // Job-API state-layer. The dispatcher is spawned below once
+    // the AppState is fully populated; the mpsc channel is owned
+    // by `start_rest_node` so the sender clone can be threaded
+    // into the AppState before the dispatcher takes ownership of
+    // the receiver half.
+    let job_store = Arc::new(JobStore::new((*pool).clone()));
+    let job_notify_map = Arc::new(DashMap::new());
+    let (job_tx, job_rx) = tokio::sync::mpsc::channel::<crate::job_dispatcher::JobEnvelope>(32);
+
     let state = AppState {
         account_node: Arc::clone(&shared_account_node),
         proof_store,
@@ -113,12 +118,9 @@ pub async fn start_rest_node(
         // it points at the same `ESPLORA_URL` as the scanner / publisher.
         esplora_config: Arc::new(NETWORK_CONFIG.clone()),
         prover_warm: Arc::clone(&prover_warm),
-        #[cfg(test)]
-        phase2_reached: Arc::new(tokio::sync::Notify::new()),
-        #[cfg(test)]
-        phase3_release_lock: Arc::new(tokio::sync::Mutex::new(())),
-        #[cfg(test)]
-        state_advance_release_lock: Arc::new(tokio::sync::Mutex::new(())),
+        job_store: Arc::clone(&job_store),
+        job_tx: job_tx.clone(),
+        job_notify_map: Arc::clone(&job_notify_map),
     };
 
     // Bootstrap the minting account if it isn't already in the DB.
@@ -196,6 +198,36 @@ pub async fn start_rest_node(
             e
         );
     }
+
+    // Job-API boot-time resumer. The dispatcher walks each job
+    // through the state machine; if the process restarts mid-way
+    // through a `proving` / `broadcasting` row, the in-process
+    // Plonky2 prover state is lost and the signed wallet payload's
+    // timestamp window has expired by the time anyone notices. The
+    // safest action is to mark every interrupted row `failed`
+    // before serving so the wallet observes a terminal status on
+    // its next poll and can re-submit (with a fresh timestamp +
+    // fresh idempotency key). Jobs already at `awaiting_signature`
+    // are different — the wallet may still come back with a valid
+    // signature, so we re-arm the per-job `Notify` channel and
+    // hand the public_id back to the dispatcher to park on. See
+    // the `list_interrupted_for_resume` doc-comment for the
+    // partitioning rationale.
+    if let Err(e) = boot_resume_jobs(&job_store, &job_notify_map, &job_tx).await {
+        eprintln!("Job-API boot-time resume failed (continuing anyway): {}", e);
+    }
+
+    // Spawn the dispatcher. Owns the `mpsc::Receiver` half of the
+    // channel created above; the matching senders are held by
+    // every cloned `AppState`. Closes cleanly when the last sender
+    // is dropped (process shutdown).
+    job_dispatcher::spawn(
+        Arc::clone(&job_store),
+        state.clone(),
+        Arc::clone(&job_notify_map),
+        DEFAULT_AWAITING_SIGNATURE_TIMEOUT,
+        job_rx,
+    );
 
     let app = create_router(state);
 
@@ -332,146 +364,94 @@ pub async fn start_rest_node(
     Ok(())
 }
 
-/// Broadcast the commit inscription and, on success, run the shared
-/// Phase E (SMT/MMR advance + atomic persist + `pending_inscriptions`
-/// row marked `complete`), then deliver the coin to the recipient and
-/// persist the account state. This contains the network call (Bitcoin
-/// broadcast) and the post-broadcast bookkeeping, plus the
-/// success/failure response dispatch.
+/// Job-API boot-time resumer. Walks every non-terminal row in the
+/// `jobs` table and applies the partition described in
+/// `JobStore::list_interrupted_for_resume` /
+/// `list_non_terminal_for_resume`:
 ///
-/// **Invariant (zk-coins/node#89).** The broadcast `if let Err(...)
-/// { return 503 }` MUST stay above every `receive_coin`/`upsert_account`
-/// line. The mint flow had to be refactored to prepare-then-commit
-/// because its old shape advanced state ahead of broadcast; this
-/// function does not have that bug because its broadcast is already
-/// the first effect. Any future refactor that moves a state mutation
-/// above the broadcast re-introduces the state-desync class — do not.
-///
-/// **Phase E symmetry.** Between the broadcast and the recipient
-/// `receive_coin` mutation, we invoke
-/// [`apply_commit_and_persist_phase_e`] synchronously — identical
-/// shape to `mint_handler`. Prior to this, the send-commit SMT
-/// integration ran only via the async scanner, which surfaced as a
-/// race for back-to-back `/api/send` + `/api/commit` + `/api/send`
-/// flows: the second send walked the SMT for the first commit's
-/// pubkey and found no entry, returning 422 `"Unable to get merkle
-/// proofs for provided public key"`. Running Phase E inline closes
-/// that window. The scanner remains the recovery path for external
-/// inscriptions and re-scans of our own commits hit
-/// `should_skip_scanner_state_update` because the `complete` row
-/// advance lands atomically here.
-pub(crate) async fn broadcast_commit_and_deliver(
-    state: &AppState,
-    commitment: Commitment,
-    coin_proof: CoinProof,
-    proof_id: u64,
-) -> (StatusCode, Json<SendCoinResponse>) {
-    let commitment_data = bincode::serialize(&commitment).expect("Failed to serialize commitment");
-    println!(
-        "Broadcasting user commitment ({} bytes)",
-        commitment_data.len()
-    );
-    // Use `state.esplora_config` (instead of the process-wide
-    // `NETWORK_CONFIG` lazy_static) so tests can redirect Esplora calls
-    // at a `wiremock::MockServer`, matching the testability shape
-    // already in place for `mint_handler`. In production
-    // `start_rest_node` clones `NETWORK_CONFIG` into this slot so the
-    // runtime behaviour is unchanged.
-    let broadcast_outcome = create_and_broadcast_inscription(
-        &commitment_data,
-        crate::db::InscriptionKind::Send,
-        &state.esplora_config,
-        Some(&state.pool),
-    )
-    .await;
-    let commit_txid_bytes: [u8; 32] = match broadcast_outcome {
-        Ok((commit_txid, _reveal_txid)) => {
-            use bitcoin::hashes::Hash as _;
-            commit_txid.to_byte_array()
-        }
-        Err(err) => {
-            eprintln!("Error broadcasting commit inscription: {}", err);
-            return handler_error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Failed to broadcast commitment inscription on-chain",
+/// * `proving` / `broadcasting` — interrupted in flight; the
+///   in-process prover / publisher state is gone. Mark `failed`
+///   with a wallet-facing message so the next poll observes a
+///   terminal status.
+/// * `queued` — the signed payload's timestamp window has expired
+///   (the wallet's timestamp gate is 5 minutes, the server may
+///   have been down longer). Mark `failed` for the same reason.
+/// * `awaiting_signature` — the wallet may still come back with
+///   the signature. Re-arm a fresh `Notify` entry and hand the
+///   public_id back to the dispatcher so it parks on the channel
+///   the same way it did pre-restart.
+async fn boot_resume_jobs(
+    job_store: &Arc<JobStore>,
+    job_notify_map: &Arc<DashMap<uuid::Uuid, Arc<JobNotifier>>>,
+    job_tx: &tokio::sync::mpsc::Sender<crate::job_dispatcher::JobEnvelope>,
+) -> anyhow::Result<()> {
+    // Interrupted in-flight rows: mark each failed so the wallet
+    // observes a terminal status.
+    let interrupted = job_store.list_interrupted_for_resume().await?;
+    for job in interrupted {
+        if let Err(e) = job_store
+            .fail(
+                job.public_id,
+                "server restarted before processing — please retry",
+            )
+            .await
+        {
+            eprintln!(
+                "boot_resume_jobs: fail({}) failed: {} (continuing)",
+                job.public_id, e
+            );
+        } else {
+            tracing::info!(
+                "boot_resume_jobs: marked {} ({:?}) failed",
+                job.public_id,
+                job.status
             );
         }
-    };
-
-    // ---- Phase E (broadcast OK) -----------------------------------------
-    // Run the shared SMT/MMR advance + atomic persist + mark-complete
-    // BEFORE the recipient `receive_coin` mutation. Locked-step with
-    // `mint_handler::Phase E`; see [`apply_commit_and_persist_phase_e`]
-    // for the full rationale, lock topology, and crash-recovery
-    // contract. On failure the broadcast already landed on chain — we
-    // surface 503 (no fallback, no retry) and the scanner-replay path
-    // is the single source of repair.
-    if let Err(failure) = apply_commit_and_persist_phase_e(
-        state,
-        &commitment,
-        &commit_txid_bytes,
-        "broadcast_commit_and_deliver",
-    )
-    .await
-    {
-        let msg: &'static str = match failure {
-            PhaseEFailure::StateUpdate => {
-                "commit broadcast landed on chain but in-process state advance failed; scanner will reconcile"
-            }
-            PhaseEFailure::DurablePersist => {
-                "commit broadcast landed on chain but durable state advance failed; scanner will reconcile"
-            }
-        };
-        return handler_error_response(StatusCode::SERVICE_UNAVAILABLE, msg);
     }
 
-    let mut updated_proof = coin_proof;
-    updated_proof.commitment = Some(commitment);
-    // Extract the prover's post-state hash pair from the stored
-    // CoinProof's public_inputs so the response carries the same
-    // (account_state_hash, output_coins_root) the wallet client used
-    // to build the commitment in the first place. Lets the client
-    // confirm the server's post-commit snapshot matches what it just
-    // signed without a second `/api/proof/:id` round-trip. Derivation
-    // is identical to the one in `mint_handler` and `send_coin_handler`.
-    let pis: [zkcoins_program::F; zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] =
-        updated_proof.proof.public_inputs
-            [..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
-            .try_into()
-            .expect("Plonky2 Proof emits N_PROOF_DATA_PUBLIC_INPUTS field elements");
-    let proof_data = ProofData::from_field_elements(&pis);
-    let ash_hex = Some(hex::encode(digest_to_bytes(&proof_data.account_state_hash)));
-    let ocr_hex = Some(hex::encode(digest_to_bytes(&proof_data.output_coins_root)));
-
-    let recipient = updated_proof.coin.recipient;
-    let snapshot: Option<Vec<u8>> = {
-        let mut account_node_guard = lock_or_recover(&state.account_node);
-        if let Err(e) = account_node_guard.receive_coin(updated_proof) {
-            eprintln!("Failed to receive coin after commit: {}", e);
-        }
-        account_node_guard
-            .get_account(&recipient)
-            .map(AccountNode::serialize_account)
-    };
-    if let Some(bytes) = snapshot {
-        let addr_bytes = digest_to_bytes(&recipient);
-        if let Err(e) =
-            db::upsert_account_with_source(&state.pool, &addr_bytes, &bytes, "receive").await
-        {
-            eprintln!("Failed to upsert account after commit: {}", e);
+    // Non-terminal rows still in admit-side states.
+    let pending = job_store.list_non_terminal_for_resume().await?;
+    for job in pending {
+        match job.status {
+            JobStatus::Queued => {
+                if let Err(e) = job_store
+                    .fail(
+                        job.public_id,
+                        "server restarted before processing — please retry",
+                    )
+                    .await
+                {
+                    eprintln!(
+                        "boot_resume_jobs: fail({}) failed: {} (continuing)",
+                        job.public_id, e
+                    );
+                }
+            }
+            JobStatus::AwaitingSignature => {
+                let notifier = Arc::new(JobNotifier::new());
+                job_notify_map.insert(job.public_id, notifier);
+                if let Err(e) = job_tx
+                    .send(crate::job_dispatcher::JobEnvelope {
+                        public_id: job.public_id,
+                    })
+                    .await
+                {
+                    eprintln!(
+                        "boot_resume_jobs: enqueue({}) failed: {} (continuing)",
+                        job.public_id, e
+                    );
+                } else {
+                    tracing::info!(
+                        "boot_resume_jobs: re-armed awaiting_signature job {}",
+                        job.public_id
+                    );
+                }
+            }
+            _ => {}
         }
     }
 
-    (
-        StatusCode::OK,
-        Json(SendCoinResponse {
-            success: true,
-            error: None,
-            proof_id: Some(proof_id),
-            account_state_hash: ash_hex,
-            output_coins_root: ocr_hex,
-        }),
-    )
+    Ok(())
 }
 
 #[cfg(test)]
