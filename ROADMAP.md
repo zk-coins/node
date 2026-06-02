@@ -141,6 +141,8 @@ rather than carrying its own perpetually-uncovered branch.
 
 ## In Progress
 
+**Step 9 — Job-API admit+poll surface** ✅ done — PR1 (`feat/jobs-api-core`, June 2026). Migration `0014_jobs.sql` + `JobStore` + `Dispatcher` + five `/api/jobs/*` routes replace the synchronous `/api/mint`, `/api/send`, `/api/commit` endpoints. Single-worker dispatcher walks every prove/broadcast off the request thread; the wallet polls `GET /api/jobs/:id` until terminal. Idempotency-Key on every admit, crash-recovery on boot, 10-min `awaiting_signature` timeout. Phase 2 ✅ done — PR2 (`feat/jobs-api-sse`, June 2026) adds `GET /api/jobs/:id/stream` SSE push channel layered on a per-job `tokio::sync::broadcast::Sender` inside `JobNotifier`; 25 s heartbeat survives Cloudflare Tunnel's idle drop; polling stays the fallback when SSE is unavailable. See `MIGRATION_RESEARCH.md` §7.27 for the PR1 architectural rationale, §7.28 for the PR2 SSE layer, `SPEC.md` §11.2.1 for the wire-level contract (including SSE event shape), `CONTRIBUTING.md` "Job-API lifecycle" for the state machine. Wallet adaptation tracked in [zk-coins/app#141](https://github.com/zk-coins/app/pull/141).
+
 **Step 5 — Monolithic state-transition circuit** (✅ done, broken into
 stages, each landed as its own reviewable commit; preserved below as
 the historical record):

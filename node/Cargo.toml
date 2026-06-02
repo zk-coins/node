@@ -84,6 +84,14 @@ sqlx = { version = "0.8", default-features = false, features = [
     # to the `request_headers` / `response_headers` JSONB columns without
     # a manual `Encode` shim.
     "json",
+    # `uuid` lets sqlx encode/decode the `jobs.public_id` column
+    # against the `uuid` crate's `Uuid` type directly; without this
+    # feature `jobs.public_id` would have to be bound as `Vec<u8>`
+    # and parsed by hand.
+    "uuid",
+    # `chrono` for `TIMESTAMPTZ` round-trip on the `jobs.created_at`
+    # / `updated_at` / `completed_at` columns.
+    "chrono",
 ] }
 # Structured logging facade. Replaces the legacy `println!` / `eprintln!`
 # calls on the API request path so log lines carry an explicit level
@@ -123,6 +131,52 @@ libc = "0.2"
 # touches the system / host-name surface, and the disabled features
 # pull in `windows` / `objc2-*` crates we don't need on Linux+macOS.
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+# OpenAPI 3.x spec generated from handler annotations + response /
+# request types at compile time. utoipa's core crate is web-framework
+# agnostic (its only normal deps are `indexmap`, `serde`, `serde_json`,
+# `serde_norway`, and `utoipa-gen`), so it composes with the workspace's
+# axum 0.7.9 without pulling in `utoipa-axum` — that companion crate
+# requires `axum ^0.8` and would force a framework-major bump. The spec
+# is built once at startup, cached as JSON in an `OnceLock<String>`,
+# and served from `GET /openapi.json`.
+utoipa = { version = "5.5", features = ["macros"] }
+# Swagger UI assets bundled into the binary. We do NOT enable the
+# `axum` feature — that pulls `axum ^0.8` and would force a workspace
+# framework-major bump; instead we use the framework-agnostic `serve()`
+# entrypoint and route the assets through our existing axum 0.7 handlers
+# (see `openapi::swagger_asset_handler`). `vendored` ships a snapshot of
+# swagger-ui-dist inside the crate so the build does not shell out to
+# `curl` and the binary carries no external CDN dependency at runtime.
+utoipa-swagger-ui = { version = "9", default-features = false, features = ["vendored"] }
+# UUID generation + sqlx encoding for the `jobs.public_id` column
+# (PR1 of the Job-API refactor — migration 0014). `v4` for
+# randomly-generated identifiers (no temporal correlation across
+# rows); `serde` so the value round-trips through the
+# `Json<JobStatusResponse>` and path-parameter extractors without a
+# manual encode/decode shim.
+uuid = { version = "1", features = ["v4", "serde"] }
+# Concurrent map keyed by `Uuid` → `Arc<tokio::sync::Notify>`. Each
+# `send` job that reaches `awaiting_signature` registers an entry so
+# the matching `POST /api/jobs/:id/commit` handler can wake the
+# dispatcher with `notify_one()`. `DashMap` is the standard sharded
+# concurrent-hashmap shape; alternatives (`Mutex<HashMap>`) would
+# serialise concurrent notify lookups under one global lock.
+dashmap = "6"
+# `chrono::DateTime<Utc>` for `TIMESTAMPTZ` round-trip on the
+# `jobs.created_at / updated_at / completed_at` columns. The sqlx
+# `chrono` feature wires the encoder; the workspace already pulls
+# chrono in transitively via the bitcoin / tokio paths.
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+# `async_stream::stream! {}` macro used by `router::build_phase_stream`
+# to express the SSE fan-out as a single async block. The alternative
+# (`futures_util::stream::unfold`) would force the cross-await state to
+# be encoded as a state enum — async-stream's syntactic sugar keeps the
+# control flow readable and matches the upstream axum SSE docs. Already
+# in the dependency graph transitively (via `tokio-stream` /
+# `reqwest`); declared here so the router resolves it deterministically
+# rather than through a transitive path that could shift on `cargo
+# update`.
+async-stream = "0.3"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

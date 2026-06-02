@@ -70,9 +70,9 @@ fn test_state() -> AppState {
         // shape. The dedicated 503/warming-tag test below overrides
         // this back to `false` to exercise the gating arm.
         prover_warm: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        phase2_reached: Arc::new(tokio::sync::Notify::new()),
-        phase3_release_lock: Arc::new(tokio::sync::Mutex::new(())),
-        state_advance_release_lock: Arc::new(tokio::sync::Mutex::new(())),
+        job_store: Arc::new(crate::job_store::JobStore::new((*dead_pool()).clone())),
+        job_tx: tokio::sync::mpsc::channel::<crate::job_dispatcher::JobEnvelope>(8).0,
+        job_notify_map: Arc::new(dashmap::DashMap::new()),
     }
 }
 
@@ -117,11 +117,30 @@ async fn root_returns_service_metadata() {
 
     assert_eq!(status, StatusCode::OK);
     // Verify the response is JSON and contains the service identifier plus
-    // a pointer to /api/info — those two are enough to prove the handler
-    // ran and serialized correctly.
+    // pointers to the real endpoints (including the Job-API surface that
+    // replaced the legacy sync /api/{mint,send,commit} routes — see PR1
+    // of the Job-API refactor).
     let json: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
     assert_eq!(json["service"], "zkcoins-node");
     assert_eq!(json["endpoints"]["info"], "GET  /api/info");
+    assert_eq!(json["endpoints"]["admit_mint"], "POST /api/jobs/mint");
+    assert_eq!(json["endpoints"]["admit_send"], "POST /api/jobs/send");
+    assert_eq!(json["endpoints"]["get_job"], "GET  /api/jobs/{job_id}");
+    assert_eq!(
+        json["endpoints"]["stream_job"],
+        "GET  /api/jobs/{job_id}/stream"
+    );
+    assert_eq!(
+        json["endpoints"]["commit"],
+        "POST /api/jobs/{job_id}/commit"
+    );
+    assert_eq!(
+        json["endpoints"]["cancel"],
+        "POST /api/jobs/{job_id}/cancel"
+    );
+    // The legacy synchronous routes must not be advertised anymore.
+    assert!(json["endpoints"].get("send").is_none());
+    assert!(json["endpoints"].get("mint").is_none());
     assert!(json["version"].as_str().is_some_and(|v| !v.is_empty()));
     assert!(json["network"].as_str().is_some_and(|v| !v.is_empty()));
 }
@@ -300,51 +319,7 @@ async fn address_returns_list() {
 
 // --- POST /api/send with missing fields ---
 
-#[tokio::test]
-async fn send_missing_body_returns_error() {
-    let req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from("{}"))
-        .unwrap();
-    let (status, _body) = send_request(req).await;
-
-    // Axum returns 422 when JSON deserialization fails (missing required fields)
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-}
-
-#[tokio::test]
-async fn send_invalid_json_returns_bad_request() {
-    let req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from("not json"))
-        .unwrap();
-    let (status, _body) = send_request(req).await;
-
-    // Axum returns 400 Bad Request for syntactically invalid JSON
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn send_no_content_type_returns_error() {
-    let req = Request::post("/api/send").body(Body::from("{}")).unwrap();
-    let (status, _body) = send_request(req).await;
-
-    // Axum returns 415 Unsupported Media Type when content-type is missing for Json extractor
-    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
-}
-
 // --- POST /api/mint with missing fields ---
-
-#[tokio::test]
-async fn mint_missing_body_returns_error() {
-    let req = Request::post("/api/mint")
-        .header("content-type", "application/json")
-        .body(Body::from("{}"))
-        .unwrap();
-    let (status, _body) = send_request(req).await;
-
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-}
 
 // --- GET /api/proof/{id} for non-existent proof ---
 
@@ -357,17 +332,6 @@ async fn proof_not_found_returns_404() {
 }
 
 // --- POST /api/commit with missing fields ---
-
-#[tokio::test]
-async fn commit_missing_body_returns_error() {
-    let req = Request::post("/api/commit")
-        .header("content-type", "application/json")
-        .body(Body::from("{}"))
-        .unwrap();
-    let (status, _body) = send_request(req).await;
-
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-}
 
 // --- Fallback for unknown routes ---
 
@@ -743,48 +707,7 @@ async fn concurrent_reads_with_username_claim() {
 
 // --- POST /api/commit with non-existent proof_id ---
 
-#[tokio::test]
-async fn commit_nonexistent_proof_id_returns_404() {
-    let state = test_state();
-    let body = serde_json::json!({
-        "proof_id": 999999,
-        "public_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
-        "signature": "00".repeat(64),
-        "message": "00".repeat(32),
-    });
-    let req = Request::post("/api/commit")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
-    let (status, _body) = send_request_with_state(state, req).await;
-
-    assert_eq!(status, StatusCode::NOT_FOUND);
-}
-
 // --- POST /api/commit with valid proof_id but invalid signature ---
-
-#[tokio::test]
-async fn commit_invalid_signature_returns_error() {
-    // Submit a commit with a fabricated proof_id that does not exist but with
-    // a structurally valid body — the handler should return 404 (proof not found).
-    let commit_body = serde_json::json!({
-        "proof_id": 99999,
-        "public_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
-        "signature": "ab".repeat(64),
-        "message": "cd".repeat(32),
-    });
-    let req = Request::post("/api/commit")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&commit_body).unwrap()))
-        .unwrap();
-    let (status, _) = send_request(req).await;
-
-    assert_eq!(
-        status,
-        StatusCode::NOT_FOUND,
-        "commit with non-existent proof_id must return 404"
-    );
-}
 
 // --- verify_send_signature tests ---
 
@@ -1723,119 +1646,6 @@ fn send_signature_accepts_valid_signature() {
 
 // --- POST /api/send (happy path, exercises the full handler) ---
 
-#[tokio::test]
-async fn send_with_valid_signature_returns_proof_id_and_hashes() {
-    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
-    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
-
-    // Build the AppState the same way test_state() does so the handler can
-    // run through the entire send pipeline (signature -> SP1 mock prover ->
-    // proof persistence -> response).
-    let state = test_state();
-
-    // Derive the minting account's BIP-32 keys from the same secret the
-    // production code uses, so the SP1 prover's expectations line up with
-    // the account already seeded in test_state.
-    let secret_bytes = include_bytes!("../minting_secret.bin");
-    let xpriv =
-        Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).expect("test minting xpriv");
-    let secp = secp::Secp256k1::new();
-
-    let derive_pk = |index: u32| -> PublicKey {
-        Xpub::from_priv(&secp, &xpriv)
-            .derive_pub(&secp, &[ChildNumber::Normal { index }])
-            .expect("derive_pub")
-            .public_key
-    };
-    let derive_sk = |index: u32| -> SecretKey {
-        xpriv
-            .derive_priv(&secp, &[ChildNumber::Normal { index }])
-            .expect("derive_priv")
-            .private_key
-    };
-
-    let sk_0 = derive_sk(0);
-    let pk_0 = derive_pk(0);
-    let pk_1 = derive_pk(1);
-
-    let account_address = "0x".to_string()
-        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
-            &zkcoins_program::types::MINTING_ADDRESS,
-        ));
-    let recipient = "0x".to_string() + &hex::encode([1u8; 32]);
-    let amount: u64 = 100;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    // Build the exact same message the handler will hash for the signature.
-    let mut hasher = Sha256::new();
-    hasher.update(account_address.as_bytes());
-    hasher.update(recipient.as_bytes());
-    hasher.update(amount.to_le_bytes());
-    hasher.update(now.to_le_bytes());
-    let hash: [u8; 32] = hasher.finalize().into();
-
-    let msg = Message::from_digest(hash);
-    let keypair = Keypair::from_secret_key(&secp, &sk_0);
-    let sig = secp.sign_schnorr(&msg, &keypair);
-
-    let body = serde_json::json!({
-        "account_address": account_address,
-        "recipient": recipient,
-        "amount": amount,
-        "public_key": hex::encode(pk_0.serialize()),
-        "next_public_key": hex::encode(pk_1.serialize()),
-        "signature": hex::encode(sig.serialize()),
-        "timestamp": now,
-    });
-
-    let app = create_router(state);
-    let req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let response = app.oneshot(req).await.unwrap();
-    let status = response.status();
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let body = String::from_utf8(bytes.to_vec()).unwrap();
-
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    let response_json: serde_json::Value =
-        serde_json::from_str(&body).expect("response is valid JSON");
-    assert_eq!(response_json["success"], true);
-    let proof_id = response_json["proof_id"]
-        .as_u64()
-        .expect("proof_id missing from response");
-    assert!(proof_id > 0, "proof_id must be a positive u64");
-
-    // Value-bearing assertions on the send response payload. The
-    // previous `.as_str().is_some()` shape passed for any non-null
-    // string — including the all-zero placeholder a buggy handler
-    // could emit, or a truncated hex string. Decoding to bytes and
-    // asserting 32-byte length + non-zero pins both regressions.
-    let account_state_hash_hex = response_json["account_state_hash"]
-        .as_str()
-        .expect("account_state_hash present");
-    let ash_bytes = hex::decode(account_state_hash_hex).expect("ash is hex");
-    assert_eq!(ash_bytes.len(), 32, "account_state_hash must be 32 bytes");
-    assert!(
-        ash_bytes.iter().any(|&b| b != 0),
-        "account_state_hash must be non-zero"
-    );
-
-    let output_coins_root_hex = response_json["output_coins_root"]
-        .as_str()
-        .expect("output_coins_root present");
-    let ocr_bytes = hex::decode(output_coins_root_hex).expect("ocr is hex");
-    assert_eq!(ocr_bytes.len(), 32, "output_coins_root must be 32 bytes");
-    assert!(
-        ocr_bytes.iter().any(|&b| b != 0),
-        "output_coins_root must be non-zero"
-    );
-}
-
 /// Companion to `send_with_valid_signature_returns_proof_id_and_hashes`
 /// that drives the post-send `db::upsert_account` path against a real
 /// Postgres 17 testcontainer instead of `dead_pool`. The default
@@ -1849,582 +1659,6 @@ async fn send_with_valid_signature_returns_proof_id_and_hashes() {
 /// (b) the `accounts` row being readable from Postgres after the
 /// call. Together they pin both observable side-effects of the
 /// happy-path upsert.
-#[tokio::test]
-async fn send_with_valid_signature_persists_sender_account_to_postgres() {
-    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
-    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
-
-    let pg_container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = pg_container
-        .get_host()
-        .await
-        .expect("failed to get container host");
-    let port = pg_container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("failed to get container port");
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(
-        crate::db::connect_and_migrate(&url)
-            .await
-            .expect("connect_and_migrate failed"),
-    );
-
-    let state = live_test_state(Arc::clone(&pool));
-
-    let secret_bytes = include_bytes!("../minting_secret.bin");
-    let xpriv =
-        Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).expect("test minting xpriv");
-    let secp = secp::Secp256k1::new();
-
-    let derive_pk = |index: u32| -> PublicKey {
-        Xpub::from_priv(&secp, &xpriv)
-            .derive_pub(&secp, &[ChildNumber::Normal { index }])
-            .expect("derive_pub")
-            .public_key
-    };
-    let derive_sk = |index: u32| -> SecretKey {
-        xpriv
-            .derive_priv(&secp, &[ChildNumber::Normal { index }])
-            .expect("derive_priv")
-            .private_key
-    };
-
-    let sk_0 = derive_sk(0);
-    let pk_0 = derive_pk(0);
-    let pk_1 = derive_pk(1);
-
-    let account_address = "0x".to_string()
-        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
-            &zkcoins_program::types::MINTING_ADDRESS,
-        ));
-    let recipient = "0x".to_string() + &hex::encode([1u8; 32]);
-    let amount: u64 = 100;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    let mut hasher = Sha256::new();
-    hasher.update(account_address.as_bytes());
-    hasher.update(recipient.as_bytes());
-    hasher.update(amount.to_le_bytes());
-    hasher.update(now.to_le_bytes());
-    let hash: [u8; 32] = hasher.finalize().into();
-
-    let msg = Message::from_digest(hash);
-    let keypair = Keypair::from_secret_key(&secp, &sk_0);
-    let sig = secp.sign_schnorr(&msg, &keypair);
-
-    let body = serde_json::json!({
-        "account_address": account_address,
-        "recipient": recipient,
-        "amount": amount,
-        "public_key": hex::encode(pk_0.serialize()),
-        "next_public_key": hex::encode(pk_1.serialize()),
-        "signature": hex::encode(sig.serialize()),
-        "timestamp": now,
-    });
-
-    let req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, resp_body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::OK, "body: {resp_body}");
-    let response_json: serde_json::Value =
-        serde_json::from_str(&resp_body).expect("response is valid JSON");
-    assert_eq!(response_json["success"], true);
-    assert!(response_json["proof_id"].as_u64().is_some());
-
-    // The post-send upsert must have written the sender (minting)
-    // account row. Confirm it via a direct SELECT so the assertion
-    // doesn't depend on the handler's own read path.
-    let from_address_bytes =
-        zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS);
-    let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT data FROM accounts WHERE address = $1")
-        .bind(&from_address_bytes[..])
-        .fetch_optional(&*pool)
-        .await
-        .expect("select accounts row");
-    let (data,) = row.expect("upsert wrote the sender account row");
-    assert!(!data.is_empty(), "account blob must be non-empty");
-}
-
-#[tokio::test]
-async fn commit_with_bad_message_hex_returns_422() {
-    // Build a sendable state + perform a valid send first so a proof_id
-    // exists in the store, then send a commit that decodes-fails on the
-    // message hex.
-    let state = test_state();
-
-    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
-    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
-    let secret_bytes = include_bytes!("../minting_secret.bin");
-    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
-    let secp = secp::Secp256k1::new();
-    let derive_pk = |idx: u32| -> PublicKey {
-        Xpub::from_priv(&secp, &xpriv)
-            .derive_pub(&secp, &[ChildNumber::Normal { index: idx }])
-            .unwrap()
-            .public_key
-    };
-    let derive_sk = |idx: u32| -> SecretKey {
-        xpriv
-            .derive_priv(&secp, &[ChildNumber::Normal { index: idx }])
-            .unwrap()
-            .private_key
-    };
-
-    let pk_0 = derive_pk(0);
-    let pk_1 = derive_pk(1);
-    let sk_0 = derive_sk(0);
-
-    let account_address = "0x".to_string()
-        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
-            &zkcoins_program::types::MINTING_ADDRESS,
-        ));
-    let recipient = "0x".to_string() + &hex::encode([2u8; 32]);
-    let amount: u64 = 50;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    let mut hasher = Sha256::new();
-    hasher.update(account_address.as_bytes());
-    hasher.update(recipient.as_bytes());
-    hasher.update(amount.to_le_bytes());
-    hasher.update(now.to_le_bytes());
-    let hash: [u8; 32] = hasher.finalize().into();
-    let msg = Message::from_digest(hash);
-    let kp = Keypair::from_secret_key(&secp, &sk_0);
-    let sig = secp.sign_schnorr(&msg, &kp);
-
-    let send_body = serde_json::json!({
-        "account_address": account_address,
-        "recipient": recipient,
-        "amount": amount,
-        "public_key": hex::encode(pk_0.serialize()),
-        "next_public_key": hex::encode(pk_1.serialize()),
-        "signature": hex::encode(sig.serialize()),
-        "timestamp": now,
-    });
-    let send_req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from(send_body.to_string()))
-        .unwrap();
-    let (status, body) = send_request_with_state(state.clone(), send_req).await;
-    assert_eq!(status, StatusCode::OK, "send failed: {body}");
-    let send_resp: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let proof_id = send_resp["proof_id"].as_u64().unwrap();
-
-    // Now post a commit with garbage in the message hex.
-    let commit_body = serde_json::json!({
-        "proof_id": proof_id,
-        "public_key": hex::encode(pk_0.serialize()),
-        "signature": hex::encode([0u8; 64]),
-        "message": "not-hex-at-all-zzzz",
-    });
-    let commit_req = Request::post("/api/commit")
-        .header("content-type", "application/json")
-        .body(Body::from(commit_body.to_string()))
-        .unwrap();
-    let (status, _body) = send_request_with_state(state, commit_req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-}
-
-#[tokio::test]
-async fn commit_with_bad_signature_hex_returns_422() {
-    let state = test_state();
-
-    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
-    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
-    let secret_bytes = include_bytes!("../minting_secret.bin");
-    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
-    let secp = secp::Secp256k1::new();
-    let derive_pk = |idx: u32| -> PublicKey {
-        Xpub::from_priv(&secp, &xpriv)
-            .derive_pub(&secp, &[ChildNumber::Normal { index: idx }])
-            .unwrap()
-            .public_key
-    };
-    let derive_sk = |idx: u32| -> SecretKey {
-        xpriv
-            .derive_priv(&secp, &[ChildNumber::Normal { index: idx }])
-            .unwrap()
-            .private_key
-    };
-    let pk_0 = derive_pk(0);
-    let pk_1 = derive_pk(1);
-    let sk_0 = derive_sk(0);
-
-    let account_address = "0x".to_string()
-        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
-            &zkcoins_program::types::MINTING_ADDRESS,
-        ));
-    let recipient = "0x".to_string() + &hex::encode([3u8; 32]);
-    let amount: u64 = 50;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let mut hasher = Sha256::new();
-    hasher.update(account_address.as_bytes());
-    hasher.update(recipient.as_bytes());
-    hasher.update(amount.to_le_bytes());
-    hasher.update(now.to_le_bytes());
-    let hash: [u8; 32] = hasher.finalize().into();
-    let msg = Message::from_digest(hash);
-    let kp = Keypair::from_secret_key(&secp, &sk_0);
-    let sig = secp.sign_schnorr(&msg, &kp);
-
-    let send_body = serde_json::json!({
-        "account_address": account_address,
-        "recipient": recipient,
-        "amount": amount,
-        "public_key": hex::encode(pk_0.serialize()),
-        "next_public_key": hex::encode(pk_1.serialize()),
-        "signature": hex::encode(sig.serialize()),
-        "timestamp": now,
-    });
-    let send_req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from(send_body.to_string()))
-        .unwrap();
-    let (status, body) = send_request_with_state(state.clone(), send_req).await;
-    assert_eq!(status, StatusCode::OK, "send failed: {body}");
-    let send_resp: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let proof_id = send_resp["proof_id"].as_u64().unwrap();
-
-    // Bad signature hex (odd length).
-    let commit_body = serde_json::json!({
-        "proof_id": proof_id,
-        "public_key": hex::encode(pk_0.serialize()),
-        "signature": "zzz",
-        "message": hex::encode([0u8; 32]),
-    });
-    let commit_req = Request::post("/api/commit")
-        .header("content-type", "application/json")
-        .body(Body::from(commit_body.to_string()))
-        .unwrap();
-    let (status, _body) = send_request_with_state(state, commit_req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-}
-
-#[tokio::test]
-async fn commit_with_unverifiable_commitment_returns_401() {
-    let state = test_state();
-
-    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
-    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
-    let secret_bytes = include_bytes!("../minting_secret.bin");
-    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
-    let secp = secp::Secp256k1::new();
-    let derive_pk = |idx: u32| -> PublicKey {
-        Xpub::from_priv(&secp, &xpriv)
-            .derive_pub(&secp, &[ChildNumber::Normal { index: idx }])
-            .unwrap()
-            .public_key
-    };
-    let derive_sk = |idx: u32| -> SecretKey {
-        xpriv
-            .derive_priv(&secp, &[ChildNumber::Normal { index: idx }])
-            .unwrap()
-            .private_key
-    };
-    let pk_0 = derive_pk(0);
-    let pk_1 = derive_pk(1);
-    let sk_0 = derive_sk(0);
-
-    let account_address = "0x".to_string()
-        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
-            &zkcoins_program::types::MINTING_ADDRESS,
-        ));
-    let recipient = "0x".to_string() + &hex::encode([4u8; 32]);
-    let amount: u64 = 50;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let mut hasher = Sha256::new();
-    hasher.update(account_address.as_bytes());
-    hasher.update(recipient.as_bytes());
-    hasher.update(amount.to_le_bytes());
-    hasher.update(now.to_le_bytes());
-    let hash: [u8; 32] = hasher.finalize().into();
-    let msg = Message::from_digest(hash);
-    let kp = Keypair::from_secret_key(&secp, &sk_0);
-    let sig = secp.sign_schnorr(&msg, &kp);
-
-    let send_body = serde_json::json!({
-        "account_address": account_address,
-        "recipient": recipient,
-        "amount": amount,
-        "public_key": hex::encode(pk_0.serialize()),
-        "next_public_key": hex::encode(pk_1.serialize()),
-        "signature": hex::encode(sig.serialize()),
-        "timestamp": now,
-    });
-    let send_req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from(send_body.to_string()))
-        .unwrap();
-    let (status, body) = send_request_with_state(state.clone(), send_req).await;
-    assert_eq!(status, StatusCode::OK, "send failed: {body}");
-
-    // Valid hex shapes but the commitment signature won't verify against
-    // the message+public_key combination.
-    let commit_body = serde_json::json!({
-        "proof_id": serde_json::from_str::<serde_json::Value>(&body).unwrap()["proof_id"],
-        "public_key": hex::encode(pk_0.serialize()),
-        "signature": hex::encode([0u8; 64]),
-        "message": hex::encode([0u8; 64]),
-    });
-    let commit_req = Request::post("/api/commit")
-        .header("content-type", "application/json")
-        .body(Body::from(commit_body.to_string()))
-        .unwrap();
-    let (status, _body) = send_request_with_state(state, commit_req).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn send_with_invalid_signature_returns_401() {
-    let body = serde_json::json!({
-        "account_address": "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS)),
-        "recipient": "0x".to_string() + &hex::encode([1u8; 32]),
-        "amount": 50,
-        "public_key": hex::encode([2u8; 33]), // garbage compressed pubkey of valid length
-        "next_public_key": hex::encode([3u8; 33]),
-        "signature": hex::encode([0u8; 64]),  // valid hex shape but wrong sig
-        "timestamp": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
-    });
-    let req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, _) = send_request(req).await;
-    // serde will reject "02" + [2u8;32] as not-a-valid-pubkey at body parsing,
-    // so we accept either UNPROCESSABLE_ENTITY (parse-failed) or UNAUTHORIZED
-    // (parse-succeeded but signature verification failed).
-    assert!(
-        status == StatusCode::UNAUTHORIZED || status == StatusCode::UNPROCESSABLE_ENTITY,
-        "expected 401 or 422, got {status}"
-    );
-}
-
-#[tokio::test]
-async fn send_with_non_hex_account_address_returns_422() {
-    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
-    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
-    let secret_bytes = include_bytes!("../minting_secret.bin");
-    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
-    let secp = secp::Secp256k1::new();
-    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .public_key;
-    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
-        .unwrap()
-        .public_key;
-    let sk_0: SecretKey = xpriv
-        .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .private_key;
-
-    let account_address = "not-hex-at-all".to_string();
-    let recipient = "0x".to_string() + &hex::encode([1u8; 32]);
-    let amount: u64 = 50;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let mut hasher = Sha256::new();
-    hasher.update(account_address.as_bytes());
-    hasher.update(recipient.as_bytes());
-    hasher.update(amount.to_le_bytes());
-    hasher.update(now.to_le_bytes());
-    let hash: [u8; 32] = hasher.finalize().into();
-    let msg = Message::from_digest(hash);
-    let kp = Keypair::from_secret_key(&secp, &sk_0);
-    let sig = secp.sign_schnorr(&msg, &kp);
-
-    let body = serde_json::json!({
-        "account_address": account_address,
-        "recipient": recipient,
-        "amount": amount,
-        "public_key": hex::encode(pk_0.serialize()),
-        "next_public_key": hex::encode(pk_1.serialize()),
-        "signature": hex::encode(sig.serialize()),
-        "timestamp": now,
-    });
-    let req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, _) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-}
-
-#[tokio::test]
-async fn send_with_wrong_length_address_returns_422() {
-    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
-    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
-    let secret_bytes = include_bytes!("../minting_secret.bin");
-    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
-    let secp = secp::Secp256k1::new();
-    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .public_key;
-    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
-        .unwrap()
-        .public_key;
-    let sk_0: SecretKey = xpriv
-        .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .private_key;
-
-    // Account address is parseable hex but only 16 bytes, not 32.
-    let account_address = "0x".to_string() + &hex::encode([1u8; 16]);
-    let recipient = "0x".to_string() + &hex::encode([2u8; 32]);
-    let amount: u64 = 50;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let mut hasher = Sha256::new();
-    hasher.update(account_address.as_bytes());
-    hasher.update(recipient.as_bytes());
-    hasher.update(amount.to_le_bytes());
-    hasher.update(now.to_le_bytes());
-    let hash: [u8; 32] = hasher.finalize().into();
-    let msg = Message::from_digest(hash);
-    let kp = Keypair::from_secret_key(&secp, &sk_0);
-    let sig = secp.sign_schnorr(&msg, &kp);
-
-    let body = serde_json::json!({
-        "account_address": account_address,
-        "recipient": recipient,
-        "amount": amount,
-        "public_key": hex::encode(pk_0.serialize()),
-        "next_public_key": hex::encode(pk_1.serialize()),
-        "signature": hex::encode(sig.serialize()),
-        "timestamp": now,
-    });
-    let req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, _) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-}
-
-#[tokio::test]
-async fn send_with_insufficient_funds_returns_422_with_error_string() {
-    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
-    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
-
-    // Build a state where the minting account has been emptied.
-    let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut account_node = AccountNode::new(Arc::clone(&state_arc));
-    let mut empty_minting = Account::new();
-    empty_minting.balance = 0;
-    account_node.import_account(*zkcoins_program::types::MINTING_ADDRESS, empty_minting);
-    let minting_client = {
-        let secret = include_bytes!("../minting_secret.bin");
-        let private_key = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Signet, secret)
-            .expect("test minting xpriv");
-        shared::ClientAccount::new(private_key)
-    };
-    let state = AppState {
-        account_node: Arc::new(Mutex::new(account_node)),
-        proof_store: Arc::new(ProofStore::new("/tmp/zkcoins-test-proofs-empty")),
-        minting_account: Arc::new(Mutex::new(minting_client)),
-        username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
-        pool: dead_pool(),
-        esplora_config: Arc::new(crate::publisher::EsploraConfig {
-            url: "http://127.0.0.1:1/api".to_string(),
-            is_mainnet: false,
-            network_name: "Mutinynet".to_string(),
-            ws_url: None,
-        }),
-        prover_warm: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        phase2_reached: Arc::new(tokio::sync::Notify::new()),
-        phase3_release_lock: Arc::new(tokio::sync::Mutex::new(())),
-        state_advance_release_lock: Arc::new(tokio::sync::Mutex::new(())),
-    };
-
-    let secret_bytes = include_bytes!("../minting_secret.bin");
-    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
-    let secp = secp::Secp256k1::new();
-    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .public_key;
-    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
-        .unwrap()
-        .public_key;
-    let sk_0: SecretKey = xpriv
-        .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .private_key;
-
-    let account_address = "0x".to_string()
-        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
-            &zkcoins_program::types::MINTING_ADDRESS,
-        ));
-    let recipient = "0x".to_string() + &hex::encode([1u8; 32]);
-    let amount: u64 = 100;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let mut hasher = Sha256::new();
-    hasher.update(account_address.as_bytes());
-    hasher.update(recipient.as_bytes());
-    hasher.update(amount.to_le_bytes());
-    hasher.update(now.to_le_bytes());
-    let hash: [u8; 32] = hasher.finalize().into();
-    let msg = Message::from_digest(hash);
-    let kp = Keypair::from_secret_key(&secp, &sk_0);
-    let sig = secp.sign_schnorr(&msg, &kp);
-
-    let body = serde_json::json!({
-        "account_address": account_address,
-        "recipient": recipient,
-        "amount": amount,
-        "public_key": hex::encode(pk_0.serialize()),
-        "next_public_key": hex::encode(pk_1.serialize()),
-        "signature": hex::encode(sig.serialize()),
-        "timestamp": now,
-    });
-    let req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, body) = send_request_with_state(state, req).await;
-    // After the Item 1 HTTP error-mapping landed (see PR following #28),
-    // send_coins failures surface as 4xx with body.error rather than
-    // 200 + success:false. Insufficient funds maps to 422.
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(resp["success"], false);
-    assert_eq!(resp["error"], "Insufficient funds");
-}
 
 #[tokio::test]
 async fn receive_coin_with_invalid_bincode_returns_default_response() {
@@ -2436,63 +1670,6 @@ async fn receive_coin_with_invalid_bincode_returns_default_response() {
     assert_eq!(status, StatusCode::OK);
     let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(resp["success"], false);
-}
-
-#[tokio::test]
-async fn send_with_non_hex_recipient_returns_422() {
-    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
-    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
-    let secret_bytes = include_bytes!("../minting_secret.bin");
-    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
-    let secp = secp::Secp256k1::new();
-    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .public_key;
-    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
-        .unwrap()
-        .public_key;
-    let sk_0: SecretKey = xpriv
-        .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .private_key;
-
-    let account_address = "0x".to_string()
-        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
-            &zkcoins_program::types::MINTING_ADDRESS,
-        ));
-    let recipient = "absolutely-not-hex".to_string();
-    let amount: u64 = 1;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let mut hasher = Sha256::new();
-    hasher.update(account_address.as_bytes());
-    hasher.update(recipient.as_bytes());
-    hasher.update(amount.to_le_bytes());
-    hasher.update(now.to_le_bytes());
-    let hash: [u8; 32] = hasher.finalize().into();
-    let msg = Message::from_digest(hash);
-    let kp = Keypair::from_secret_key(&secp, &sk_0);
-    let sig = secp.sign_schnorr(&msg, &kp);
-
-    let body = serde_json::json!({
-        "account_address": account_address,
-        "recipient": recipient,
-        "amount": amount,
-        "public_key": hex::encode(pk_0.serialize()),
-        "next_public_key": hex::encode(pk_1.serialize()),
-        "signature": hex::encode(sig.serialize()),
-        "timestamp": now,
-    });
-    let req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, _) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 // -----------------------------------------------------------------
@@ -2535,160 +1712,6 @@ fn lock_or_recover_recovers_from_poisoned_mutex() {
     // Recovering must succeed and yield the inner value.
     let guard = lock_or_recover(&mutex);
     assert_eq!(*guard, 42);
-}
-
-#[tokio::test]
-async fn commit_with_valid_signature_fails_broadcast_returns_503() {
-    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
-    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    // Spin up a wiremock Esplora that returns the publisher's UTXOs
-    // (so `get_publisher_utxo` finds inputs) but FAILS the broadcast
-    // with a 400. This pins the test to "valid signature, broadcast
-    // genuinely fails → 503" instead of "valid signature, broadcast
-    // might or might not succeed against a public Mutinynet". The
-    // previous accept-either assertion masked a hypothetical
-    // regression where the handler returned 200 without actually
-    // broadcasting.
-    let mock_server = MockServer::start().await;
-    let secp = secp::Secp256k1::new();
-    let publisher_sk = SecretKey::from_slice(
-        &hex::decode("0000000000000000000000000000000000000000000000000000000000000001").unwrap(),
-    )
-    .expect("CI test publisher key parses");
-    let publisher_kp = Keypair::from_secret_key(&secp, &publisher_sk);
-    let (publisher_xonly, _) = bitcoin::secp256k1::XOnlyPublicKey::from_keypair(&publisher_kp);
-    let publisher_address =
-        bitcoin::Address::p2tr(&secp, publisher_xonly, None, bitcoin::Network::Signet);
-    Mock::given(method("GET"))
-        .and(path(format!("/address/{}/utxo", publisher_address)))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-            {
-                "txid": "4444444444444444444444444444444444444444444444444444444444444444",
-                "vout": 0,
-                "value": 100_000,
-                "status": {
-                    "confirmed": true,
-                    "block_height": 100,
-                    "block_hash": "0000000000000000000000000000000000000000000000000000000000000001",
-                    "block_time": 1_700_000_000
-                }
-            }
-        ])))
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/tx"))
-        .respond_with(
-            ResponseTemplate::new(400).set_body_string("sendrawtransaction RPC error -25"),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let mut state = test_state();
-    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
-        url: mock_server.uri(),
-        is_mainnet: false,
-        network_name: "Mutinynet".to_string(),
-        ws_url: None,
-    });
-
-    let secret_bytes = include_bytes!("../minting_secret.bin");
-    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
-    let secp = secp::Secp256k1::new();
-    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .public_key;
-    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
-        .unwrap()
-        .public_key;
-    let sk_0: SecretKey = xpriv
-        .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .private_key;
-
-    // Send first to get proof_id + the hashes the client signs over.
-    let account_address = "0x".to_string()
-        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
-            &zkcoins_program::types::MINTING_ADDRESS,
-        ));
-    let recipient = "0x".to_string() + &hex::encode([5u8; 32]);
-    let amount: u64 = 50;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let mut hasher = Sha256::new();
-    hasher.update(account_address.as_bytes());
-    hasher.update(recipient.as_bytes());
-    hasher.update(amount.to_le_bytes());
-    hasher.update(now.to_le_bytes());
-    let hash: [u8; 32] = hasher.finalize().into();
-    let msg = Message::from_digest(hash);
-    let kp = Keypair::from_secret_key(&secp, &sk_0);
-    let sig = secp.sign_schnorr(&msg, &kp);
-
-    let send_body = serde_json::json!({
-        "account_address": account_address,
-        "recipient": recipient,
-        "amount": amount,
-        "public_key": hex::encode(pk_0.serialize()),
-        "next_public_key": hex::encode(pk_1.serialize()),
-        "signature": hex::encode(sig.serialize()),
-        "timestamp": now,
-    });
-    let send_req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from(send_body.to_string()))
-        .unwrap();
-    let (status, body) = send_request_with_state(state.clone(), send_req).await;
-    assert_eq!(status, StatusCode::OK, "send failed: {body}");
-    let send_resp: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let proof_id = send_resp["proof_id"].as_u64().unwrap();
-    let ash_hex = send_resp["account_state_hash"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let ocr_hex = send_resp["output_coins_root"].as_str().unwrap().to_string();
-
-    // Build a valid commitment that the handler will accept.
-    let ash_bytes = hex::decode(&ash_hex).unwrap();
-    let ocr_bytes = hex::decode(&ocr_hex).unwrap();
-    let mut commit_message = Vec::with_capacity(ash_bytes.len() + ocr_bytes.len());
-    commit_message.extend_from_slice(&ash_bytes);
-    commit_message.extend_from_slice(&ocr_bytes);
-    // Commitment::new SHA256s the message internally, so just pass the
-    // pre-image bytes the handler will receive.
-    let commitment = shared::commitment::Commitment::new(&sk_0, commit_message.clone())
-        .expect("commitment creation");
-    assert!(commitment.verify(), "test commitment must verify locally");
-
-    let commit_body = serde_json::json!({
-        "proof_id": proof_id,
-        "public_key": hex::encode(commitment.public_key.serialize()),
-        "signature": hex::encode(commitment.signature.serialize()),
-        "message": hex::encode(&commitment.message),
-    });
-    let commit_req = Request::post("/api/commit")
-        .header("content-type", "application/json")
-        .body(Body::from(commit_body.to_string()))
-        .unwrap();
-    let (status, _) = send_request_with_state(state, commit_req).await;
-    // The commitment verifies, the handler proceeds to broadcast. The
-    // wiremock Esplora rejects the broadcast (400) so the handler MUST
-    // return SERVICE_UNAVAILABLE. Anything else means the handler
-    // either bypassed the broadcast (a regression — it should always
-    // attempt it on a valid commitment) or fabricated a 200 response
-    // despite the upstream failure (a worse regression).
-    assert_eq!(
-        status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "expected 503 from valid-commit + broken-broadcast, got {status}"
-    );
 }
 
 #[test]
@@ -2744,431 +1767,6 @@ fn persist_proof_bytes_succeeds_when_write_succeeds() {
     let path = tmp.path().join("99.bin");
     ProofStore::persist_proof_bytes(&path, b"payload", 99);
     assert_eq!(std::fs::read(&path).unwrap(), b"payload");
-}
-
-#[tokio::test]
-async fn commit_with_wrong_length_signature_returns_422() {
-    let state = test_state();
-
-    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
-    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
-    let secret_bytes = include_bytes!("../minting_secret.bin");
-    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
-    let secp = secp::Secp256k1::new();
-    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .public_key;
-    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
-        .unwrap()
-        .public_key;
-    let sk_0: SecretKey = xpriv
-        .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .private_key;
-
-    let account_address = "0x".to_string()
-        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
-            &zkcoins_program::types::MINTING_ADDRESS,
-        ));
-    let recipient = "0x".to_string() + &hex::encode([6u8; 32]);
-    let amount: u64 = 1;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let mut hasher = Sha256::new();
-    hasher.update(account_address.as_bytes());
-    hasher.update(recipient.as_bytes());
-    hasher.update(amount.to_le_bytes());
-    hasher.update(now.to_le_bytes());
-    let hash: [u8; 32] = hasher.finalize().into();
-    let msg = Message::from_digest(hash);
-    let kp = Keypair::from_secret_key(&secp, &sk_0);
-    let sig = secp.sign_schnorr(&msg, &kp);
-
-    let send_body = serde_json::json!({
-        "account_address": account_address,
-        "recipient": recipient,
-        "amount": amount,
-        "public_key": hex::encode(pk_0.serialize()),
-        "next_public_key": hex::encode(pk_1.serialize()),
-        "signature": hex::encode(sig.serialize()),
-        "timestamp": now,
-    });
-    let send_req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from(send_body.to_string()))
-        .unwrap();
-    let (status, body) = send_request_with_state(state.clone(), send_req).await;
-    assert_eq!(status, StatusCode::OK, "send failed: {body}");
-    let send_resp: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let proof_id = send_resp["proof_id"].as_u64().unwrap();
-
-    // Signature hex is parseable, but length is wrong (1 byte instead of 64).
-    let commit_body = serde_json::json!({
-        "proof_id": proof_id,
-        "public_key": hex::encode(pk_0.serialize()),
-        "signature": "00",
-        "message": hex::encode([0u8; 32]),
-    });
-    let commit_req = Request::post("/api/commit")
-        .header("content-type", "application/json")
-        .body(Body::from(commit_body.to_string()))
-        .unwrap();
-    let (status, _) = send_request_with_state(state, commit_req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-}
-
-#[tokio::test]
-async fn receive_coin_with_valid_proof_succeeds() {
-    let state = test_state();
-
-    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
-    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
-    let secret_bytes = include_bytes!("../minting_secret.bin");
-    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
-    let secp = secp::Secp256k1::new();
-    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .public_key;
-    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
-        .unwrap()
-        .public_key;
-    let sk_0: SecretKey = xpriv
-        .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .private_key;
-
-    let account_address = "0x".to_string()
-        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
-            &zkcoins_program::types::MINTING_ADDRESS,
-        ));
-    let recipient = "0x".to_string() + &hex::encode([7u8; 32]);
-    let amount: u64 = 1;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let mut hasher = Sha256::new();
-    hasher.update(account_address.as_bytes());
-    hasher.update(recipient.as_bytes());
-    hasher.update(amount.to_le_bytes());
-    hasher.update(now.to_le_bytes());
-    let hash: [u8; 32] = hasher.finalize().into();
-    let msg = Message::from_digest(hash);
-    let kp = Keypair::from_secret_key(&secp, &sk_0);
-    let sig = secp.sign_schnorr(&msg, &kp);
-
-    let send_body = serde_json::json!({
-        "account_address": account_address,
-        "recipient": recipient,
-        "amount": amount,
-        "public_key": hex::encode(pk_0.serialize()),
-        "next_public_key": hex::encode(pk_1.serialize()),
-        "signature": hex::encode(sig.serialize()),
-        "timestamp": now,
-    });
-    let send_req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from(send_body.to_string()))
-        .unwrap();
-    let (status, body) = send_request_with_state(state.clone(), send_req).await;
-    assert_eq!(status, StatusCode::OK, "send failed: {body}");
-    let proof_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["proof_id"]
-        .as_u64()
-        .unwrap();
-
-    // Read the stored proof bytes via /api/proof/:id and POST them back
-    // to /api/receive — this should exercise the success path of
-    // receive_coin_handler.
-    let proof_req = Request::get(format!("/api/proof/{}", proof_id))
-        .body(Body::empty())
-        .unwrap();
-    let app = create_router(state.clone());
-    let proof_resp = app.oneshot(proof_req).await.unwrap();
-    assert_eq!(proof_resp.status(), StatusCode::OK);
-    let proof_bytes = proof_resp.into_body().collect().await.unwrap().to_bytes();
-    assert!(!proof_bytes.is_empty());
-
-    let receive_req = Request::post("/api/receive")
-        .header("content-type", "application/octet-stream")
-        .body(Body::from(proof_bytes.to_vec()))
-        .unwrap();
-    let (status, body) = send_request_with_state(state, receive_req).await;
-    assert_eq!(status, StatusCode::OK);
-    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(
-        resp["success"], true,
-        "receive should report success: {body}"
-    );
-}
-
-#[tokio::test]
-async fn send_with_wrong_signature_returns_401() {
-    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
-    use bitcoin::secp256k1::PublicKey;
-    let secret_bytes = include_bytes!("../minting_secret.bin");
-    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
-    let secp = secp::Secp256k1::new();
-    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .public_key;
-    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
-        .unwrap()
-        .public_key;
-
-    let account_address = "0x".to_string()
-        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
-            &zkcoins_program::types::MINTING_ADDRESS,
-        ));
-    let recipient = "0x".to_string() + &hex::encode([8u8; 32]);
-    let amount: u64 = 1;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    // 64 zero bytes — valid hex shape, valid signature length, but
-    // will never verify against the request's pk_0 over the SHA256
-    // of (account_address || recipient || amount || timestamp).
-    let body = serde_json::json!({
-        "account_address": account_address,
-        "recipient": recipient,
-        "amount": amount,
-        "public_key": hex::encode(pk_0.serialize()),
-        "next_public_key": hex::encode(pk_1.serialize()),
-        "signature": hex::encode([0u8; 64]),
-        "timestamp": now,
-    });
-    let req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, _) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn receive_coin_duplicate_returns_success_false() {
-    // After a valid receive, posting the same proof bytes again should
-    // exercise the Err arm of account_node.receive_coin (duplicate
-    // detection via coin_queue).
-    let state = test_state();
-
-    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
-    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
-    let secret_bytes = include_bytes!("../minting_secret.bin");
-    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
-    let secp = secp::Secp256k1::new();
-    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .public_key;
-    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
-        .unwrap()
-        .public_key;
-    let sk_0: SecretKey = xpriv
-        .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .private_key;
-
-    let account_address = "0x".to_string()
-        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
-            &zkcoins_program::types::MINTING_ADDRESS,
-        ));
-    let recipient = "0x".to_string() + &hex::encode([9u8; 32]);
-    let amount: u64 = 1;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let mut hasher = Sha256::new();
-    hasher.update(account_address.as_bytes());
-    hasher.update(recipient.as_bytes());
-    hasher.update(amount.to_le_bytes());
-    hasher.update(now.to_le_bytes());
-    let hash: [u8; 32] = hasher.finalize().into();
-    let msg = Message::from_digest(hash);
-    let kp = Keypair::from_secret_key(&secp, &sk_0);
-    let sig = secp.sign_schnorr(&msg, &kp);
-
-    let send_body = serde_json::json!({
-        "account_address": account_address,
-        "recipient": recipient,
-        "amount": amount,
-        "public_key": hex::encode(pk_0.serialize()),
-        "next_public_key": hex::encode(pk_1.serialize()),
-        "signature": hex::encode(sig.serialize()),
-        "timestamp": now,
-    });
-    let send_req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from(send_body.to_string()))
-        .unwrap();
-    let (status, body) = send_request_with_state(state.clone(), send_req).await;
-    assert_eq!(status, StatusCode::OK, "send failed: {body}");
-    let proof_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["proof_id"]
-        .as_u64()
-        .unwrap();
-
-    let app = create_router(state.clone());
-    let proof_resp = app
-        .oneshot(
-            Request::get(format!("/api/proof/{}", proof_id))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let proof_bytes = proof_resp.into_body().collect().await.unwrap().to_bytes();
-
-    // First receive: succeeds.
-    let receive_req = Request::post("/api/receive")
-        .header("content-type", "application/octet-stream")
-        .body(Body::from(proof_bytes.to_vec()))
-        .unwrap();
-    let (status, body) = send_request_with_state(state.clone(), receive_req).await;
-    assert_eq!(status, StatusCode::OK);
-    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(resp["success"], true);
-
-    // Second receive of the same bytes: receive_coin returns Err, the
-    // handler responds with success=false (the L351 Err arm).
-    let receive_req = Request::post("/api/receive")
-        .header("content-type", "application/octet-stream")
-        .body(Body::from(proof_bytes.to_vec()))
-        .unwrap();
-    let (status, body) = send_request_with_state(state, receive_req).await;
-    assert_eq!(status, StatusCode::OK);
-    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(resp["success"], false);
-}
-
-#[tokio::test]
-async fn send_without_signature_returns_401_missing_signature() {
-    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
-    use bitcoin::secp256k1::PublicKey;
-    let secret_bytes = include_bytes!("../minting_secret.bin");
-    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
-    let secp = secp::Secp256k1::new();
-    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .public_key;
-    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
-        .unwrap()
-        .public_key;
-
-    // signature field omitted entirely -> request.signature is None.
-    // Before the require-signature fix, the handler silently skipped
-    // signature verification and proceeded with the send — a security
-    // gap that let an unauthenticated caller spend any known account.
-    // The handler now rejects with 401 + the app-known
-    // `"Missing signature"` string.
-    let body = serde_json::json!({
-        "account_address": "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS)),
-        "recipient": "0x".to_string() + &hex::encode([1u8; 32]),
-        "amount": 1,
-        "public_key": hex::encode(pk_0.serialize()),
-        "next_public_key": hex::encode(pk_1.serialize()),
-    });
-    let req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
-    assert_eq!(v["success"], false);
-    assert_eq!(v["error"], "Missing signature");
-}
-
-#[tokio::test]
-async fn send_without_timestamp_returns_401_missing_signature() {
-    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
-    use bitcoin::secp256k1::PublicKey;
-    let secret_bytes = include_bytes!("../minting_secret.bin");
-    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
-    let secp = secp::Secp256k1::new();
-    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .public_key;
-    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
-        .unwrap()
-        .public_key;
-
-    // signature present but timestamp omitted: the signed payload is
-    // incomplete (the signature commits to the timestamp). Collapsed
-    // into the same `"Missing signature"` response since neither half
-    // is independently useful and the app maps only one error code.
-    let body = serde_json::json!({
-        "account_address": "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS)),
-        "recipient": "0x".to_string() + &hex::encode([1u8; 32]),
-        "amount": 1,
-        "public_key": hex::encode(pk_0.serialize()),
-        "next_public_key": hex::encode(pk_1.serialize()),
-        "signature": "ab".repeat(64),
-    });
-    let req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
-    assert_eq!(v["error"], "Missing signature");
-}
-
-#[tokio::test]
-async fn send_with_stale_timestamp_returns_401_request_timestamp() {
-    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
-    use bitcoin::secp256k1::PublicKey;
-    let secret_bytes = include_bytes!("../minting_secret.bin");
-    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
-    let secp = secp::Secp256k1::new();
-    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .public_key;
-    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
-        .unwrap()
-        .public_key;
-
-    // Stale timestamp: well outside MAX_TIMESTAMP_SKEW_SECS. Signature
-    // present so the upstream Missing-signature gate passes — the
-    // request reaches `check_timestamp_window` and trips its dedicated
-    // 401 branch (router.rs:674-677). Distinct from the "Signature
-    // verification failed" string that the signature-verify path would
-    // emit otherwise.
-    let stale_timestamp: u64 = 1u64; // 1970, definitely > 300s in the past
-    let body = serde_json::json!({
-        "account_address": "0x".to_string() + &hex::encode(zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS)),
-        "recipient": "0x".to_string() + &hex::encode([1u8; 32]),
-        "amount": 1,
-        "public_key": hex::encode(pk_0.serialize()),
-        "next_public_key": hex::encode(pk_1.serialize()),
-        "signature": "ab".repeat(64),
-        "timestamp": stale_timestamp,
-    });
-    let req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
-    assert_eq!(v["error"], "Request timestamp too old or in the future");
 }
 
 #[test]
@@ -3376,69 +1974,6 @@ fn map_send_coins_error_unknown_string_is_500_internal_error() {
     let (status, body) = crate::router::map_send_coins_error("a string we never added");
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(body, "internal error");
-}
-
-#[tokio::test]
-async fn send_with_unknown_account_returns_404_with_error_string() {
-    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
-    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
-
-    // test_state() only seeds the minting account. Any other 32-byte
-    // address is unknown to the account_node, so send_coins returns
-    // "Unknown account address" which the handler maps to 404.
-    let secret_bytes = include_bytes!("../minting_secret.bin");
-    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
-    let secp = secp::Secp256k1::new();
-    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .public_key;
-    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
-        .unwrap()
-        .public_key;
-    let sk_0: SecretKey = xpriv
-        .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .private_key;
-
-    // An address that is well-formed (hex, 32 bytes) but never claimed
-    // an account on the node.
-    let account_address = "0x".to_string() + &hex::encode([0xAAu8; 32]);
-    let recipient = "0x".to_string() + &hex::encode([1u8; 32]);
-    let amount: u64 = 50;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let mut hasher = Sha256::new();
-    hasher.update(account_address.as_bytes());
-    hasher.update(recipient.as_bytes());
-    hasher.update(amount.to_le_bytes());
-    hasher.update(now.to_le_bytes());
-    let hash: [u8; 32] = hasher.finalize().into();
-    let msg = Message::from_digest(hash);
-    let kp = Keypair::from_secret_key(&secp, &sk_0);
-    let sig = secp.sign_schnorr(&msg, &kp);
-
-    let body = serde_json::json!({
-        "account_address": account_address,
-        "recipient": recipient,
-        "amount": amount,
-        "public_key": hex::encode(pk_0.serialize()),
-        "next_public_key": hex::encode(pk_1.serialize()),
-        "signature": hex::encode(sig.serialize()),
-        "timestamp": now,
-    });
-    let req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(resp["success"], false);
-    assert_eq!(resp["error"], "Unknown account address");
 }
 
 // =======================================================================
@@ -3808,1675 +2343,1510 @@ fn mint_test_state() -> AppState {
             ws_url: None,
         }),
         prover_warm: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        phase2_reached: Arc::new(tokio::sync::Notify::new()),
-        phase3_release_lock: Arc::new(tokio::sync::Mutex::new(())),
-        state_advance_release_lock: Arc::new(tokio::sync::Mutex::new(())),
+        job_store: Arc::new(crate::job_store::JobStore::new((*dead_pool()).clone())),
+        job_tx: tokio::sync::mpsc::channel::<crate::job_dispatcher::JobEnvelope>(8).0,
+        job_notify_map: Arc::new(dashmap::DashMap::new()),
     }
 }
 
-/// Variant of [`mint_test_state`] that DROPS the minting account so
-/// `get_minting_account_address` returns Err — drives the 500
-/// "Minting account not configured" arm in `mint_handler`.
-fn mint_test_state_without_minting_account() -> AppState {
-    let state = mint_test_state();
-    {
-        let mut node = state.account_node.lock().unwrap();
-        // Reset to a brand-new node with no accounts at all. The
-        // `Arc<Mutex<State>>` inside `node` is replaced too, but the
-        // shared `state_inner` is dropped on overwrite which is fine
-        // — nothing else holds it after `mint_test_state` returns.
-        *node = AccountNode::new(Arc::new(Mutex::new(State::new())));
-    }
-    state
-}
+// =======================================================================
+// Job-API admit + poll handler coverage (PR1: /api/jobs/*).
+// =======================================================================
+//
+// The handlers themselves are thin: validate the request shape +
+// idempotency header, `JobStore::create`, hand the public_id to the
+// dispatcher channel, return 202. Coverage targets the
+// admit-handler arms only; the dispatcher's prove + broadcast legs
+// live in `flow::*` / `job_dispatcher::*` (coverage-excluded — see
+// the CI `--ignore-filename-regex` flag) and are exercised
+// end-to-end by the post-deploy API E2E suite.
 
-#[tokio::test]
-async fn mint_invalid_hex_address_returns_422() {
-    let body = serde_json::json!({
-        "account_address": "not_hex",
-        "amount": 100u64,
-    });
-    let req = Request::post("/api/mint")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, resp_body) = send_request_with_state(mint_test_state(), req).await;
-
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
-    assert_eq!(v["success"], false);
-    assert_eq!(v["error"], "account_address is not valid hex");
-}
-
-#[tokio::test]
-async fn mint_wrong_address_length_returns_422() {
-    // 16 bytes of hex (32 chars) — well-formed hex but not 32 bytes,
-    // so the length check fires.
-    let body = serde_json::json!({
-        "account_address": "0x".to_string() + &"ab".repeat(16),
-        "amount": 100u64,
-    });
-    let req = Request::post("/api/mint")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, resp_body) = send_request_with_state(mint_test_state(), req).await;
-
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
-    assert_eq!(v["success"], false);
-    assert_eq!(
-        v["error"],
-        "account_address must be 32 bytes (64 hex chars)"
-    );
-}
-
-#[tokio::test]
-async fn mint_without_minting_account_returns_500() {
-    let body = serde_json::json!({
-        "account_address": "0x".to_string() + &hex::encode([1u8; 32]),
-        "amount": 100u64,
-    });
-    let req = Request::post("/api/mint")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, resp_body) =
-        send_request_with_state(mint_test_state_without_minting_account(), req).await;
-
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
-    assert_eq!(v["success"], false);
-    assert_eq!(v["error"], "Minting account not configured");
-}
-
-#[tokio::test]
-async fn mint_insufficient_funds_returns_422() {
-    // Replace the minting account's balance with zero so `send_coins`
-    // bails out on the balance check (Err arm of `mint_handler`'s
-    // outer match) before paying the prover cost. Maps to 422 via
-    // `send_coins_error_response`.
-    let state = mint_test_state();
-    {
-        let mut node = state.account_node.lock().unwrap();
-        // Re-import the minting account with balance=0. The previous
-        // import is overwritten by HashMap semantics inside
-        // `import_account`.
-        let mut empty = Account::new();
-        empty.balance = 0;
-        node.import_account(*zkcoins_program::types::MINTING_ADDRESS, empty);
-    }
-
-    let body = serde_json::json!({
-        "account_address": "0x".to_string() + &hex::encode([1u8; 32]),
-        "amount": 100u64,
-    });
-    let req = Request::post("/api/mint")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, resp_body) = send_request_with_state(state, req).await;
-
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
-    assert_eq!(v["success"], false);
-    assert_eq!(v["error"], "Insufficient funds");
-}
-
-/// Drives `mint_handler` through the prepare-then-broadcast phases:
-/// `prepare_mint` runs the full prover, builds the commitment, then
-/// the inscription broadcast fails against the default unreachable
-/// `esplora_config` (127.0.0.1:1) and the handler returns 503.
-///
-/// **zk-coins/node#89 regression guard.** The asserts below pin the
-/// no-state-advance contract that the prepare-then-commit refactor
-/// introduced: after a broadcast failure the in-memory
-/// `minting_account.num_pubkeys` MUST still be 0, the minting
-/// `Account` in the node's map MUST still have an empty
-/// `coin_queue`, `proof = None`, and the unchanged seed balance, and
-/// the recipient account MUST NOT exist yet. Before this PR the
-/// handler had already bumped the counter + mutated the minting
-/// `Account` + (in the soft-fail DEV flavour) returned 200 — see the
-/// issue text for the production manifestation.
-#[tokio::test]
-async fn mint_broadcast_failure_returns_503() {
-    let state = mint_test_state();
-    let recipient_bytes = [7u8; 32];
-    let recipient_addr = zkcoins_program::hash::digest_from_bytes(&recipient_bytes);
-
-    // Snapshot the pre-mint minting Account so we can prove the
-    // failed-broadcast path leaves it byte-identical.
-    let minting_balance_before: u64;
-    let minting_coin_queue_len_before: usize;
-    let minting_proof_some_before: bool;
-    {
-        let account_node_guard = state.account_node.lock().unwrap();
-        let acct = account_node_guard
-            .get_account(&zkcoins_program::types::MINTING_ADDRESS)
-            .expect("minting account seeded by mint_test_state");
-        minting_balance_before = acct.balance;
-        minting_coin_queue_len_before = acct.coin_queue.len();
-        minting_proof_some_before = acct.proof.is_some();
-    }
-    let num_pubkeys_before = state.minting_account.lock().unwrap().num_pubkeys;
-    assert_eq!(
-        num_pubkeys_before, 0,
-        "fresh mint_test_state starts with num_pubkeys=0"
-    );
-
-    let recipient = "0x".to_string() + &hex::encode(recipient_bytes);
-    let body = serde_json::json!({
-        "account_address": recipient,
-        "amount": 1u64,
-    });
-    let req = Request::post("/api/mint")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, resp_body) = send_request_with_state(state.clone(), req).await;
-
-    assert_eq!(
-        status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "body: {}",
-        resp_body
-    );
-    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
-    assert_eq!(v["success"], false);
-    assert_eq!(v["error"], "Failed to broadcast mint inscription on-chain");
-
-    // No-state-advance asserts: every persistent + in-memory side of
-    // the mint flow must look exactly as it did before the request.
-    let num_pubkeys_after = state.minting_account.lock().unwrap().num_pubkeys;
-    assert_eq!(
-        num_pubkeys_after, 0,
-        "in-memory minting_account.num_pubkeys must NOT advance on broadcast failure (zk-coins/node#89)"
-    );
-    {
-        let account_node_guard = state.account_node.lock().unwrap();
-        let acct_after = account_node_guard
-            .get_account(&zkcoins_program::types::MINTING_ADDRESS)
-            .expect("minting account still present after failed mint");
-        assert_eq!(
-            acct_after.balance, minting_balance_before,
-            "minting Account balance must NOT change on broadcast failure"
-        );
-        assert_eq!(
-            acct_after.coin_queue.len(),
-            minting_coin_queue_len_before,
-            "minting Account coin_queue must NOT change on broadcast failure"
-        );
-        assert_eq!(
-            acct_after.proof.is_some(),
-            minting_proof_some_before,
-            "minting Account proof must NOT be set by a failed-broadcast mint"
-        );
-        assert!(
-            account_node_guard.get_account(&recipient_addr).is_none(),
-            "recipient account must NOT be created when broadcast fails"
-        );
-    }
-}
-
-/// Companion to `mint_broadcast_failure_returns_503` that drives the
-/// inscription broadcast through a wiremock Esplora that ACCEPTS the
-/// commit + reveal POSTs, so `mint_handler` falls through into the
-/// post-broadcast section: `receive_coin` loop, account-snapshot
-/// builder, per-account `db::upsert_account` log-and-continue loop,
-/// and the `coin_proofs.pop().expect(...)` value-extraction returning
-/// 200 with a usable `proof_id`.
-///
-/// Uses a live Postgres testcontainer so the `upsert_minting_num_pubkeys`
-/// + `upsert_account` calls hit the Ok arm of the persistence helpers
-/// (rather than the dead-pool Err arm, which the broadcast-failure test
-/// above covers). Together the two tests pin every line of the
-/// mint_handler Ok branch.
-#[tokio::test]
-async fn mint_happy_path_broadcasts_and_returns_proof_id() {
-    use bitcoin::Network;
-    use bitcoin::{
-        key::Secp256k1,
-        secp256k1::{Keypair, SecretKey},
-        XOnlyPublicKey,
-    };
-    use std::str::FromStr;
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    // 1. Spin up a real Postgres so the upsert helpers run their Ok
-    //    arms (the dead-pool test above already covers the Err arms).
-    let pg_container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = pg_container.get_host().await.unwrap();
-    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(
-        crate::db::connect_and_migrate(&url)
-            .await
-            .expect("connect_and_migrate failed"),
-    );
-
-    // 2. Spin up wiremock and answer the publisher's UTXO + broadcast
-    //    requests. The publisher key under test is the CI test value
-    //    set via the `PUBLISHER_KEY` env var in `.github/workflows/ci.yaml`
-    //    (`0000…0001`, a syntactically valid 32-byte hex placeholder
-    //    distinct from the publicly burned `1234…` key removed in the
-    //    "require PUBLISHER_KEY on every network" hardening) — derive
-    //    the matching Taproot address so the `/address/<addr>/utxo`
-    //    mock matches.
-    let mock_server = MockServer::start().await;
-    let secp = Secp256k1::new();
-    let sk =
-        SecretKey::from_str("0000000000000000000000000000000000000000000000000000000000000001")
-            .expect("CI test publisher key parses");
-    let key_pair = Keypair::from_secret_key(&secp, &sk);
-    let (xonly, _) = XOnlyPublicKey::from_keypair(&key_pair);
-    let publisher_address = bitcoin::Address::p2tr(&secp, xonly, None, Network::Signet);
-
-    // 100_000 sats covers the commit + reveal fees (mirrors the
-    // publisher_tests::create_and_broadcast_inscription_succeeds_end_to_end
-    // setup).
-    Mock::given(method("GET"))
-        .and(path(format!("/address/{}/utxo", publisher_address)))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-            {
-                "txid": "3333333333333333333333333333333333333333333333333333333333333333",
-                "vout": 0,
-                "value": 100_000,
-                "status": {
-                    "confirmed": true,
-                    "block_height": 100,
-                    "block_hash": "0000000000000000000000000000000000000000000000000000000000000001",
-                    "block_time": 1_700_000_000
-                }
-            }
-        ])))
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/tx"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
-        .mount(&mock_server)
-        .await;
-
-    // 3. Wire the AppState to the live pool + wiremock URL.
-    let mut state = mint_test_state();
-    state.pool = Arc::clone(&pool);
-    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
-        url: mock_server.uri(),
-        is_mainnet: false,
-        network_name: "Mutinynet".to_string(),
-        ws_url: None,
-    });
-
-    let recipient_bytes = [9u8; 32];
-    let recipient_hex = "0x".to_string() + &hex::encode(recipient_bytes);
-    let body = serde_json::json!({
-        "account_address": recipient_hex,
-        "amount": 1u64,
-    });
-    let req = Request::post("/api/mint")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, resp_body) = send_request_with_state(state, req).await;
-
-    assert_eq!(status, StatusCode::OK, "body: {}", resp_body);
-    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
-    assert_eq!(v["success"], true);
-    let proof_id = v["proof_id"]
-        .as_u64()
-        .expect("proof_id missing from response");
-    // NOTE (B5 deferred): can't pin proof_id == 1 because proof store ID
-    // grows across DB lifetime — same constraint as the minting balance
-    // bound. We assert > 0 (= the proof was actually persisted) and rely
-    // on the integration test (api_remote `mint_roundtrip_lands_balance_and_proof`)
-    // to verify the proof file is fetchable + bincode-decodable.
-    assert!(
-        proof_id > 0,
-        "fresh-state mint must emit a non-zero proof_id"
-    );
-    // The mint response now carries the prover's post-mint
-    // `(account_state_hash, output_coins_root)` pair so the wallet
-    // can advance its local snapshot atomically with the mint
-    // response — same shape as the send response. Both fields are
-    // 32-byte hex strings extracted from `coin_proofs[0].proof
-    // .public_inputs` via `ProofData::from_field_elements`. See the
-    // `mint_response_carries_state_hash_and_coins_root` integration
-    // test in `node/tests/api_remote.rs` for the contract.
-    let ash_hex = v["account_state_hash"]
-        .as_str()
-        .expect("account_state_hash present on mint response");
-    let ash_bytes = hex::decode(ash_hex).expect("account_state_hash is hex");
-    assert_eq!(ash_bytes.len(), 32, "account_state_hash must be 32 bytes");
-    let ocr_hex = v["output_coins_root"]
-        .as_str()
-        .expect("output_coins_root present on mint response");
-    let ocr_bytes = hex::decode(ocr_hex).expect("output_coins_root is hex");
-    assert_eq!(ocr_bytes.len(), 32, "output_coins_root must be 32 bytes");
-
-    // 4. Verify the persistence side-effects of the Ok arm: the
-    //    accounts row for the MINTING address was upserted by
-    //    `commit_mint_tx`. Phase D removed the separately-stored
-    //    `minting_meta.num_pubkeys` counter; the value is derived from
-    //    SMT membership at runtime, and the SMT is updated
-    //    asynchronously by the scanner when it observes the
-    //    inscription on chain. Within the test boundary the scanner
-    //    has not run, so the only persisted evidence of the successful
-    //    mint is the upserted accounts row.
-    let minting_addr_bytes =
-        zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS);
-    let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT data FROM accounts WHERE address = $1")
-        .bind(&minting_addr_bytes[..])
-        .fetch_optional(&*pool)
-        .await
-        .expect("select minting accounts row");
-    let (data,) = row.expect("upsert wrote the minting account row");
-    assert!(!data.is_empty(), "minting account blob must be non-empty");
-}
-
-/// Covers the `current_num_pubkeys > 0` arm of the
-/// `prev_commitment_pubkey` derivation at the top of `mint_handler`.
-/// The default mint state has empty SMT → derive returns 0 → handler
-/// takes the `None` arm of that `if`. Pre-seeding the SMT with `pk_0`
-/// (the minting account's first BIP-32 child pubkey) bumps
-/// `derive_num_pubkeys_from_smt` to 1, so the handler takes the
-/// `Some(prev_pk)` arm. The downstream `send_coins` stays on the
-/// initial-prove path because the in-memory minting `Account` still
-/// has `proof = None` (no prior mint has actually run on this
-/// AppState), so the handler reaches the broadcast call. The broadcast
-/// then fails against the default unreachable Esplora URL and the
-/// handler returns 503, but the key-generation arm we wanted is
-/// already covered by that point.
-#[tokio::test]
-async fn mint_with_nonzero_num_pubkeys_covers_prev_pubkey_arm() {
-    use bitcoin::hashes::Hash;
-    let state = mint_test_state();
-    // Seed the SMT with pk_0 so `derive_num_pubkeys_from_smt` returns
-    // 1. The leaf value is arbitrary (we only check membership).
-    {
-        let mc = state.minting_account.lock().unwrap();
-        let pk0 = mc.generate_public_key(0);
-        let key: [u8; 32] = bitcoin::hashes::sha256::Hash::hash(&pk0.serialize()).to_byte_array();
-        let node_guard = state.account_node.lock().unwrap();
-        let state_arc = node_guard.state().clone();
-        drop(node_guard);
-        let mut state_guard = state_arc.lock().unwrap();
-        state_guard
-            .smt
-            .insert(key, zkcoins_program::hash::digest_from_bytes(&[1u8; 32]))
-            .expect("seed pk_0 into SMT");
-    }
-
-    let recipient = "0x".to_string() + &hex::encode([5u8; 32]);
-    let body = serde_json::json!({
-        "account_address": recipient,
-        "amount": 1u64,
-    });
-    let req = Request::post("/api/mint")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, resp_body) = send_request_with_state(state, req).await;
-
-    assert_eq!(
-        status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "body: {}",
-        resp_body
-    );
-}
-
-/// Spin up the wiremock Esplora + matching publisher Taproot UTXO mock
-/// used by the mint happy-path test. Returned `MockServer` is kept
-/// alive by the caller; dropping it tears down the HTTP listener.
-async fn mint_broadcast_mock_server() -> wiremock::MockServer {
-    use bitcoin::Network;
-    use bitcoin::{
-        key::Secp256k1,
-        secp256k1::{Keypair, SecretKey},
-        XOnlyPublicKey,
-    };
-    use std::str::FromStr;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let mock_server = MockServer::start().await;
-    let secp = Secp256k1::new();
-    let sk =
-        SecretKey::from_str("0000000000000000000000000000000000000000000000000000000000000001")
-            .expect("CI test publisher key parses");
-    let key_pair = Keypair::from_secret_key(&secp, &sk);
-    let (xonly, _) = XOnlyPublicKey::from_keypair(&key_pair);
-    let publisher_address = bitcoin::Address::p2tr(&secp, xonly, None, Network::Signet);
-
-    Mock::given(method("GET"))
-        .and(path(format!("/address/{}/utxo", publisher_address)))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-            {
-                "txid": "3333333333333333333333333333333333333333333333333333333333333333",
-                "vout": 0,
-                "value": 100_000,
-                "status": {
-                    "confirmed": true,
-                    "block_height": 100,
-                    "block_hash": "0000000000000000000000000000000000000000000000000000000000000001",
-                    "block_time": 1_700_000_000
-                }
-            }
-        ])))
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/tx"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
-        .mount(&mock_server)
-        .await;
-
-    mock_server
-}
-
-/// Drives the Err arm of the pre-broadcast `pending_inscriptions`
-/// persist that PR #107 introduced. With the lazy `dead_pool` that
-/// connect-errors on first use, the publisher's
-/// `broadcast_inscription_txs_with_persistence` fails at the very
-/// first DB write (the `constructed`-row INSERT) BEFORE any tx is
-/// broadcast on chain. The publisher wraps the persistence error as
-/// `"persist pending inscription: …"` and the handler maps that to
-/// `503 SERVICE_UNAVAILABLE` "Failed to broadcast mint inscription
-/// on-chain".
-///
-/// Contract: with a broken persistence layer, no on-chain commitment
-/// is published and `mint_handler` returns 503 cleanly. Coverage of
-/// the deeper post-broadcast `commit_mint_tx` Err branch is in
-/// `mint_commit_mint_tx_failure_returns_503` below (live pool +
-/// `accounts`-table trigger).
-#[tokio::test]
-async fn mint_pending_inscriptions_persist_failure_returns_503() {
-    let mock_server = mint_broadcast_mock_server().await;
-    let mut state = mint_test_state();
-    // dead_pool stays in place from mint_test_state; only swap the
-    // Esplora URL so the broadcast succeeds.
-    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
-        url: mock_server.uri(),
-        is_mainnet: false,
-        network_name: "Mutinynet".to_string(),
-        ws_url: None,
-    });
-
-    let recipient = "0x".to_string() + &hex::encode([4u8; 32]);
-    let body = serde_json::json!({
-        "account_address": recipient,
-        "amount": 1u64,
-    });
-    let req = Request::post("/api/mint")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, resp_body) = send_request_with_state(state, req).await;
-
-    assert_eq!(
-        status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "body: {}",
-        resp_body
-    );
-    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
-    assert_eq!(v["success"], false);
-    assert_eq!(v["error"], "Failed to broadcast mint inscription on-chain");
-}
-
-/// Drives the Err arm of the post-broadcast `db::commit_mint_tx` call
-/// at the tail of `mint_handler` (router.rs ~ "Failed to persist mint
-/// commit transaction"). Uses a live Postgres so the publisher's
-/// pre-broadcast `pending_inscriptions` INSERT, the broadcast itself,
-/// the in-memory `state.update`, and the atomic
-/// `persist_state_and_mark_complete_tx` all succeed; an `accounts`
-/// trigger then raises on the final `INSERT` so `commit_mint_tx`
-/// rolls back. Handler converts to 503.
-///
-/// Coverage: this is the only test exercising the `commit_mint_tx`
-/// Err branch in `mint_handler` post-Phase-E (the dead-pool path
-/// short-circuits earlier — see
-/// `mint_pending_inscriptions_persist_failure_returns_503`).
-#[tokio::test]
-async fn mint_commit_mint_tx_failure_returns_503() {
+mod jobs_endpoint_tests {
+    use super::*;
+    use crate::db::connect_and_migrate;
+    use crate::router::create_router;
+    use std::sync::Arc;
     use testcontainers::{runners::AsyncRunner, ImageExt};
     use testcontainers_modules::postgres::Postgres;
 
-    let pg_container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = pg_container.get_host().await.unwrap();
-    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(
-        crate::db::connect_and_migrate(&url)
+    /// Build an `AppState` whose `job_store` is wired to a fresh
+    /// testcontainers Postgres pool (with migration 0014 applied),
+    /// `job_tx` to a never-recv'd channel (the dispatcher is not
+    /// running in this test), `job_notify_map` to an empty DashMap.
+    /// Mirrors the production wiring closely enough that the admit
+    /// handlers exercise their Ok / Err arms verbatim.
+    async fn jobs_test_state() -> (
+        AppState,
+        Arc<sqlx::PgPool>,
+        testcontainers::ContainerAsync<Postgres>,
+    ) {
+        let container = Postgres::default()
+            .with_tag("17")
+            .start()
             .await
-            .expect("connect_and_migrate failed"),
-    );
+            .expect("postgres container");
+        let host = container.get_host().await.unwrap();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+        let pool = Arc::new(connect_and_migrate(&url).await.expect("migrate"));
 
-    // Trigger raises on every accounts INSERT, surfacing as
-    // `sqlx::Error::Database` from inside `commit_mint_tx`'s tx.
-    sqlx::query(
-        "CREATE OR REPLACE FUNCTION fail_accounts_insert() RETURNS trigger AS $$
-         BEGIN
-             RAISE EXCEPTION 'simulated commit_mint_tx failure';
-         END;
-         $$ LANGUAGE plpgsql",
-    )
-    .execute(&*pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "CREATE TRIGGER block_accounts_insert BEFORE INSERT ON accounts \
-         FOR EACH ROW EXECUTE FUNCTION fail_accounts_insert()",
-    )
-    .execute(&*pool)
-    .await
-    .unwrap();
-
-    let mock_server = mint_broadcast_mock_server().await;
-    let mut state = mint_test_state();
-    state.pool = Arc::clone(&pool);
-    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
-        url: mock_server.uri(),
-        is_mainnet: false,
-        network_name: "Mutinynet".to_string(),
-        ws_url: None,
-    });
-
-    let recipient_bytes = [12u8; 32];
-    let recipient = "0x".to_string() + &hex::encode(recipient_bytes);
-    let body = serde_json::json!({
-        "account_address": recipient,
-        "amount": 1u64,
-    });
-    let req = Request::post("/api/mint")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, resp_body) = send_request_with_state(state, req).await;
-
-    assert_eq!(
-        status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "commit_mint_tx failure must surface 503, body: {}",
-        resp_body
-    );
-    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
-    assert_eq!(v["success"], false);
-    assert_eq!(v["error"], "Failed to persist mint commit transaction");
-}
-
-/// Drives the Err arm of `AccountNode::receive_coin_into` inside
-/// the commit phase of `mint_handler`. Pre-populates the recipient
-/// account's `coin_history` SMT with the identifier that
-/// `prepare_mint` is about to produce, so `receive_coin_into` returns
-/// `Err("Coin already spent (replay)")` on the cloned recipient.
-/// Identifier prediction mirrors `Account::create_coins` off-circuit
-/// (canonical AccountState layout + Poseidon hash + index 0).
-///
-/// Per the prepare-then-commit refactor (zk-coins/node#89) the
-/// receive error is logged and the unchanged recipient clone still
-/// participates in `commit_mint_tx`. With a live Postgres the
-/// transaction commits, the handler returns 200 OK, and
-/// `minting_meta.num_pubkeys` advances to 1.
-#[tokio::test]
-async fn mint_receive_coin_failure_logs_and_returns_ok() {
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
-
-    let pg_container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = pg_container.get_host().await.unwrap();
-    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(
-        crate::db::connect_and_migrate(&url)
-            .await
-            .expect("connect_and_migrate failed"),
-    );
-
-    let mock_server = mint_broadcast_mock_server().await;
-
-    let recipient_bytes = [6u8; 32];
-    let recipient = zkcoins_program::hash::digest_from_bytes(&recipient_bytes);
-
-    let mut state = mint_test_state();
-    state.pool = Arc::clone(&pool);
-    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
-        url: mock_server.uri(),
-        is_mainnet: false,
-        network_name: "Mutinynet".to_string(),
-        ws_url: None,
-    });
-
-    // Predict the coin identifier that `prepare_mint` will assign to
-    // the freshly-minted output coin. `Account::create_coins` builds
-    // `next_account_state` with `owner = MINTING_ADDRESS`,
-    // `balance = minting_balance - amount`, and
-    // `public_key = current minting pubkey`, then hashes it and feeds
-    // the digest into `calculate_coin_identifier(_, 0)`.
-    let amount: u64 = 1;
-    let minting_balance: u64 = 1u64 << 48;
-    let minting_pubkey_bytes = {
-        let mc = state.minting_account.lock().unwrap();
-        mc.generate_public_key(0).serialize()
-    };
-    let next_account_state = zkcoins_program::types::AccountState {
-        owner: *zkcoins_program::types::MINTING_ADDRESS,
-        balance: minting_balance - amount,
-        public_key: minting_pubkey_bytes,
-    };
-    let predicted_coin_id =
-        zkcoins_program::types::calculate_coin_identifier(next_account_state.hash(), 0);
-    let predicted_coin_id_bytes = zkcoins_program::hash::digest_to_bytes(&predicted_coin_id);
-
-    // Pre-insert the predicted identifier into the recipient's
-    // coin_history SMT so `receive_coin_into` sees the coin as
-    // already spent.
-    let mut recipient_account = Account::new();
-    recipient_account
-        .coin_history
-        .insert(predicted_coin_id_bytes, predicted_coin_id)
-        .expect("insert into fresh SMT must succeed");
-    {
-        let mut node = state.account_node.lock().unwrap();
-        node.import_account(recipient, recipient_account);
+        let mut state = mint_test_state();
+        state.pool = Arc::clone(&pool);
+        state.job_store = Arc::new(crate::job_store::JobStore::new((*pool).clone()));
+        // Fresh (rx-side held by `_rx`) channel so the admit
+        // handlers can `.send().await` without an unbounded queue;
+        // the rx end stays alive so the send never errors with a
+        // closed-channel error.
+        let (tx, rx) = tokio::sync::mpsc::channel::<crate::job_dispatcher::JobEnvelope>(8);
+        state.job_tx = tx;
+        // Leak the rx so it does not drop while the test runs.
+        std::mem::forget(rx);
+        state.job_notify_map = Arc::new(dashmap::DashMap::new());
+        (state, pool, container)
     }
 
-    let recipient_hex = "0x".to_string() + &hex::encode(recipient_bytes);
-    let body = serde_json::json!({
-        "account_address": recipient_hex,
-        "amount": amount,
-    });
-    let req = Request::post("/api/mint")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, resp_body) = send_request_with_state(state, req).await;
-
-    assert_eq!(status, StatusCode::OK, "body: {}", resp_body);
-    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
-    assert_eq!(v["success"], true);
-    let proof_id = v["proof_id"]
-        .as_u64()
-        .expect("proof_id missing from response");
-    // NOTE (B5 deferred): can't pin proof_id == 1 because proof store ID
-    // grows across DB lifetime — same constraint as the minting balance
-    // bound. We assert > 0 (= the proof was actually persisted) and rely
-    // on the integration test (api_remote `mint_roundtrip_lands_balance_and_proof`)
-    // to verify the proof file is fetchable + bincode-decodable.
-    assert!(
-        proof_id > 0,
-        "fresh-state mint must emit a non-zero proof_id"
-    );
-}
-
-/// Retry-after-broadcast-failure (zk-coins/node#89).
-///
-/// First mint runs against an unreachable Esplora (the default
-/// `mint_test_state` config points at 127.0.0.1:1) — the handler
-/// fails the broadcast and returns 503. The persisted state must be
-/// untouched: no `accounts` row for the minting address, the minting
-/// Account still has `proof = None` and `coin_queue` empty. Second
-/// mint reuses the same `AppState` but swaps in a working wiremock
-/// Esplora; the broadcast succeeds, `commit_mint_tx` writes the
-/// bundle in one transaction, and the handler returns 200. After the
-/// second call the recipient `accounts` row exists with the minted
-/// coin in its queue, and the proofs Vec was popped once.
-///
-/// Phase D removed the `minting_meta.num_pubkeys` counter; the
-/// per-mint `derive_num_pubkeys_from_smt` walks the SMT directly so
-/// there is no persisted counter to assert here. The scanner has not
-/// run within the test boundary, so `derive_num_pubkeys_from_smt`
-/// would still return 0 after the second mint — that race window is
-/// the documented in-process gate (see `mint_handler` doc-comment),
-/// not a regression.
-///
-/// **Idempotent-retry caveat (documented in `mint_handler`).** On a
-/// real broadcast failure where the first commit + reveal pair
-/// actually landed on chain but the response was lost, a retry
-/// produces an identical inscription txid and Bitcoin returns
-/// `txn-already-known`. The handler returns 503 again; reconciliation
-/// happens on the next scanner sweep. This test does NOT cover that
-/// branch — it only proves the "broadcast genuinely failed, no chain
-/// effect, retry succeeds" flow.
-#[tokio::test]
-async fn mint_retry_after_broadcast_failure_succeeds() {
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
-
-    let pg_container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = pg_container.get_host().await.unwrap();
-    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(
-        crate::db::connect_and_migrate(&url)
-            .await
-            .expect("connect_and_migrate failed"),
-    );
-
-    // ---- First mint: dead Esplora → 503 ---------------------------------
-    let mut state = mint_test_state();
-    state.pool = Arc::clone(&pool);
-    // Keep the default unreachable URL so the broadcast fails.
-    let cloned_state_first = state.clone();
-
-    let recipient_bytes = [9u8; 32];
-    let recipient = "0x".to_string() + &hex::encode(recipient_bytes);
-    let body = serde_json::json!({
-        "account_address": recipient,
-        "amount": 1u64,
-    });
-    let req = Request::post("/api/mint")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status1, _body1) = send_request_with_state(cloned_state_first, req).await;
-    assert_eq!(status1, StatusCode::SERVICE_UNAVAILABLE);
-
-    // Confirm no `accounts` row was written for the minting address —
-    // Phase D's `commit_mint_tx` only runs after the broadcast
-    // succeeds, so a 503 from the broadcast leg leaves the table
-    // empty. Phase D removed the separately-stored
-    // `minting_meta.num_pubkeys` counter, so there is no DB-side
-    // counter to inspect.
-    let minting_addr_bytes =
-        zkcoins_program::hash::digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS);
-    let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT data FROM accounts WHERE address = $1")
-        .bind(&minting_addr_bytes[..])
-        .fetch_optional(&*pool)
-        .await
-        .expect("select accounts row after failed mint");
-    assert!(
-        row.is_none(),
-        "no accounts row for minting address must be written when broadcast fails"
-    );
-
-    // ---- Second mint: working Esplora → 200 -----------------------------
-    let mock_server = mint_broadcast_mock_server().await;
-    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
-        url: mock_server.uri(),
-        is_mainnet: false,
-        network_name: "Mutinynet".to_string(),
-        ws_url: None,
-    });
-    let cloned_state_second = state.clone();
-    let body2 = serde_json::json!({
-        "account_address": recipient,
-        "amount": 1u64,
-    });
-    let req2 = Request::post("/api/mint")
-        .header("content-type", "application/json")
-        .body(Body::from(body2.to_string()))
-        .unwrap();
-    let (status2, resp_body2) = send_request_with_state(cloned_state_second, req2).await;
-    assert_eq!(status2, StatusCode::OK, "body: {}", resp_body2);
-
-    // Final state: minting accounts row was upserted (the retry
-    // landed in `commit_mint_tx`), recipient account exists with the
-    // minted coin in its queue. No `minting_meta.num_pubkeys`
-    // assertion — Phase D removed the counter.
-    let minting_row: Option<(Vec<u8>,)> =
-        sqlx::query_as("SELECT data FROM accounts WHERE address = $1")
-            .bind(&minting_addr_bytes[..])
-            .fetch_optional(&*pool)
-            .await
-            .expect("select minting accounts row after retry");
-    assert!(
-        minting_row.is_some(),
-        "minting accounts row must be written by the successful retry"
-    );
-    let recipient_digest = zkcoins_program::hash::digest_from_bytes(&recipient_bytes);
-    {
-        let node_guard = state.account_node.lock().unwrap();
-        let recipient_account = node_guard
-            .get_account(&recipient_digest)
-            .expect("recipient account must be created on successful mint");
-        // The second mint above credits `1u64`; the recipient's
-        // coin_queue must reflect exactly that single inflow. A
-        // shape-only `is_some()` previously masked a bug where the
-        // account row was inserted with an empty queue.
-        assert_eq!(
-            recipient_account.coin_queue.len(),
-            1,
-            "recipient coin_queue must hold exactly the minted coin, got {:?}",
-            recipient_account.coin_queue.len()
-        );
-    }
-}
-
-// Phase D removed the optimistic `commit_mint_tx` UPDATE branch that
-// the pre-Phase-D `concurrent_mints_only_one_commits` test pinned.
-// The new concurrency gate is the phase-2 re-derive of
-// `derive_num_pubkeys_from_smt` against the live SMT — covered by
-// `mint_handler_concurrent_mint_during_proof_returns_503` below, which
-// drives the same 503 exit through `mint_handler` end-to-end.
-
-/// Drives the post-proof "concurrent mint detected during proof phase"
-/// branch of `mint_handler` (router.rs:854-858 / zk-coins/node#90)
-/// against the pure helper.
-///
-/// Pairs with `mint_handler_concurrent_mint_during_proof_returns_503`
-/// below, which drives the SAME branch end-to-end through
-/// `mint_handler` so the call site itself (the
-/// `return concurrent_mint_during_proof_response(...)` invocation)
-/// is covered, not just the helper.
-#[tokio::test]
-async fn concurrent_mint_during_proof_response_returns_503() {
-    let (status, Json(body)) = crate::router::concurrent_mint_during_proof_response(0, 1);
-    assert_eq!(
-        status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "concurrent-mint-during-proof must surface 503"
-    );
-    assert!(!body.success);
-    assert_eq!(body.error.as_deref(), Some("Concurrent mint detected"));
-}
-
-/// End-to-end race that drives the post-proof "concurrent mint
-/// detected during proof phase" branch of `mint_handler` through the
-/// HTTP layer so the `return concurrent_mint_during_proof_response(...)`
-/// call site (router.rs) is covered, not just the helper.
-///
-/// Phase D shape: the in-process gate is a re-derive of
-/// `derive_num_pubkeys_from_smt` between the phase-1 SNAPSHOT and the
-/// phase-3 commit-signing leg. Triggering the gate deterministically
-/// means inserting `pk_0`'s key into the SMT between the two derives
-/// (simulating a scanner ingestion of a concurrent mint's inscription
-/// while we were proving).
-///
-/// Synchronisation strategy (deterministic, NOT time-based): the
-/// handler signals it has acquired the `state.account_node` guard
-/// at the top of phase 2 via the test-only
-/// `state.phase2_reached: Arc<tokio::sync::Notify>` field; the test
-/// `.notified().await`s on it, then inserts the minting account's
-/// `pk_0` into the SMT. The handler proceeds through phase 2 (prover
-/// work), reaches phase 3, re-derives `num_pubkeys` from the SMT,
-/// observes the bumped count (1 vs the captured expected 0), and
-/// returns 503 before ever touching the broadcast / Esplora /
-/// Postgres paths — so the bare `mint_test_state()` (dead pool,
-/// unreachable Esplora) is sufficient.
-///
-/// Requires the multi-thread runtime: phase 2's `prepare_mint` is
-/// blocking CPU work that would otherwise stall the single-threaded
-/// executor and prevent the test thread from running the SMT
-/// insertion step.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mint_handler_concurrent_mint_during_proof_returns_503() {
-    use bitcoin::hashes::Hash;
-    let state = mint_test_state();
-
-    // Acquire `phase3_release_lock` BEFORE spawning the request. The
-    // handler's `lock().await` between `prepare_mint` and the phase-3
-    // re-derive will BLOCK until this test drops the guard after
-    // injecting `pk_0`. Using a Mutex (vs a Notify with one-permit
-    // semantics) makes this primitive reusable for any number of
-    // sequential mints — production-shaped tests acquire + drop in
-    // one step against the unlocked Mutex.
-    let phase3_guard = state.phase3_release_lock.clone().lock_owned().await;
-
-    // Pre-subscribe to the phase-2 notify BEFORE spawning the request
-    // so a fast handler that acquires `account_node` and fires
-    // `notify_one()` immediately cannot lose the signal. `Notified` is
-    // a future created up-front; the `notify_one` call buffers the
-    // wake-up even when no one is currently awaiting, so dropping the
-    // `Notified` before the await would be unsound here.
-    let notified = state.phase2_reached.notified();
-    tokio::pin!(notified);
-
-    let recipient = "0x".to_string() + &hex::encode([7u8; 32]);
-    let body = serde_json::json!({
-        "account_address": recipient,
-        "amount": 1u64,
-    });
-    let req = Request::post("/api/mint")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-
-    // Drive the request on a worker so we can manipulate state from
-    // this task while the handler runs.
-    let state_for_request = state.clone();
-    let request_task =
-        tokio::spawn(async move { send_request_with_state(state_for_request, req).await });
-
-    // Wait until the handler signals it has acquired the
-    // `account_node` guard at the top of phase 2. Phase 1 (the SMT
-    // walk + minting_account pubkey derivation) has finished by this
-    // point because it runs BEFORE phase 2 in `mint_handler`. This is
-    // a hard happens-before edge: the SMT insert below cannot run
-    // until the handler is observably past the phase-1 snapshot.
-    // Defensive timeouts: if a regression skips notify_one(), the test
-    // would otherwise hang for the full 120-min CI job budget. 30 s is
-    // >>> prepare_mint typical runtime (~200ms in the test build).
-    tokio::time::timeout(std::time::Duration::from_secs(30), notified.as_mut())
-        .await
-        .expect(
-            "phase2_reached notify must fire within 30s — regression in mint_handler phase 2 entry",
-        );
-
-    // Insert pk_0's key into the SMT so the phase-3 re-derive returns
-    // 1 instead of the captured `expected_num_pubkeys = 0`. The
-    // handler is currently blocked on `state.phase3_release` (drained
-    // above) so phase 3 cannot run before this insert lands, even on
-    // a sub-microsecond prover.
-    {
-        let pk0 = {
-            let mc = state.minting_account.lock().unwrap();
-            mc.generate_public_key(0)
-        };
-        let key: [u8; 32] = bitcoin::hashes::sha256::Hash::hash(&pk0.serialize()).to_byte_array();
-        let node_guard = state.account_node.lock().unwrap();
-        let state_arc = node_guard.state().clone();
-        drop(node_guard);
-        let mut state_guard = state_arc.lock().unwrap();
-        state_guard
-            .smt
-            .insert(key, zkcoins_program::hash::digest_from_bytes(&[2u8; 32]))
-            .expect("inject pk_0 into SMT");
+    /// Helper: drive a request through the live router built off
+    /// the test state.
+    async fn run(
+        state: AppState,
+        req: Request<Body>,
+    ) -> (StatusCode, Vec<(String, String)>, String) {
+        let app = create_router(state);
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let headers: Vec<(String, String)> = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        (status, headers, body)
     }
 
-    // Release the handler from the phase3_release hold. It now runs
-    // the phase-3 re-derive against the just-mutated SMT, observes
-    // the bumped count, and returns 503 "Concurrent mint detected".
-    drop(phase3_guard);
+    // ---- POST /api/jobs/mint ----
 
-    let (status, resp_body) =
-        tokio::time::timeout(std::time::Duration::from_secs(60), request_task)
-            .await
-            .expect("mint request must complete within 60s")
-            .expect("request task panicked");
-
-    assert_eq!(
-        status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "concurrent-mint-during-proof must surface 503, body: {}",
-        resp_body
-    );
-    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
-    assert_eq!(v["success"], false);
-    assert_eq!(v["error"], "Concurrent mint detected");
-}
-
-// Phase D folded the recipient upsert into the same `commit_mint_tx`
-// transaction as the minting account upsert (one bundle, one Postgres
-// transaction). The pre-Phase-D `upsert_mint_recipient_or_log` helper
-// was a standalone best-effort step after the commit and is gone, so
-// the dead-pool branch test that pinned it is gone too — failure of
-// `commit_mint_tx` itself is covered by `mint_commit_tx_failure_returns_503`.
-
-/// Phase E: `mint_handler` advances `state.update` synchronously after
-/// a successful broadcast — the SMT contains the freshly-minted
-/// pubkey BEFORE the response returns, and the corresponding
-/// `pending_inscriptions` row is `complete`, both observable from
-/// outside the handler immediately after the request finishes.
-///
-/// Closes the regression that motivated Phase E: a second `/api/mint`
-/// issued in the ~20-30 s scanner-observation window for the first
-/// mint walked an un-updated SMT, derived `num_pubkeys = 0` again,
-/// and surfaced `Unable to get mmr inclusion proof for the previous
-/// root` at the prover. Synchronous state.update closes that window.
-#[tokio::test]
-async fn mint_handler_advances_state_synchronously_with_broadcast() {
-    use bitcoin::hashes::Hash as _;
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
-
-    let pg_container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = pg_container.get_host().await.unwrap();
-    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(
-        crate::db::connect_and_migrate(&url)
-            .await
-            .expect("connect_and_migrate failed"),
-    );
-
-    let mock_server = mint_broadcast_mock_server().await;
-    let mut state = mint_test_state();
-    state.pool = Arc::clone(&pool);
-    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
-        url: mock_server.uri(),
-        is_mainnet: false,
-        network_name: "Mutinynet".to_string(),
-        ws_url: None,
-    });
-
-    // Sanity: the SMT starts empty so derive_num_pubkeys_from_smt
-    // returns 0.
-    let pk0_key = {
-        let mc = state.minting_account.lock().unwrap();
-        let pk0 = mc.generate_public_key(0);
-        bitcoin::hashes::sha256::Hash::hash(&pk0.serialize()).to_byte_array()
-    };
-    {
-        let node_guard = state.account_node.lock().unwrap();
-        let state_arc = node_guard.state().clone();
-        let state_guard = state_arc.lock().unwrap();
-        assert!(
-            state_guard.smt.get(&pk0_key).is_none(),
-            "fresh test state must not contain pk_0 in its SMT"
-        );
-        assert_eq!(
-            crate::state::derive_num_pubkeys_from_smt(
-                &state.minting_account.lock().unwrap().private_key,
-                &state_guard.smt
-            ),
-            0,
-            "fresh test state must derive num_pubkeys == 0"
-        );
-    }
-
-    let recipient_bytes = [10u8; 32];
-    let recipient = "0x".to_string() + &hex::encode(recipient_bytes);
-    let body = serde_json::json!({
-        "account_address": recipient,
-        "amount": 1u64,
-    });
-    let req = Request::post("/api/mint")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, resp_body) = send_request_with_state(state.clone(), req).await;
-    assert_eq!(status, StatusCode::OK, "body: {}", resp_body);
-
-    // After the response returns, the SMT must already hold pk_0 —
-    // this is the load-bearing Phase E behaviour. A second mint in the
-    // same scanner window would now derive num_pubkeys = 1 and
-    // proceed against the correct root.
-    let state_arc = {
-        let node_guard = state.account_node.lock().unwrap();
-        node_guard.state().clone()
-    };
-    {
-        let state_guard = state_arc.lock().unwrap();
-        assert!(
-            state_guard.smt.get(&pk0_key).is_some(),
-            "Phase E regression: mint_handler must advance SMT before returning 200"
-        );
-        assert_eq!(
-            crate::state::derive_num_pubkeys_from_smt(
-                &state.minting_account.lock().unwrap().private_key,
-                &state_guard.smt
-            ),
-            1,
-            "Phase E: SMT must reflect the new mint so the next mint sees num_pubkeys = 1"
-        );
-        // MMR advanced by exactly one leaf.
-        assert_eq!(state_guard.mmr.leaf_count(), 1);
-        // The new MMR leaf's prev_mmr_root must be a key in root_indices —
-        // this is the lookup the second mint's prover needs.
-        assert!(
-            state_guard
-                .root_indices
-                .contains_key(&state_guard.prev_mmr_root),
-            "root_indices must hold the entry for the freshly written prev_mmr_root"
-        );
-    }
-
-    // And the pending_inscriptions row reached `complete` in the same
-    // request, so a scanner observation of the same commit will
-    // short-circuit via `should_skip_scanner_state_update`.
-    let (pending_status,): (String,) =
-        sqlx::query_as("SELECT status FROM pending_inscriptions ORDER BY id DESC LIMIT 1")
-            .fetch_one(&*pool)
-            .await
-            .expect("a pending row must exist for the minted commitment");
-    assert_eq!(
-        pending_status,
-        crate::db::PENDING_STATUS_COMPLETE,
-        "Phase E: mint_handler must mark pending_inscriptions complete after state.update"
-    );
-    let (commit_txid_bytes,): (Vec<u8>,) =
-        sqlx::query_as("SELECT commit_txid FROM pending_inscriptions ORDER BY id DESC LIMIT 1")
-            .fetch_one(&*pool)
-            .await
-            .expect("commit_txid column must populate");
-    assert!(crate::scanner::should_skip_scanner_state_update(
-        crate::db::pending_inscription_status_by_commit_txid(&pool, &commit_txid_bytes)
-            .await
-            .unwrap()
-            .as_deref()
-    ));
-}
-
-/// Phase E BLOCKER fix: if the atomic
-/// `persist_state_and_mark_complete_tx` rolls back mid-transaction, the
-/// `pending_inscriptions` row MUST stay at its prior status (here:
-/// `reveal_broadcast`) and the on-disk SMT/MMR/root_index must NOT
-/// advance. The scanner-replay path is then free to integrate the
-/// inscription from chain on the next sweep without doubling up the MMR
-/// leaf (which is exactly the BLOCKER class the atomic tx eliminated).
-///
-/// Mechanism: install a `BEFORE UPDATE` trigger on
-/// `pending_inscriptions` that raises an exception when the new
-/// `status` value is `complete`. The trigger fires INSIDE the atomic
-/// tx — the BEGIN/UPSERT(smt)/UPSERT(mmr)/INSERT(mmr_root_index) steps
-/// all run successfully, then the final UPDATE...SET status='complete'
-/// raises and the COMMIT envelope rolls everything back. The handler
-/// surfaces 503 and the on-disk state is byte-for-byte identical to
-/// the pre-call snapshot.
-///
-/// (The in-memory SMT/MMR mutation already happened before the await
-/// — that is a known property of the new shape; the contract is that
-/// on tx Err, durable state is unchanged and the handler signals 503
-/// so the caller knows not to trust the in-memory state across a
-/// restart.)
-#[tokio::test]
-async fn mint_handler_atomic_tx_rollback_leaves_state_and_row_consistent() {
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
-
-    let pg_container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = pg_container.get_host().await.unwrap();
-    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(
-        crate::db::connect_and_migrate(&url)
-            .await
-            .expect("connect_and_migrate failed"),
-    );
-
-    // Install the trigger that fails the in-tx mark-complete UPDATE.
-    // PL/pgSQL: any UPDATE that sets `status = 'complete'` raises
-    // before the row mutates, surfacing a `sqlx::Error::Database` from
-    // inside the atomic envelope.
-    sqlx::query(
-        "CREATE OR REPLACE FUNCTION fail_complete() RETURNS trigger AS $$
-         BEGIN
-             IF NEW.status = 'complete' THEN
-                 RAISE EXCEPTION 'simulated mark-complete failure';
-             END IF;
-             RETURN NEW;
-         END;
-         $$ LANGUAGE plpgsql",
-    )
-    .execute(&*pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "CREATE TRIGGER block_complete BEFORE UPDATE ON pending_inscriptions \
-         FOR EACH ROW EXECUTE FUNCTION fail_complete()",
-    )
-    .execute(&*pool)
-    .await
-    .unwrap();
-
-    let mock_server = mint_broadcast_mock_server().await;
-    let mut state = mint_test_state();
-    state.pool = Arc::clone(&pool);
-    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
-        url: mock_server.uri(),
-        is_mainnet: false,
-        network_name: "Mutinynet".to_string(),
-        ws_url: None,
-    });
-
-    let recipient_bytes = [11u8; 32];
-    let recipient = "0x".to_string() + &hex::encode(recipient_bytes);
-    let body = serde_json::json!({
-        "account_address": recipient,
-        "amount": 1u64,
-    });
-    let req = Request::post("/api/mint")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let (status, resp_body) = send_request_with_state(state.clone(), req).await;
-
-    // The trigger fires inside the atomic tx, the tx rolls back, the
-    // handler converts to 503.
-    assert_eq!(
-        status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "atomic tx rollback must surface 503, body: {}",
-        resp_body
-    );
-    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
-    assert_eq!(v["success"], false);
-    assert!(
-        v["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("durable state advance failed"),
-        "response error must explain the failure mode, got: {}",
-        v["error"]
-    );
-
-    // On-disk SMT/MMR/root_index did NOT advance — the atomic
-    // envelope rolled them back together with the failed UPDATE.
-    assert_eq!(
-        crate::db::load_smt(&pool).await.unwrap(),
-        None,
-        "atomic-tx rollback must leave smt_state untouched"
-    );
-    assert_eq!(
-        crate::db::load_mmr(&pool).await.unwrap(),
-        None,
-        "atomic-tx rollback must leave mmr_state untouched"
-    );
-    assert!(
-        crate::db::load_root_indices(&pool)
-            .await
-            .unwrap()
-            .is_empty(),
-        "atomic-tx rollback must leave mmr_root_index untouched"
-    );
-
-    // The pending row stays at `reveal_broadcast` (the publisher set
-    // it there before the broadcast, and the mark-complete UPDATE was
-    // exactly the call that the trigger blocked). Scanner-replay on
-    // next boot observes the row, falls through
-    // `should_skip_scanner_state_update`, integrates the inscription
-    // itself, and runs state.update against the (still-clean) on-disk
-    // SMT — yielding leaf_count == 1, not 2.
-    let (pending_status,): (String,) =
-        sqlx::query_as("SELECT status FROM pending_inscriptions ORDER BY id DESC LIMIT 1")
-            .fetch_one(&*pool)
-            .await
-            .expect("a pending row must exist for the broadcasted commitment");
-    assert_eq!(
-        pending_status,
-        crate::db::PENDING_STATUS_REVEAL_BROADCAST,
-        "atomic-tx rollback: pending row must stay at reveal_broadcast for scanner-replay to pick up"
-    );
-    let (commit_txid_bytes,): (Vec<u8>,) =
-        sqlx::query_as("SELECT commit_txid FROM pending_inscriptions ORDER BY id DESC LIMIT 1")
-            .fetch_one(&*pool)
-            .await
+    #[tokio::test]
+    async fn jobs_mint_without_idempotency_key_returns_400() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let body = serde_json::json!({
+            "account_address": "0x".to_string() + &hex::encode([1u8; 32]),
+            "amount": 1u64,
+        });
+        let req = Request::post("/api/jobs/mint")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
             .unwrap();
-    assert!(
-        !crate::scanner::should_skip_scanner_state_update(
-            crate::db::pending_inscription_status_by_commit_txid(&pool, &commit_txid_bytes)
-                .await
-                .unwrap()
-                .as_deref()
-        ),
-        "scanner must NOT skip its state.update for an inscription whose mark-complete failed"
-    );
+        let (status, _headers, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["error"], "Idempotency-Key header is required");
+    }
 
-    // Drop the trigger so any follow-up scanner-replay (out of scope
-    // for this test) would succeed; we assert the contract above and
-    // leave the verification of the heal-on-replay path to the e2e
-    // tests covered by `mint_handler_advances_state_synchronously_with_broadcast`.
-    sqlx::query("DROP TRIGGER block_complete ON pending_inscriptions")
-        .execute(&*pool)
-        .await
-        .unwrap();
-}
+    #[tokio::test]
+    async fn jobs_mint_with_empty_idempotency_key_returns_400() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let body = serde_json::json!({
+            "account_address": "0x".to_string() + &hex::encode([1u8; 32]),
+            "amount": 1u64,
+        });
+        let req = Request::post("/api/jobs/mint")
+            .header("content-type", "application/json")
+            .header("idempotency-key", "")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _headers, _body) = run(state, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
 
-/// Phase E in-process state.update Err coverage: if the SMT already
-/// contains the mint's signing pubkey under a DIFFERENT value when
-/// `update_and_snapshot_for_persist` runs (a concurrent-mint race that
-/// slipped both phase-2 gates, or a genuine bug), the handler must
-/// return 503 with the documented "in-process state advance failed"
-/// reason. The broadcast already landed on chain at this point, so the
-/// publisher has advanced the row to `reveal_broadcast`; the scanner-
-/// replay path picks the inscription up from chain on its next sweep.
-///
-/// Mechanism: hold `state_advance_release_lock` BEFORE spawning the
-/// request so the handler blocks AFTER the broadcast and BEFORE
-/// acquiring the state lock for `update_and_snapshot_for_persist`. Mid-
-/// hold, inject `pk_0`'s key into the SMT with a bogus value. Drop the
-/// guard — the handler resumes, the SMT `insert` returns
-/// `"Key already exists in the tree with different value"`, and the
-/// match arm at the top of phase 3b surfaces 503.
-///
-/// Asserts:
-///   - response is 503 with the expected error message
-///   - the pending_inscriptions row stays at `reveal_broadcast`
-///   - the on-disk SMT/MMR/root_index DID NOT advance (no atomic
-///     persist tx ran for this mint)
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mint_handler_in_process_state_advance_collision_returns_503() {
-    use bitcoin::hashes::Hash;
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
+    #[tokio::test]
+    async fn jobs_mint_with_invalid_hex_returns_422() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let body = serde_json::json!({"account_address": "not_hex", "amount": 1u64});
+        let req = Request::post("/api/jobs/mint")
+            .header("content-type", "application/json")
+            .header("idempotency-key", "k1")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["error"], "account_address is not valid hex");
+    }
 
-    let pg_container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = pg_container.get_host().await.unwrap();
-    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(
-        crate::db::connect_and_migrate(&url)
-            .await
-            .expect("connect_and_migrate failed"),
-    );
+    #[tokio::test]
+    async fn jobs_mint_wrong_address_length_returns_422() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let body = serde_json::json!({
+            "account_address": "0x".to_string() + &"ab".repeat(16),
+            "amount": 1u64,
+        });
+        let req = Request::post("/api/jobs/mint")
+            .header("content-type", "application/json")
+            .header("idempotency-key", "k1")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, _b) = run(state, req).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
 
-    let mock_server = mint_broadcast_mock_server().await;
-    let mut state = mint_test_state();
-    state.pool = Arc::clone(&pool);
-    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
-        url: mock_server.uri(),
-        is_mainnet: false,
-        network_name: "Mutinynet".to_string(),
-        ws_url: None,
-    });
+    #[tokio::test]
+    async fn jobs_mint_admits_returns_202_with_job_id() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let body = serde_json::json!({
+            "account_address": "0x".to_string() + &hex::encode([1u8; 32]),
+            "amount": 1u64,
+        });
+        let req = Request::post("/api/jobs/mint")
+            .header("content-type", "application/json")
+            .header("Idempotency-Key", "k-mint-1")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, headers, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let location = headers
+            .iter()
+            .find(|(k, _)| k == "location")
+            .map(|(_, v)| v.clone())
+            .expect("Location header present");
+        assert!(location.starts_with("/api/jobs/"));
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["status"], "queued");
+        let _ = uuid::Uuid::parse_str(v["job_id"].as_str().unwrap()).expect("job_id is UUID");
+    }
 
-    // Hold the state-advance release lock so the handler will block
-    // after broadcast and before `update_and_snapshot_for_persist`.
-    let advance_guard = state.state_advance_release_lock.clone().lock_owned().await;
-
-    let recipient = "0x".to_string() + &hex::encode([12u8; 32]);
-    let body = serde_json::json!({
-        "account_address": recipient,
-        "amount": 1u64,
-    });
-    let req = Request::post("/api/mint")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-
-    let state_for_request = state.clone();
-    let request_task =
-        tokio::spawn(async move { send_request_with_state(state_for_request, req).await });
-
-    // Wait until the publisher has advanced the row to
-    // `reveal_broadcast` — that is the observable signal that the
-    // broadcast has landed and the handler is now blocked on the
-    // state_advance_release_lock. Polling avoids races with the
-    // publisher's WS handshake; a hard timeout guards against a
-    // regression that would otherwise hang for the full CI budget.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let commit_txid_bytes: Vec<u8> = loop {
-        if std::time::Instant::now() > deadline {
-            panic!(
-                "publisher did not advance any pending row to `reveal_broadcast` within 60s; \
-                 regression in mint_handler broadcast phase"
-            );
-        }
-        let row: Option<(Vec<u8>, String)> = sqlx::query_as(
-            "SELECT commit_txid, status FROM pending_inscriptions ORDER BY id DESC LIMIT 1",
+    #[tokio::test]
+    async fn jobs_mint_idempotent_replay_returns_existing_job_id() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let body = serde_json::json!({
+            "account_address": "0x".to_string() + &hex::encode([2u8; 32]),
+            "amount": 1u64,
+        });
+        let key = "k-replay";
+        let first = run(
+            state.clone(),
+            Request::post("/api/jobs/mint")
+                .header("content-type", "application/json")
+                .header("idempotency-key", key)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
         )
-        .fetch_optional(&*pool)
-        .await
-        .unwrap();
-        if let Some((ctxid, status)) = row {
-            if status == crate::db::PENDING_STATUS_REVEAL_BROADCAST {
-                break ctxid;
+        .await;
+        let v1: serde_json::Value = serde_json::from_str(&first.2).unwrap();
+        let job_id_1 = v1["job_id"].as_str().unwrap().to_string();
+
+        let second = run(
+            state,
+            Request::post("/api/jobs/mint")
+                .header("content-type", "application/json")
+                .header("idempotency-key", key)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(second.0, StatusCode::ACCEPTED);
+        let v2: serde_json::Value = serde_json::from_str(&second.2).unwrap();
+        assert_eq!(
+            v2["job_id"], job_id_1,
+            "second admit must surface first job_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn jobs_mint_idempotent_replay_after_completion_returns_cached_body() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        // Admit a job, then flip it to `completed` directly via the
+        // JobStore so the second admit surfaces the cached response.
+        let body = serde_json::json!({
+            "account_address": "0x".to_string() + &hex::encode([3u8; 32]),
+            "amount": 1u64,
+        });
+        let first = run(
+            state.clone(),
+            Request::post("/api/jobs/mint")
+                .header("content-type", "application/json")
+                .header("idempotency-key", "k-cached")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        let v1: serde_json::Value = serde_json::from_str(&first.2).unwrap();
+        let job_id = uuid::Uuid::parse_str(v1["job_id"].as_str().unwrap()).unwrap();
+
+        state
+            .job_store
+            .complete(
+                job_id,
+                serde_json::json!({"success": true, "proof_id": 99u64}),
+                200,
+            )
+            .await
+            .expect("complete");
+
+        let second = run(
+            state,
+            Request::post("/api/jobs/mint")
+                .header("content-type", "application/json")
+                .header("idempotency-key", "k-cached")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            second.0,
+            StatusCode::OK,
+            "completed replay should surface cached 200"
+        );
+        let v2: serde_json::Value = serde_json::from_str(&second.2).unwrap();
+        assert_eq!(v2["proof_id"], 99u64);
+    }
+
+    // ---- POST /api/jobs/send ----
+
+    #[tokio::test]
+    async fn jobs_send_without_signature_returns_401() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let body = serde_json::json!({
+            "account_address": "0x".to_string() + &hex::encode([1u8; 32]),
+            "recipient": "0x".to_string() + &hex::encode([2u8; 32]),
+            "amount": 1u64,
+            "public_key": "020000000000000000000000000000000000000000000000000000000000000001",
+            "next_public_key": "020000000000000000000000000000000000000000000000000000000000000002",
+        });
+        let req = Request::post("/api/jobs/send")
+            .header("content-type", "application/json")
+            .header("idempotency-key", "k1")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["error"], "Missing signature");
+    }
+
+    #[tokio::test]
+    async fn jobs_send_admits_returns_202_with_job_id() {
+        // Success-path coverage for `jobs_send_handler`: a valid
+        // Schnorr signature drives the handler through
+        // `read_idempotency_key` Ok → `flow::validate_send_request`
+        // Ok → `serde_json::to_value` (now `.expect`) → `admit_and_enqueue`
+        // and lands a 202 Accepted with a fresh job_id. Mirrors
+        // `jobs_mint_admits_returns_202_with_job_id` above but on the
+        // send route.
+        use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
+        let (state, _pool, _c) = jobs_test_state().await;
+
+        // Deterministic sender / recipient pair — the signature only
+        // needs to verify against `public_key`, no on-chain account
+        // lookup happens before admit.
+        let sk = SecretKey::from_slice(&[7u8; 32]).expect("valid sk");
+        let secp = secp::Secp256k1::new();
+        let pk: PublicKey = sk.public_key(&secp);
+        let kp = Keypair::from_secret_key(&secp, &sk);
+
+        let account_address = "0x".to_string() + &hex::encode([1u8; 32]);
+        let recipient = "0x".to_string() + &hex::encode([2u8; 32]);
+        let amount: u64 = 1;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(account_address.as_bytes());
+        hasher.update(recipient.as_bytes());
+        hasher.update(amount.to_le_bytes());
+        hasher.update(timestamp.to_le_bytes());
+        use sha2::Digest;
+        let hash: [u8; 32] = hasher.finalize().into();
+        let msg = bitcoin::secp256k1::Message::from_digest(hash);
+        let sig = secp.sign_schnorr(&msg, &kp);
+
+        let body = serde_json::json!({
+            "account_address": account_address,
+            "recipient": recipient,
+            "amount": amount,
+            "public_key": hex::encode(pk.serialize()),
+            "next_public_key": hex::encode(pk.serialize()),
+            "signature": hex::encode(sig.serialize()),
+            "timestamp": timestamp,
+        });
+        let req = Request::post("/api/jobs/send")
+            .header("content-type", "application/json")
+            .header("Idempotency-Key", "k-send-success")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, headers, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "body={body}");
+        let location = headers
+            .iter()
+            .find(|(k, _)| k == "location")
+            .map(|(_, v)| v.clone())
+            .expect("Location header present");
+        assert!(location.starts_with("/api/jobs/"));
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["status"], "queued");
+        let _ = uuid::Uuid::parse_str(v["job_id"].as_str().unwrap()).expect("job_id is UUID");
+    }
+
+    #[tokio::test]
+    async fn jobs_send_without_idempotency_key_returns_400() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let body = serde_json::json!({
+            "account_address": "0x".to_string() + &hex::encode([1u8; 32]),
+            "recipient": "0x".to_string() + &hex::encode([2u8; 32]),
+            "amount": 1u64,
+            "public_key": "020000000000000000000000000000000000000000000000000000000000000001",
+            "next_public_key": "020000000000000000000000000000000000000000000000000000000000000002",
+        });
+        let req = Request::post("/api/jobs/send")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, _b) = run(state, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ---- GET /api/jobs/:id ----
+
+    #[tokio::test]
+    async fn get_job_unknown_id_returns_404() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let id = uuid::Uuid::new_v4();
+        let req = Request::get(format!("/api/jobs/{}", id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, _b) = run(state, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_job_queued_returns_retry_after_2() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Mint,
+                &[5u8; 32],
+                Some("k-poll"),
+                serde_json::json!({"any": "body"}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!("expected fresh"),
+        };
+        let req = Request::get(format!("/api/jobs/{}", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers.iter().any(|(k, v)| k == "retry-after" && v == "2"));
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["status"], "queued");
+        assert_eq!(v["kind"], "mint");
+    }
+
+    #[tokio::test]
+    async fn get_job_completed_includes_result_no_retry_after() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Mint,
+                &[6u8; 32],
+                Some("k-done"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        state
+            .job_store
+            .complete(
+                job_id,
+                serde_json::json!({"success": true, "proof_id": 7u64}),
+                200,
+            )
+            .await
+            .expect("complete");
+
+        let req = Request::get(format!("/api/jobs/{}", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!headers.iter().any(|(k, _)| k == "retry-after"));
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["result"]["proof_id"], 7u64);
+    }
+
+    #[tokio::test]
+    async fn get_job_failed_includes_error() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Mint,
+                &[7u8; 32],
+                Some("k-fail"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        state
+            .job_store
+            .fail(job_id, "synthetic error")
+            .await
+            .expect("fail");
+
+        let req = Request::get(format!("/api/jobs/{}", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["error"], "synthetic error");
+    }
+
+    #[tokio::test]
+    async fn get_job_awaiting_signature_includes_proof_id() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[8u8; 32],
+                Some("k-sig"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 42)
+            .await
+            .expect("await sig");
+
+        let req = Request::get(format!("/api/jobs/{}", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["status"], "awaiting_signature");
+        assert_eq!(v["proof_id"], 42i64);
+    }
+
+    // ---- POST /api/jobs/:id/cancel ----
+
+    #[tokio::test]
+    async fn jobs_cancel_unknown_returns_409() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let id = uuid::Uuid::new_v4();
+        let req = Request::post(format!("/api/jobs/{}/cancel", id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, _b) = run(state, req).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn jobs_cancel_queued_returns_200() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Mint,
+                &[9u8; 32],
+                Some("k-cancel"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+
+        let req = Request::post(format!("/api/jobs/{}/cancel", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["status"], "cancelled");
+    }
+
+    // ---- POST /api/jobs/:id/commit ----
+
+    #[tokio::test]
+    async fn jobs_commit_unknown_job_returns_404() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let id = uuid::Uuid::new_v4();
+        let commit_body = serde_json::json!({
+            "proof_id": 1u64,
+            "public_key": "020000000000000000000000000000000000000000000000000000000000000001",
+            "signature": "00".repeat(64),
+            "message": "ff".repeat(32),
+        });
+        let req = Request::post(format!("/api/jobs/{}/commit", id))
+            .header("content-type", "application/json")
+            .body(Body::from(commit_body.to_string()))
+            .unwrap();
+        let (status, _h, _b) = run(state, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn jobs_commit_job_in_queued_returns_409() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[10u8; 32],
+                Some("k-commit-bad"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        let commit_body = serde_json::json!({
+            "proof_id": 1u64,
+            "public_key": "020000000000000000000000000000000000000000000000000000000000000001",
+            "signature": "00".repeat(64),
+            "message": "ff".repeat(32),
+        });
+        let req = Request::post(format!("/api/jobs/{}/commit", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(commit_body.to_string()))
+            .unwrap();
+        let (status, _h, _b) = run(state, req).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn jobs_commit_awaiting_signature_signals_notify() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[11u8; 32],
+                Some("k-commit-ok"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 7)
+            .await
+            .expect("aw sig");
+        let notifier = Arc::new(crate::job_dispatcher::JobNotifier::new());
+        let commit_wake = notifier.commit_wake.clone();
+        state.job_notify_map.insert(job_id, notifier);
+
+        let commit_body = serde_json::json!({
+            "proof_id": 7u64,
+            "public_key": "020000000000000000000000000000000000000000000000000000000000000001",
+            "signature": "00".repeat(64),
+            "message": "ff".repeat(32),
+        });
+        let req = Request::post(format!("/api/jobs/{}/commit", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(commit_body.to_string()))
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {}", body);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["status"], "broadcasting");
+        // The handler signals the notifier's commit_wake; verifying
+        // that requires observing the wake-up. We assert that
+        // .notified() resolves immediately afterwards.
+        tokio::time::timeout(std::time::Duration::from_secs(1), commit_wake.notified())
+            .await
+            .expect("notify_one must have been called");
+    }
+
+    #[tokio::test]
+    async fn jobs_commit_no_notify_entry_returns_409() {
+        // Job is in `awaiting_signature` but the notify_map entry
+        // was removed (timeout-and-cleanup race). Surface 409 so
+        // the wallet does not silently spin.
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[12u8; 32],
+                Some("k-commit-no-notify"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 7)
+            .await
+            .expect("aw sig");
+        // No notify_map.insert — simulates the post-timeout state.
+
+        let commit_body = serde_json::json!({
+            "proof_id": 7u64,
+            "public_key": "020000000000000000000000000000000000000000000000000000000000000001",
+            "signature": "00".repeat(64),
+            "message": "ff".repeat(32),
+        });
+        let req = Request::post(format!("/api/jobs/{}/commit", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(commit_body.to_string()))
+            .unwrap();
+        let (status, _h, _b) = run(state, req).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    // ---- DB-error 500 arms ----
+    //
+    // The handlers' error branches that fire when `JobStore` calls
+    // return `Err` (DB unreachable / mid-call disconnect). Routed
+    // through a `dead_pool`-backed `JobStore` so every `.await`
+    // against it fails fast with a connect error. Mirrors the
+    // existing `r2_probe_history_db_error_returns_500` pattern.
+
+    /// Build an `AppState` whose `job_store` is wired to `dead_pool`
+    /// (every query fails with a connect error). The admit + load +
+    /// cancel handlers all hit their `Err` arm. The mpsc rx is
+    /// leaked the same way `jobs_test_state` does — the 503 test
+    /// uses a separate helper that drops the rx explicitly.
+    fn jobs_test_state_dead_db() -> AppState {
+        let mut state = mint_test_state();
+        state.job_store = Arc::new(crate::job_store::JobStore::new((*dead_pool()).clone()));
+        let (tx, rx) = tokio::sync::mpsc::channel::<crate::job_dispatcher::JobEnvelope>(8);
+        state.job_tx = tx;
+        std::mem::forget(rx);
+        state.job_notify_map = Arc::new(dashmap::DashMap::new());
+        state
+    }
+
+    #[tokio::test]
+    async fn jobs_admit_returns_500_when_db_unavailable() {
+        // Targets the `JobStore::create` Err arm in `admit_and_enqueue`
+        // (~router.rs Z889-898). Body is otherwise valid so we sail
+        // past `validate_mint_request` and reach the store call.
+        let state = jobs_test_state_dead_db();
+        let body = serde_json::json!({
+            "account_address": "0x".to_string() + &hex::encode([1u8; 32]),
+            "amount": 1u64,
+        });
+        let req = Request::post("/api/jobs/mint")
+            .header("content-type", "application/json")
+            .header("idempotency-key", "k-db-admit")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["error"], "Failed to admit job");
+    }
+
+    #[tokio::test]
+    async fn jobs_get_returns_500_when_db_unavailable() {
+        // Targets the `JobStore::load` Err arm in `get_job_handler`
+        // (~router.rs Z985-994). Random UUID — the load call fails
+        // before the row-not-found arm gets a chance to run.
+        let state = jobs_test_state_dead_db();
+        let id = uuid::Uuid::new_v4();
+        let req = Request::get(format!("/api/jobs/{}", id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["error"], "Failed to load job");
+    }
+
+    #[tokio::test]
+    async fn jobs_commit_returns_500_when_db_unavailable() {
+        // Targets the `JobStore::load` Err arm in `jobs_commit_handler`
+        // (~router.rs Z1050-1059). Body is structurally valid so we
+        // reach the load call before any handler-local validation.
+        let state = jobs_test_state_dead_db();
+        let id = uuid::Uuid::new_v4();
+        let commit_body = serde_json::json!({
+            "proof_id": 1u64,
+            "public_key": "020000000000000000000000000000000000000000000000000000000000000001",
+            "signature": "00".repeat(64),
+            "message": "ff".repeat(32),
+        });
+        let req = Request::post(format!("/api/jobs/{}/commit", id))
+            .header("content-type", "application/json")
+            .body(Body::from(commit_body.to_string()))
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["error"], "Failed to load job");
+    }
+
+    #[tokio::test]
+    async fn jobs_cancel_returns_500_when_db_unavailable() {
+        // Targets the `JobStore::cancel` Err arm in `jobs_cancel_handler`
+        // (~router.rs Z1162-1170). Cancel is one statement — `dead_pool`
+        // makes the connect attempt fail before any row-state check.
+        let state = jobs_test_state_dead_db();
+        let id = uuid::Uuid::new_v4();
+        let req = Request::post(format!("/api/jobs/{}/cancel", id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["error"], "Failed to cancel job");
+    }
+
+    #[tokio::test]
+    async fn jobs_admit_returns_503_when_dispatcher_unavailable() {
+        // Targets the `state.job_tx.send(...)` Err arm in
+        // `admit_and_enqueue` (~router.rs Z947-953). The default
+        // `jobs_test_state` helper leaks the rx so this arm never
+        // fires; here we drop it explicitly so the send fails with
+        // a closed-channel error.
+        //
+        // Setup mirrors `jobs_test_state` so the admit-then-enqueue
+        // sequence reaches the channel send: live testcontainer
+        // Postgres for the `JobStore::create` happy path, then a
+        // freshly-created channel whose rx is dropped before the
+        // request is dispatched.
+        let container = Postgres::default()
+            .with_tag("17")
+            .start()
+            .await
+            .expect("postgres container");
+        let host = container.get_host().await.unwrap();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+        let pool = Arc::new(connect_and_migrate(&url).await.expect("migrate"));
+
+        let mut state = mint_test_state();
+        state.pool = Arc::clone(&pool);
+        state.job_store = Arc::new(crate::job_store::JobStore::new((*pool).clone()));
+        let (tx, rx) = tokio::sync::mpsc::channel::<crate::job_dispatcher::JobEnvelope>(8);
+        state.job_tx = tx;
+        // Drop the rx before the request runs so the admit handler's
+        // `job_tx.send(...).await` returns `Err(SendError(...))`.
+        drop(rx);
+        state.job_notify_map = Arc::new(dashmap::DashMap::new());
+
+        let body = serde_json::json!({
+            "account_address": "0x".to_string() + &hex::encode([13u8; 32]),
+            "amount": 1u64,
+        });
+        let req = Request::post("/api/jobs/mint")
+            .header("content-type", "application/json")
+            .header("idempotency-key", "k-dispatcher-down")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["error"], "Dispatcher unavailable");
+    }
+
+    #[tokio::test]
+    async fn jobs_commit_returns_500_when_persist_fails() {
+        // Targets the persist-side Err arm in `jobs_commit_handler`
+        // (~router.rs Z1106-1113): the `UPDATE jobs SET request_body
+        // = $1 ...` statement fails after `JobStore::load` already
+        // returned `Ok(Some(_))`.
+        //
+        // Same-pool problem: load and persist use `job_store.pool()`,
+        // so a dead pool short-circuits load before persist is ever
+        // reached. We make persist fail in isolation by installing a
+        // `NOT VALID` CHECK constraint on the `jobs` table after the
+        // row exists — NOT VALID skips existing rows, so the row
+        // stays readable, but any subsequent UPDATE has to satisfy
+        // the constraint and fails with a constraint violation.
+        let container = Postgres::default()
+            .with_tag("17")
+            .start()
+            .await
+            .expect("postgres container");
+        let host = container.get_host().await.unwrap();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+        let pool = Arc::new(connect_and_migrate(&url).await.expect("migrate"));
+
+        let mut state = mint_test_state();
+        state.pool = Arc::clone(&pool);
+        state.job_store = Arc::new(crate::job_store::JobStore::new((*pool).clone()));
+        let (tx, rx) = tokio::sync::mpsc::channel::<crate::job_dispatcher::JobEnvelope>(8);
+        state.job_tx = tx;
+        std::mem::forget(rx);
+        state.job_notify_map = Arc::new(dashmap::DashMap::new());
+
+        // Admit a Send job and flip to awaiting_signature so the
+        // commit handler's status guard passes and reaches the
+        // persist statement.
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[14u8; 32],
+                Some("k-persist-fail"),
+                serde_json::json!({"any": "body"}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!("expected fresh"),
+        };
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 7)
+            .await
+            .expect("aw sig");
+        let notifier = Arc::new(crate::job_dispatcher::JobNotifier::new());
+        state.job_notify_map.insert(job_id, notifier);
+
+        // Install a CHECK constraint that no future UPDATE can
+        // satisfy. NOT VALID lets the existing (already-stored) row
+        // remain — load still succeeds — but the UPDATE issued by
+        // the persist arm fails with a constraint violation, which
+        // surfaces as the 500 we are testing.
+        sqlx::query("ALTER TABLE jobs ADD CONSTRAINT block_persist CHECK (false) NOT VALID")
+            .execute(&*pool)
+            .await
+            .expect("install blocking constraint");
+
+        let commit_body = serde_json::json!({
+            "proof_id": 7u64,
+            "public_key": "020000000000000000000000000000000000000000000000000000000000000001",
+            "signature": "00".repeat(64),
+            "message": "ff".repeat(32),
+        });
+        let req = Request::post(format!("/api/jobs/{}/commit", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(commit_body.to_string()))
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["error"], "Failed to persist commit payload");
+    }
+
+    // =======================================================================
+    // SSE push channel coverage — `GET /api/jobs/:id/stream` (PR2).
+    // =======================================================================
+    //
+    // The handler entry point + helper functions
+    // (`initial_event_from_job`, `event_from_phase`) stay covered
+    // here. The long-lived stream loop in `build_phase_stream` is
+    // marked `#[cfg_attr(coverage_nightly, coverage(off))]` because
+    // its inner `tokio::select!` arms depend on real-time
+    // broadcast-channel deliveries that can't be deterministically
+    // covered without a wall-clock advance — same exclusion pattern
+    // as `scanner_ws::run_subscription_loop`.
+
+    use crate::job_dispatcher::{JobNotifier, JobPhaseEvent};
+    use crate::job_store::{Job, JobKind, JobStatus};
+
+    /// Decode an SSE-formatted body chunk into `(event, data)` pairs.
+    /// The body is the raw bytes that flow through the wire — each
+    /// event is delimited by a blank line; comments (`: heartbeat`)
+    /// are skipped.
+    fn parse_sse_events(body: &str) -> Vec<(String, String)> {
+        let mut events = Vec::new();
+        for block in body.split("\n\n") {
+            let mut event_name = String::from("message");
+            let mut data = String::new();
+            for line in block.lines() {
+                if let Some(rest) = line.strip_prefix("event:") {
+                    event_name = rest.trim().to_string();
+                } else if let Some(rest) = line.strip_prefix("data:") {
+                    if !data.is_empty() {
+                        data.push('\n');
+                    }
+                    data.push_str(rest.trim());
+                }
+                // Comments (lines starting with ':' but no second
+                // ':') and other fields are ignored.
+            }
+            if !data.is_empty() {
+                events.push((event_name, data));
             }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    };
-
-    // Inject pk_0's key into the SMT with a value that will NOT match
-    // what `update_and_snapshot_for_persist` is about to write. The
-    // handler is currently blocked on the state_advance_release_lock
-    // (drained above) so its SMT mutation cannot run before this
-    // injection lands.
-    {
-        let pk0 = {
-            let mc = state.minting_account.lock().unwrap();
-            mc.generate_public_key(0)
-        };
-        let key: [u8; 32] = bitcoin::hashes::sha256::Hash::hash(&pk0.serialize()).to_byte_array();
-        let node_guard = state.account_node.lock().unwrap();
-        let state_arc = node_guard.state().clone();
-        drop(node_guard);
-        let mut state_guard = state_arc.lock().unwrap();
-        // A digest that does NOT match the legitimate
-        // `commitment.get_account_state_hash()` the handler will derive.
-        state_guard
-            .smt
-            .insert(key, zkcoins_program::hash::digest_from_bytes(&[0xAAu8; 32]))
-            .expect("inject pk_0 -> bogus value into SMT");
+        events
     }
 
-    // Release the handler. It now runs `update_and_snapshot_for_persist`,
-    // the SMT insert at pk_0 errors with "Key already exists in the
-    // tree with different value", and the handler returns 503.
-    drop(advance_guard);
-
-    let (status, resp_body) =
-        tokio::time::timeout(std::time::Duration::from_secs(60), request_task)
+    /// Drain the response body to a String. Caps at ~64 KiB so a
+    /// runaway stream cannot wedge the test indefinitely.
+    async fn collect_body_string(resp: axum::response::Response) -> String {
+        let bytes = http_body_util::BodyExt::collect(resp.into_body())
             .await
-            .expect("mint request must complete within 60s")
-            .expect("request task panicked");
+            .expect("collect")
+            .to_bytes();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
 
-    assert_eq!(
-        status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "in-process state.update collision must surface 503, body: {}",
-        resp_body
-    );
-    let v: serde_json::Value = serde_json::from_str(&resp_body).expect("valid JSON");
-    assert_eq!(v["success"], false);
-    assert!(
-        v["error"]
-            .as_str()
+    // ---- `initial_event_from_job` pure-helper coverage ----
+
+    /// Helper: build a `Job` row directly (no DB) so the pure helpers
+    /// can be exercised without a testcontainer.
+    fn make_job(
+        status: JobStatus,
+        proof_id: Option<i64>,
+        response_body: Option<serde_json::Value>,
+        error: Option<String>,
+    ) -> Job {
+        Job {
+            id: 1,
+            public_id: uuid::Uuid::new_v4(),
+            kind: JobKind::Mint,
+            status,
+            phase: status.as_str().to_string(),
+            account_address: [0u8; 32],
+            idempotency_key: None,
+            request_body: serde_json::json!({}),
+            response_body,
+            response_status: None,
+            proof_id,
+            error,
+            progress: 0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn initial_event_proving_serialises_as_phase() {
+        let job = make_job(JobStatus::Proving, None, None, None);
+        let event = crate::router::initial_event_from_job(&job);
+        let wire = format!("{:?}", event);
+        // The Event Debug impl renders the assembled SSE frame; we
+        // assert on the event name field rather than the entire
+        // formatted output.
+        assert!(wire.contains("phase"), "wire: {}", wire);
+    }
+
+    #[test]
+    fn initial_event_awaiting_signature_includes_proof_id() {
+        let job = make_job(JobStatus::AwaitingSignature, Some(42), None, None);
+        let event = crate::router::initial_event_from_job(&job);
+        // Re-serialise to check the payload contents.
+        let wire = format!("{:?}", event);
+        assert!(wire.contains("phase"), "wire: {}", wire);
+        assert!(
+            wire.contains("42"),
+            "proof_id 42 must surface; wire: {}",
+            wire
+        );
+    }
+
+    #[test]
+    fn initial_event_completed_emits_complete_event() {
+        let job = make_job(
+            JobStatus::Completed,
+            None,
+            Some(serde_json::json!({"success": true})),
+            None,
+        );
+        let event = crate::router::initial_event_from_job(&job);
+        let wire = format!("{:?}", event);
+        assert!(wire.contains("complete"), "wire: {}", wire);
+        assert!(
+            wire.contains("success"),
+            "result body must surface; wire: {}",
+            wire
+        );
+    }
+
+    #[test]
+    fn initial_event_failed_emits_complete_event_with_error() {
+        let job = make_job(JobStatus::Failed, None, None, Some("boom".to_string()));
+        let event = crate::router::initial_event_from_job(&job);
+        let wire = format!("{:?}", event);
+        assert!(wire.contains("complete"), "wire: {}", wire);
+        assert!(wire.contains("boom"), "wire: {}", wire);
+    }
+
+    #[test]
+    fn initial_event_cancelled_emits_complete_event() {
+        let job = make_job(JobStatus::Cancelled, None, None, None);
+        let event = crate::router::initial_event_from_job(&job);
+        let wire = format!("{:?}", event);
+        assert!(wire.contains("complete"), "wire: {}", wire);
+    }
+
+    // ---- `event_from_phase` pure-helper coverage ----
+
+    #[test]
+    fn event_from_phase_proving_emits_phase_event() {
+        let ev = JobPhaseEvent {
+            status: JobStatus::Proving,
+            phase: "proving".to_string(),
+            proof_id: None,
+            result: None,
+            error: None,
+        };
+        let frame = crate::router::event_from_phase(&ev);
+        let wire = format!("{:?}", frame);
+        assert!(wire.contains("phase"), "wire: {}", wire);
+    }
+
+    #[test]
+    fn event_from_phase_awaiting_signature_includes_proof_id() {
+        let ev = JobPhaseEvent {
+            status: JobStatus::AwaitingSignature,
+            phase: "awaiting_signature".to_string(),
+            proof_id: Some(17),
+            result: None,
+            error: None,
+        };
+        let frame = crate::router::event_from_phase(&ev);
+        let wire = format!("{:?}", frame);
+        assert!(wire.contains("phase"), "wire: {}", wire);
+        assert!(wire.contains("17"), "wire: {}", wire);
+    }
+
+    #[test]
+    fn event_from_phase_completed_emits_complete_event() {
+        let ev = JobPhaseEvent {
+            status: JobStatus::Completed,
+            phase: "completed".to_string(),
+            proof_id: None,
+            result: Some(serde_json::json!({"ok": 1})),
+            error: None,
+        };
+        let frame = crate::router::event_from_phase(&ev);
+        let wire = format!("{:?}", frame);
+        assert!(wire.contains("complete"), "wire: {}", wire);
+    }
+
+    #[test]
+    fn event_from_phase_failed_emits_complete_event() {
+        let ev = JobPhaseEvent {
+            status: JobStatus::Failed,
+            phase: "failed".to_string(),
+            proof_id: None,
+            result: None,
+            error: Some("err".to_string()),
+        };
+        let frame = crate::router::event_from_phase(&ev);
+        let wire = format!("{:?}", frame);
+        assert!(wire.contains("complete"), "wire: {}", wire);
+    }
+
+    #[test]
+    fn event_from_phase_cancelled_emits_complete_event() {
+        let ev = JobPhaseEvent {
+            status: JobStatus::Cancelled,
+            phase: "cancelled".to_string(),
+            proof_id: None,
+            result: None,
+            error: None,
+        };
+        let frame = crate::router::event_from_phase(&ev);
+        let wire = format!("{:?}", frame);
+        assert!(wire.contains("complete"), "wire: {}", wire);
+    }
+
+    // ---- `stream_job_handler` route-level coverage ----
+
+    #[tokio::test]
+    async fn jobs_stream_404_for_unknown_id() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let id = uuid::Uuid::new_v4();
+        let req = Request::get(format!("/api/jobs/{}/stream", id))
+            .body(Body::empty())
+            .unwrap();
+        let app = create_router(state);
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn jobs_stream_returns_500_when_db_unavailable() {
+        // Targets the `JobStore::load` Err arm in
+        // `stream_job_handler` — same shape as the GET 500 test.
+        let state = jobs_test_state_dead_db();
+        let id = uuid::Uuid::new_v4();
+        let req = Request::get(format!("/api/jobs/{}/stream", id))
+            .body(Body::empty())
+            .unwrap();
+        let app = create_router(state);
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn jobs_stream_closes_immediately_for_terminal_job() {
+        // Completed jobs surface the cached body as a single
+        // `event: complete` frame and the stream closes — no
+        // subscription needed.
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                JobKind::Mint,
+                &[20u8; 32],
+                Some("k-stream-done"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        state
+            .job_store
+            .complete(
+                job_id,
+                serde_json::json!({"success": true, "proof_id": 5u64}),
+                200,
+            )
+            .await
+            .expect("complete");
+
+        let req = Request::get(format!("/api/jobs/{}/stream", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let app = create_router(state);
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
             .unwrap_or("")
-            .contains("in-process state advance failed"),
-        "response error must explain the in-process collision failure mode, got: {}",
-        v["error"]
-    );
+            .to_string();
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "content-type was {}",
+            content_type
+        );
+        let body = collect_body_string(resp).await;
+        let events = parse_sse_events(&body);
+        // First event must be `complete` (terminal job).
+        assert!(
+            !events.is_empty(),
+            "expected at least one event; body={}",
+            body
+        );
+        let (first_name, first_data) = &events[0];
+        assert_eq!(first_name, "complete");
+        let v: serde_json::Value = serde_json::from_str(first_data).expect("first event JSON");
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["result"]["proof_id"], 5u64);
+    }
 
-    // The pending row stays at `reveal_broadcast`: the publisher set it
-    // there before the broadcast and the handler bailed before the
-    // atomic persist + mark-complete tx could run.
-    let (pending_status,): (String,) =
-        sqlx::query_as("SELECT status FROM pending_inscriptions WHERE commit_txid = $1")
-            .bind(&commit_txid_bytes)
-            .fetch_one(&*pool)
+    #[tokio::test]
+    async fn jobs_stream_failed_terminal_closes_with_complete_and_error() {
+        // Failed jobs surface the error string as a single
+        // `event: complete` and close.
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                JobKind::Mint,
+                &[21u8; 32],
+                Some("k-stream-fail"),
+                serde_json::json!({}),
+            )
             .await
-            .expect("the broadcasted commitment's row must exist");
-    assert_eq!(
-        pending_status,
-        crate::db::PENDING_STATUS_REVEAL_BROADCAST,
-        "in-process collision: pending row must stay at reveal_broadcast for scanner-replay to pick up"
-    );
-
-    // On-disk SMT/MMR/root_index did NOT advance — the handler bailed
-    // before invoking the atomic persist + mark-complete transaction.
-    assert_eq!(
-        crate::db::load_smt(&pool).await.unwrap(),
-        None,
-        "in-process collision must leave smt_state untouched"
-    );
-    assert_eq!(
-        crate::db::load_mmr(&pool).await.unwrap(),
-        None,
-        "in-process collision must leave mmr_state untouched"
-    );
-    assert!(
-        crate::db::load_root_indices(&pool)
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        state
+            .job_store
+            .fail(job_id, "synthetic fail")
             .await
-            .unwrap()
-            .is_empty(),
-        "in-process collision must leave mmr_root_index untouched"
-    );
+            .expect("fail");
 
-    // Scanner-replay path stays armed (row not at `complete`).
-    assert!(
-        !crate::scanner::should_skip_scanner_state_update(
-            crate::db::pending_inscription_status_by_commit_txid(&pool, &commit_txid_bytes)
-                .await
-                .unwrap()
-                .as_deref()
-        ),
-        "scanner must NOT skip its state.update for an inscription whose in-process advance failed"
-    );
+        let req = Request::get(format!("/api/jobs/{}/stream", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let app = create_router(state);
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = collect_body_string(resp).await;
+        let events = parse_sse_events(&body);
+        assert!(!events.is_empty(), "body={}", body);
+        let (name, data) = &events[0];
+        assert_eq!(name, "complete");
+        let v: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["error"], "synthetic fail");
+    }
+
+    #[tokio::test]
+    async fn jobs_stream_emits_initial_phase_for_non_terminal_job() {
+        // Queued (non-terminal) jobs emit an initial `event: phase`
+        // and then stay open waiting for transitions. We close the
+        // stream by flipping the job to a terminal state and reading
+        // the second event.
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                JobKind::Mint,
+                &[22u8; 32],
+                Some("k-stream-queued"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+
+        // Pre-arm the notifier so the dispatcher's not-yet-running
+        // race condition does not lose the phase event we push below.
+        let notifier = Arc::new(JobNotifier::new());
+        state.job_notify_map.insert(job_id, notifier.clone());
+
+        let req = Request::get(format!("/api/jobs/{}/stream", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let app = create_router(state.clone());
+
+        // Drive the request in the background so we can publish a
+        // phase event into the broadcast channel while the stream
+        // is still open. The handler subscribes BEFORE yielding the
+        // first initial event, so any event published during the
+        // handler's setup window also lands in the receiver queue.
+        let request_task = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+
+        // Give the handler a beat to subscribe; then publish a
+        // terminal event so the stream closes promptly.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        crate::job_dispatcher::publish_phase(
+            &state.job_notify_map,
+            job_id,
+            JobPhaseEvent {
+                status: JobStatus::Completed,
+                phase: "completed".to_string(),
+                proof_id: None,
+                result: Some(serde_json::json!({"ok": true})),
+                error: None,
+            },
+        );
+
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), request_task)
+            .await
+            .expect("request did not complete in time")
+            .expect("join");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = collect_body_string(resp).await;
+        let events = parse_sse_events(&body);
+        assert!(
+            events.len() >= 2,
+            "expected initial phase + complete; body={}",
+            body
+        );
+        let (first_name, first_data) = &events[0];
+        assert_eq!(first_name, "phase", "first event must be phase");
+        let v: serde_json::Value = serde_json::from_str(first_data).unwrap();
+        assert_eq!(v["status"], "queued");
+        // The last event is the complete one we published.
+        let (last_name, last_data) = events.last().unwrap();
+        assert_eq!(last_name, "complete");
+        let v: serde_json::Value = serde_json::from_str(last_data).unwrap();
+        assert_eq!(v["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn jobs_stream_forwards_dispatcher_phase_transition() {
+        // Drive a full happy-path sequence:
+        //   initial (queued) → proving (published) → completed (published)
+        // through the handler and verify all three frames land in
+        // the wallet-visible body.
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                JobKind::Send,
+                &[23u8; 32],
+                Some("k-stream-transitions"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+
+        // Pre-arm the notifier; the dispatcher would normally do
+        // this when it picks the row off the channel.
+        let notifier = Arc::new(JobNotifier::new());
+        state.job_notify_map.insert(job_id, notifier);
+
+        let req = Request::get(format!("/api/jobs/{}/stream", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let app = create_router(state.clone());
+        let request_task = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        crate::job_dispatcher::publish_phase(
+            &state.job_notify_map,
+            job_id,
+            JobPhaseEvent {
+                status: JobStatus::Proving,
+                phase: "proving".to_string(),
+                proof_id: None,
+                result: None,
+                error: None,
+            },
+        );
+        // Small spacer so the proving event lands before the close.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        crate::job_dispatcher::publish_phase(
+            &state.job_notify_map,
+            job_id,
+            JobPhaseEvent {
+                status: JobStatus::Completed,
+                phase: "completed".to_string(),
+                proof_id: None,
+                result: Some(serde_json::json!({"done": true})),
+                error: None,
+            },
+        );
+
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), request_task)
+            .await
+            .expect("request stalled")
+            .expect("join");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = collect_body_string(resp).await;
+        let events = parse_sse_events(&body);
+        // initial phase + proving + complete = 3 events, possibly
+        // interleaved with heartbeat comments (which `parse_sse_events`
+        // strips).
+        let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"phase"),
+            "expected `phase` event; got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"complete"),
+            "expected `complete` event; got {:?}",
+            names
+        );
+        // Verify proving payload arrived.
+        let has_proving = events
+            .iter()
+            .filter(|(n, _)| n == "phase")
+            .any(|(_, d)| d.contains("\"proving\""));
+        assert!(has_proving, "proving phase event missing; body={}", body);
+    }
+
+    // ---- Cancel → SSE complete event smoke test ----
+
+    #[tokio::test]
+    async fn jobs_cancel_publishes_phase_to_sse() {
+        // Cancel-handler publishes a `cancelled` event so a subscriber
+        // attached BEFORE the cancel observes the terminal frame.
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                JobKind::Mint,
+                &[24u8; 32],
+                Some("k-stream-cancel"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        let notifier = Arc::new(JobNotifier::new());
+        let mut rx = notifier.phase_tx.subscribe();
+        state.job_notify_map.insert(job_id, notifier);
+
+        // Run the cancel via the router so the publish path runs end-to-end.
+        let req = Request::post(format!("/api/jobs/{}/cancel", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let app = create_router(state);
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("event in 10s")
+            .expect("ok");
+        assert_eq!(ev.status, JobStatus::Cancelled);
+        assert_eq!(ev.phase, "cancelled");
+    }
 }
 
-/// Phase E concurrent-mint coverage: two `/api/mint` requests with
-/// DIFFERENT recipients (different commitments → different SMT keys)
-/// must both succeed end-to-end. Both walk past the phase-2 re-derive
-/// gate (they observe DIFFERENT `expected_num_pubkeys` because the
-/// first mint's state advance lands before the second's gate runs —
-/// or, if interleaved, the gate's re-derive observes the freshly
-/// inserted pubkey and the second's `num_pubkeys` is already bumped).
-/// Both serialize on the state lock for the in-process state.update,
-/// and the atomic persist + mark-complete commits both rows.
-///
-/// Asserts:
-///   - both responses are 200
-///   - both pending_inscriptions rows reach `complete`
-///   - MMR `leaf_count == 2`
-///   - mmr_root_index has exactly 2 entries
-///   - no SMT key-collision error path was hit (no `Key already exists`
-///     log; tested indirectly by both 200 responses — the new 503 path
-///     for in-process state.update Err would surface here if a
-///     collision occurred).
-///
-/// Note: this test serializes the two requests deliberately (await
-/// the first 200 before sending the second) so we can deterministically
-/// assert end-state. The earlier `mint_handler_concurrent_mint_during_proof_returns_503`
-/// covers the truly-concurrent case (same `expected_num_pubkeys`); the
-/// genuine concurrent-different-recipients race relies on the in-process
-/// re-derive gate to either let both through (sequentially) or 503 one
-/// of them. The end-state invariant — MMR leaf_count == 2 for two
-/// successful mints — is the load-bearing piece this test pins.
-#[tokio::test]
-async fn mint_handler_two_sequential_mints_with_different_recipients_advance_cleanly() {
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
+// =======================================================================
+// Coverage for `router::verify_send_signature_pub` (the public wrapper
+// that `flow::validate_send_request` calls). The wrapper's body just
+// delegates to the private `verify_send_signature`, but the gate
+// still requires the three lines to be touched by at least one test.
+// The "Missing signature" arm is the cheapest reachable case.
+// =======================================================================
 
-    let pg_container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = pg_container.get_host().await.unwrap();
-    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(
-        crate::db::connect_and_migrate(&url)
-            .await
-            .expect("connect_and_migrate failed"),
-    );
-
-    let mock_server = mint_broadcast_mock_server().await;
-    let mut state = mint_test_state();
-    state.pool = Arc::clone(&pool);
-    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
-        url: mock_server.uri(),
-        is_mainnet: false,
-        network_name: "Mutinynet".to_string(),
-        ws_url: None,
-    });
-
-    // First mint: recipient A.
-    let recipient_a = "0x".to_string() + &hex::encode([0xAAu8; 32]);
-    let req_a = Request::post("/api/mint")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::json!({ "account_address": recipient_a, "amount": 1u64 }).to_string(),
-        ))
-        .unwrap();
-    let (status_a, body_a) = send_request_with_state(state.clone(), req_a).await;
-    assert_eq!(status_a, StatusCode::OK, "first mint body: {}", body_a);
-
-    // After the first mint returns, the SMT must hold pk_0 and
-    // derive_num_pubkeys_from_smt must observe 1. This is the
-    // invariant the synchronous state.update advance gives the next
-    // mint.
-    {
-        let state_arc = {
-            let node_guard = state.account_node.lock().unwrap();
-            node_guard.state().clone()
-        };
-        let state_guard = state_arc.lock().unwrap();
-        assert_eq!(state_guard.mmr.leaf_count(), 1, "after mint A");
-        assert_eq!(
-            crate::state::derive_num_pubkeys_from_smt(
-                &state.minting_account.lock().unwrap().private_key,
-                &state_guard.smt
-            ),
-            1,
-            "after mint A, num_pubkeys must derive to 1 so mint B uses pk_1"
-        );
-    }
-
-    // Second mint: recipient B (different commitment → different SMT
-    // key). Must walk through cleanly; no `Key already exists` path.
-    let recipient_b = "0x".to_string() + &hex::encode([0xBBu8; 32]);
-    let req_b = Request::post("/api/mint")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::json!({ "account_address": recipient_b, "amount": 2u64 }).to_string(),
-        ))
-        .unwrap();
-    let (status_b, body_b) = send_request_with_state(state.clone(), req_b).await;
-    assert_eq!(status_b, StatusCode::OK, "second mint body: {}", body_b);
-
-    // Final invariants:
-    //   - in-memory MMR holds exactly 2 leaves
-    //   - in-memory derive_num_pubkeys_from_smt == 2
-    //   - 2 root_indices entries
-    {
-        let state_arc = {
-            let node_guard = state.account_node.lock().unwrap();
-            node_guard.state().clone()
-        };
-        let state_guard = state_arc.lock().unwrap();
-        assert_eq!(
-            state_guard.mmr.leaf_count(),
-            2,
-            "two successful mints → leaf_count == 2 (regression: a duplicate append would give 3 or 4)"
-        );
-        assert_eq!(
-            crate::state::derive_num_pubkeys_from_smt(
-                &state.minting_account.lock().unwrap().private_key,
-                &state_guard.smt
-            ),
-            2,
-            "two successful mints → derive_num_pubkeys_from_smt == 2"
-        );
-        assert_eq!(
-            state_guard.root_indices.len(),
-            2,
-            "two successful mints → 2 root_indices entries"
-        );
-    }
-
-    // Both pending_inscriptions rows reached `complete`.
-    let complete_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM pending_inscriptions WHERE status = 'complete'")
-            .fetch_one(&*pool)
-            .await
-            .unwrap();
-    assert_eq!(
-        complete_count, 2,
-        "both pending rows must reach `complete` after their respective atomic txs"
-    );
-
-    // On-disk MMR root_index table mirrors the in-memory state: 2
-    // rows, one per mint. The atomic tx wrote both
-    // SMT/MMR/root_index/status-complete bundles together.
-    let on_disk_root_indices = crate::db::load_root_indices(&pool).await.unwrap();
-    assert_eq!(
-        on_disk_root_indices.len(),
-        2,
-        "on-disk mmr_root_index must have 2 entries after two successful atomic txs"
-    );
+#[test]
+fn verify_send_signature_pub_returns_missing_signature_when_absent() {
+    // `verify_send_signature_pub` is the `pub(crate)` wrapper that
+    // `flow::validate_send_request` calls; the three-line body just
+    // delegates to the private `verify_send_signature`. The cheapest
+    // reachable arm is "missing signature" so the wrapper itself
+    // gets touched by at least one test.
+    let req = SendCoinRequest {
+        account_address: "0x".to_string() + &hex::encode([1u8; 32]),
+        recipient: "0x".to_string() + &hex::encode([2u8; 32]),
+        amount: 1,
+        public_key: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+            .parse()
+            .unwrap(),
+        next_public_key: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+            .parse()
+            .unwrap(),
+        prev_commitment_pubkey: None,
+        signature: None,
+        timestamp: Some(0),
+    };
+    let err = crate::router::verify_send_signature_pub(&req).unwrap_err();
+    assert_eq!(err, "Missing signature");
 }
 
 // =======================================================================
@@ -5984,428 +4354,6 @@ async fn r2_probe_history_limit_clamped_to_max() {
 //    unchanged; the row stays at `reveal_broadcast` so scanner-replay
 //    will integrate the inscription from chain.
 // ---------------------------------------------------------------------------
-
-/// End-to-end mirror of `mint_handler_advances_state_synchronously_with_broadcast`
-/// for the send-commit path. Runs `/api/send` (real prover) followed by
-/// `/api/commit` (real broadcast against a wiremock Esplora that
-/// accepts both the UTXO lookup and the `POST /tx`), then asserts the
-/// in-memory and on-disk Phase E aftermath that closes the second-send
-/// race (the regression that `second_send_roundtrip_succeeds_without_prev_commitment_pubkey_field`
-/// surfaced against Mutinynet).
-#[tokio::test]
-async fn commit_handler_advances_state_synchronously_with_broadcast() {
-    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
-    use bitcoin::hashes::Hash as _;
-    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
-
-    let pg_container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = pg_container.get_host().await.unwrap();
-    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(
-        crate::db::connect_and_migrate(&url)
-            .await
-            .expect("connect_and_migrate failed"),
-    );
-
-    // `mint_broadcast_mock_server` is publisher-key-agnostic — same
-    // `0x01` SecretKey used for every test-mode broadcast. It accepts
-    // the UTXO GET and the `POST /tx` so the commit-side
-    // `create_and_broadcast_inscription` succeeds.
-    let mock_server = mint_broadcast_mock_server().await;
-
-    // `test_state()` carries `dead_pool`; swap in the live pool and the
-    // mock Esplora before exercising the handler.
-    let mut state = test_state();
-    state.pool = Arc::clone(&pool);
-    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
-        url: mock_server.uri(),
-        is_mainnet: false,
-        network_name: "Mutinynet".to_string(),
-        ws_url: None,
-    });
-
-    // Derive the same BIP-32 child keys the other commit tests use.
-    let secret_bytes = include_bytes!("../minting_secret.bin");
-    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
-    let secp = secp::Secp256k1::new();
-    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .public_key;
-    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
-        .unwrap()
-        .public_key;
-    let sk_0: SecretKey = xpriv
-        .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .private_key;
-
-    // ---- /api/send (real prover, returns the post-state hashes) ----
-    let account_address = "0x".to_string()
-        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
-            &zkcoins_program::types::MINTING_ADDRESS,
-        ));
-    let recipient = "0x".to_string() + &hex::encode([0xa1u8; 32]);
-    let amount: u64 = 1;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let mut hasher = Sha256::new();
-    hasher.update(account_address.as_bytes());
-    hasher.update(recipient.as_bytes());
-    hasher.update(amount.to_le_bytes());
-    hasher.update(now.to_le_bytes());
-    let hash: [u8; 32] = hasher.finalize().into();
-    let msg = Message::from_digest(hash);
-    let kp = Keypair::from_secret_key(&secp, &sk_0);
-    let sig = secp.sign_schnorr(&msg, &kp);
-
-    let send_body = serde_json::json!({
-        "account_address": account_address,
-        "recipient": recipient,
-        "amount": amount,
-        "public_key": hex::encode(pk_0.serialize()),
-        "next_public_key": hex::encode(pk_1.serialize()),
-        "signature": hex::encode(sig.serialize()),
-        "timestamp": now,
-    });
-    let send_req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from(send_body.to_string()))
-        .unwrap();
-    let (send_status, send_body_text) = send_request_with_state(state.clone(), send_req).await;
-    assert_eq!(send_status, StatusCode::OK, "send failed: {send_body_text}");
-    let send_resp: serde_json::Value = serde_json::from_str(&send_body_text).unwrap();
-    let proof_id = send_resp["proof_id"].as_u64().unwrap();
-    let ash_hex = send_resp["account_state_hash"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let ocr_hex = send_resp["output_coins_root"].as_str().unwrap().to_string();
-
-    // Pre-commit sanity: pk_0 is NOT yet in the SMT (send_coin_handler
-    // does not advance the SMT; that is exactly the Phase E gap this
-    // commit closes for the send branch).
-    let pk0_smt_key = bitcoin::hashes::sha256::Hash::hash(&pk_0.serialize()).to_byte_array();
-    {
-        let node_guard = state.account_node.lock().unwrap();
-        let state_arc = node_guard.state().clone();
-        let state_guard = state_arc.lock().unwrap();
-        assert!(
-            state_guard.smt.get(&pk0_smt_key).is_none(),
-            "post-send / pre-commit: pk_0 must NOT be in SMT yet (commit's Phase E inserts it)"
-        );
-        assert_eq!(
-            state_guard.mmr.leaf_count(),
-            0,
-            "post-send / pre-commit: MMR must be empty"
-        );
-    }
-
-    // ---- /api/commit (broadcast OK → Phase E runs synchronously) ----
-    let ash_bytes = hex::decode(&ash_hex).unwrap();
-    let ocr_bytes = hex::decode(&ocr_hex).unwrap();
-    let mut commit_message = Vec::with_capacity(ash_bytes.len() + ocr_bytes.len());
-    commit_message.extend_from_slice(&ash_bytes);
-    commit_message.extend_from_slice(&ocr_bytes);
-    let commitment = shared::commitment::Commitment::new(&sk_0, commit_message.clone())
-        .expect("commitment creation");
-    assert!(commitment.verify(), "test commitment must verify locally");
-
-    let commit_body = serde_json::json!({
-        "proof_id": proof_id,
-        "public_key": hex::encode(commitment.public_key.serialize()),
-        "signature": hex::encode(commitment.signature.serialize()),
-        "message": hex::encode(&commitment.message),
-    });
-    let commit_req = Request::post("/api/commit")
-        .header("content-type", "application/json")
-        .body(Body::from(commit_body.to_string()))
-        .unwrap();
-    let (commit_status, commit_resp_body) =
-        send_request_with_state(state.clone(), commit_req).await;
-    assert_eq!(
-        commit_status,
-        StatusCode::OK,
-        "commit must succeed against accepting Esplora + live pool: {}",
-        commit_resp_body
-    );
-
-    // ---- Phase E aftermath: SMT/MMR/root_indices reflect the commit ----
-    let state_arc = {
-        let node_guard = state.account_node.lock().unwrap();
-        node_guard.state().clone()
-    };
-    {
-        let state_guard = state_arc.lock().unwrap();
-        assert!(
-            state_guard.smt.get(&pk0_smt_key).is_some(),
-            "Phase E regression: commit_handler must advance SMT with pk_0 before returning 200"
-        );
-        assert_eq!(
-            state_guard.mmr.leaf_count(),
-            1,
-            "Phase E: MMR must hold exactly one new leaf after the commit"
-        );
-        assert!(
-            state_guard
-                .root_indices
-                .contains_key(&state_guard.prev_mmr_root),
-            "Phase E: root_indices must hold the freshly written prev_mmr_root"
-        );
-    }
-
-    // ---- pending_inscriptions row marked `complete` atomically ----
-    let (pending_status,): (String,) =
-        sqlx::query_as("SELECT status FROM pending_inscriptions ORDER BY id DESC LIMIT 1")
-            .fetch_one(&*pool)
-            .await
-            .expect("a pending row must exist for the broadcast commit");
-    assert_eq!(
-        pending_status,
-        crate::db::PENDING_STATUS_COMPLETE,
-        "Phase E: commit_handler must mark pending_inscriptions complete after state.update"
-    );
-    let (commit_txid_bytes,): (Vec<u8>,) =
-        sqlx::query_as("SELECT commit_txid FROM pending_inscriptions ORDER BY id DESC LIMIT 1")
-            .fetch_one(&*pool)
-            .await
-            .expect("commit_txid column must populate");
-    assert!(
-        crate::scanner::should_skip_scanner_state_update(
-            crate::db::pending_inscription_status_by_commit_txid(&pool, &commit_txid_bytes)
-                .await
-                .unwrap()
-                .as_deref()
-        ),
-        "scanner must skip its redundant state.update for a Phase-E-completed send commit"
-    );
-}
-
-/// Mirror of `mint_handler_atomic_tx_rollback_leaves_state_and_row_consistent`
-/// for the send-commit path. Installs a `BEFORE UPDATE` trigger on
-/// `pending_inscriptions` that raises an exception when the new
-/// `status` value is `complete`. The trigger fires inside the atomic
-/// `persist_state_and_mark_complete_tx` envelope so the SMT/MMR/
-/// root_index UPSERTs and the mark-complete UPDATE all roll back
-/// together. `broadcast_commit_and_deliver` converts the failure to
-/// 503; on-disk durable state is unchanged; the row stays at
-/// `reveal_broadcast` so the scanner-replay path can integrate the
-/// inscription from chain without doubling up the MMR leaf.
-#[tokio::test]
-async fn commit_handler_atomic_tx_rollback_leaves_state_and_row_consistent() {
-    use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
-    use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
-    use testcontainers::{runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::postgres::Postgres;
-
-    let pg_container = Postgres::default()
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres container");
-    let host = pg_container.get_host().await.unwrap();
-    let port = pg_container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
-    let pool = Arc::new(
-        crate::db::connect_and_migrate(&url)
-            .await
-            .expect("connect_and_migrate failed"),
-    );
-
-    // Trigger raises on every UPDATE that sets `status = 'complete'`.
-    sqlx::query(
-        "CREATE OR REPLACE FUNCTION fail_complete_commit() RETURNS trigger AS $$
-         BEGIN
-             IF NEW.status = 'complete' THEN
-                 RAISE EXCEPTION 'simulated mark-complete failure (commit)';
-             END IF;
-             RETURN NEW;
-         END;
-         $$ LANGUAGE plpgsql",
-    )
-    .execute(&*pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "CREATE TRIGGER block_complete_commit BEFORE UPDATE ON pending_inscriptions \
-         FOR EACH ROW EXECUTE FUNCTION fail_complete_commit()",
-    )
-    .execute(&*pool)
-    .await
-    .unwrap();
-
-    let mock_server = mint_broadcast_mock_server().await;
-    let mut state = test_state();
-    state.pool = Arc::clone(&pool);
-    state.esplora_config = Arc::new(crate::publisher::EsploraConfig {
-        url: mock_server.uri(),
-        is_mainnet: false,
-        network_name: "Mutinynet".to_string(),
-        ws_url: None,
-    });
-
-    let secret_bytes = include_bytes!("../minting_secret.bin");
-    let xpriv = Xpriv::new_master(bitcoin::Network::Signet, secret_bytes).unwrap();
-    let secp = secp::Secp256k1::new();
-    let pk_0: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .public_key;
-    let pk_1: PublicKey = Xpub::from_priv(&secp, &xpriv)
-        .derive_pub(&secp, &[ChildNumber::Normal { index: 1 }])
-        .unwrap()
-        .public_key;
-    let sk_0: SecretKey = xpriv
-        .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
-        .unwrap()
-        .private_key;
-
-    let account_address = "0x".to_string()
-        + &hex::encode(zkcoins_program::hash::digest_to_bytes(
-            &zkcoins_program::types::MINTING_ADDRESS,
-        ));
-    let recipient = "0x".to_string() + &hex::encode([0xa2u8; 32]);
-    let amount: u64 = 1;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let mut hasher = Sha256::new();
-    hasher.update(account_address.as_bytes());
-    hasher.update(recipient.as_bytes());
-    hasher.update(amount.to_le_bytes());
-    hasher.update(now.to_le_bytes());
-    let hash: [u8; 32] = hasher.finalize().into();
-    let msg = Message::from_digest(hash);
-    let kp = Keypair::from_secret_key(&secp, &sk_0);
-    let sig = secp.sign_schnorr(&msg, &kp);
-
-    let send_body = serde_json::json!({
-        "account_address": account_address,
-        "recipient": recipient,
-        "amount": amount,
-        "public_key": hex::encode(pk_0.serialize()),
-        "next_public_key": hex::encode(pk_1.serialize()),
-        "signature": hex::encode(sig.serialize()),
-        "timestamp": now,
-    });
-    let send_req = Request::post("/api/send")
-        .header("content-type", "application/json")
-        .body(Body::from(send_body.to_string()))
-        .unwrap();
-    let (send_status, send_body_text) = send_request_with_state(state.clone(), send_req).await;
-    assert_eq!(send_status, StatusCode::OK, "send failed: {send_body_text}");
-    let send_resp: serde_json::Value = serde_json::from_str(&send_body_text).unwrap();
-    let proof_id = send_resp["proof_id"].as_u64().unwrap();
-    let ash_hex = send_resp["account_state_hash"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let ocr_hex = send_resp["output_coins_root"].as_str().unwrap().to_string();
-
-    let ash_bytes = hex::decode(&ash_hex).unwrap();
-    let ocr_bytes = hex::decode(&ocr_hex).unwrap();
-    let mut commit_message = Vec::with_capacity(ash_bytes.len() + ocr_bytes.len());
-    commit_message.extend_from_slice(&ash_bytes);
-    commit_message.extend_from_slice(&ocr_bytes);
-    let commitment = shared::commitment::Commitment::new(&sk_0, commit_message.clone())
-        .expect("commitment creation");
-    assert!(commitment.verify(), "test commitment must verify locally");
-
-    let commit_body = serde_json::json!({
-        "proof_id": proof_id,
-        "public_key": hex::encode(commitment.public_key.serialize()),
-        "signature": hex::encode(commitment.signature.serialize()),
-        "message": hex::encode(&commitment.message),
-    });
-    let commit_req = Request::post("/api/commit")
-        .header("content-type", "application/json")
-        .body(Body::from(commit_body.to_string()))
-        .unwrap();
-    let (commit_status, commit_resp_body) = send_request_with_state(state, commit_req).await;
-
-    // Trigger fires inside the atomic tx → handler converts to 503.
-    assert_eq!(
-        commit_status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "atomic tx rollback must surface 503, body: {}",
-        commit_resp_body
-    );
-    let v: serde_json::Value = serde_json::from_str(&commit_resp_body).expect("valid JSON");
-    assert_eq!(v["success"], false);
-    assert!(
-        v["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("durable state advance failed"),
-        "response error must explain the durable-persist failure, got: {}",
-        v["error"]
-    );
-
-    // On-disk SMT/MMR/root_index did NOT advance — the atomic
-    // envelope rolled them back together with the failed UPDATE.
-    assert_eq!(
-        crate::db::load_smt(&pool).await.unwrap(),
-        None,
-        "atomic-tx rollback must leave smt_state untouched"
-    );
-    assert_eq!(
-        crate::db::load_mmr(&pool).await.unwrap(),
-        None,
-        "atomic-tx rollback must leave mmr_state untouched"
-    );
-    assert!(
-        crate::db::load_root_indices(&pool)
-            .await
-            .unwrap()
-            .is_empty(),
-        "atomic-tx rollback must leave mmr_root_index untouched"
-    );
-
-    // Pending row stays at `reveal_broadcast`: publisher set it there
-    // before the broadcast, mark-complete was the call the trigger
-    // blocked. Scanner-replay on next boot picks up the inscription
-    // and integrates it via its own state.update path.
-    let (pending_status,): (String,) =
-        sqlx::query_as("SELECT status FROM pending_inscriptions ORDER BY id DESC LIMIT 1")
-            .fetch_one(&*pool)
-            .await
-            .expect("a pending row must exist for the broadcasted commitment");
-    assert_eq!(
-        pending_status,
-        crate::db::PENDING_STATUS_REVEAL_BROADCAST,
-        "atomic-tx rollback: pending row must stay at reveal_broadcast for scanner-replay to pick up"
-    );
-    let (commit_txid_bytes,): (Vec<u8>,) =
-        sqlx::query_as("SELECT commit_txid FROM pending_inscriptions ORDER BY id DESC LIMIT 1")
-            .fetch_one(&*pool)
-            .await
-            .unwrap();
-    assert!(
-        !crate::scanner::should_skip_scanner_state_update(
-            crate::db::pending_inscription_status_by_commit_txid(&pool, &commit_txid_bytes)
-                .await
-                .unwrap()
-                .as_deref()
-        ),
-        "scanner must NOT skip its state.update for a send commit whose mark-complete failed"
-    );
-
-    sqlx::query("DROP TRIGGER block_complete_commit ON pending_inscriptions")
-        .execute(&*pool)
-        .await
-        .unwrap();
-}
 
 // =======================================================================
 // GET /api/history — paginated per-address history (issue #153)

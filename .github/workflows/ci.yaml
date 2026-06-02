@@ -574,7 +574,7 @@ jobs:
       - name: Run llvm-cov nextest (MVP scope, 100% line + function gate)
         run: |
           cargo llvm-cov nextest --release -p node -p shared --all-features --show-missing-lines \
-            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|_tests\.rs$|bin/.*\.rs$|shared/src/.*\.rs$' \
+            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|flow\.rs|job_dispatcher\.rs|_tests\.rs$|bin/.*\.rs$|shared/src/.*\.rs$' \
             --fail-under-lines 100 \
             --fail-under-functions 100 \
             --test-threads 1 \
@@ -594,16 +594,50 @@ jobs:
       - name: Show missing coverage on gate failure
         if: failure()
         run: |
+          IGNORE='main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|flow\.rs|job_dispatcher\.rs|_tests\.rs$|bin/.*\.rs$|shared/src/.*\.rs$'
+
           echo "--- llvm-cov report: --show-missing-lines (text) ---"
           cargo llvm-cov report --release --show-missing-lines \
-            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|_tests\.rs$|bin/.*\.rs$|shared/src/.*\.rs$' || true
+            --ignore-filename-regex "$IGNORE" || true
+
           echo "--- llvm-cov report: per-file json (filter < 100%) ---"
           cargo llvm-cov report --release --json \
-            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|_tests\.rs$|bin/.*\.rs$|shared/src/.*\.rs$' \
+            --ignore-filename-regex "$IGNORE" \
             | jq -r '.data[0].files[]
                 | select(.summary.lines.percent < 100 or .summary.functions.percent < 100)
                 | {filename, lines: .summary.lines, functions: .summary.functions}' \
-          || echo "(jq not available or json parse failed)"
+            || echo "(jq not available or json parse failed)"
+
+          # Per-function coverage list: emits one line per uncovered
+          # function with file + name + line so the operator sees the
+          # exact `pub fn foo at router.rs:1234` without having to
+          # cross-reference the line ranges manually.
+          echo "--- llvm-cov report: uncovered functions (per-symbol) ---"
+          cargo llvm-cov report --release --json \
+            --ignore-filename-regex "$IGNORE" \
+            | jq -r '.data[0].functions[]
+                | select(.count == 0)
+                | "\(.filenames[0]):\(.regions[0][0])\t\(.name)"' \
+            | sort -u || echo "(per-function extraction failed)"
+
+          # Full HTML report — uploaded as an artifact below so the
+          # operator can browse the per-line coverage in a browser
+          # without re-running llvm-cov locally (heavy gate is
+          # ~50 min on M3 Ultra).
+          echo "--- llvm-cov report: generating HTML for artifact ---"
+          cargo llvm-cov report --release --html \
+            --output-dir target/llvm-cov-html \
+            --ignore-filename-regex "$IGNORE" \
+            || echo "(HTML generation failed)"
+
+      - name: Upload coverage HTML report on gate failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-cov-html-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/llvm-cov-html
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: sccache stats (post-build)
         if: always()

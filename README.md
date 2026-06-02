@@ -74,9 +74,12 @@ API endpoints, background services, their activation status, and the tests that 
 | Get balance                          | `GET /api/balance?address=<hex>`      | always                   | mvp     | 100% (router)                  |
 | List per-address history             | `GET /api/history?address=<hex>&limit=<n>&offset=<n>` | always   | mvp     | 100% (router)                  |
 | List all addresses                   | `GET /api/address`                    | feature (`address-list`) | gate    | 100% (router)                  |
-| Mint coins (single-phase)            | `POST /api/mint`                      | always²                  | mvp     | 100% (account_node)                 |
-| Send — phase 1 (generate proof)      | `POST /api/send`                      | env²                     | mvp     | 100% (router)                  |
-| Send — phase 2 (commit + broadcast)  | `POST /api/commit`                    | env³                     | mvp     | 100% (router) · 0% (publisher) |
+| Admit mint job                       | `POST /api/jobs/mint`                 | always²                  | mvp     | 100% (router)                  |
+| Admit send job (phase 1)             | `POST /api/jobs/send`                 | env²                     | mvp     | 100% (router)                  |
+| Attach signed commit (phase 2)       | `POST /api/jobs/:id/commit`           | env³                     | mvp     | 100% (router) · 0% (flow)      |
+| Poll job status                      | `GET /api/jobs/:id`                   | always                   | mvp     | 100% (router)                  |
+| Stream job phase events (SSE)        | `GET /api/jobs/:id/stream`            | always                   | mvp     | 100% (router)                  |
+| Cancel queued job                    | `POST /api/jobs/:id/cancel`           | always                   | mvp     | 100% (router)                  |
 | Receive coin                         | `POST /api/receive`                   | always                   | mvp     | 100% (account_node)                 |
 | Download coin proof                  | `GET /api/proof/:id`                  | always                   | mvp     | 100% (router)                  |
 | Claim username                       | `POST /api/username/claim`            | always                   | mvp     | 100% (username)                |
@@ -85,8 +88,10 @@ API endpoints, background services, their activation status, and the tests that 
 | LNURL-Pay callback                   | `GET /lnurl/pay/:username`            | feature (`lnurl`)        | gate    | 100% (router)                  |
 | Bitcoin block scanner (background)   | WS subscription in `scanner_ws.rs`    | env⁴                     | mvp     | 100% (scanner) · — (main, excluded) |
 | State persistence (SMT/MMR write)    | Scanner callback on commitment match  | always                   | mvp     | 100% (state)                   |
-| Taproot inscription broadcast        | Called by `/api/commit`               | env³                     | mvp     | 0% (publisher)                |
+| Taproot inscription broadcast        | Called by dispatcher (`flow.rs`)      | env³                     | mvp     | 0% (publisher)                |
 | Publisher UTXO lookup                | Internal, before broadcast            | env³                     | mvp     | 0% (publisher)                |
+| OpenAPI 3.x spec                     | `GET /openapi.json`                   | always                   | mvp     | 100% (openapi_smoke)           |
+| Swagger UI                           | `GET /docs`                           | always                   | mvp     | 100% (openapi_smoke)           |
 | Explorer endpoints (`/api/stats`, …) | n/a                                   | planned                  | planned | —                             |
 | Light client support                 | n/a                                   | planned                  | planned | —                             |
 
@@ -270,15 +275,17 @@ cargo run -p node
 # Node starts on http://0.0.0.0:4242
 ```
 
-## Two-Phase Send Flow
+## Job-API send flow
 
-User sends require a two-phase flow because the node doesn't hold sender private keys:
+User sends are admitted to the Job-API and driven by the background dispatcher (PR1, June 2026 — `migrations/0014_jobs.sql` + `src/job_dispatcher.rs`). The wallet never holds an HTTP connection across the ~5 s prove call; each step is a separate poll-friendly request:
 
-1. **`POST /api/send`** — node generates ZK proof, returns `proof_id` + `account_state_hash` + `output_coins_root`
-2. **Client signs commitment** — `Schnorr(hash_concat(account_state_hash, output_coins_root))` with BIP-32 key at `numPubkeys`
-3. **`POST /api/commit`** — node verifies commitment, broadcasts Taproot inscription, delivers coin to recipient via `receive_coin`
+1. **`POST /api/jobs/send`** (with `Idempotency-Key` header) — admit the send job. Returns `202` + `{job_id, status: "queued"}` immediately. The dispatcher picks the row up and runs the ZK prove.
+2. **Poll `GET /api/jobs/:id` every ~2 s** — wallet observes `queued → proving → awaiting_signature`. When `status = awaiting_signature`, the body carries `proof_id` so the wallet can `GET /api/proof/:id` to download the proof, sign `Schnorr(hash_concat(account_state_hash, output_coins_root))` with the BIP-32 key at `numPubkeys`, and...
+3. **`POST /api/jobs/:id/commit`** — attach the signed commitment. Returns `200` + `{status: "broadcasting"}`. The dispatcher broadcasts the Taproot inscription and `state.update`s the recipient; the next poll observes `status = completed` with the cached result body.
 
-Mint uses a single-phase flow (node holds the minting account key).
+Mint follows the same admit-then-poll pattern (`POST /api/jobs/mint`) — single-phase under the hood because the node holds the minting key, so `awaiting_signature` is skipped and the job transitions `queued → proving → broadcasting → completed` directly.
+
+Cancellation: `POST /api/jobs/:id/cancel` only succeeds while the job is `queued` (no prove cost paid yet). Past that, the dispatcher has already committed sunk cost and the row is no longer cancellable.
 
 ## Project Structure
 

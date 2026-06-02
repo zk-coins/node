@@ -21,25 +21,63 @@ use testcontainers_modules::postgres::Postgres;
 /// to it. The container handle is returned alongside the pool so the
 /// caller can keep it alive for the duration of the test — dropping
 /// it tears the container down.
+///
+/// Retries the container-start + pool-init sequence up to
+/// `SETUP_POOL_MAX_ATTEMPTS` times. The m3-ultra CI runner (dfx01) is
+/// a shared host (~20 production containers next door, occasional
+/// manual `cargo nextest` runs from operators) and a single failure
+/// pattern — testcontainers reports "ready" the moment Postgres logs
+/// `database system is ready to accept connections`, but the
+/// initial TCP handshake from the SQLx pool can still stall past the
+/// `acquire_timeout` budget when the Colima vNIC is saturated. The
+/// retry rebuilds the container from scratch (the failing one is
+/// dropped on each loop iteration), so an aborted Postgres process
+/// never poisons the next attempt. Backoff is intentionally short:
+/// transient load spikes resolve in seconds, not minutes.
+const SETUP_POOL_MAX_ATTEMPTS: u32 = 3;
+
 async fn setup_pool() -> (PgPool, ContainerAsync<Postgres>) {
+    let mut last_err: Option<String> = None;
+    for attempt in 1..=SETUP_POOL_MAX_ATTEMPTS {
+        match try_setup_pool().await {
+            Ok(pair) => return pair,
+            Err(e) => {
+                eprintln!("setup_pool attempt {attempt}/{SETUP_POOL_MAX_ATTEMPTS} failed: {e}");
+                last_err = Some(e);
+                if attempt < SETUP_POOL_MAX_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        500u64 * u64::from(attempt),
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+    panic!(
+        "setup_pool failed after {SETUP_POOL_MAX_ATTEMPTS} attempts: {}",
+        last_err.unwrap_or_else(|| "<no error captured>".to_string())
+    );
+}
+
+async fn try_setup_pool() -> Result<(PgPool, ContainerAsync<Postgres>), String> {
     let container = Postgres::default()
         .with_tag("17")
         .start()
         .await
-        .expect("failed to start postgres container");
+        .map_err(|e| format!("container start: {e}"))?;
     let host = container
         .get_host()
         .await
-        .expect("failed to get container host");
+        .map_err(|e| format!("container get_host: {e}"))?;
     let port = container
         .get_host_port_ipv4(5432)
         .await
-        .expect("failed to get container port");
+        .map_err(|e| format!("container get_host_port_ipv4: {e}"))?;
     let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
     let pool = connect_and_migrate(&url)
         .await
-        .expect("connect_and_migrate failed");
-    (pool, container)
+        .map_err(|e| format!("connect_and_migrate: {e}"))?;
+    Ok((pool, container))
 }
 
 #[tokio::test]
@@ -84,6 +122,7 @@ async fn connect_and_migrate_creates_all_tables() {
             "coin_proof_store".to_string(),
             "error_log".to_string(),
             "esplora_log".to_string(),
+            "jobs".to_string(),
             "latest_block".to_string(),
             "mmr_root_index".to_string(),
             "mmr_state".to_string(),

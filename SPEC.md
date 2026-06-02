@@ -388,7 +388,55 @@ For the **initial proof** there is no prior account proof to verify. The circuit
 Given a fresh node response `(proof_id, account_state_hash, output_coins_root)`:
 
 1. Sign `H(account_state_hash || output_coins_root)` with the **current** commitment private key (BIP-32 derivation index = `num_pubkeys - 1` in the reference).
-2. POST `(proof_id, commitment)` to `/api/commit`. The node attaches this commitment to the proof, builds a Taproot commit+reveal tx pair whose commit-tx txid begins with `4242`, and broadcasts.
+2. POST `(proof_id, commitment)` to `/api/jobs/:id/commit` (the path includes the send-job's UUID returned by the original `/api/jobs/send` admit). The node attaches this commitment to the proof, builds a Taproot commit+reveal tx pair whose commit-tx txid begins with `4242`, and broadcasts.
+
+### 11.2.1 Job-API endpoints (PR1 — replacing the legacy synchronous routes)
+
+Wallet flow is now poll-based. The synchronous `/api/mint`, `/api/send`, `/api/commit` routes are removed; every request that touches the prover or the publisher goes through a job row.
+
+| Route | Purpose |
+|---|---|
+| `POST /api/jobs/mint` | Admit a fresh mint job. Body identical to the legacy `/api/mint`. Requires `Idempotency-Key` header. Returns 202 + `{job_id, status: "queued"}` + `Location: /api/jobs/<id>`. |
+| `POST /api/jobs/send` | Admit a fresh send job. Body identical to the legacy `/api/send` (signature + timestamp verified inline before admission). Requires `Idempotency-Key`. Returns 202 + `{job_id, status}`. |
+| `GET /api/jobs/:id` | Poll handler. Non-terminal rows carry `Retry-After: 2`. Body shape: `{job_id, kind, status, phase, progress, proof_id?, result?, error?}`. |
+| `GET /api/jobs/:id/stream` | **SSE push channel** (PR2). Server-Sent Events stream that emits an initial `event: phase` (or `event: complete` for terminal jobs) with the current snapshot, then forwards every dispatcher phase transition as `event: phase`, and closes with `event: complete` once the job reaches a terminal status. `: heartbeat` comment every 25 s so Cloudflare Tunnel's ~100 s idle drop does not kill the stream. Polling (`GET /api/jobs/:id`) remains the fallback when SSE is unavailable. |
+| `POST /api/jobs/:id/commit` | Attach the wallet-signed commitment to a `send` job in `awaiting_signature`. Body identical to the legacy `/api/commit`. Returns 200 + `{status: "broadcasting"}`. |
+| `POST /api/jobs/:id/cancel` | Cancel a job. Only succeeds while `status = queued`; later states return 409. |
+
+**State machine (per job row, `migrations/0014_jobs.sql`):**
+
+```
+queued
+   ↓  dispatcher pulls from mpsc::Receiver<JobEnvelope>
+proving
+   ↓  mint: → broadcasting → completed
+   ↓  send: → awaiting_signature ─ /jobs/:id/commit → broadcasting → completed
+   ↓  any failure: → failed
+```
+
+**Idempotency.** Every admit carries `Idempotency-Key`. Replays of the same `(account, key)` pair surface the original `job_id` (or the cached response body if `status = completed`) instead of inserting a second row.
+
+**Crash recovery.** The boot-time `runtime::boot_resume_jobs` walks every non-terminal row: rows in `queued / proving / broadcasting` are marked `failed` (the wallet's signed timestamp window has expired and in-process Plonky2 state is lost); rows in `awaiting_signature` get a fresh `Notify` channel and are handed back to the dispatcher so the wallet can still attach the signature.
+
+See `MIGRATION_RESEARCH.md` §7.27 for the architectural rationale of the poll-based contract; §7.28 for the SSE push channel added on top (PR2).
+
+**SSE event shape** (`/api/jobs/:id/stream`):
+
+```
+event: phase
+data: {"status":"proving","phase":"proving","proof_id":null,"result":null,"error":null}
+
+event: phase
+data: {"status":"awaiting_signature","phase":"awaiting_signature","proof_id":17,"result":null,"error":null}
+
+event: phase
+data: {"status":"broadcasting","phase":"broadcasting","proof_id":null,"result":null,"error":null}
+
+event: complete
+data: {"status":"completed","phase":"completed","proof_id":null,"result":{<same shape as GET 200 response>},"error":null}
+```
+
+Failure / cancel variants emit `event: complete` with `status = failed` (plus `error`) or `status = cancelled`. The stream closes after the first `event: complete` frame.
 
 ### 11.3 Scanner (`node::scanner`)
 
