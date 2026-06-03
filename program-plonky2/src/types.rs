@@ -438,4 +438,18 @@ mod tests {
         assert_eq!(*NATIVE_ASSET_ID, *NATIVE_ASSET_ID);
         assert_eq!(*NATIVE_ASSET_ID, hash_bytes(b"zkcoins:native-asset:v1"));
     }
+
+    #[test]
+    fn same_name_different_creator_produces_different_asset_id() {
+        let pk_a = dummy_pubkey(1);
+        let pk_b = dummy_pubkey(2);
+        let id_a = calculate_asset_id(&pk_a, "TestToken", 8);
+        let id_b = calculate_asset_id(&pk_b, "TestToken", 8);
+        assert_ne!(
+            id_a, id_b,
+            "same name + different creator must produce different asset_ids"
+        );
+        // Same creator, same name, same decimals = same id (idempotent)
+        assert_eq!(id_a, calculate_asset_id(&pk_a, "TestToken", 8));
+    }
 }
