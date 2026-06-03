@@ -73,14 +73,12 @@ async fn connect_and_migrate_creates_all_tables() {
     //     filter — included at the correct alphabetic position below.)
     //   * After 0014 (jobs):             23 tables + 1 view (#161
     //     introduces the async Job-API state table.)
-    //   * After 0015 (multi_asset):       24 tables + 1 view
     assert_eq!(
         names,
         vec![
             "_sqlx_migrations".to_string(),
             "account_history".to_string(),
             "accounts".to_string(),
-            "assets".to_string(),
             "block_log".to_string(),
             "boot_log".to_string(),
             "coin_proof_store".to_string(),
