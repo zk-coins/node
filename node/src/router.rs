@@ -776,9 +776,32 @@ pub struct CommitRequest {
     pub(crate) message: String,
 }
 
+/// Normalized, machine-readable Bitcoin network identifier exposed on
+/// `/api/info` as `bitcoin_network`. Serializes to the lowercase string
+/// `"mainnet"` or `"mutinynet"`.
+///
+/// This is the typed counterpart to the free-text `network` field
+/// (e.g. `"Mainnet"` / `"Mutinynet"` from `NETWORK_CONFIG.network_name`),
+/// which stays a human-readable, operator-overridable label. Clients
+/// switch behaviour on `bitcoin_network` to avoid the case-sensitivity
+/// foot-gun of matching the free-text string.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BitcoinNetwork {
+    Mainnet,
+    Mutinynet,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct InfoResponse {
+    /// Human-readable network label (e.g. `"Mainnet"` / `"Mutinynet"`),
+    /// sourced from `NETWORK_CONFIG.network_name`. Operator-overridable
+    /// and intended for display only — clients gate behaviour on
+    /// `bitcoin_network` instead.
     network: String,
+    /// Typed, lowercase network identifier derived from the node's
+    /// `is_mainnet` flag. One of `"mainnet"` or `"mutinynet"`.
+    bitcoin_network: BitcoinNetwork,
     capabilities: Capabilities,
     /// External hostname this node serves, used by the client to render
     /// `<hex|username>@<domain>`. DEV and PRD share the chain identifier
@@ -2430,6 +2453,18 @@ pub(crate) async fn health_handler() -> &'static str {
     "ok"
 }
 
+/// Map the node's mainnet flag to the normalized, lowercase
+/// `bitcoin_network` enum exposed in `/api/info`. Pure so both arms are
+/// unit-testable without touching the env-derived `NETWORK_CONFIG`
+/// global.
+fn bitcoin_network_label(is_mainnet: bool) -> BitcoinNetwork {
+    if is_mainnet {
+        BitcoinNetwork::Mainnet
+    } else {
+        BitcoinNetwork::Mutinynet
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/api/info",
@@ -2443,6 +2478,7 @@ pub(crate) async fn health_handler() -> &'static str {
 pub(crate) async fn info_handler() -> impl IntoResponse {
     Json(InfoResponse {
         network: NETWORK_CONFIG.network_name.clone(),
+        bitcoin_network: bitcoin_network_label(NETWORK_CONFIG.is_mainnet),
         capabilities: Capabilities {
             address_list: cfg!(feature = "address-list"),
             username_claim: cfg!(feature = "username-claim"),

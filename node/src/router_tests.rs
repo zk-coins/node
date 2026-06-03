@@ -173,6 +173,10 @@ async fn info_returns_network_name_capabilities_and_username_domain() {
     // The lazy_static defaults to "Mutinynet" when IS_MAINNET is unset
     assert!(!info.network.is_empty(), "network name must not be empty");
 
+    // The typed network identifier is derived from the same global; the
+    // test harness never sets IS_MAINNET=true, so it resolves to Mutinynet.
+    assert_eq!(info.bitcoin_network, BitcoinNetwork::Mutinynet);
+
     // Capabilities reflect the cargo feature set this binary was built with.
     // Same `cfg!(...)` evaluation as the handler, so the test passes both in
     // MVP builds (all false) and `--all-features` builds (all true).
@@ -204,10 +208,25 @@ async fn info_serialization_format_is_stable() {
     assert!(v["capabilities"].is_object());
     assert!(v["username_domain"].is_string());
 
+    // `bitcoin_network` serializes as a lowercase string enum.
+    let bn = v["bitcoin_network"]
+        .as_str()
+        .expect("bitcoin_network must be a string");
+    assert!(
+        bn == "mainnet" || bn == "mutinynet",
+        "bitcoin_network must be `mainnet` or `mutinynet`, got {bn}"
+    );
+
     let caps = &v["capabilities"];
     for key in ["address_list", "username_claim", "lnurl"] {
         assert!(caps[key].is_boolean(), "capability `{key}` must be bool");
     }
+}
+
+#[test]
+fn bitcoin_network_label_maps_both_arms() {
+    assert_eq!(bitcoin_network_label(true), BitcoinNetwork::Mainnet);
+    assert_eq!(bitcoin_network_label(false), BitcoinNetwork::Mutinynet);
 }
 
 // --- GET /api/balance ---
