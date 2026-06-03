@@ -87,11 +87,11 @@
 //! ```text
 //! [0                          .. MAX_IN_COINS * PER_SLOT_PIS]:
 //!     For each slot i (0-indexed):
-//!         [i*17 + 0..i*17 + 16]:  source's ProofData (16 elements)
-//!         [i*17 + 16]:            slot's `active` bit (0 or 1)
-//! [MAX_IN_COINS * 17 ..        + 4]:
+//!         [i*21 + 0..i*21 + 20]:  source's ProofData (20 elements)
+//!         [i*21 + 20]:            slot's `active` bit (0 or 1)
+//! [MAX_IN_COINS * 21 ..        + 4]:
 //!     state-transition vk circuit_digest (4 elements)
-//! [MAX_IN_COINS * 17 + 4 ..    + 4 + 4 * cap_elements]:
+//! [MAX_IN_COINS * 21 + 4 ..    + 4 + 4 * cap_elements]:
 //!     state-transition vk constants_sigmas_cap (4 elements per cap entry)
 //! ```
 //!
