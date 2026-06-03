@@ -87,18 +87,18 @@
 //! ```text
 //! [0                          .. MAX_IN_COINS * PER_SLOT_PIS]:
 //!     For each slot i (0-indexed):
-//!         [i*17 + 0..i*17 + 16]:  source's ProofData (16 elements)
-//!         [i*17 + 16]:            slot's `active` bit (0 or 1)
-//! [MAX_IN_COINS * 17 ..        + 4]:
+//!         [i*21 + 0..i*21 + 20]:  source's ProofData (20 elements)
+//!         [i*21 + 20]:            slot's `active` bit (0 or 1)
+//! [MAX_IN_COINS * 21 ..        + 4]:
 //!     state-transition vk circuit_digest (4 elements)
-//! [MAX_IN_COINS * 17 + 4 ..    + 4 + 4 * cap_elements]:
+//! [MAX_IN_COINS * 21 + 4 ..    + 4 + 4 * cap_elements]:
 //!     state-transition vk constants_sigmas_cap (4 elements per cap entry)
 //! ```
 //!
 //! `cap_elements = 1 << cap_height`. For
 //! `CircuitConfig::standard_recursion_config()` (`cap_height = 4`),
 //! `cap_elements = 16`, so the cap occupies `4 * 16 = 64` elements.
-//! Total aggregator PIs: `8 * 17 + 4 + 64 = 204`.
+//! Total aggregator PIs: `8 * 21 + 4 + 64 = 236`.
 
 use anyhow::Result;
 use plonky2::iop::target::BoolTarget;
@@ -366,7 +366,7 @@ pub fn verify_aggregator(
 mod tests {
     use super::*;
     use crate::circuit::main::{build_circuit, prove_initial};
-    use crate::hash::hash_bytes;
+    use crate::hash::{hash_bytes, ZERO_HASH};
     use crate::types::{AccountState, MINTING_ADDRESS};
     use plonky2::field::types::Field;
 
@@ -453,8 +453,9 @@ mod tests {
         source_account.owner = *MINTING_ADDRESS;
         source_account.balance = 1_000_000;
         let source_history_root = hash_bytes(b"aggregator-init-source");
-        let source_proof = prove_initial(&st_circuit, &source_account, source_history_root)
-            .expect("prove init source");
+        let source_proof =
+            prove_initial(&st_circuit, &source_account, source_history_root, ZERO_HASH)
+                .expect("prove init source");
 
         // Slot 0 active, others inactive.
         let mut slot_witnesses: Vec<AggregatorSlotWitness> = Vec::with_capacity(MAX_IN_COINS);

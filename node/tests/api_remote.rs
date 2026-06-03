@@ -199,6 +199,9 @@ async fn fetch_capabilities(client: &reqwest::Client) -> Capabilities {
         lnurl: body["capabilities"]["lnurl"].as_bool().expect(
             "/api/info capabilities.lnurl must be a bool — missing field is a contract regression",
         ),
+        multi_asset: body["capabilities"]["multi_asset"].as_bool().expect(
+            "/api/info capabilities.multi_asset must be a bool — missing field is a contract regression",
+        ),
     };
     if let Ok(force) = std::env::var("ZKCOINS_FORCE_DISABLE_FEATURES") {
         for flag in force.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -206,6 +209,7 @@ async fn fetch_capabilities(client: &reqwest::Client) -> Capabilities {
                 "address_list" | "address-list" => caps.address_list = false,
                 "username_claim" | "username-claim" => caps.username_claim = false,
                 "lnurl" => caps.lnurl = false,
+                "multi_asset" | "multi-asset" => caps.multi_asset = false,
                 other => {
                     eprintln!(
                         "ZKCOINS_FORCE_DISABLE_FEATURES: unknown flag `{}` — ignored",

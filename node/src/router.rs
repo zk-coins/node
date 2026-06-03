@@ -515,12 +515,18 @@ pub struct SendCoinRequest {
     pub(crate) signature: Option<String>,
     /// Unix epoch seconds the signature was produced at.
     pub(crate) timestamp: Option<u64>,
+    /// Asset identifier for multi-asset sends. Defaults to the native
+    /// asset when omitted (backward-compatible with single-asset wallets).
+    #[serde(default)]
+    pub(crate) asset_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
 pub struct MintRequest {
     pub(crate) account_address: String,
     pub(crate) amount: u64,
+    #[serde(default)]
+    pub(crate) asset_id: Option<String>,
 }
 
 // `ReceiveCoinRequest` was the SP1-era POST body shape for a coin
@@ -804,6 +810,7 @@ pub struct Capabilities {
     /// the response so the app does not have to sniff build flags.
     pub username_claim: bool,
     pub lnurl: bool,
+    pub multi_asset: bool,
 }
 
 // --- Username & LNURL types ---
@@ -2447,6 +2454,7 @@ pub(crate) async fn info_handler() -> impl IntoResponse {
             address_list: cfg!(feature = "address-list"),
             username_claim: cfg!(feature = "username-claim"),
             lnurl: cfg!(feature = "lnurl"),
+            multi_asset: false,
         },
         username_domain: USERNAME_DOMAIN.clone(),
     })
