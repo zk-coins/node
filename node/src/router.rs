@@ -204,14 +204,6 @@ pub struct BalanceResponse {
     /// account that has never sent (matches `Account::new()`).
     #[serde(default)]
     num_sends: u32,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    balances: Vec<AssetBalance>,
-}
-
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct AssetBalance {
-    pub asset_id: String,
-    pub amount: u64,
 }
 
 #[cfg(any(feature = "address-list", feature = "lnurl"))]
@@ -821,32 +813,6 @@ pub struct Capabilities {
     pub multi_asset: bool,
 }
 
-// --- Multi-asset types ---
-
-#[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
-pub struct CreateAssetRequest {
-    pub name: String,
-    pub decimals: u8,
-    #[schema(value_type = String)]
-    pub mint_authority_pubkey: bitcoin::secp256k1::PublicKey,
-    pub signature: String,
-    pub timestamp: u64,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct AssetResponse {
-    pub asset_id: String,
-    pub name: String,
-    pub decimals: u8,
-    pub mint_authority_pubkey: String,
-    pub creator_address: String,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct AssetListResponse {
-    pub assets: Vec<AssetResponse>,
-}
-
 // --- Username & LNURL types ---
 
 #[cfg(feature = "username-claim")]
@@ -918,7 +884,6 @@ pub(crate) async fn get_balance_handler(
                         balance: 0,
                         username: None,
                         num_sends: 0,
-                        balances: vec![],
                     }),
                 )
             }
@@ -935,7 +900,6 @@ pub(crate) async fn get_balance_handler(
                     balance: 0,
                     username: None,
                     num_sends: 0,
-                    balances: vec![],
                 }),
             );
         }
@@ -961,7 +925,6 @@ pub(crate) async fn get_balance_handler(
                     balance,
                     username,
                     num_sends,
-                    balances: vec![],
                 }),
             ),
             // Unobserved address: canonical zero-balance state, not a not-found condition.
@@ -971,7 +934,6 @@ pub(crate) async fn get_balance_handler(
                     balance: 0,
                     username,
                     num_sends,
-                    balances: vec![],
                 }),
             ),
         }
@@ -985,7 +947,6 @@ pub(crate) async fn get_balance_handler(
                 balance: 0,
                 username: None,
                 num_sends: 0,
-                balances: vec![],
             }),
         )
     }
@@ -2982,32 +2943,6 @@ pub(crate) async fn lnurl_callback_handler(
     })
 }
 
-// --- Multi-asset stub handlers ---
-
-pub(crate) async fn create_asset_handler(
-    State(_state): State<AppState>,
-    Json(_request): Json<CreateAssetRequest>,
-) -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({"error": "Asset creation not yet implemented"})),
-    )
-}
-
-pub(crate) async fn list_assets_handler(State(_state): State<AppState>) -> impl IntoResponse {
-    Json(AssetListResponse { assets: vec![] })
-}
-
-pub(crate) async fn get_asset_handler(
-    State(_state): State<AppState>,
-    Path(_id): Path<String>,
-) -> impl IntoResponse {
-    (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({"error": "Asset not found"})),
-    )
-}
-
 /// Build the full application router with all API routes, CORS, health check, and fallback.
 /// Extracted so it can be reused in integration tests via `oneshot()`.
 pub(crate) fn create_router(state: AppState) -> Router {
@@ -3048,11 +2983,7 @@ pub(crate) fn create_router(state: AppState) -> Router {
         // Operator-facing R2 probe trend (see `r2_probe_history_handler`
         // doc-comment). Grouped under `/api/admin/` so it is visibly
         // separate from the user-facing surface.
-        .route("/api/admin/r2-probe/history", get(r2_probe_history_handler))
-        // Multi-asset endpoints (stubs).
-        .route("/api/asset/create", post(create_asset_handler))
-        .route("/api/asset/list", get(list_assets_handler))
-        .route("/api/asset/info/:id", get(get_asset_handler));
+        .route("/api/admin/r2-probe/history", get(r2_probe_history_handler));
 
     // Gated routes — only compiled in when their Cargo feature is enabled.
     // With a feature off, the handler does not exist in the binary and the

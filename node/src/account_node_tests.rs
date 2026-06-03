@@ -91,7 +91,7 @@ impl TestAccountData {
             // Plonky2 bridge: SP1's `proof.public_values: Vec<u8>` (bincode
             // blob) is replaced by `proof.public_inputs: Vec<F>` (Goldilocks
             // field elements). The first
-            // `N_PROOF_DATA_PUBLIC_INPUTS = 16` slots reconstruct `ProofData`.
+            // `N_PROOF_DATA_PUBLIC_INPUTS = 20` slots reconstruct `ProofData`.
             let pis: [zkcoins_program::F;
                 zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] = cp
                 .proof
@@ -128,7 +128,6 @@ fn test_wallet_operations() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
-            balances: BTreeMap::new(),
             num_sends: 0,
             commitment_public_key: None,
         },
@@ -267,7 +266,6 @@ fn test_create_minting_account() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
-            balances: BTreeMap::new(),
             num_sends: 0,
             commitment_public_key: None,
         },
@@ -293,7 +291,6 @@ fn test_mint_single_invoice() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
-            balances: BTreeMap::new(),
             num_sends: 0,
             commitment_public_key: None,
         },
@@ -326,7 +323,6 @@ fn test_receive_duplicate_coin_rejected() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
-            balances: BTreeMap::new(),
             num_sends: 0,
             commitment_public_key: None,
         },
@@ -379,7 +375,6 @@ fn test_receive_updates_balance() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
-            balances: BTreeMap::new(),
             num_sends: 0,
             commitment_public_key: None,
         },
@@ -442,7 +437,6 @@ fn test_mint_repro_live_setup() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 1_000_000,
-            balances: BTreeMap::new(),
             num_sends: 0,
             commitment_public_key: None,
         },
@@ -665,7 +659,6 @@ fn test_receive_coin_rejects_invalid_inclusion_proof() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
-            balances: BTreeMap::new(),
             num_sends: 0,
             commitment_public_key: None,
         },
@@ -703,7 +696,6 @@ fn test_send_coins_twice_from_same_account_uses_update_account() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
-            balances: BTreeMap::new(),
             num_sends: 0,
             commitment_public_key: None,
         },
@@ -800,7 +792,6 @@ fn test_send_coins_second_send_succeeds_without_prev_commitment_pubkey() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
-            balances: BTreeMap::new(),
             num_sends: 0,
             commitment_public_key: None,
         },
@@ -875,7 +866,6 @@ fn test_receive_coin_rejects_replay_via_coin_history() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
-            balances: BTreeMap::new(),
             num_sends: 0,
             commitment_public_key: None,
         },
@@ -943,7 +933,6 @@ fn test_send_coins_rejects_tampered_source_proof_inclusion() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
-            balances: BTreeMap::new(),
             num_sends: 0,
             commitment_public_key: None,
         },
@@ -1038,7 +1027,6 @@ fn test_send_coins_rejects_too_many_invoices() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 1_000_000,
-            balances: BTreeMap::new(),
             num_sends: 0,
             commitment_public_key: None,
         },
@@ -1079,7 +1067,6 @@ fn test_send_coins_rejects_too_many_coins_in_queue() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
-            balances: BTreeMap::new(),
             num_sends: 0,
             commitment_public_key: None,
         },
@@ -1166,7 +1153,6 @@ fn test_send_coins_errors_when_state_lacks_commitment_for_in_coin() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
-            balances: BTreeMap::new(),
             num_sends: 0,
             commitment_public_key: None,
         },
@@ -1235,7 +1221,6 @@ fn test_send_coins_errors_when_state_lacks_commitment_for_prev_account_proof() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
-            balances: BTreeMap::new(),
             num_sends: 0,
             commitment_public_key: None,
         },
@@ -1338,7 +1323,6 @@ fn test_send_coins_rejects_coin_queue_entry_without_commitment() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
-            balances: BTreeMap::new(),
             num_sends: 0,
             commitment_public_key: None,
         },
@@ -1419,7 +1403,6 @@ fn test_send_coins_rejects_source_commitment_missing_from_history_mmr() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 10_000,
-            balances: BTreeMap::new(),
             num_sends: 0,
             commitment_public_key: None,
         },
@@ -1526,7 +1509,6 @@ fn history_row_to_item_balance_from_coin_queue_only() {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 1_000_000,
-            balances: BTreeMap::new(),
             num_sends: 0,
             commitment_public_key: None,
         },
@@ -1606,4 +1588,74 @@ fn history_row_to_item_balance_from_coin_queue_only() {
         item.amount, MINT_AMOUNT,
         "first mint must surface the full credit (regression: was 0 when balance_from_account_blob read only Account.balance)"
     );
+}
+
+/// Covers the in-coin asset guard's **queue branch** in
+/// `send_coins_inner` (a coin already sitting in `account.coin_queue`
+/// whose `asset_id` differs from the transition asset). The sibling
+/// `send_coins_rejects_mixed_asset_invoices` exercises the *invoices*
+/// branch; this one mints a NATIVE coin into a recipient's queue and
+/// then attempts to send a NON-native invoice, so the transition asset
+/// (taken from the invoice) mismatches the queued coin. The guard must
+/// reject before any prove is attempted.
+#[test]
+fn send_coins_rejects_queued_coin_with_foreign_asset() {
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    let mut node = AccountNode::new(Arc::clone(&state_arc));
+
+    let mut minting_account_data = TestAccountData::new_minting_account();
+    node.import_account(
+        minting_account_data.address,
+        Account {
+            proof: None,
+            coin_queue: vec![],
+            coin_history: SparseMerkleTree::new(),
+            balance: 10_000,
+            num_sends: 0,
+            commitment_public_key: None,
+        },
+    );
+
+    // Mint a NATIVE coin to a fresh recipient and let them receive it,
+    // so the recipient's `coin_queue` holds exactly one NATIVE coin.
+    let recipient_data = TestAccountData::new_generic(&[7u8; 32], Network::Signet);
+    let invoice = Invoice::new(
+        100,
+        recipient_data.address,
+        *zkcoins_program::types::NATIVE_ASSET_ID,
+    );
+    let mut coin_proofs = minting_account_data
+        .execute_send_coins(&mut node, vec![invoice])
+        .expect("mint send_coins");
+    state_arc
+        .lock()
+        .unwrap()
+        .update(
+            &coin_proofs
+                .iter()
+                .map(|x| x.commitment.clone().unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .expect("state.update");
+    node.receive_coin(coin_proofs.pop().expect("one coin"))
+        .expect("recipient receive_coin");
+
+    // Attempt to send a FOREIGN-asset invoice from the recipient.
+    // transition_asset_id = the foreign asset; the queued coin is NATIVE
+    // and therefore mismatches, so the queue-branch guard fires.
+    let foreign_asset = hash_bytes(b"foreign-asset");
+    let current_pk = generate_test_public_key(&recipient_data.xpriv, 0);
+    let next_pk = generate_test_public_key(&recipient_data.xpriv, 1);
+    let result = node.send_coins(
+        vec![Invoice::new(
+            1,
+            digest_from_bytes(&[9u8; 32]),
+            foreign_asset,
+        )],
+        recipient_data.address,
+        current_pk,
+        next_pk,
+        None,
+    );
+    assert_eq!(result.unwrap_err(), "Mixed assets in single transition");
 }

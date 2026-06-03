@@ -99,6 +99,37 @@ pub(crate) fn validate_mint_request(req: &MintRequest) -> Result<[u8; 32], FlowE
     Ok(bytes)
 }
 
+/// Resolve an optional caller-supplied `asset_id` hex string.
+///
+/// An ABSENT field (`None`) legitimately selects the native asset. A
+/// PRESENT field MUST be valid 32-byte hex: a malformed or wrong-length
+/// value is a hard `422`, never a silent fall-back to native — that
+/// would mint/send the wrong asset under a `200` the caller cannot
+/// notice.
+fn parse_optional_asset_id(
+    asset_id: Option<&str>,
+) -> Result<zkcoins_program::types::AssetId, FlowError> {
+    let hex_str = match asset_id {
+        None => return Ok(*zkcoins_program::types::NATIVE_ASSET_ID),
+        Some(s) => s,
+    };
+    let raw = hex::decode(hex_str.trim_start_matches("0x")).map_err(|_| {
+        FlowError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "asset_id is not valid hex",
+        )
+    })?;
+    if raw.len() != 32 {
+        return Err(FlowError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "asset_id must be 32 bytes (64 hex chars)",
+        ));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&raw);
+    Ok(digest_from_bytes(&arr))
+}
+
 /// Pre-flight validation of a `SendCoinRequest` body. The signature +
 /// timestamp gates run here so the wallet observes a 401 from
 /// `POST /api/jobs/send` before the job is enqueued, matching the
@@ -164,20 +195,7 @@ pub(crate) fn validate_send_request(
 pub(crate) async fn mint_flow(state: &AppState, request: MintRequest) -> FlowResult {
     let account_address_bytes = validate_mint_request(&request)?;
     let account_address = digest_from_bytes(&account_address_bytes);
-    let mint_asset_id = request
-        .asset_id
-        .as_deref()
-        .and_then(|hex| {
-            hex::decode(hex.trim_start_matches("0x"))
-                .ok()
-                .filter(|b| b.len() == 32)
-                .map(|b| {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&b);
-                    zkcoins_program::hash::digest_from_bytes(&arr)
-                })
-        })
-        .unwrap_or(*zkcoins_program::types::NATIVE_ASSET_ID);
+    let mint_asset_id = parse_optional_asset_id(request.asset_id.as_deref())?;
 
     // ---- 1. SNAPSHOT phase (no mutation) -----------------------------------
     let state_arc = {
@@ -434,20 +452,7 @@ pub(crate) async fn send_flow(
     let next_public_key = request.next_public_key;
     let prev_commitment_pubkey = request.prev_commitment_pubkey;
     let amount = request.amount;
-    let send_asset_id = request
-        .asset_id
-        .as_deref()
-        .and_then(|hex| {
-            hex::decode(hex.trim_start_matches("0x"))
-                .ok()
-                .filter(|b| b.len() == 32)
-                .map(|b| {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&b);
-                    zkcoins_program::hash::digest_from_bytes(&arr)
-                })
-        })
-        .unwrap_or(*zkcoins_program::types::NATIVE_ASSET_ID);
+    let send_asset_id = parse_optional_asset_id(request.asset_id.as_deref())?;
 
     // The prove call is CPU-bound; push it through spawn_blocking so
     // the dispatcher's tokio worker is not blocked during the prove.

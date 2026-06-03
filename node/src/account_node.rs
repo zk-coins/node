@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::db;
@@ -37,12 +37,6 @@ pub struct Account {
     pub coin_queue: Vec<CoinProof>,
     pub coin_history: SparseMerkleTree,
     pub balance: u64,
-    /// Per-asset balance breakdown. The total across all entries equals
-    /// `balance` (the settled total). Added for multi-asset tracking;
-    /// `serde(default)` ensures backward-compatible deserialization of
-    /// pre-existing blobs that lack this field.
-    #[serde(default)]
-    pub balances: BTreeMap<[u8; 32], u64>,
     /// Number of own sends this account has committed (i.e. how often
     /// `account.proof` has been advanced via `send_coins_inner`).
     ///
@@ -141,7 +135,6 @@ impl Account {
             coin_queue: vec![],
             coin_history: SparseMerkleTree::new(),
             balance: 0,
-            balances: BTreeMap::new(),
             num_sends: 0,
             commitment_public_key: None,
         }
@@ -195,15 +188,6 @@ impl Account {
         self.coin_queue
             .iter()
             .fold(self.balance, |acc, x| acc + x.coin.amount)
-    }
-
-    pub fn get_asset_balances(&self) -> BTreeMap<[u8; 32], u64> {
-        let mut result = self.balances.clone();
-        for cp in &self.coin_queue {
-            let key = zkcoins_program::hash::digest_to_bytes(&cp.coin.asset_id);
-            *result.entry(key).or_insert(0) += cp.coin.amount;
-        }
-        result
     }
 }
 
@@ -717,15 +701,6 @@ impl AccountNode {
             .coin_queue
             .retain(|cp| cp.coin.asset_id != transition_asset_id);
         account.balance = balance - invoiced_amount;
-        let asset_key = zkcoins_program::hash::digest_to_bytes(&transition_asset_id);
-        let prev_asset_balance = account.balances.get(&asset_key).copied().unwrap_or(0);
-        let in_coin_amount: u64 = in_coins.iter().map(|c| c.amount).sum();
-        let new_asset_balance = prev_asset_balance + in_coin_amount - invoiced_amount;
-        if new_asset_balance == 0 {
-            account.balances.remove(&asset_key);
-        } else {
-            account.balances.insert(asset_key, new_asset_balance);
-        }
         account.proof = Some(proof.clone());
         // Bump the per-account send counter atomically with `proof`.
         // `num_sends > 0 iff proof.is_some()` is the invariant the
@@ -906,11 +881,9 @@ impl AccountNode {
             *b = (7u8).wrapping_add(i as u8);
         }
         let warmup_account_state = AccountState::new(pk);
-        self.prover.prove_initial(
-            &warmup_account_state,
-            ZERO_HASH,
-            *zkcoins_program::types::NATIVE_ASSET_ID,
-        )?;
+        let asset_id = *zkcoins_program::types::NATIVE_ASSET_ID;
+        self.prover
+            .prove_initial(&warmup_account_state, ZERO_HASH, asset_id)?;
         Ok(())
     }
 
@@ -1249,7 +1222,6 @@ mod inline_tests {
         let account_address = zkcoins_program::hash::digest_from_bytes(&[4u8; 32]);
         let mut account = Account::new();
         account.balance = 200;
-        account.balances = BTreeMap::new();
         node.import_account(account_address, account);
         let recipient = zkcoins_program::hash::digest_from_bytes(&[5u8; 32]);
         let pk = dummy_secp_public_key();
