@@ -214,7 +214,11 @@ pub(crate) async fn mint_flow(state: &AppState, request: MintRequest) -> FlowRes
             }
             guard
                 .prepare_mint(
-                    vec![Invoice::new(amount, account_address)],
+                    vec![Invoice::new(
+                        amount,
+                        account_address,
+                        *zkcoins_program::types::NATIVE_ASSET_ID,
+                    )],
                     minting_pubkey,
                     next_minting_pubkey,
                     prev_commitment_pubkey,
@@ -427,7 +431,11 @@ pub(crate) async fn send_flow(
     let result = tokio::task::spawn_blocking(move || -> Result<(CoinProof, Vec<u8>), FlowError> {
         let mut guard = lock_or_recover(&account_node_clone);
         let res = guard.send_coins(
-            vec![Invoice::new(amount, to_address)],
+            vec![Invoice::new(
+                amount,
+                to_address,
+                *zkcoins_program::types::NATIVE_ASSET_ID,
+            )],
             from_address,
             public_key,
             next_public_key,

@@ -87,8 +87,9 @@ impl Prover {
         &self,
         account_state: &AccountState,
         history_root: HashDigest,
+        asset_id: HashDigest,
     ) -> Result<Proof> {
-        prove_initial(&self.circuit, account_state, history_root)
+        prove_initial(&self.circuit, account_state, history_root, asset_id)
     }
 
     /// Prove an Initial-branch transition with caller-supplied
@@ -106,8 +107,15 @@ impl Prover {
         account_state: &AccountState,
         history_root: HashDigest,
         in_coins: &[(bool, &Coin, &NonInclusionProof)],
+        asset_id: HashDigest,
     ) -> Result<Proof> {
-        prove_initial_with_in_coins(&self.circuit, account_state, history_root, in_coins)
+        prove_initial_with_in_coins(
+            &self.circuit,
+            account_state,
+            history_root,
+            in_coins,
+            asset_id,
+        )
     }
 
     /// Full-control Initial-branch prove: in-coin tuples, out-coin
@@ -126,6 +134,7 @@ impl Prover {
         in_coins: &[(bool, &Coin, &NonInclusionProof)],
         out_coins: &[(bool, HashDigest, u64, &NonInclusionProof)],
         next_public_key: &PublicKey,
+        asset_id: HashDigest,
     ) -> Result<Proof> {
         prove_initial_with_in_and_out_coins(
             &self.circuit,
@@ -134,6 +143,7 @@ impl Prover {
             in_coins,
             out_coins,
             next_public_key,
+            asset_id,
         )
     }
 
@@ -145,8 +155,16 @@ impl Prover {
         history_root: HashDigest,
         prev: &Proof,
         cmp: &CommitmentMerkleProofs,
+        asset_id: HashDigest,
     ) -> Result<Proof> {
-        prove_account_update(&self.circuit, account_state, history_root, prev, cmp)
+        prove_account_update(
+            &self.circuit,
+            account_state,
+            history_root,
+            prev,
+            cmp,
+            asset_id,
+        )
     }
 
     /// Prove an AccountUpdate transition with caller-supplied
@@ -164,6 +182,7 @@ impl Prover {
         prev: &Proof,
         cmp: &CommitmentMerkleProofs,
         in_coins: &[(bool, &Coin, &NonInclusionProof)],
+        asset_id: HashDigest,
     ) -> Result<Proof> {
         prove_account_update_with_in_coins(
             &self.circuit,
@@ -172,6 +191,7 @@ impl Prover {
             prev,
             cmp,
             in_coins,
+            asset_id,
         )
     }
 
@@ -192,6 +212,7 @@ impl Prover {
         in_coins: &[(bool, &Coin, &NonInclusionProof)],
         out_coins: &[(bool, HashDigest, u64, &NonInclusionProof)],
         next_public_key: &PublicKey,
+        asset_id: HashDigest,
     ) -> Result<Proof> {
         prove_account_update_with_in_and_out_coins(
             &self.circuit,
@@ -202,6 +223,7 @@ impl Prover {
             in_coins,
             out_coins,
             next_public_key,
+            asset_id,
         )
     }
 
@@ -218,6 +240,7 @@ impl Prover {
         out_coins: &[(bool, HashDigest, u64, &NonInclusionProof)],
         next_public_key: &PublicKey,
         sources: &[Option<InCoinSourceWitness>],
+        asset_id: HashDigest,
     ) -> Result<Proof> {
         prove_initial_with_in_and_out_coins_and_sources(
             &self.circuit,
@@ -227,6 +250,7 @@ impl Prover {
             out_coins,
             next_public_key,
             sources,
+            asset_id,
         )
     }
 
@@ -244,6 +268,7 @@ impl Prover {
         out_coins: &[(bool, HashDigest, u64, &NonInclusionProof)],
         next_public_key: &PublicKey,
         sources: &[Option<InCoinSourceWitness>],
+        asset_id: HashDigest,
     ) -> Result<Proof> {
         prove_account_update_with_in_and_out_coins_and_sources(
             &self.circuit,
@@ -255,6 +280,7 @@ impl Prover {
             out_coins,
             next_public_key,
             sources,
+            asset_id,
         )
     }
 
@@ -271,6 +297,7 @@ impl Prover {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zkcoins_program_plonky2::hash::ZERO_HASH;
     use zkcoins_program_plonky2::types::MINTING_ADDRESS;
 
     fn dummy_pubkey(seed: u8) -> [u8; 33] {
@@ -300,7 +327,7 @@ mod tests {
 
         let history_root = zkcoins_program_plonky2::hash::hash_bytes(b"prover-test-history");
         let proof = prover
-            .prove_initial(&account_state, history_root)
+            .prove_initial(&account_state, history_root, ZERO_HASH)
             .expect("prove initial");
         prover.verify(&proof).expect("verify");
     }

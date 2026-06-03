@@ -1507,6 +1507,80 @@ pub async fn list_account_history(
     Ok((items, total))
 }
 
+// ---- Multi-asset persistence -------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct AssetRow {
+    pub asset_id: Vec<u8>,
+    pub name: String,
+    pub decimals: i16,
+    pub mint_authority_pubkey: Vec<u8>,
+    pub creator_address: Vec<u8>,
+}
+
+pub async fn insert_asset(
+    pool: &PgPool,
+    asset_id: &[u8],
+    name: &str,
+    decimals: i16,
+    mint_authority_pubkey: &[u8],
+    creator_address: &[u8],
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO assets (asset_id, name, decimals, mint_authority_pubkey, creator_address) \
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (asset_id) DO NOTHING",
+    )
+    .bind(asset_id)
+    .bind(name)
+    .bind(decimals)
+    .bind(mint_authority_pubkey)
+    .bind(creator_address)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn get_asset(pool: &PgPool, asset_id: &[u8]) -> Result<Option<AssetRow>, sqlx::Error> {
+    let row: Option<(Vec<u8>, String, i16, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        "SELECT asset_id, name, decimals, mint_authority_pubkey, creator_address \
+         FROM assets WHERE asset_id = $1",
+    )
+    .bind(asset_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(
+        |(asset_id, name, decimals, mint_authority_pubkey, creator_address)| AssetRow {
+            asset_id,
+            name,
+            decimals,
+            mint_authority_pubkey,
+            creator_address,
+        },
+    ))
+}
+
+pub async fn list_assets(pool: &PgPool) -> Result<Vec<AssetRow>, sqlx::Error> {
+    let rows: Vec<(Vec<u8>, String, i16, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        "SELECT asset_id, name, decimals, mint_authority_pubkey, creator_address \
+         FROM assets ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(asset_id, name, decimals, mint_authority_pubkey, creator_address)| AssetRow {
+                asset_id,
+                name,
+                decimals,
+                mint_authority_pubkey,
+                creator_address,
+            },
+        )
+        .collect())
+}
+
 #[cfg(test)]
 #[path = "db_tests.rs"]
 mod tests;

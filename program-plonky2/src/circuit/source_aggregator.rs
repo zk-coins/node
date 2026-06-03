@@ -366,7 +366,7 @@ pub fn verify_aggregator(
 mod tests {
     use super::*;
     use crate::circuit::main::{build_circuit, prove_initial};
-    use crate::hash::hash_bytes;
+    use crate::hash::{hash_bytes, ZERO_HASH};
     use crate::types::{AccountState, MINTING_ADDRESS};
     use plonky2::field::types::Field;
 
@@ -453,8 +453,9 @@ mod tests {
         source_account.owner = *MINTING_ADDRESS;
         source_account.balance = 1_000_000;
         let source_history_root = hash_bytes(b"aggregator-init-source");
-        let source_proof = prove_initial(&st_circuit, &source_account, source_history_root)
-            .expect("prove init source");
+        let source_proof =
+            prove_initial(&st_circuit, &source_account, source_history_root, ZERO_HASH)
+                .expect("prove init source");
 
         // Slot 0 active, others inactive.
         let mut slot_witnesses: Vec<AggregatorSlotWitness> = Vec::with_capacity(MAX_IN_COINS);
