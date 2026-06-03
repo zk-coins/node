@@ -151,7 +151,9 @@ pub struct JobPhaseEvent {
     /// download the proof file via `/api/proof/:id` without an extra
     /// poll.
     pub proof_id: Option<i64>,
-    /// Cached response body, set only on a `completed` transition.
+    /// Cached response body, set on an `awaiting_signature` transition
+    /// (the `account_state_hash` / `output_coins_root` hex the wallet
+    /// signs) and on a `completed` transition (the terminal body).
     /// Shape matches the `JobStatusResponse` field-for-field so the
     /// SSE consumer's parse path mirrors the existing GET 200 parse
     /// path.
