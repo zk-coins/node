@@ -200,10 +200,77 @@ and the relevant `### Step N` section *in the same PR*.
 
 The repo-level pre-push hook (`.githooks/pre-push`) runs `cargo fmt
 --check`, `cargo clippy` (all three feature scopes), and `cargo
-check --workspace --all-features` automatically. The full test +
-coverage gate for `node` and `shared` runs in CI on the self-hosted
-M3 Ultra runner pool — push and keep working, do not block the
-terminal on the suite.
+check --workspace --all-features` automatically.
+
+**Mandatory local gates — run BOTH green before every push.** These
+reproduce the two CI jobs that most often go red after a push, so
+verifying them locally first turns a ~13 min red-CI round-trip into a
+local check. Both need a working Docker daemon (OrbStack/Colima) for
+the per-test `postgres:17` testcontainer.
+
+**1. Coverage gate** (mirrors the `Tests + Coverage Gate` CI job —
+100% lines + functions on the `node` package; the `--ignore-filename-regex`
+is copied verbatim from `.github/workflows/ci.yaml`). One-time setup:
+`cargo install cargo-llvm-cov` + `rustup component add llvm-tools-preview`.
+
+```bash
+IS_MAINNET=false ESPLORA_URL=http://127.0.0.1:1/api \
+ESPLORA_WS_URL=ws://127.0.0.1:1/api/v1/ws \
+USERNAME_DOMAIN=test.zkcoins.local \
+PUBLISHER_KEY=0000000000000000000000000000000000000000000000000000000000000001 \
+cargo llvm-cov nextest --release -p node -p shared --all-features \
+  --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|flow\.rs|job_dispatcher\.rs|_tests\.rs$|test_db\.rs$|bin/.*\.rs$|shared/src/.*\.rs$' \
+  --fail-under-lines 100 --fail-under-functions 100 \
+  --test-threads 8 -E 'not binary(api_remote)'
+```
+
+`--fail-under-*` hard-fails on any gap (no silent degradation). The
+first run recompiles the suite with `-C instrument-coverage`; `sccache`
+(`RUSTC_WRAPPER=sccache`) makes repeats fast.
+
+**2. `api_remote` against public Mutinynet** (the deploy-dev API E2E
+suite — 47 tests — run locally instead of waiting for deploy; catches
+contract regressions like the #179 class before they ship). It needs a
+local node pointed at public Mutinynet **with an on-chain-funded
+publisher wallet** (the 8 mint/send/commit roundtrips broadcast real
+Taproot inscriptions; the other 39 are funding-free contract checks).
+
+Keep the stable test config (incl. a long-lived publisher key to keep
+funded) in `~/.config/zkcoins/mutinynet.env` (git-ignored, signet
+test-only):
+
+```bash
+# ~/.config/zkcoins/mutinynet.env
+export IS_MAINNET=false
+export NETWORK_NAME=Mutinynet
+export ESPLORA_URL=https://mutinynet.com/api
+export ESPLORA_WS_URL=wss://mutinynet.com/api/v1/ws
+export USERNAME_DOMAIN=local.zkcoins.test
+export PUBLISHER_KEY=<32-byte hex; its P2TR(signet) addr must hold Mutinynet UTXOs>
+export DATABASE_URL=postgres://zkcoins:zkpw@127.0.0.1:5433/zkcoins
+export PROOFS_DIR=/tmp/zkcoins-proofs
+```
+
+```bash
+# one-time runtime Postgres for the node (separate from the test container):
+docker run -d --name zkcoins-smoke-pg -p 5433:5432 \
+  -e POSTGRES_PASSWORD=zkpw -e POSTGRES_USER=zkcoins -e POSTGRES_DB=zkcoins postgres:17
+
+# start the node, fund its publisher, run the suite:
+source ~/.config/zkcoins/mutinynet.env
+ZKCOINS_SKIP_BOOTSTRAP_WARMUP=1 ./target/release/node &   # binds 0.0.0.0:4242
+curl -s localhost:4242/health/publisher   # -> fund the printed P2TR address on Mutinynet
+curl -s localhost:4242/health/ready       # -> {"ready":true,...} once funded
+ZKCOINS_API_URL=http://127.0.0.1:4242 \
+  cargo nextest run -p node --release --all-features -E 'binary(api_remote)'   # expect 47/47
+```
+
+> **Funding note:** `faucet.mutinynet.com` is, despite older docs, an
+> L402 Lightning paywall (`POST /api/onchain` requires a paid token;
+> `POST /api/l402` issues a ~50-sat invoice). A self-signed NIP-98
+> token is rejected. Fund the publisher P2TR address out-of-band
+> (existing Mutinynet wallet / pay the 50-sat L402 once) and keep the
+> key in the env file so it stays funded across runs.
 
 When touching `program-plonky2/` specifically, also run the local
 sweep + coverage gate **before** opening / updating the PR — the

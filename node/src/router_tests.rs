@@ -746,6 +746,7 @@ fn send_signature_rejects_missing_signature() {
                 .unwrap()
                 .as_secs(),
         ),
+        asset_id: None,
     };
     let result = verify_send_signature(&request);
     assert!(result.is_err());
@@ -767,6 +768,7 @@ fn send_signature_rejects_missing_timestamp() {
         prev_commitment_pubkey: None,
         signature: Some("ab".repeat(64)),
         timestamp: None,
+        asset_id: None,
     };
     let result = verify_send_signature(&request);
     assert!(result.is_err());
@@ -819,6 +821,7 @@ fn send_signature_rejects_invalid_hex() {
         prev_commitment_pubkey: None,
         signature: Some("not_valid_hex".to_string()),
         timestamp: Some(now),
+        asset_id: None,
     };
     let result = verify_send_signature(&request);
     assert!(result.is_err());
@@ -853,6 +856,7 @@ fn send_signature_rejects_wrong_signature() {
         prev_commitment_pubkey: None,
         signature: Some(hex::encode(sig.serialize())),
         timestamp: Some(now),
+        asset_id: None,
     };
     let result = verify_send_signature(&request);
     assert!(result.is_err());
@@ -1602,6 +1606,7 @@ fn send_signature_accepts_valid_signature() {
         prev_commitment_pubkey: None,
         signature: Some(hex::encode(sig.serialize())),
         timestamp: Some(now),
+        asset_id: None,
     };
     // `.expect` surfaces the actual error string on failure; the
     // previous `is_ok()` shape silently swallowed it.
@@ -3773,6 +3778,7 @@ fn verify_send_signature_pub_returns_missing_signature_when_absent() {
         prev_commitment_pubkey: None,
         signature: None,
         timestamp: Some(0),
+        asset_id: None,
     };
     let err = crate::router::verify_send_signature_pub(&req).unwrap_err();
     assert_eq!(err, "Missing signature");

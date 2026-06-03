@@ -169,10 +169,9 @@ impl Account {
 
         let next_account_state_hash = next_account_state.hash();
         let coins = coin_templates.into_iter().enumerate().map(|(i, template)| {
-            Coin::new(
-                template,
-                calculate_coin_identifier(next_account_state_hash, i as u32),
-            )
+            let id =
+                calculate_coin_identifier(next_account_state_hash, template.asset_id, i as u32);
+            Coin::new(template, id)
         });
         // Set the next public key.
         let _ = next_public_key.serialize();
@@ -375,6 +374,7 @@ impl AccountNode {
             identifier: ZERO_HASH,
             recipient: ZERO_HASH,
             amount: 0,
+            asset_id: ZERO_HASH,
         }
     }
 
@@ -459,7 +459,22 @@ impl AccountNode {
             return Err("Too many out-coins for one transition");
         }
 
-        // Check if the account balance is enough
+        let transition_asset_id = invoices
+            .first()
+            .map(|i| i.asset_id)
+            .unwrap_or(*zkcoins_program::types::NATIVE_ASSET_ID);
+
+        for cp in &account.coin_queue {
+            if cp.coin.asset_id != transition_asset_id {
+                return Err("Mixed assets in single transition");
+            }
+        }
+        for inv in &invoices {
+            if inv.asset_id != transition_asset_id {
+                return Err("Mixed assets in single transition");
+            }
+        }
+
         let balance = account
             .coin_queue
             .iter()
@@ -469,12 +484,13 @@ impl AccountNode {
             return Err("Insufficient funds");
         }
 
-        // TODO: Copy this over to the client because they too have to check that the
-        // out_coins_tree is correct and only contains the coins from the invoices.
-        // Create the coin templates.
         let mut coin_templates = vec![];
-        for invoice in invoices {
-            coin_templates.push(CoinTemplate::new(invoice.recipient, invoice.amount));
+        for invoice in &invoices {
+            coin_templates.push(CoinTemplate::new(
+                invoice.recipient,
+                invoice.amount,
+                invoice.asset_id,
+            ));
         }
 
         let mut coin_history_proofs = vec![];
@@ -663,6 +679,7 @@ impl AccountNode {
                         &out_coin_slots,
                         &next_public_key_bytes,
                         &sources,
+                        transition_asset_id,
                     )
                     .map_err(|_| "prove_account_update_with_in_and_out_coins_and_sources failed")?
             }
@@ -674,12 +691,15 @@ impl AccountNode {
                     &out_coin_slots,
                     &next_public_key_bytes,
                     &sources,
+                    transition_asset_id,
                 )
                 .map_err(|_| "prove_initial_with_in_and_out_coins_and_sources failed")?,
         };
 
         // Proof generation succeeded — commit the state changes.
-        account.coin_queue.clear();
+        account
+            .coin_queue
+            .retain(|cp| cp.coin.asset_id != transition_asset_id);
         account.balance = balance - invoiced_amount;
         account.proof = Some(proof.clone());
         // Bump the per-account send counter atomically with `proof`.
@@ -861,8 +881,9 @@ impl AccountNode {
             *b = (7u8).wrapping_add(i as u8);
         }
         let warmup_account_state = AccountState::new(pk);
+        let asset_id = *zkcoins_program::types::NATIVE_ASSET_ID;
         self.prover
-            .prove_initial(&warmup_account_state, ZERO_HASH)?;
+            .prove_initial(&warmup_account_state, ZERO_HASH, asset_id)?;
         Ok(())
     }
 
@@ -1153,7 +1174,11 @@ mod inline_tests {
         let account_address = zkcoins_program::hash::digest_from_bytes(&[3u8; 32]);
         let pk = dummy_secp_public_key();
         let result = node.send_coins(
-            vec![Invoice::new(1, recipient)],
+            vec![Invoice::new(
+                1,
+                recipient,
+                *zkcoins_program::types::NATIVE_ASSET_ID,
+            )],
             account_address,
             pk,
             pk,
@@ -1170,7 +1195,11 @@ mod inline_tests {
         let recipient = zkcoins_program::hash::digest_from_bytes(&[5u8; 32]);
         let pk = dummy_secp_public_key();
         let result = node.send_coins(
-            vec![Invoice::new(100, recipient)],
+            vec![Invoice::new(
+                100,
+                recipient,
+                *zkcoins_program::types::NATIVE_ASSET_ID,
+            )],
             account_address,
             pk,
             pk,
@@ -1185,6 +1214,30 @@ mod inline_tests {
         let pk = dummy_secp_public_key();
         let result = node.prepare_mint(vec![], pk, pk, None);
         assert_eq!(result.unwrap_err(), "Minting account not created");
+    }
+
+    #[test]
+    fn send_coins_rejects_mixed_asset_invoices() {
+        let mut node = fresh_node();
+        let account_address = zkcoins_program::hash::digest_from_bytes(&[4u8; 32]);
+        let mut account = Account::new();
+        account.balance = 200;
+        node.import_account(account_address, account);
+        let recipient = zkcoins_program::hash::digest_from_bytes(&[5u8; 32]);
+        let pk = dummy_secp_public_key();
+        let asset_a = zkcoins_program::hash::hash_bytes(b"asset-a");
+        let asset_b = zkcoins_program::hash::hash_bytes(b"asset-b");
+        let result = node.send_coins(
+            vec![
+                Invoice::new(50, recipient, asset_a),
+                Invoice::new(50, recipient, asset_b),
+            ],
+            account_address,
+            pk,
+            pk,
+            None,
+        );
+        assert_eq!(result.unwrap_err(), "Mixed assets in single transition");
     }
 
     #[test]
@@ -1297,7 +1350,11 @@ mod inline_tests {
         // The send_coins call must traverse the poisoned-lock recovery
         // path before hitting the "Unknown account address" guard.
         let result = node.send_coins(
-            vec![Invoice::new(1, recipient)],
+            vec![Invoice::new(
+                1,
+                recipient,
+                *zkcoins_program::types::NATIVE_ASSET_ID,
+            )],
             account_address,
             pk,
             pk,
