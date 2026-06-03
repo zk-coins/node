@@ -1509,7 +1509,7 @@ pub async fn list_account_history(
 
 // ---- Multi-asset persistence -------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct AssetRow {
     pub asset_id: Vec<u8>,
     pub name: String,
@@ -1542,43 +1542,22 @@ pub async fn insert_asset(
 }
 
 pub async fn get_asset(pool: &PgPool, asset_id: &[u8]) -> Result<Option<AssetRow>, sqlx::Error> {
-    let row: Option<(Vec<u8>, String, i16, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+    sqlx::query_as::<_, AssetRow>(
         "SELECT asset_id, name, decimals, mint_authority_pubkey, creator_address \
          FROM assets WHERE asset_id = $1",
     )
     .bind(asset_id)
     .fetch_optional(pool)
-    .await?;
-    Ok(row.map(
-        |(asset_id, name, decimals, mint_authority_pubkey, creator_address)| AssetRow {
-            asset_id,
-            name,
-            decimals,
-            mint_authority_pubkey,
-            creator_address,
-        },
-    ))
+    .await
 }
 
 pub async fn list_assets(pool: &PgPool) -> Result<Vec<AssetRow>, sqlx::Error> {
-    let rows: Vec<(Vec<u8>, String, i16, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+    sqlx::query_as::<_, AssetRow>(
         "SELECT asset_id, name, decimals, mint_authority_pubkey, creator_address \
          FROM assets ORDER BY name",
     )
     .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(
-            |(asset_id, name, decimals, mint_authority_pubkey, creator_address)| AssetRow {
-                asset_id,
-                name,
-                decimals,
-                mint_authority_pubkey,
-                creator_address,
-            },
-        )
-        .collect())
+    .await
 }
 
 #[cfg(test)]
