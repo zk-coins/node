@@ -164,6 +164,20 @@ pub(crate) fn validate_send_request(
 pub(crate) async fn mint_flow(state: &AppState, request: MintRequest) -> FlowResult {
     let account_address_bytes = validate_mint_request(&request)?;
     let account_address = digest_from_bytes(&account_address_bytes);
+    let mint_asset_id = request
+        .asset_id
+        .as_deref()
+        .and_then(|hex| {
+            hex::decode(hex.trim_start_matches("0x"))
+                .ok()
+                .filter(|b| b.len() == 32)
+                .map(|b| {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&b);
+                    zkcoins_program::hash::digest_from_bytes(&arr)
+                })
+        })
+        .unwrap_or(*zkcoins_program::types::NATIVE_ASSET_ID);
 
     // ---- 1. SNAPSHOT phase (no mutation) -----------------------------------
     let state_arc = {
@@ -214,11 +228,7 @@ pub(crate) async fn mint_flow(state: &AppState, request: MintRequest) -> FlowRes
             }
             guard
                 .prepare_mint(
-                    vec![Invoice::new(
-                        amount,
-                        account_address,
-                        *zkcoins_program::types::NATIVE_ASSET_ID,
-                    )],
+                    vec![Invoice::new(amount, account_address, mint_asset_id)],
                     minting_pubkey,
                     next_minting_pubkey,
                     prev_commitment_pubkey,
@@ -424,6 +434,20 @@ pub(crate) async fn send_flow(
     let next_public_key = request.next_public_key;
     let prev_commitment_pubkey = request.prev_commitment_pubkey;
     let amount = request.amount;
+    let send_asset_id = request
+        .asset_id
+        .as_deref()
+        .and_then(|hex| {
+            hex::decode(hex.trim_start_matches("0x"))
+                .ok()
+                .filter(|b| b.len() == 32)
+                .map(|b| {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&b);
+                    zkcoins_program::hash::digest_from_bytes(&arr)
+                })
+        })
+        .unwrap_or(*zkcoins_program::types::NATIVE_ASSET_ID);
 
     // The prove call is CPU-bound; push it through spawn_blocking so
     // the dispatcher's tokio worker is not blocked during the prove.
@@ -431,11 +455,7 @@ pub(crate) async fn send_flow(
     let result = tokio::task::spawn_blocking(move || -> Result<(CoinProof, Vec<u8>), FlowError> {
         let mut guard = lock_or_recover(&account_node_clone);
         let res = guard.send_coins(
-            vec![Invoice::new(
-                amount,
-                to_address,
-                *zkcoins_program::types::NATIVE_ASSET_ID,
-            )],
+            vec![Invoice::new(amount, to_address, send_asset_id)],
             from_address,
             public_key,
             next_public_key,

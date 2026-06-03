@@ -196,6 +196,15 @@ impl Account {
             .iter()
             .fold(self.balance, |acc, x| acc + x.coin.amount)
     }
+
+    pub fn get_asset_balances(&self) -> BTreeMap<[u8; 32], u64> {
+        let mut result = self.balances.clone();
+        for cp in &self.coin_queue {
+            let key = zkcoins_program::hash::digest_to_bytes(&cp.coin.asset_id);
+            *result.entry(key).or_insert(0) += cp.coin.amount;
+        }
+        result
+    }
 }
 
 pub struct AccountNode {
@@ -466,7 +475,22 @@ impl AccountNode {
             return Err("Too many out-coins for one transition");
         }
 
-        // Check if the account balance is enough
+        let transition_asset_id = invoices
+            .first()
+            .map(|i| i.asset_id)
+            .unwrap_or(*zkcoins_program::types::NATIVE_ASSET_ID);
+
+        for cp in &account.coin_queue {
+            if cp.coin.asset_id != transition_asset_id {
+                return Err("Mixed assets in single transition");
+            }
+        }
+        for inv in &invoices {
+            if inv.asset_id != transition_asset_id {
+                return Err("Mixed assets in single transition");
+            }
+        }
+
         let balance = account
             .coin_queue
             .iter()
@@ -476,11 +500,8 @@ impl AccountNode {
             return Err("Insufficient funds");
         }
 
-        // TODO: Copy this over to the client because they too have to check that the
-        // out_coins_tree is correct and only contains the coins from the invoices.
-        // Create the coin templates.
         let mut coin_templates = vec![];
-        for invoice in invoices {
+        for invoice in &invoices {
             coin_templates.push(CoinTemplate::new(
                 invoice.recipient,
                 invoice.amount,
@@ -674,7 +695,7 @@ impl AccountNode {
                         &out_coin_slots,
                         &next_public_key_bytes,
                         &sources,
-                        *zkcoins_program::types::NATIVE_ASSET_ID,
+                        transition_asset_id,
                     )
                     .map_err(|_| "prove_account_update_with_in_and_out_coins_and_sources failed")?
             }
@@ -686,14 +707,25 @@ impl AccountNode {
                     &out_coin_slots,
                     &next_public_key_bytes,
                     &sources,
-                    *zkcoins_program::types::NATIVE_ASSET_ID,
+                    transition_asset_id,
                 )
                 .map_err(|_| "prove_initial_with_in_and_out_coins_and_sources failed")?,
         };
 
         // Proof generation succeeded — commit the state changes.
-        account.coin_queue.clear();
+        account
+            .coin_queue
+            .retain(|cp| cp.coin.asset_id != transition_asset_id);
         account.balance = balance - invoiced_amount;
+        let asset_key = zkcoins_program::hash::digest_to_bytes(&transition_asset_id);
+        let prev_asset_balance = account.balances.get(&asset_key).copied().unwrap_or(0);
+        let in_coin_amount: u64 = in_coins.iter().map(|c| c.amount).sum();
+        let new_asset_balance = prev_asset_balance + in_coin_amount - invoiced_amount;
+        if new_asset_balance == 0 {
+            account.balances.remove(&asset_key);
+        } else {
+            account.balances.insert(asset_key, new_asset_balance);
+        }
         account.proof = Some(proof.clone());
         // Bump the per-account send counter atomically with `proof`.
         // `num_sends > 0 iff proof.is_some()` is the invariant the
@@ -1209,6 +1241,31 @@ mod inline_tests {
         let pk = dummy_secp_public_key();
         let result = node.prepare_mint(vec![], pk, pk, None);
         assert_eq!(result.unwrap_err(), "Minting account not created");
+    }
+
+    #[test]
+    fn send_coins_rejects_mixed_asset_invoices() {
+        let mut node = fresh_node();
+        let account_address = zkcoins_program::hash::digest_from_bytes(&[4u8; 32]);
+        let mut account = Account::new();
+        account.balance = 200;
+        account.balances = BTreeMap::new();
+        node.import_account(account_address, account);
+        let recipient = zkcoins_program::hash::digest_from_bytes(&[5u8; 32]);
+        let pk = dummy_secp_public_key();
+        let asset_a = zkcoins_program::hash::hash_bytes(b"asset-a");
+        let asset_b = zkcoins_program::hash::hash_bytes(b"asset-b");
+        let result = node.send_coins(
+            vec![
+                Invoice::new(50, recipient, asset_a),
+                Invoice::new(50, recipient, asset_b),
+            ],
+            account_address,
+            pk,
+            pk,
+            None,
+        );
+        assert_eq!(result.unwrap_err(), "Mixed assets in single transition");
     }
 
     #[test]

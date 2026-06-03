@@ -2493,7 +2493,7 @@ pub(crate) async fn info_handler() -> impl IntoResponse {
             address_list: cfg!(feature = "address-list"),
             username_claim: cfg!(feature = "username-claim"),
             lnurl: cfg!(feature = "lnurl"),
-            multi_asset: true,
+            multi_asset: false,
         },
         username_domain: USERNAME_DOMAIN.clone(),
     })

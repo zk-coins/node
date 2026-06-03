@@ -98,7 +98,7 @@
 //! `cap_elements = 1 << cap_height`. For
 //! `CircuitConfig::standard_recursion_config()` (`cap_height = 4`),
 //! `cap_elements = 16`, so the cap occupies `4 * 16 = 64` elements.
-//! Total aggregator PIs: `8 * 17 + 4 + 64 = 204`.
+//! Total aggregator PIs: `8 * 21 + 4 + 64 = 236`.
 
 use anyhow::Result;
 use plonky2::iop::target::BoolTarget;
