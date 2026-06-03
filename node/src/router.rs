@@ -1596,7 +1596,13 @@ pub(crate) async fn get_job_handler(
         } else {
             None
         },
-        result: if job.status == JobStatus::Completed {
+        // `awaiting_signature` carries the ash/ocr hex the wallet must
+        // sign (persisted in `response_body` by
+        // `JobStore::set_awaiting_signature`); `completed` carries the
+        // cached terminal body. Both live in `response_body`, so the
+        // same field surfaces on either status.
+        result: if job.status == JobStatus::Completed || job.status == JobStatus::AwaitingSignature
+        {
             job.response_body.clone()
         } else {
             None
@@ -1853,7 +1859,13 @@ pub(crate) fn initial_event_from_job(job: &Job) -> Event {
         } else {
             serde_json::Value::Null
         },
-        "result": if job.status == JobStatus::Completed {
+        "result": if job.status == JobStatus::Completed
+            || job.status == JobStatus::AwaitingSignature
+        {
+            // `awaiting_signature` carries the ash/ocr hex the wallet
+            // signs; `completed` carries the terminal body. Both are in
+            // `response_body`, so the SSE initial frame mirrors the GET
+            // snapshot for either status.
             job.response_body.clone().unwrap_or(serde_json::Value::Null)
         } else {
             serde_json::Value::Null

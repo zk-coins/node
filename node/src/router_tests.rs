@@ -2778,9 +2778,18 @@ mod jobs_endpoint_tests {
             crate::job_store::CreateResult::Fresh(j) => j.public_id,
             _ => panic!(),
         };
+        let ash = "aa".repeat(32);
+        let ocr = "bb".repeat(32);
         state
             .job_store
-            .set_awaiting_signature(job_id, 42)
+            .set_awaiting_signature(
+                job_id,
+                42,
+                serde_json::json!({
+                    "account_state_hash": ash,
+                    "output_coins_root": ocr,
+                }),
+            )
             .await
             .expect("await sig");
 
@@ -2792,6 +2801,11 @@ mod jobs_endpoint_tests {
         let v: serde_json::Value = serde_json::from_str(&body).expect("json");
         assert_eq!(v["status"], "awaiting_signature");
         assert_eq!(v["proof_id"], 42i64);
+        // The ash/ocr hex the wallet signs surfaces in `result` on the
+        // `awaiting_signature` snapshot — this is the field the thin
+        // pure-TS wallet reads instead of decoding the binary proof.
+        assert_eq!(v["result"]["account_state_hash"], ash);
+        assert_eq!(v["result"]["output_coins_root"], ocr);
     }
 
     // ---- POST /api/jobs/:id/cancel ----
@@ -2904,7 +2918,7 @@ mod jobs_endpoint_tests {
         };
         state
             .job_store
-            .set_awaiting_signature(job_id, 7)
+            .set_awaiting_signature(job_id, 7, serde_json::json!({}))
             .await
             .expect("aw sig");
         let notifier = Arc::new(crate::job_dispatcher::JobNotifier::new());
@@ -2955,7 +2969,7 @@ mod jobs_endpoint_tests {
         };
         state
             .job_store
-            .set_awaiting_signature(job_id, 7)
+            .set_awaiting_signature(job_id, 7, serde_json::json!({}))
             .await
             .expect("aw sig");
         // No notify_map.insert — simulates the post-timeout state.
@@ -3163,7 +3177,7 @@ mod jobs_endpoint_tests {
         };
         state
             .job_store
-            .set_awaiting_signature(job_id, 7)
+            .set_awaiting_signature(job_id, 7, serde_json::json!({}))
             .await
             .expect("aw sig");
         let notifier = Arc::new(crate::job_dispatcher::JobNotifier::new());
@@ -3291,8 +3305,20 @@ mod jobs_endpoint_tests {
     }
 
     #[test]
-    fn initial_event_awaiting_signature_includes_proof_id() {
-        let job = make_job(JobStatus::AwaitingSignature, Some(42), None, None);
+    fn initial_event_awaiting_signature_includes_proof_id_and_result() {
+        // `awaiting_signature` carries the ash/ocr hex in `response_body`
+        // (set by `JobStore::set_awaiting_signature`); the SSE initial
+        // frame must surface both the `proof_id` and that `result` so a
+        // wallet reconnecting after a node restart gets the hex to sign.
+        let job = make_job(
+            JobStatus::AwaitingSignature,
+            Some(42),
+            Some(serde_json::json!({
+                "account_state_hash": "aa".repeat(32),
+                "output_coins_root": "bb".repeat(32),
+            })),
+            None,
+        );
         let event = crate::router::initial_event_from_job(&job);
         // Re-serialise to check the payload contents.
         let wire = format!("{:?}", event);
@@ -3300,6 +3326,11 @@ mod jobs_endpoint_tests {
         assert!(
             wire.contains("42"),
             "proof_id 42 must surface; wire: {}",
+            wire
+        );
+        assert!(
+            wire.contains("account_state_hash") && wire.contains("output_coins_root"),
+            "ash/ocr result must surface on the awaiting_signature frame; wire: {}",
             wire
         );
     }

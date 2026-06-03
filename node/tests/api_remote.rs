@@ -1337,6 +1337,38 @@ async fn send_commit_roundtrip_moves_balance() {
         "output_coins_root must be non-zero"
     );
 
+    // ---- Thin-client contract: ash/ocr hex on the awaiting_signature
+    // result ----
+    // A pure-TypeScript wallet cannot decode the binary bincode
+    // `CoinProof` from `GET /api/proof/{id}`, so the node surfaces the
+    // hashes it must sign directly on the job result as hex. Assert the
+    // `awaiting_signature` snapshot carries `result.account_state_hash`
+    // + `result.output_coins_root`, AND that they equal the digests
+    // decoded from the proof above — so what the wallet signs from the
+    // thin path is bit-identical to the proof's public inputs.
+    let result = awaiting
+        .get("result")
+        .and_then(Value::as_object)
+        .expect("awaiting_signature job carries a result object");
+    let result_ash = result
+        .get("account_state_hash")
+        .and_then(Value::as_str)
+        .expect("result carries account_state_hash hex");
+    let result_ocr = result
+        .get("output_coins_root")
+        .and_then(Value::as_str)
+        .expect("result carries output_coins_root hex");
+    assert_eq!(
+        result_ash,
+        hex::encode(ash_bytes),
+        "awaiting_signature result.account_state_hash must equal the proof-decoded ash"
+    );
+    assert_eq!(
+        result_ocr,
+        hex::encode(ocr_bytes),
+        "awaiting_signature result.output_coins_root must equal the proof-decoded ocr"
+    );
+
     // ---- Commit (phase 2: sign ash || ocr, attach, broadcast) ----
     let mut commit_message = Vec::with_capacity(64);
     commit_message.extend_from_slice(&ash_bytes);
