@@ -939,6 +939,24 @@ pub async fn store_circuit_digest(pool: &PgPool, digest: &[u8]) -> Result<(), sq
 /// construction, and stop being appended to until the next user
 /// round-trip re-populates `accounts`.
 ///
+/// `usernames` is deliberately PRESERVED (not in the DELETE set above):
+/// a `name → address` mapping is a human-facing handle, not
+/// proof-dependent state — it does not feed proof construction and
+/// survives a genesis reset so a user keeps their handle even though
+/// their balance/proof are wiped. (The address it points at simply has
+/// no `accounts` row until the next round-trip re-creates one.)
+///
+/// `coin_proof_store` (migration 0008) is deliberately NOT in the DELETE
+/// set either, but for a different reason: it is unused schema
+/// groundwork. Migration 0008 only CREATEs the table as a persisted view
+/// of the in-memory `ProofStore`; the bootstrap that would populate it is
+/// an explicit follow-up (see the migration 0008 comment), so there is no
+/// production INSERT today and nothing to wipe. MIGRATION_RESEARCH: if the
+/// DB-backed `ProofStore` bootstrap later lands and starts persisting
+/// proof bytes here, `coin_proof_store` becomes proof-dependent state and
+/// MUST be added to this DELETE set (its rows reference proof ids that a
+/// genesis reset invalidates).
+///
 /// The on-disk per-proof file store (`PROOFS_DIR`) is dropped by the
 /// caller (see `crate::self_heal::reset_proof_store_dir`) — it lives
 /// outside Postgres so it cannot ride this transaction, but the

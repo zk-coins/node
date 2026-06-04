@@ -925,12 +925,60 @@ impl AccountNode {
     /// cleanly (the canary does NOT false-positive) and only a genuinely
     /// stale proof fails.
     ///
-    /// The surrounding `AccountState` is synthetic (a fresh state with
-    /// the persisted commitment pubkey); a wrong post-transition state
-    /// only makes the resulting proof semantically unverifiable, it does
-    /// not cause the witness-generation copy-constraint conflict that
-    /// distinguishes stale from fresh. The produced proof is discarded —
-    /// no state is mutated and nothing is broadcast.
+    /// Surrounding `AccountState`: the REAL persisted account state is
+    /// rebuilt exactly as the production prove path does in
+    /// [`Self::send_coins_inner`] (`account_state_for_prove`): `owner` =
+    /// the account address (the `self.accounts` map key), `balance` =
+    /// `account.balance`, `public_key` = the account's CURRENT key — the
+    /// key the NEXT transition would witness as its `public_key`, supplied
+    /// by the `current_pubkey_for` resolver (handed the already-held SMT;
+    /// for the minting account it returns
+    /// `generate_public_key(derive_num_pubkeys_from_smt(.., smt))`, exactly
+    /// what `mint_flow` passes). This is deliberately NOT the persisted
+    /// `commitment_public_key`: the AccountUpdate branch enforces two
+    /// arithmetic equality constraints on a circuit-compatible recursion
+    /// (see `program-plonky2/src/circuit/main.rs`): SPEC §8(b)
+    /// `account_state_hash == prev_account_state_hash` (the inner proof's
+    /// committed state-hash PI) and SPEC §8(c) `account_state_hash ==
+    /// cmp.commitment_account_state_hash` (read back from that same inner
+    /// proof's PI by [`Self::get_merkle_proofs`], which sets
+    /// `commitment_account_state_hash: proof_data.account_state_hash`).
+    /// Both reference `account.proof`'s state-hash PI, which the circuit
+    /// computes as `final_account_state_hash` using the producing
+    /// transition's `next_public_key` (the key it rotated TO) — NOT the
+    /// key it started from. The producing transition's `next_public_key`
+    /// equals the next transition's `public_key` (the rotation chain), so
+    /// the resolver's current key is precisely the preimage whose hash
+    /// matches that PI. `commitment_public_key` (the producing
+    /// transition's FROM-key) is still used — but only to look the
+    /// COMMITMENT up in the SMT via `get_merkle_proofs`, mirroring how
+    /// `send_coins_inner` resolves `prev_cmp`. Feeding the correct current
+    /// key makes BOTH §8(b)/(c) satisfiable, so for a circuit-compatible
+    /// proof the ONLY remaining prove-time failure path is the recursion
+    /// copy-constraint that `set_proof_with_pis` imposes on the inner
+    /// proof — which is exactly what a breaking circuit change violates.
+    /// The previous implementation used a synthetic `{ owner: ZERO_HASH,
+    /// balance: 0 }` state, which violated §8(b)/(c); that it still proved
+    /// `Ok` relied on the fragile Plonky2 invariant that arithmetic gate
+    /// constraints are not checked at witness/prove time (only copy
+    /// constraints are). Using the real state removes that dependency:
+    /// `Err ⇒ Stale` now hangs solely on the recursion copy-constraint,
+    /// not on which constraints Plonky2 happens to evaluate at prove time.
+    /// An earlier draft of this fix used `commitment_public_key` for the
+    /// account-state pubkey and false-positived (`Stale`) on a genuinely
+    /// compatible digest-less DB — the live positive control (Schritt 3b)
+    /// caught it; the rotation analysis above is why the current key is
+    /// correct. The produced proof is discarded — no state is mutated and
+    /// nothing is broadcast.
+    ///
+    /// The POSITIVE direction (a genuinely circuit-COMPATIBLE but
+    /// digest-less DB ⇒ [`CanaryOutcome::Compatible`], NOT a
+    /// false-positive `Stale` that would wipe a healthy production node on
+    /// its first boot after adopting this fix) is proven empirically by
+    /// the live boot-gate positive control documented in the PR: boot a
+    /// node, mint/send to produce a recursable proof, `DELETE FROM
+    /// circuit_digest_meta`, reboot the SAME build — the canary returns
+    /// `Compatible`, the digest is baselined and accounts are preserved.
     ///
     /// Accounts whose commitment cannot be resolved in the loaded SMT
     /// (e.g. a pubkey not yet indexed) are skipped — that is a
@@ -941,15 +989,36 @@ impl AccountNode {
     /// account yields a usable sample (fresh DB, or no resolvable
     /// commitment) it returns [`CanaryOutcome::NoSample`].
     ///
+    /// Staleness-detection invariant (append-only PI slots): the canary
+    /// recurses every persisted proof through [`Self::get_merkle_proofs`],
+    /// which reads `previous_proof.public_inputs[..N_PROOF_DATA_PUBLIC_INPUTS]`.
+    /// This assumes the first `N_PROOF_DATA_PUBLIC_INPUTS` proof-data PI
+    /// slots stay APPEND-ONLY across circuit changes. A future circuit
+    /// change that REORDERS those low slots (e.g. moves slots 0..16) would
+    /// make `get_merkle_proofs` `Err` for every sample ⇒ every account
+    /// skipped ⇒ `NoSample` ⇒ `Baseline` ⇒ no reset despite genuine
+    /// staleness (a False Negative). Any such reordering MUST update the
+    /// canary in lockstep. We deliberately do NOT map `NoSample` ⇒
+    /// `Stale`: a `NoSample` from a benign state-derivation gap on an
+    /// otherwise-healthy node must NOT trigger a full genesis wipe, so the
+    /// data-loss-safe direction is `NoSample` ⇒ `Baseline` (no reset).
+    /// When proof-carrying accounts exist but ALL were skipped via a
+    /// `get_merkle_proofs` `Err`, a `tracing::warn!` is emitted so the
+    /// operator can see the canary produced no sample on a non-empty DB.
+    ///
     /// `coverage(off)`: called only from the boot path in `main.rs`
     /// (which is in the CI `--ignore-filename-regex`), and it runs a
     /// real ~5 s recursive prove against a recursable persisted proof +
     /// the loaded SMT/MMR — neither cheap nor reconstructible in a unit
-    /// test. It is validated by the live boot-gate repro against the DEV
-    /// dump (documented in the PR). The pure decision logic it feeds
-    /// ([`crate::self_heal::reset_decision`]) is covered exhaustively.
+    /// test. Both directions are validated by the live boot-gate repro
+    /// (negative: DEV dump ⇒ `Stale`; positive: digest-less compatible DB
+    /// ⇒ `Compatible`), documented in the PR. The pure decision logic it
+    /// feeds ([`crate::self_heal::reset_decision`]) is covered exhaustively.
     #[cfg_attr(coverage_nightly, coverage(off))]
-    pub fn canary_recursion(&self) -> CanaryOutcome {
+    pub fn canary_recursion(
+        &self,
+        current_pubkey_for: &dyn Fn(&Address, &SparseMerkleTree) -> Option<PublicKey>,
+    ) -> CanaryOutcome {
         let state = self
             .state
             .lock()
@@ -971,27 +1040,77 @@ impl AccountNode {
             .collect();
         let native_asset = *zkcoins_program::types::NATIVE_ASSET_ID;
 
-        for account in self.accounts.values() {
-            let (Some(proof), Some(pubkey)) =
+        // Track whether we saw any proof-carrying account at all, so we
+        // can distinguish a genuinely empty/fresh DB (no warning) from a
+        // non-empty DB where every recursable sample was skipped because
+        // `get_merkle_proofs` could not resolve its commitment OR the
+        // caller could not resolve the account's current pubkey (both
+        // worth a warning — see the False-Negative note in the doc).
+        let mut saw_proof_carrying_account = false;
+
+        // `.iter()` (not `.values()`) so we have the account ADDRESS (the
+        // map key) to rebuild the real `AccountState`, mirroring the
+        // production prove path's `account_state_for_prove`.
+        for (account_address, account) in self.accounts.iter() {
+            let (Some(proof), Some(commitment_pubkey)) =
                 (account.proof.as_ref(), account.commitment_public_key)
             else {
                 continue;
             };
-            // Real commitment-merkle witnesses from the loaded state —
-            // the same the next user transition would build.
-            let cmp = match Self::get_merkle_proofs(proof.clone(), pubkey, &state) {
+            saw_proof_carrying_account = true;
+            // The §8(b)/(c) state-continuity constraints fix
+            // `account_state.hash() == account.proof's account_state_hash
+            // PI`. That PI is the proof's FINAL (post-transition) state
+            // hash, which embeds the NEXT public key the producing
+            // transition rotated TO (circuit: `final_account_state_hash`
+            // uses `next_public_key_limbs`) — NOT the
+            // `commitment_public_key` (which is the key the producing
+            // transition started FROM, stored for the SMT commitment
+            // lookup). So the account-state pubkey we must witness is the
+            // key the NEXT transition would use as its CURRENT key — the
+            // same value `send_coins`/`mint_flow` pass as `public_key`
+            // (e.g. `generate_public_key(derive_num_pubkeys_from_smt(..))`
+            // for the minting account). The caller resolves it; if it
+            // cannot (an account whose current key is not derivable here,
+            // e.g. a non-minting account in a future multi-proof DB), we
+            // skip — a state-derivation gap is not circuit staleness.
+            //
+            // The resolver is handed the SMT we already hold under
+            // `state` (it needs SMT membership to derive the minting
+            // account's pubkey index); it MUST NOT re-lock `self.state`
+            // or this thread deadlocks on the non-reentrant guard.
+            let Some(current_pubkey) = current_pubkey_for(account_address, &state.smt) else {
+                continue;
+            };
+            // Commitment-merkle witnesses are looked up by the COMMITMENT
+            // pubkey (the key that backed the persisted commitment), the
+            // same way the production AccountUpdate branch resolves
+            // `prev_cmp` in `send_coins_inner` — NOT by the current key.
+            let cmp = match Self::get_merkle_proofs(proof.clone(), commitment_pubkey, &state) {
                 Ok(cmp) => cmp,
                 // Commitment not resolvable in the loaded SMT/MMR: a
                 // state gap, not circuit staleness — try another sample.
                 Err(_) => continue,
             };
-            // Synthetic surrounding state (the inner proof + CMP are what
-            // matter for the recursion copy-constraints).
+            // REAL persisted account state, rebuilt exactly as the
+            // production prove path does (`account_state_for_prove` in
+            // `send_coins_inner`): owner = address, balance =
+            // account.balance, public_key = the account's CURRENT key
+            // (the next transition's `public_key`, == the producing
+            // transition's `next_public_key` == the pubkey embedded in
+            // `account.proof`'s state-hash PI). Its hash therefore equals
+            // that PI, so the §8(b)/(c) state-continuity constraints are
+            // satisfiable for a compatible proof and the ONLY remaining
+            // prove-time failure is the recursion copy-constraint. See the
+            // doc comment.
             let account_state = AccountState {
-                owner: ZERO_HASH,
-                balance: 0,
-                public_key: pubkey.serialize(),
+                owner: *account_address,
+                balance: account.balance,
+                public_key: current_pubkey.serialize(),
             };
+            // `next_public_key` only affects the canary's OWN (discarded)
+            // output state hash, which is not constrained against anything
+            // persisted — keep it equal to the current key (no rotation).
             return match self
                 .prover
                 .prove_account_update_with_in_and_out_coins_and_sources(
@@ -1001,13 +1120,27 @@ impl AccountNode {
                     &cmp,
                     &inactive_in,
                     &inactive_out,
-                    &pubkey.serialize(),
+                    &current_pubkey.serialize(),
                     &no_sources,
                     native_asset,
                 ) {
                 Ok(_) => CanaryOutcome::Compatible,
                 Err(_) => CanaryOutcome::Stale,
             };
+        }
+        if saw_proof_carrying_account {
+            // Proof-carrying accounts exist but none yielded a usable
+            // sample (all skipped via `get_merkle_proofs` Err). This is
+            // the False-Negative-prone path: we return `NoSample` (⇒
+            // Baseline ⇒ no reset, the data-loss-safe direction) but make
+            // it visible so the operator knows the canary could not probe.
+            tracing::warn!(
+                "self-heal canary: DB has proof-carrying accounts but none yielded a \
+                 recursable sample (all commitments unresolvable in the loaded SMT/MMR); \
+                 returning NoSample (no reset). If a circuit change reordered the \
+                 proof-data public-input slots this would mask genuine staleness — see \
+                 AccountNode::canary_recursion docs."
+            );
         }
         CanaryOutcome::NoSample
     }
