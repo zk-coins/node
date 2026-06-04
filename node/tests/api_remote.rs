@@ -420,6 +420,18 @@ async fn info_returns_well_formed_response() {
         body["username_domain"]
     );
 
+    // `bitcoin_network` is the typed, lowercase network identifier the
+    // wallet/SDK switch behaviour on. No fallback: a missing field or a
+    // value outside the two-variant enum is a contract regression.
+    let bitcoin_network = body["bitcoin_network"].as_str().expect(
+        "/api/info bitcoin_network must be a string — missing field is a contract regression",
+    );
+    assert!(
+        bitcoin_network == "mainnet" || bitcoin_network == "mutinynet",
+        "/api/info bitcoin_network must be `mainnet` or `mutinynet`, got {bitcoin_network:?} \
+         — value outside the enum is a contract regression"
+    );
+
     for cap in ["address_list", "username_claim", "lnurl"] {
         assert!(
             body["capabilities"][cap].is_boolean(),
