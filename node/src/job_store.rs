@@ -323,16 +323,30 @@ impl JobStore {
     }
 
     /// Move a `send` job to `awaiting_signature` and persist the
-    /// `proof_id` produced by the dispatcher. The wallet's
-    /// `POST /api/jobs/:id/commit` request reads this back so it can
-    /// download the proof file and sign the commitment.
-    pub async fn set_awaiting_signature(&self, public_id: Uuid, proof_id: i64) -> sqlx::Result<()> {
+    /// `proof_id` produced by the dispatcher together with the `result`
+    /// JSON the wallet needs to sign.
+    ///
+    /// `result` carries the `account_state_hash` / `output_coins_root`
+    /// hex (see `flow::SendCommitHashes`) so a thin pure-TypeScript
+    /// wallet can build the commitment without decoding the binary
+    /// `CoinProof` blob `GET /api/proof/{id}` serves. It is stored in
+    /// the same `response_body` column the terminal `complete` body
+    /// later overwrites, and surfaced on the `awaiting_signature`
+    /// `GET /api/jobs/:id` snapshot + SSE phase event. The `proof_id`
+    /// is read back by `POST /api/jobs/:id/commit` to look the proof up.
+    pub async fn set_awaiting_signature(
+        &self,
+        public_id: Uuid,
+        proof_id: i64,
+        result: serde_json::Value,
+    ) -> sqlx::Result<()> {
         sqlx::query(
             "UPDATE jobs SET status = 'awaiting_signature', phase = 'awaiting_signature', \
-                              proof_id = $1, updated_at = NOW() \
-             WHERE public_id = $2",
+                              proof_id = $1, response_body = $2, updated_at = NOW() \
+             WHERE public_id = $3",
         )
         .bind(proof_id)
+        .bind(&result)
         .bind(public_id)
         .execute(&self.pool)
         .await?;
