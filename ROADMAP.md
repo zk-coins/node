@@ -5,6 +5,8 @@ every commit to `develop`** — if this file is stale relative to recent
 commits, that is a bug. The migration PR ([#17](https://github.com/zk-coins/node/pull/17))
 merged 2026-05-18; Steps 1–8 are done and Step 9 is partially done
 (DEV live, signet e2e roundtrip + R2 performance measurement remain).
+With the migration essentially complete, the roadmap's active focus is
+**decentralization** — see [§ Current Focus](#current-focus-decentralization-run-your-own-node).
 
 Source documents:
 
@@ -39,9 +41,9 @@ person-days at full focus; multiply for part-time work.
 | 7 | Node: **replace** SP1 path with Plonky2 (no feature flag, no dual backend) | ✅ done — `send_coins` performs **in-circuit source-side validation via Stage 5d-next-5 Phase 2 aggregator** (PR [#23](https://github.com/zk-coins/node/pull/23)); off-circuit pre-checks retained as defense-in-depth (microsecond-level fast-fail before the minute-scale prove). Initial node cut (`c71c9fc`) ran off-circuit-only because Phase 2 was deferred; the in-circuit wiring landed via the Step-7 follow-up. Dockerfile re-introduced (`dac0179`). 106 node tests pass on the MVP build, 119 with `--all-features` (32 baseline + 10 inline error-path in `d6a3cb9` + 64 ported SP1-era fixtures re-enabled in `account_node_tests.rs` / `router_tests.rs` + 13 feature-gated). Smoke-test verified end-to-end (`cargo run` + `/health` + `/api/info`, block scanner connects). | — | — |
 | 8 | App / wallet: Schnorr-signing boundary, node-API integration | ✅ done — `zk-coins/app` ships `wasm.createCommitment(xpriv, num_pubkeys, asth_hex, ocr_hex)` (in `app/rust/client/src/lib.rs`) signing `SHA256(asth ‖ ocr)` via BIP-340 Schnorr (D11). Two-phase send: `/api/send` (Phase 1, proof) → `/api/commit` (Phase 2, signature). API client in `app/src/lib/api/client.ts` covers `info` / `balance` / `send` / `commit` / `mint` / `username/*` endpoints exactly matching API routes registered at `node/src/router.rs:1261–1289`. WASM mock + Vitest coverage gate already enforced in app repo. | — | — |
 | 9 | DEV deployment + end-to-end roundtrip on signet | 🟡 DEV live — PR [#17](https://github.com/zk-coins/node/pull/17) merged 2026-05-18 21:50 UTC; auto-deploy via `.github/workflows/deploy-dev.yaml` landed `zkcoins/node:beta` on `dev-api.zkcoins.app`. `/health` → 200 `ok`; `/api/info` → 200 with `{network:"Mutinynet", capabilities:{address_list, faucet, usernames, lnurl: true}, username_domain:"dev.zkcoins.app"}` (post-[#73](https://github.com/zk-coins/node/pull/73) `address_list` and `lnurl` are `false` because DEV ships the MVP-only binary identical to PRD; `faucet` and `usernames` are hardcoded `true` — mint and usernames are permanent MVP, not feature-gated; the `usernames` Cargo feature was later removed outright — see PR [#76](https://github.com/zk-coins/node/pull/76)). Bootstrap-unblock fix in PR [#36](https://github.com/zk-coins/node/pull/36) (explicit `MINTING_ADDRESS` override + global panic hook + smoke test + deploy-dev post-curl-retry; see [`MIGRATION_RESEARCH.md` §7.23](./MIGRATION_RESEARCH.md#723-minting_address-panic-in-tokiospawn-ed-task-swallows-node-bootstrap--medium-codified)). Deploy concurrency guards + PRD smoke test in PR [#51](https://github.com/zk-coins/node/pull/51). DEV/PRD parity (drop DEV-only Cargo features + remove `DEV_SKIP_BROADCAST_FAILURE` env-gate) in PR [#73](https://github.com/zk-coins/node/pull/73). **Remaining:** ① e2e roundtrip (create account → mint → send → receive) on signet from `dev.zkcoins.app`; ② R2 measurement on M3 Ultra (warm ≤ 5 s, ideal ≤ 1 s; cold ≤ 30 s; peak mem < 64 GB); ③ reactive: redesign per R2 if the budget is missed. | 2–4 d | medium |
-| — | Pre-mainnet blockers: D2/D10 (recipient hiding), D7 (reorg safety), D8 (per-coin nullifier-accum) | ⏳ todo | **+2–3 weeks** | high (real protocol redesign) |
+| — | **Current focus: Decentralization** — S1 trustless receive · S2/D8 · S3/D7 · S4 own chain · S5/D11 emission · S6/D2/D10 privacy · S7/D6 (see [§ Current Focus](#current-focus-decentralization-run-your-own-node)) | 🟡 active | **~4–6 weeks** | high (protocol work) |
 
-**MVP status:** Steps 1–8 ✅ done. Step 9 partially done — DEV is live and serving traffic; signet e2e roundtrip and the R2 performance measurement on M3 Ultra remain. **Remaining engineering effort: 0 d** for the migration itself; **remaining ops effort: ~2–4 d** for the e2e probe campaign + R2 budget check. If the R2 budget holds on first measurement, the migration is complete and the project moves to the pre-mainnet hardening track.
+**MVP status:** Steps 1–8 ✅ done. Step 9 partially done — DEV is live and serving traffic; signet e2e roundtrip and the R2 performance measurement on M3 Ultra remain. **Remaining engineering effort: 0 d** for the migration itself; **remaining ops effort: ~2–4 d** for the e2e probe campaign + R2 budget check. If the R2 budget holds on first measurement, the migration is complete and the project moves to the decentralization track (see [§ Current Focus](#current-focus-decentralization-run-your-own-node)).
 
 ### Definition of "MVP"
 
@@ -60,7 +62,7 @@ The architecture is **node-side compute**: the node generates all ZK proofs; the
 
 zkCoins is in a **closed test environment** (DEV *and* PRD). No external users, no real money, no existing user-base to migrate. Step 7 therefore **replaces** the SP1 path outright rather than running a dual backend: SP1 modules are deleted, node starts with a clean Poseidon SMT/MMR state, no Cargo feature flag, no migration helpers. This is reflected in the lower effort estimates for step 7 (2–3 d instead of 3–5 d) and the dropped risk for R5.
 
-Pre-mainnet hardening adds another 2–3 weeks on top.
+The decentralization track adds ~4–6 weeks on top (see [§ Current Focus](#current-focus-decentralization-run-your-own-node)).
 
 ---
 
@@ -383,18 +385,32 @@ Each stage carries the 100 % line coverage gate before commit.
 
 ---
 
-## Pre-Mainnet Hardening
+## Current Focus: Decentralization (run-your-own-node)
 
-These are not MVP scope but block mainnet, per `SPEC.md` §15.
+With the Plonky2 migration essentially complete (Steps 1–8 done, Step 9 DEV-live), the roadmap's active focus is **making zkCoins fully trustless and decentralized under the run-your-own-node model** — see the **Trust model** section in [`CONTRIBUTING.md`](./CONTRIBUTING.md). These strands also subsume the pre-mainnet blockers of `SPEC.md` §15 (D2/D10, D7, D8).
 
-| # | Item | Effort |
-| - | ---- | ------ |
-| D2/D10 | Hiding recipient commitments (`Commitment::commit(acct_id, rand)`) — fixes coin-linkability | 1 week |
-| D7 | Conditional-noop on reorg (gracefully degrade when claimed nullifier-accum no longer a prefix) | 4–5 days |
-| D8 | Per-coin nullifier-accum snapshot — recipients verify coin age locally | 2–3 days |
-| Tests | Paper-derived test suite from `MIGRATION_RESEARCH.md` §3 (A-SEC, ToSAcc prefix, half-aggregate Schnorr, etc.) | 1 week |
+**North star.** No node consensus, no privileged operator; Bitcoin is the only shared layer. A self-hosted node (1) derives all global state from Bitcoin itself, and (2) **verifies every proof it accepts** — never trusting another node. "The wallet trusts the node" is not a compromise: the node is _yours_, like your own `bitcoind`. Issuance is **native** (a transparent on-protocol act); a BTC peg is out of scope (orthogonal).
 
-**Total pre-mainnet add-on: ~2–3 weeks.**
+**Decentralization invariant.** A self-hosted node must validate everything it relies on from _(Bitcoin it sees itself) + (the proof in hand)_ — never from another node's word. Each strand moves a guarantee from "trusted because one node said so" to "verified from Bitcoin + a proof."
+
+| Strand | Anchor | What | Effort | Depends on |
+| ------ | ------ | ---- | ------ | ---------- |
+| **S1 Trustless receive** (keystone) | impl gap (uses §D4) | `receive_coin_into` / `/api/receive` verify the **recursive proof** (`Prover::verify`) + **anchor** `H(asth‖ocr)` in the node's chain-derived commitment SMT — today only the inclusion proof is checked | 3–5 d | — |
+| **S2 Global double-spend** | **D8** | `Coin` carries a `nullifier_accum` snapshot; receiver verifies it against its own chain-derived history; circuit binds it | 2–3 d | S1 |
+| **S3 Reorg safety** | **D7** | `conditional_nav` — tx degrades to a no-op if its claimed nullifier-accum is no longer a canonical prefix | 4–5 d | S2 |
+| **S4 Own chain view** | impl/infra | own `bitcoind` + local inscription index as scanner source; genesis bootstrap with no trusted checkpoint | ~1 wk | S1 |
+| **S5 Trustless emission** | **D11** | off-circuit mint → in-circuit `issuance(IssuanceProof)` + transparent, conserved, **auditable supply** (builds on #191's `asset_id`) | 1–2 wk | circuit; coord S2 |
+| **S6 Recipient hiding** | **D2/D10** | `coin.essence.address = Commitment::commit(acct_id, rand)`; `apply_coin` opens with witnessed randomness (privacy track) | ~1 wk | coord S2/S5 |
+| **S7 Publisher incentive** | **D6** | `fee` field + reserved `FEE_IDX` payout; permissionless publisher batching (censorship economics) | 3–5 d | S2 |
+| Tests | §3 | Paper-derived suite from `MIGRATION_RESEARCH.md` §3 (A-SEC, ToSAcc prefix, half-aggregate Schnorr) — lands with S2/S3 | ~1 wk | S2 |
+
+**Sequencing:** S1 → S2 → S3 → S4, with S5 (emission) and S6 (privacy) as parallel circuit-tracks and S7 after S2. **S1 is the keystone:** until the node verifies what it accepts, every other guarantee is only as strong as a trusted peer.
+
+**Definition of done.** A self-hosted node, given only its own Bitcoin full node + the coin data it holds: verifies every coin it accepts (recursive proof + on-chain anchoring + global non-double-spend); reconstructs all global state from Bitcoin with no trusted checkpoint; issues assets with publicly auditable supply; and the user custodies their own coin data — the one inherent, non-trust trade-off (see Trust model).
+
+**Out of scope (orthogonal):** BTC peg/bridge (native issuance instead — see [`BITVM_BRIDGE.md`](./BITVM_BRIDGE.md)); cross-node name coordination (#170 P5; `asset_id` is already coordination-free); a data-availability service (coin data is self-custodied by design — a DA committee re-introduces trust).
+
+**Total decentralization track: ~4–6 weeks.**
 
 ---
 
@@ -506,7 +522,7 @@ Whenever a commit lands on this branch:
 
 1. If the commit completes a step → flip its row in *Status at a Glance* to ✅ and move its entry under *Done*.
 2. If the commit partially completes a step → flip to 🟡 and note progress under *In Progress*.
-3. If new tasks emerge → add a row in *Next* or *Pre-Mainnet Hardening* with effort estimate.
+3. If new tasks emerge → add a row in *Next* or *Current Focus: Decentralization* with effort estimate.
 4. If the commit invalidates an estimate → revise the *Effort* column.
 5. If the commit hits or escalates a risk → update the relevant *Risk Register* entry.
 
