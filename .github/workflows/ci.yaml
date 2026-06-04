@@ -29,10 +29,9 @@ on:
   # `if:` guard on each job (saves self-hosted-runner time while
   # work is still in progress).
   #
-  # `labeled` / `unlabeled` are added so toggling the `ci:full`,
-  # `ci:db`, or `ci:prover` labels triggers (or removes) the
-  # corresponding self-hosted-runner jobs on demand — see the
-  # `test-and-coverage`, `db-tests`, and `prover-tests` jobs below.
+  # `labeled` / `unlabeled` are added so toggling the `ci:full` label
+  # triggers (or removes) the heavy self-hosted-runner gate on demand
+  # — see the `test-and-coverage` job below.
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
@@ -70,35 +69,36 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
-# Job topology:
+# Job topology — a two-tier test-gating model:
 #
-# * `lint-and-build` — GitHub-hosted Linux. Catches cross-platform
-#   compile bitrot and lint regressions cheaply. Runs in PARALLEL
-#   with the m3-ultra jobs below — it no longer gates them via
-#   `needs:`. Each job carries its own draft/label `if:` guard, so a
-#   lint failure no longer blocks the heavy tests from starting
-#   (deliberate: parallel feedback. Trade-off: on a lint failure the
-#   m3-ultra runner time is spent regardless).
+# * Tier 1 — `lint-and-build` — GitHub-hosted Linux, the DEFAULT.
+#   Runs on every non-draft PR and every push with no label required.
+#   Catches cross-platform compile bitrot and lint regressions
+#   cheaply. Runs in PARALLEL with the heavy gate below — it does not
+#   gate it via `needs:`. Each job carries its own draft/label `if:`
+#   guard, so a lint failure does not block the heavy gate from
+#   starting (deliberate: parallel feedback. Trade-off: on a lint
+#   failure the m3-ultra runner time is spent regardless).
 #
-# * `db-tests` / `prover-tests` — narrow, label-gated subsets on the
-#   m3-ultra pool for fast developer iteration. They run plain
-#   `cargo nextest` (no llvm-cov instrumentation), enforce NO
-#   coverage gate, and only execute the tests relevant to the area
-#   the developer is working on. Two labels:
-#     - `ci:db`     → Postgres / state / coordinator (~15 min)
-#     - `ci:prover` → Plonky2-heavy mint/send/receive (~25 min)
-#   Both are mutually exclusive with `ci:full`: a PR carrying
-#   `ci:full` skips the subset jobs because the heavy gate is a
-#   strict superset (runs every test the subsets do, plus the
-#   coverage gate). See the `if:` guard on each subset job.
+# * Tier 2 — `test-and-coverage` — the authoritative test + coverage
+#   gate, opt-in via the `ci:full` label. Single heavy job (~60-90 min
+#   on a self-hosted M3 Ultra runner — one of 6 agents on dfx01
+#   sharing the host's 96 GB / 28 cores). It runs the FULL node +
+#   shared nextest suite under llvm-cov instrumentation: the Postgres
+#   `db_tests`, the Plonky2-heavy mint/send/receive prover flows, and
+#   the 100% line + function coverage gate, all in one binary run.
+#   Gated behind `ci:full` so we don't burn runner time on every
+#   speculative PR — apply the label when the PR is ready for the
+#   authoritative gate. Both auto-promote PRs (staging -> develop and
+#   develop -> main) get the label applied automatically by
+#   auto-release-pr-staging.yaml / auto-release-pr.yaml.
 #
-# * `test-and-coverage` — the authoritative test + coverage gate.
-#   Single heavy job (~60-90 min on a self-hosted M3 Ultra runner —
-#   one of 6 agents on dfx01 sharing the host's 96 GB / 28 cores).
-#   Gated behind the `ci:full` label so we don't burn runner time on
-#   every speculative PR — apply the label when the PR is ready for
-#   the authoritative gate. The Release PR (`develop -> main`) gets
-#   the label applied automatically by auto-release-pr.yaml.
+# There is no third "subset" tier: a test either runs in the default
+# Lint & Build (compile/lint) or comes in with `ci:full` (the full
+# suite). The previous narrow per-area subset jobs (and their
+# per-area opt-in labels) were removed — the heavy gate is a strict
+# superset of everything they selected, so they added a maintenance
+# burden (filter drift) without extending coverage.
 #
 #   Why test + coverage are merged into one job: the previous topology
 #   had a `node-tests` job and a separate `coverage` job, both
@@ -121,10 +121,10 @@ env:
 jobs:
   lint-and-build:
     name: Lint & Build
-    # Skip on draft PRs. The m3-ultra jobs each carry the same
-    # draft/push guard on their own `if:` (they used to inherit it via
-    # `needs: lint-and-build`, which has been removed so they run in
-    # parallel with this job).
+    # Skip on draft PRs. The heavy `test-and-coverage` gate carries
+    # the same draft/push guard plus the `ci:full` label check on its
+    # own `if:`, so it runs in parallel with this job rather than
+    # gating behind it via `needs:`.
     if: github.event_name == 'push' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -190,305 +190,6 @@ jobs:
       - name: Build node (all features — self-host opt-in build)
         run: cargo build -p node --all-features
 
-  db-tests:
-    name: DB Subset Tests (M3 Ultra)
-    # Narrow label-gated subset for fast developer iteration on
-    # Postgres / state / coordinator changes. Runs ONLY the tests
-    # that touch the storage layer, the coordinator state machine,
-    # the username registry, the audit log, the publisher/runtime
-    # plumbing, and the router job endpoints. Estimated ~15 min on
-    # an M3 Ultra agent.
-    #
-    # Mutually exclusive with `ci:full`: if a PR carries `ci:full`,
-    # the heavy `test-and-coverage` job already runs the entire
-    # suite (including everything below) plus the coverage gate, so
-    # running this subset would just waste an m3-ultra agent slot.
-    # The `&& !contains(... 'ci:full')` clause enforces that.
-    #
-    # Plain `cargo nextest` (no llvm-cov wrapping): subset gates are
-    # for iteration speed; the authoritative 100% coverage gate
-    # stays exclusive to `test-and-coverage` / `ci:full`.
-    if: >-
-      (github.event_name == 'push' || github.event.pull_request.draft == false)
-      && contains(github.event.pull_request.labels.*.name, 'ci:db')
-      && !contains(github.event.pull_request.labels.*.name, 'ci:full')
-    runs-on: [self-hosted, m3-ultra]
-    timeout-minutes: 45
-    env:
-      # All three chain-shaping env vars are required by the node
-      # bootstrap — no defaults exist (see
-      # `lib::build_network_config_from_env`). CI uses
-      # `127.0.0.1:1` endpoints so any test that exercises the commit
-      # pipeline / scanner WS fails fast instead of reaching a public
-      # third-party host (a previous Mutinynet-flavoured silent
-      # fallback used to add >60 s per test).
-      IS_MAINNET: "false"
-      ESPLORA_URL: http://127.0.0.1:1/api
-      ESPLORA_WS_URL: ws://127.0.0.1:1/api/v1/ws
-      # `USERNAME_DOMAIN` is required by the node bootstrap (no
-      # default — see node/src/main.rs and issue #95). The test value
-      # is irrelevant for the `info_returns_*` assertions (they only
-      # check non-empty + shape).
-      USERNAME_DOMAIN: test.zkcoins.local
-      # `PUBLISHER_KEY` is required on every network (no default —
-      # see `node/src/lib.rs`). The previous `1234567890abcdef…`
-      # fallback was a publicly-known test key that drainer bots
-      # swept within minutes of any on-chain top-up; the fallback was
-      # removed network-wide in the "require PUBLISHER_KEY on every
-      # network" hardening. The value below is a syntactically valid
-      # 32-byte hex placeholder (`0000…0001`) chosen so a future grep
-      # for the burned `1234…` key returns empty across the repo +
-      # CI config; it is NOT a secret and MUST NEVER be reused on any
-      # chain that holds value. The same value is hard-coded in the
-      # test mocks at `node/src/router_tests.rs` so the wiremock'd
-      # publisher address path matches the lazy_static-derived
-      # `PUBLISHER_ADDRESS`.
-      PUBLISHER_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
-      # `db_tests` use the `testcontainers` crate, which talks to the
-      # local Docker daemon. The self-hosted runner runs Colima (not
-      # Docker Desktop), whose socket lives under the runner user's
-      # home directory. `testcontainers` defaults to
-      # `/var/run/docker.sock`, which does not exist on Colima, so
-      # the `Set DOCKER_HOST` step below points it at the real
-      # socket via `$HOME` — same value the `docker info` step picks
-      # up implicitly via the default `docker` context.
-      # `sccache` wraps `rustc` and caches compiled crates across CI
-      # runs. The M3 Ultra runner agents are self-hosted, so the
-      # cache lives on local disk and survives between jobs — the
-      # speedup is biggest for PR pushes that re-touch the same
-      # dependency set.
-      RUSTC_WRAPPER: sccache
-      # Bump cache cap above sccache's 10-GiB default. The cache is
-      # user-level (~/Library/Caches/Mozilla.sccache) and shared by
-      # every m3-ultra agent on the host; with 3+ parallel agents
-      # the 10-GiB default thrashed — writes from one agent evicted
-      # hits another had not consumed yet. 50 GiB fits the current
-      # working set with room to grow; the host has >600 GiB free
-      # disk. The server only reads SCCACHE_CACHE_SIZE at start, so
-      # the install step below restarts it when the running cap
-      # differs from this value.
-      SCCACHE_CACHE_SIZE: "50G"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # The launchd-spawned runner agent inherits a minimal PATH that
-      # includes /opt/homebrew/bin (where a stable Rust lives) but
-      # not ~/.cargo/bin (where rustup proxies live). Without this
-      # step, `cargo` resolves to Homebrew's stable cargo, the
-      # rust-toolchain file pinning nightly is ignored, and
-      # dependencies that need `#![feature(...)]` (e.g. plonky2_field)
-      # fail to compile. Prepend ~/.cargo/bin so the rustup proxy is
-      # found first and reads the workspace rust-toolchain.
-      - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      # Point `testcontainers` at the Colima socket under the runner
-      # user's home; see the `DOCKER_HOST` comment in the job env
-      # block above. Set in a step (not the static `env:` block) so
-      # the path resolves from `$HOME` at runtime instead of being
-      # hard-coded.
-      - name: Set DOCKER_HOST for Colima socket
-        run: echo "DOCKER_HOST=unix://$HOME/.colima/default/docker.sock" >> "$GITHUB_ENV"
-
-      # `sccache` (compile cache) and `cargo-nextest` (test runner)
-      # are installed once per runner via Homebrew. Re-running on a
-      # host where they already exist is a no-op. Start sccache's
-      # server explicitly so the first compile step has a warm cache
-      # daemon and print stats up-front for visibility in the run
-      # log.
-      #
-      # If a server is already running with a different cap than the
-      # requested SCCACHE_CACHE_SIZE (e.g. carried over from a
-      # previous workflow version), stop it so the next
-      # --start-server picks up the new env value. The on-disk cache
-      # files survive the restart.
-      - name: Ensure sccache + cargo-nextest are installed
-        run: |
-          command -v sccache >/dev/null || brew install sccache
-          command -v cargo-nextest >/dev/null || brew install cargo-nextest
-          if ! sccache --show-stats 2>/dev/null | grep -qE "Max cache size +50 GiB"; then
-            sccache --stop-server >/dev/null 2>&1 || true
-          fi
-          sccache --start-server >/dev/null 2>&1 || true
-          sccache --show-stats
-
-      # `db_tests` use testcontainers to spin up a real Postgres 17
-      # per test. The runner host has Docker (via Colima) available
-      # on PATH; fail fast with a readable error if it ever goes
-      # away, instead of letting the test suite die 5 minutes into
-      # the run with a hard-to-read bollard error.
-      - name: Verify Docker is reachable (testcontainers dependency)
-        run: docker info > /dev/null
-
-      # Subset filter — DB / state / coordinator paths only.
-      # Module path notes (verified against node/src/ tree on this branch):
-      #   - `<module>_tests.rs` files are mounted via `mod tests;`
-      #     under the owning module (e.g. `db::tests::*`,
-      #     `state::tests::*`).
-      #   - `main_tests.rs` is mounted by `lib.rs` at crate root as
-      #     `mod tests` — so its tests appear as `tests::*` in
-      #     nextest output (NOT `main::tests::*`).
-      #   - `job_store::tests::*` and `router::tests::jobs_*` are
-      #     included for forward compatibility with the jobs-API
-      #     stack landing in app#141 / node#161-#163; if a pattern
-      #     matches no tests today it is a harmless no-op.
-      #   - `shared` crate tests live under `commitment::tests::*`
-      #     and are pulled in by `-p shared`.
-      # `api_remote` is the live-DEV-node integration test
-      # (node/tests/api_remote.rs). It targets
-      # `https://dev-api.zkcoins.app` by default and is meant to run
-      # AFTER a deploy, from the `api-e2e` job in deploy-dev.yaml —
-      # not against whatever DEV currently runs while a PR is still
-      # open. Excluded here for the same reason as in
-      # `test-and-coverage`.
-      - name: Run DB subset (release, plain nextest, no coverage)
-        # `--test-threads=8` (issue #181 Opt A): the M3 Ultra runner
-        # has 24 cores; Plonky2 prove tests are Rayon-bound and pin
-        # every available core internally, so 8 outer nextest threads
-        # leaves enough headroom for the Rayon pool without
-        # over-subscribing. Per-test schema isolation (#182) +
-        # cross-process file lock around the shared container
-        # (`test_db::init_shared_pg`) make the suite parallel-safe.
-        run: |
-          cargo nextest run -p node -p shared --release --all-features --test-threads 8 \
-            -E 'not binary(api_remote) & (test(/^db::tests::/) + test(/^state::tests::/) + test(/^job_store::tests::/) + test(/^audit::tests::/) + test(/^username::tests::/) + test(/^router::tests::jobs_/) + test(/^r2_probe::tests::/) + test(/^tests::build_network_config_/) + test(/^account_node::tests::test_persist/) + test(/^account_node::tests::test_load/) + test(/^publisher::tests::/) + test(/^runtime::tests::/) + test(/^commitment::tests::/))'
-
-      # Tear down the shared test container created by
-      # `test_db::setup_pool` via testcontainers' `ReuseDirective::
-      # Always` (see `node/src/test_db.rs`). The reuse flag tells
-      # testcontainers NOT to drop the container at process exit so
-      # every `cargo nextest` test process can attach to the same
-      # daemon-side container — but that means nobody removes it
-      # either. Always-on cleanup so a stale container from one PR
-      # run cannot bleed into the next on the same self-hosted
-      # runner (different image hash → reuse-lookup misses → fresh
-      # spawn, but the stale row leaks until manual cleanup).
-      - name: Tear down shared test Postgres container
-        if: always()
-        run: docker rm -f zkcoins-test-shared-pg 2>/dev/null || true
-
-      - name: sccache stats (post-build)
-        if: always()
-        run: sccache --show-stats
-
-      # Mirror of the `notify-failure` job downstream, scoped to this
-      # subset so the operator sees DB-subset failures too (the
-      # `notify-failure` job only fires when one of its `needs:`
-      # transitions to `failure`, and chaining subset jobs into that
-      # list would make a single subset failure mask the heavy gate's
-      # status under the workflow-level conclusion).
-      - name: Telegram alert on failure
-        if: failure()
-        env:
-          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          TEXT=$'❌ <b>'"${{ github.workflow }}"$' / db-tests</b> failed\n<b>Repo:</b> '"${{ github.repository }}"$'\n<b>Branch:</b> '"${{ github.ref_name }}"$'\n<b>Run:</b> '"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-               --data-urlencode "chat_id=${TG_CHAT}" \
-               --data-urlencode "text=${TEXT}" \
-               -d "parse_mode=HTML" \
-               -d "disable_web_page_preview=true"
-
-  prover-tests:
-    name: Prover Subset Tests (M3 Ultra)
-    # Narrow label-gated subset for fast developer iteration on
-    # Plonky2 prover changes. Runs ONLY the mint / send / receive
-    # flows in `account_node::tests` plus the persist/load roundtrip
-    # (which exercises the wallet end-to-end). Estimated ~25 min on
-    # an M3 Ultra agent.
-    #
-    # Mutually exclusive with `ci:full` — see the matching comment
-    # on `db-tests` above for the rationale.
-    if: >-
-      (github.event_name == 'push' || github.event.pull_request.draft == false)
-      && contains(github.event.pull_request.labels.*.name, 'ci:prover')
-      && !contains(github.event.pull_request.labels.*.name, 'ci:full')
-    runs-on: [self-hosted, m3-ultra]
-    timeout-minutes: 60
-    env:
-      # Mirror of the `db-tests` env block above — see there for
-      # rationale on each var. The env shape is identical because
-      # both subset jobs share the same bootstrap requirements
-      # (chain-shaping vars are mandatory, the publisher key must
-      # match the wiremock'd mocks in `router_tests.rs`).
-      IS_MAINNET: "false"
-      ESPLORA_URL: http://127.0.0.1:1/api
-      ESPLORA_WS_URL: ws://127.0.0.1:1/api/v1/ws
-      USERNAME_DOMAIN: test.zkcoins.local
-      PUBLISHER_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
-      RUSTC_WRAPPER: sccache
-      SCCACHE_CACHE_SIZE: "50G"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Set DOCKER_HOST for Colima socket
-        run: echo "DOCKER_HOST=unix://$HOME/.colima/default/docker.sock" >> "$GITHUB_ENV"
-
-      - name: Ensure sccache + cargo-nextest are installed
-        run: |
-          command -v sccache >/dev/null || brew install sccache
-          command -v cargo-nextest >/dev/null || brew install cargo-nextest
-          if ! sccache --show-stats 2>/dev/null | grep -qE "Max cache size +50 GiB"; then
-            sccache --stop-server >/dev/null 2>&1 || true
-          fi
-          sccache --start-server >/dev/null 2>&1 || true
-          sccache --show-stats
-
-      # The `test_persist_and_load_from_pg_roundtrip` test in this
-      # subset uses testcontainers, so Docker must be reachable.
-      - name: Verify Docker is reachable (testcontainers dependency)
-        run: docker info > /dev/null
-
-      # Subset filter — the full account_node send/mint/receive
-      # surface. Includes both Plonky2-heavy happy paths and pure-Rust
-      # error-path tests (e.g. `test_send_coins_returns_err_for_unknown_account`,
-      # `test_send_coins_rejects_too_many_invoices`), so the gate is
-      # conservative and runs anything touching account-node state
-      # transitions. The `test_persist_and_load_from_pg_roundtrip` test
-      # exercises the wallet end-to-end (build → persist → reload →
-      # reuse), so it lives in BOTH subsets by design; nextest
-      # deduplicates within a single run, this is harmless when both
-      # subsets are run on separate PR labels.
-      - name: Run Prover subset (release, plain nextest, no coverage)
-        # `--test-threads=8` (issue #181 Opt A): see the rationale on
-        # the matching `db-tests` step. The prover subset is the
-        # heaviest Rayon consumer in the suite, so 8 outer threads
-        # × Rayon-pinned cores is the headroom budget on the 24-core
-        # M3 Ultra runner.
-        run: |
-          cargo nextest run -p node -p shared --release --all-features --test-threads 8 \
-            -E 'not binary(api_remote) & (test(/^account_node::tests::test_mint/) + test(/^account_node::tests::test_send/) + test(/^account_node::tests::test_receive/) + test(/^account_node::tests::test_persist_and_load_from_pg_roundtrip/) + test(/^account_node::tests::test_wallet_operations/))'
-
-      # See the matching cleanup step in `db-tests` for the rationale.
-      - name: Tear down shared test Postgres container
-        if: always()
-        run: docker rm -f zkcoins-test-shared-pg 2>/dev/null || true
-
-      - name: sccache stats (post-build)
-        if: always()
-        run: sccache --show-stats
-
-      # Mirror of the `notify-failure` job downstream — see the
-      # matching comment on `db-tests` for the rationale.
-      - name: Telegram alert on failure
-        if: failure()
-        env:
-          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          TEXT=$'❌ <b>'"${{ github.workflow }}"$' / prover-tests</b> failed\n<b>Repo:</b> '"${{ github.repository }}"$'\n<b>Branch:</b> '"${{ github.ref_name }}"$'\n<b>Run:</b> '"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-               --data-urlencode "chat_id=${TG_CHAT}" \
-               --data-urlencode "text=${TEXT}" \
-               -d "parse_mode=HTML" \
-               -d "disable_web_page_preview=true"
-
   test-and-coverage:
     name: Tests + Coverage Gate (M3 Ultra, 100% lines + functions)
     # Authoritative heavy gate: runs the full nextest suite under
@@ -498,8 +199,10 @@ jobs:
     # nextest suite — see the file header for the merge rationale).
     #
     # Gated behind the `ci:full` label so we don't burn runner time
-    # on every speculative PR. The Release PR (`develop -> main`)
-    # gets the label applied automatically by auto-release-pr.yaml.
+    # on every speculative PR. Both auto-promote PRs get the label
+    # applied automatically: staging -> develop by
+    # auto-release-pr-staging.yaml and develop -> main by
+    # auto-release-pr.yaml.
     if: >-
       (github.event_name == 'push' || github.event.pull_request.draft == false)
       && contains(github.event.pull_request.labels.*.name, 'ci:full')
@@ -521,20 +224,36 @@ jobs:
       # check non-empty + shape).
       USERNAME_DOMAIN: test.zkcoins.local
       # `PUBLISHER_KEY` is required on every network (no default —
-      # see `node/src/lib.rs`); the value mirrors the subset jobs
-      # above and is a syntactically valid 32-byte hex placeholder,
-      # NOT a secret. MUST match `node/src/router_tests.rs` — the
-      # test mocks derive the wiremock'd publisher address from this
-      # key.
+      # see `node/src/lib.rs`); the value is a syntactically valid
+      # 32-byte hex placeholder, NOT a secret. MUST match
+      # `node/src/router_tests.rs` — the test mocks derive the
+      # wiremock'd publisher address from this key. The previous
+      # `1234567890abcdef…` fallback was a publicly-known test key that
+      # drainer bots swept within minutes of any on-chain top-up; the
+      # fallback was removed network-wide. The `0000…0001` value here
+      # is chosen so a future grep for the burned `1234…` key returns
+      # empty across the repo + CI config; it MUST NEVER be reused on
+      # any chain that holds value.
       PUBLISHER_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
-      # `db_tests` use the `testcontainers` crate; see the subset
-      # jobs above for the rationale. `DOCKER_HOST` is set in a step
+      # The full suite includes the `db_tests`, which use the
+      # `testcontainers` crate to spin up a real Postgres 17 per test
+      # against the local Docker daemon. The self-hosted runner runs
+      # Colima (not Docker Desktop), whose socket lives under the
+      # runner user's home directory; `DOCKER_HOST` is set in a step
       # below so the Colima socket path resolves from `$HOME` at
       # runtime.
-      # Same sccache wrapper as the subset jobs; reuses the same
-      # on-disk cache populated by previous runs on the same runner.
+      # `sccache` wraps `rustc` and caches compiled crates across CI
+      # runs. The M3 Ultra runner agents are self-hosted, so the cache
+      # lives on local disk and survives between jobs.
       RUSTC_WRAPPER: sccache
-      # See the subset jobs above for the 50-GiB rationale.
+      # Bump the cache cap above sccache's 10-GiB default. The cache is
+      # user-level (~/Library/Caches/Mozilla.sccache) and shared by
+      # every m3-ultra agent on the host; with 3+ parallel agents the
+      # 10-GiB default thrashed (writes from one agent evicted hits
+      # another had not consumed yet). 50 GiB fits the current working
+      # set with room to grow; the host has >600 GiB free disk. The
+      # server only reads SCCACHE_CACHE_SIZE at start, so the install
+      # step below restarts it when the running cap differs.
       SCCACHE_CACHE_SIZE: "50G"
       # Activate the workspace's `coverage_nightly` cfg gate so the
       # `#[cfg_attr(coverage_nightly, coverage(off))]` annotations
@@ -546,9 +265,8 @@ jobs:
       # which silently broke the 100%-line + 100%-function gate the
       # moment the first annotation landed in the `node` crate. Set
       # only on this job: the `lint-and-build` job runs stable
-      # 1.81.0 and would reject `feature(coverage_attribute)`, and
-      # the subset jobs run plain nextest (no instrumentation) so
-      # the cfg has no effect there.
+      # 1.81.0 and would reject `feature(coverage_attribute)`, so the
+      # cfg has no effect there.
       RUSTFLAGS: "--cfg coverage_nightly"
     steps:
       - name: Checkout
@@ -557,14 +275,19 @@ jobs:
       - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      # See the subset jobs above for the rationale; resolves the
-      # Colima socket path from `$HOME` at runtime.
+      # Point `testcontainers` at the Colima socket under the runner
+      # user's home (see the `DOCKER_HOST` comment in the job env block
+      # above). Set in a step so the path resolves from `$HOME` at
+      # runtime instead of being hard-coded.
       - name: Set DOCKER_HOST for Colima socket
         run: echo "DOCKER_HOST=unix://$HOME/.colima/default/docker.sock" >> "$GITHUB_ENV"
 
-      # Same install gate as the subset jobs. Idempotent: no-op on a
-      # warm runner where both tools already exist. See the subset
-      # jobs for why we conditionally restart the sccache server.
+      # `sccache` (compile cache) and `cargo-nextest` (test runner)
+      # are installed once per runner via Homebrew. Idempotent: no-op
+      # on a warm runner where both tools already exist. If a server is
+      # already running with a different cap than the requested
+      # SCCACHE_CACHE_SIZE, stop it so the next --start-server picks up
+      # the new env value; the on-disk cache files survive the restart.
       - name: Ensure sccache + cargo-nextest are installed
         run: |
           command -v sccache >/dev/null || brew install sccache
@@ -575,9 +298,11 @@ jobs:
           sccache --start-server >/dev/null 2>&1 || true
           sccache --show-stats
 
-      # Same `db_tests` as the subset jobs and so needs Docker
-      # reachable for testcontainers. See the matching check in the
-      # subset jobs for the rationale.
+      # The full suite's `db_tests` use testcontainers to spin up a
+      # real Postgres 17 per test, so Docker (via Colima) must be
+      # reachable on PATH. Fail fast with a readable error if it ever
+      # goes away, instead of letting the suite die minutes into the
+      # run with a hard-to-read bollard error.
       - name: Verify Docker is reachable (testcontainers dependency)
         run: docker info > /dev/null
 
@@ -686,7 +411,14 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      # See the matching cleanup step in `db-tests` for the rationale.
+      # Tear down the shared test container created by
+      # `test_db::setup_pool` via testcontainers' `ReuseDirective::
+      # Always` (see `node/src/test_db.rs`). The reuse flag tells
+      # testcontainers NOT to drop the container at process exit so
+      # every `cargo nextest` test process can attach to the same
+      # daemon-side container — but that means nobody removes it
+      # either. Always-on cleanup so a stale container from one PR run
+      # cannot bleed into the next on the same self-hosted runner.
       - name: Tear down shared test Postgres container
         if: always()
         run: docker rm -f zkcoins-test-shared-pg 2>/dev/null || true
@@ -701,10 +433,7 @@ jobs:
   # evaluates against the whole `needs:` group: any listed job
   # transitioning to `failure` triggers it, while skipped jobs
   # (`test-and-coverage` on a non-ci:full PR, or all jobs on a draft
-  # PR) and manual cancellation stay silent. The subset jobs
-  # (`db-tests` / `prover-tests`) fire their own inline Telegram
-  # alerts so a subset failure does not get masked by the heavy
-  # gate's status under the workflow-level conclusion.
+  # PR) and manual cancellation stay silent.
   notify-failure:
     name: Telegram alert on failure
     needs: [lint-and-build, test-and-coverage]
