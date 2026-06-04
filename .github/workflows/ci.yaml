@@ -37,8 +37,8 @@ on:
 
 concurrency:
   # Group by PR number so a new push to the same PR cancels the
-  # in-flight Heavy run on the outdated commit. The m3-ultra pool
-  # (6 runner agents on dfx01) is shared with every other open PR —
+  # in-flight Heavy run on the outdated commit. The self-hosted
+  # M3 Ultra runner pool is shared with every other open PR —
   # letting an obsolete 60-90-min run finish wastes a slot another
   # PR could use. Grouping by SHA (the previous approach) put every
   # commit in its own group, so `cancel-in-progress: true` never
@@ -82,9 +82,8 @@ env:
 #
 # * Tier 2 — `test-and-coverage` — the authoritative test + coverage
 #   gate, opt-in via the `ci:full` label. Single heavy job (~60-90 min
-#   on a self-hosted M3 Ultra runner — one of 6 agents on dfx01
-#   sharing the host's 96 GB / 28 cores). It runs the FULL node +
-#   shared nextest suite under llvm-cov instrumentation: the Postgres
+#   on the shared self-hosted M3 Ultra runner pool). It runs the FULL
+#   node + shared nextest suite under llvm-cov instrumentation: the Postgres
 #   `db_tests`, the Plonky2-heavy mint/send/receive prover flows, and
 #   the 100% line + function coverage gate, all in one binary run.
 #   Gated behind `ci:full` so we don't burn runner time on every
