@@ -48,6 +48,7 @@ pub mod scanner;
 pub mod scanner_runtime;
 pub mod scanner_ws;
 pub mod scanner_ws_parse;
+pub mod self_heal;
 pub mod state;
 pub mod username;
 

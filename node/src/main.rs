@@ -103,6 +103,14 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     );
     println!("Connected to Postgres state-layer");
 
+    // Build the Plonky2 prover ONCE, up front. Its
+    // `circuit_digest_bytes` drives the boot-time self-heal below, and
+    // the same instance is reused by the `AccountNode` rehydration so we
+    // pay the ~14 s circuit build exactly once.
+    let prover = zkcoins_prover::Prover::new();
+    let live_digest = prover.circuit_digest_bytes();
+    println!("Built Plonky2 prover (circuit ready)");
+
     // Load existing state from Postgres (PR-A2). When SMT/MMR rows are
     // absent (fresh DB), `load_from_pg` returns an empty State —
     // equivalent to the previous file-based `State::new()` fallback.
@@ -116,11 +124,60 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // Reload AccountNode + UsernameStore from Postgres. The matching
     // file-based loaders from PR-A1/A2 are gone — these two calls are
     // the single source of truth after PR-A3. A DB error here aborts
-    // the bootstrap (same reasoning as the State load above).
-    let account_node = account_node::AccountNode::load_from_pg(Arc::clone(&state), &pool)
+    // the bootstrap (same reasoning as the State load above). The
+    // pre-built `prover` is moved in here so the circuit is built once.
+    let account_node = account_node::AccountNode::load_from_pg(Arc::clone(&state), &pool, prover)
         .await
         .expect("load account node from Postgres");
     println!("Loaded AccountNode from Postgres");
+
+    // Self-heal on a breaking circuit change. A circuit change makes
+    // every persisted proof incompatible with the current circuit; the
+    // next AccountUpdate send/mint would fail to prove ("prove failed").
+    // The check runs AFTER the state + account load so the canary
+    // detector (used on the adoption boundary, when no digest is
+    // recorded yet) can recurse a persisted proof through the live
+    // circuit with the REAL commitment-merkle witnesses from the loaded
+    // state — a `circuit_digest` comparison and `Prover::verify` both
+    // miss the failure class where the digest is unchanged but recursion
+    // breaks (verified against the live DEV dump). On a mismatch / stale
+    // probe this resets the proof-dependent state to genesis (the same
+    // consistent tabula rasa as `reset-zkcoins-node`) and stores the new
+    // digest, so no future circuit change can brick DEV/PRD and no
+    // manual reset is needed. A DB error aborts the bootstrap (serving
+    // with half-reset state is worse than failing loudly); proof-store
+    // cleanup failures are logged and swallowed inside the helper.
+    let proofs_dir = std::env::var("PROOFS_DIR").unwrap_or_else(|_| "./proofs".to_string());
+    let heal_decision =
+        node::self_heal::heal_circuit_digest(&pool, &live_digest, &proofs_dir, &|| {
+            account_node.canary_recursion()
+        })
+        .await
+        .expect("circuit-digest self-heal");
+    println!("Circuit-digest self-heal: {:?}", heal_decision);
+
+    // On a reset the in-memory `state` + `account_node` were rehydrated
+    // from the pre-reset rows that `heal_circuit_digest` just wiped, so
+    // they no longer match Postgres. Reload both from the now-empty DB,
+    // recovering the prover (and its ~14 s circuit build) from the stale
+    // `account_node` so the circuit is still built exactly once.
+    let (state, account_node) = if heal_decision == node::self_heal::ResetDecision::Reset {
+        let prover = account_node.take_prover();
+        let state = Arc::new(Mutex::new(
+            State::load_from_pg(&pool)
+                .await
+                .expect("reload state after self-heal reset"),
+        ));
+        let account_node =
+            account_node::AccountNode::load_from_pg(Arc::clone(&state), &pool, prover)
+                .await
+                .expect("reload account node after self-heal reset");
+        println!("Reloaded State + AccountNode from genesis after self-heal reset");
+        (state, account_node)
+    } else {
+        (state, account_node)
+    };
+
     let username_store = username::UsernameStore::load_from_pg(&pool)
         .await
         .expect("load username store from Postgres");
@@ -136,12 +193,12 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // alerting fires on the loop, matching the panic-hook behaviour
     // above (zk-coins/node#89 round-2 MAJOR 2).
     let pool_for_rest = Arc::clone(&pool);
-    // Read `PROOFS_DIR` at the binary edge and pass it through —
-    // `start_rest_node` no longer touches `std::env` so the runtime
-    // tests can each pass their own `tempfile::tempdir()` path
+    // `proofs_dir` was already read at the binary edge above (for the
+    // self-heal proof-store cleanup) and is moved into the spawned
+    // task here. `start_rest_node` no longer touches `std::env` so the
+    // runtime tests can each pass their own `tempfile::tempdir()` path
     // instead of racing on the process-wide env var under
     // `--test-threads=8` (issue #181 Opt A).
-    let proofs_dir = std::env::var("PROOFS_DIR").unwrap_or_else(|_| "./proofs".to_string());
     tokio::spawn(async move {
         if let Err(e) = start_rest_node(
             account_node,

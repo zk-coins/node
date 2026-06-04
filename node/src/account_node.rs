@@ -23,6 +23,21 @@ use zkcoins_prover::{InCoinSourceWitness, Proof, Prover};
 /// [`zkcoins_program::circuit::main::MMR_PROOF_PATH_LEN`].
 const MMR_PROOF_PATH_LEN: usize = MMR_MAX_DEPTH - 1;
 
+/// Outcome of [`AccountNode::canary_recursion`], the boot-time self-heal
+/// staleness probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanaryOutcome {
+    /// A persisted proof recursed cleanly through the current circuit —
+    /// the persisted proofs are circuit-compatible.
+    Compatible,
+    /// A persisted proof failed to recurse — the persisted state was
+    /// produced by an incompatible circuit and must be self-healed.
+    Stale,
+    /// No usable sample (fresh DB, or no account carries a proof whose
+    /// commitment resolves in the loaded SMT) — nothing to probe.
+    NoSample,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CoinProof {
     pub proof: Proof,
@@ -887,6 +902,135 @@ impl AccountNode {
         Ok(())
     }
 
+    /// Boot-time self-heal canary: does a persisted proof still recurse
+    /// through the CURRENT circuit's AccountUpdate (cyclic) branch?
+    ///
+    /// This is the RELIABLE staleness detector. A breaking circuit
+    /// change invalidates every persisted proof: the next `/api/mint` or
+    /// `/api/send` feeds the stale proof as the recursive inner proof and
+    /// the new circuit's witness generator aborts with a copy-constraint
+    /// conflict ("Partition … was set twice with different values"),
+    /// surfaced to the wallet as "prove failed". Crucially this can
+    /// happen while the verifier-key `circuit_digest` is UNCHANGED (so
+    /// [`Prover::verify`] and a raw digest comparison both pass) — the
+    /// only thing that reliably reproduces it is running the actual
+    /// recursive prove, which is what this does.
+    ///
+    /// It mirrors the production prove path in [`Self::send_coins_inner`]
+    /// for the AccountUpdate branch with all coin slots inactive: it
+    /// reuses the persisted `account.proof` as the inner proof and the
+    /// REAL [`CommitmentMerkleProofs`] derived from the loaded SMT/MMR
+    /// via [`Self::get_merkle_proofs`] — the same witnesses the next user
+    /// transition would build — so a circuit-compatible proof recurses
+    /// cleanly (the canary does NOT false-positive) and only a genuinely
+    /// stale proof fails.
+    ///
+    /// The surrounding `AccountState` is synthetic (a fresh state with
+    /// the persisted commitment pubkey); a wrong post-transition state
+    /// only makes the resulting proof semantically unverifiable, it does
+    /// not cause the witness-generation copy-constraint conflict that
+    /// distinguishes stale from fresh. The produced proof is discarded —
+    /// no state is mutated and nothing is broadcast.
+    ///
+    /// Accounts whose commitment cannot be resolved in the loaded SMT
+    /// (e.g. a pubkey not yet indexed) are skipped — that is a
+    /// state-derivation gap, not circuit staleness — and the next
+    /// proof-carrying account is tried. The first account whose proof
+    /// recurses cleanly returns [`CanaryOutcome::Compatible`]; the first
+    /// whose recursion fails returns [`CanaryOutcome::Stale`]; if no
+    /// account yields a usable sample (fresh DB, or no resolvable
+    /// commitment) it returns [`CanaryOutcome::NoSample`].
+    ///
+    /// `coverage(off)`: called only from the boot path in `main.rs`
+    /// (which is in the CI `--ignore-filename-regex`), and it runs a
+    /// real ~5 s recursive prove against a recursable persisted proof +
+    /// the loaded SMT/MMR — neither cheap nor reconstructible in a unit
+    /// test. It is validated by the live boot-gate repro against the DEV
+    /// dump (documented in the PR). The pure decision logic it feeds
+    /// ([`crate::self_heal::reset_decision`]) is covered exhaustively.
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub fn canary_recursion(&self) -> CanaryOutcome {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let history_root_extended = state.mmr.root_extended(MMR_PROOF_PATH_LEN);
+        let dummy_nip = Self::dummy_nip();
+        let dummy_coin = Self::dummy_coin();
+        let inactive_in: Vec<(bool, &Coin, &NonInclusionProof)> = (0
+            ..zkcoins_program::circuit::main::MAX_IN_COINS)
+            .map(|_| (false, &dummy_coin, &dummy_nip))
+            .collect();
+        let inactive_out: Vec<(bool, HashDigest, u64, &NonInclusionProof)> = (0
+            ..zkcoins_program::circuit::main::MAX_OUT_COINS)
+            .map(|_| (false, ZERO_HASH, 0u64, &dummy_nip))
+            .collect();
+        let no_sources: Vec<Option<InCoinSourceWitness>> = (0
+            ..zkcoins_program::circuit::main::MAX_IN_COINS)
+            .map(|_| None)
+            .collect();
+        let native_asset = *zkcoins_program::types::NATIVE_ASSET_ID;
+
+        for account in self.accounts.values() {
+            let (Some(proof), Some(pubkey)) =
+                (account.proof.as_ref(), account.commitment_public_key)
+            else {
+                continue;
+            };
+            // Real commitment-merkle witnesses from the loaded state —
+            // the same the next user transition would build.
+            let cmp = match Self::get_merkle_proofs(proof.clone(), pubkey, &state) {
+                Ok(cmp) => cmp,
+                // Commitment not resolvable in the loaded SMT/MMR: a
+                // state gap, not circuit staleness — try another sample.
+                Err(_) => continue,
+            };
+            // Synthetic surrounding state (the inner proof + CMP are what
+            // matter for the recursion copy-constraints).
+            let account_state = AccountState {
+                owner: ZERO_HASH,
+                balance: 0,
+                public_key: pubkey.serialize(),
+            };
+            return match self
+                .prover
+                .prove_account_update_with_in_and_out_coins_and_sources(
+                    &account_state,
+                    history_root_extended,
+                    proof,
+                    &cmp,
+                    &inactive_in,
+                    &inactive_out,
+                    &pubkey.serialize(),
+                    &no_sources,
+                    native_asset,
+                ) {
+                Ok(_) => CanaryOutcome::Compatible,
+                Err(_) => CanaryOutcome::Stale,
+            };
+        }
+        CanaryOutcome::NoSample
+    }
+
+    /// Consume this `AccountNode`, returning its pre-built [`Prover`].
+    ///
+    /// Used by the boot path's self-heal: when the circuit-digest probe
+    /// decides a [`crate::self_heal::ResetDecision::Reset`] is needed,
+    /// the in-memory maps loaded against the pre-reset rows are stale, so
+    /// the bootstrap reloads an empty `AccountNode` from the now-wiped
+    /// DB. The (~14 s) circuit build is recovered here and handed to the
+    /// fresh [`Self::load_from_pg`] so the circuit is still built exactly
+    /// once across the whole boot.
+    ///
+    /// `coverage(off)`: called only from the self-heal reset path in
+    /// `main.rs` (in the CI `--ignore-filename-regex`); a unit test would
+    /// have to pay a full `Prover::new()` circuit build to construct the
+    /// `AccountNode` it consumes. Exercised by the live boot-gate repro.
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub fn take_prover(self) -> Prover {
+        self.prover
+    }
+
     /// Read-only handle on the shared [`State`] (SMT + MMR). Exposed so
     /// the startup invariant check in `runtime` can verify
     /// every persisted minting-account pubkey has a corresponding SMT
@@ -924,16 +1068,26 @@ impl AccountNode {
             .expect("bincode::serialize cannot fail for the current Account shape")
     }
 
-    /// Reload an `AccountNode` from Postgres.
+    /// Reload an `AccountNode` from Postgres, reusing a pre-built
+    /// [`Prover`].
     ///
     /// The bootstrap-seeded minting account is NOT created here —
     /// `start_rest_node` does that explicitly once it has observed an
     /// absent minting row. Returning the rebuilt map here keeps this
     /// constructor a pure "rehydrate everything that was persisted"
     /// call with no side effects.
+    ///
+    /// The `Prover` is injected (rather than built here) so the
+    /// bootstrap can build the circuit exactly once: `main.rs` builds
+    /// it, reads its `circuit_digest_bytes` to run the circuit-digest
+    /// self-heal against Postgres (see [`crate::self_heal`]) BEFORE this
+    /// rehydration loads any account row, then hands the same prover in
+    /// here. Building the circuit twice would double the ~14 s startup
+    /// cost.
     pub async fn load_from_pg(
         state: Arc<Mutex<State>>,
         pool: &PgPool,
+        prover: Prover,
     ) -> Result<Self, LoadAccountNodeError> {
         let rows = db::load_all_accounts(pool).await?;
         let mut accounts: HashMap<Address, Account> = HashMap::with_capacity(rows.len());
@@ -946,7 +1100,6 @@ impl AccountNode {
             let account: Account = bincode::deserialize(&data_bytes)?;
             accounts.insert(address, account);
         }
-        let prover = Prover::new();
         Ok(AccountNode {
             accounts,
             prover,
@@ -1310,7 +1463,7 @@ mod inline_tests {
         // unreachable in a passing test, which leaves the Coverage
         // Gate (`account_node.rs` is in scope, only `_tests.rs$`
         // files are ignored) at 99.83% on the dead match arm.
-        let err = AccountNode::load_from_pg(state, &pool)
+        let err = AccountNode::load_from_pg(state, &pool, Prover::new())
             .await
             .err()
             .expect("load_from_pg should fail when DB is unreachable");

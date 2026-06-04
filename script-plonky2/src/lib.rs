@@ -291,6 +291,37 @@ impl Prover {
     pub fn verify(&self, proof: &Proof) -> Result<()> {
         verify(&self.circuit, proof)
     }
+
+    /// Stable byte encoding of this circuit's verifier-key
+    /// `circuit_digest` (the cyclic recursion's fixed-point digest,
+    /// a `HashOut<F>` of 4 Goldilocks field elements).
+    ///
+    /// The node persists this at boot and compares it against the digest
+    /// of the previously-running build as the cheap steady-state
+    /// staleness fast path (`node::self_heal::reset_decision`). The
+    /// digest is `Poseidon(constants_sigmas_cap || domain_separator ||
+    /// degree_bits)` — it is **deterministic across separate builds of
+    /// identical circuit code** (no timestamp / nonce; verified against
+    /// the live DEV dump, whose proofs carried a byte-identical digest to
+    /// a later rebuild). A digest change therefore reliably signals a
+    /// circuit change.
+    ///
+    /// The converse does NOT hold: the digest does **not** encode the
+    /// gate *constraints* (see upstream `circuit_builder.rs` "TODO: This
+    /// should also include an encoding of gate constraints"), so a change
+    /// that alters constraint behaviour while preserving the
+    /// constants/sigmas cap + degree leaves the digest UNCHANGED yet can
+    /// still break recursion. That blind spot is why the boot self-heal
+    /// pairs this comparison with a canary recursion probe on the
+    /// adoption boundary — see `node::self_heal` and
+    /// `node::account_node::AccountNode::canary_recursion`.
+    ///
+    /// The encoding is `bincode::serialize` of the `HashOut`; the bytes
+    /// are opaque to the comparison — only equality matters.
+    pub fn circuit_digest_bytes(&self) -> Vec<u8> {
+        bincode::serialize(&self.circuit.data.verifier_only.circuit_digest)
+            .expect("HashOut<F> bincode-serialize is infallible")
+    }
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]

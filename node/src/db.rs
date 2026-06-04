@@ -866,6 +866,116 @@ pub async fn upsert_account(pool: &PgPool, address: &[u8], data: &[u8]) -> Resul
     Ok(())
 }
 
+// ---- Circuit-digest self-heal (issue: self-healing circuit digest) --------
+
+/// Load the persisted circuit digest blob, or `None` on a fresh
+/// database / a database last written by a build that predates the
+/// `circuit_digest_meta` table.
+///
+/// The blob is the bincode encoding of the active circuit's
+/// `verifier_only.circuit_digest` (a `HashOut<F>`), written by
+/// [`reset_proof_dependent_state_tx`] / [`store_circuit_digest`]. The
+/// boot path compares it byte-for-byte against the live circuit's
+/// digest to decide whether the persisted proofs are still
+/// circuit-compatible — see `crate::self_heal::reset_decision`.
+pub async fn load_circuit_digest(pool: &PgPool) -> Result<Option<Vec<u8>>, sqlx::Error> {
+    let row: Option<(Vec<u8>,)> =
+        sqlx::query_as("SELECT digest FROM circuit_digest_meta WHERE id = 1")
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(digest,)| digest))
+}
+
+/// Upsert the singleton circuit-digest row WITHOUT touching any other
+/// state.
+///
+/// Used on the "digest matches (or first boot on an otherwise-empty
+/// DB)" path: there is nothing to heal, we only record / refresh the
+/// digest so the next boot has a baseline to compare against. The
+/// "digest mismatch" path goes through [`reset_proof_dependent_state_tx`]
+/// instead, which wipes the proof-dependent state and stores the new
+/// digest in the same transaction.
+pub async fn store_circuit_digest(pool: &PgPool, digest: &[u8]) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO circuit_digest_meta (id, digest, updated_at) \
+         VALUES (1, $1, NOW()) \
+         ON CONFLICT (id) DO UPDATE \
+         SET digest = EXCLUDED.digest, updated_at = EXCLUDED.updated_at",
+    )
+    .bind(digest)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Reset all proof-dependent state to genesis and store the new circuit
+/// digest, atomically, in a single transaction.
+///
+/// Invoked from the boot path when the live circuit's digest does not
+/// match the persisted one (a breaking circuit change). Because a
+/// circuit change invalidates EVERY proof in the system at once — each
+/// `account.proof`, every queued `CoinProof` source proof, every
+/// recipient-held proof — and the global SMT/MMR are append-only and
+/// shared across all accounts (they cannot be partially unwound per
+/// account without leaving a global-vs-account mismatch), the only
+/// provably-consistent recovery is a full reset to genesis. This is
+/// exactly the documented `reset-zkcoins-node` tabula rasa, permitted
+/// in the closed test env (CONTRIBUTING § "Closed test environment").
+///
+/// Tables wiped (the proof-dependent state-layer set, mirroring the
+/// DEV-recovery `TRUNCATE` in CONTRIBUTING § "DEV state recovery",
+/// minus `minting_meta` which migration 0005 dropped):
+///
+/// * `accounts`      — per-address ledger (carries the stale `proof`).
+/// * `smt_state`     — global commitment Sparse Merkle Tree.
+/// * `mmr_state`     — global Merkle Mountain Range of SMT roots.
+/// * `mmr_root_index`— `prev_mmr_root → (smt_root, leaf_index)` map.
+/// * `latest_block`  — scanner resume cursor (re-derived from the tip).
+///
+/// `_sqlx_migrations` is intentionally left untouched so
+/// `connect_and_migrate` skips re-applying the schema. The append-only
+/// log/audit tables (`account_history`, `state_update_log`, …) are NOT
+/// wiped — they are historical evidence, do not feed proof
+/// construction, and stop being appended to until the next user
+/// round-trip re-populates `accounts`.
+///
+/// The on-disk per-proof file store (`PROOFS_DIR`) is dropped by the
+/// caller (see `crate::self_heal::reset_proof_store_dir`) — it lives
+/// outside Postgres so it cannot ride this transaction, but the
+/// proof_id space resets cleanly because the files are content-
+/// addressed by id and no surviving row references them.
+pub async fn reset_proof_dependent_state_tx(
+    pool: &PgPool,
+    new_digest: &[u8],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM accounts")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM smt_state")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM mmr_state")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM mmr_root_index")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM latest_block")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO circuit_digest_meta (id, digest, updated_at) \
+         VALUES (1, $1, NOW()) \
+         ON CONFLICT (id) DO UPDATE \
+         SET digest = EXCLUDED.digest, updated_at = EXCLUDED.updated_at",
+    )
+    .bind(new_digest)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
+}
+
 // ---- Username persistence (PR-A3) -----------------------------------------
 
 /// Load every `(name, address)` pair from the `usernames` table.

@@ -73,6 +73,9 @@ async fn connect_and_migrate_creates_all_tables() {
     //     filter — included at the correct alphabetic position below.)
     //   * After 0014 (jobs):             23 tables + 1 view (#161
     //     introduces the async Job-API state table.)
+    //   * After 0015 (circuit digest):   24 tables + 1 view (the
+    //     circuit-digest self-heal singleton — sorts between
+    //     `boot_log` and `coin_proof_store`.)
     assert_eq!(
         names,
         vec![
@@ -81,6 +84,7 @@ async fn connect_and_migrate_creates_all_tables() {
             "accounts".to_string(),
             "block_log".to_string(),
             "boot_log".to_string(),
+            "circuit_digest_meta".to_string(),
             "coin_proof_store".to_string(),
             "error_log".to_string(),
             "esplora_log".to_string(),
@@ -291,6 +295,90 @@ async fn upsert_account_inserts_then_updates() {
     upsert_account(&pool, &addr, b"second").await.unwrap();
     let rows = load_all_accounts(&pool).await.unwrap();
     assert_eq!(rows, vec![(addr, b"second".to_vec())]);
+}
+
+// ---- Circuit-digest self-heal -------------------------------------------
+
+#[tokio::test]
+async fn load_circuit_digest_returns_none_initially() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    assert_eq!(load_circuit_digest(&pool).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn store_circuit_digest_inserts_then_updates_on_conflict() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    store_circuit_digest(&pool, b"first-digest").await.unwrap();
+    assert_eq!(
+        load_circuit_digest(&pool).await.unwrap(),
+        Some(b"first-digest".to_vec())
+    );
+    // Second call hits the `ON CONFLICT (id) DO UPDATE` arm.
+    store_circuit_digest(&pool, b"second-digest").await.unwrap();
+    assert_eq!(
+        load_circuit_digest(&pool).await.unwrap(),
+        Some(b"second-digest".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn reset_proof_dependent_state_tx_wipes_state_and_stores_digest() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+
+    // Seed every table the reset touches.
+    upsert_account(&pool, &[9u8; 32], b"acct").await.unwrap();
+    let prev_root = zkcoins_program::hash::digest_from_bytes(&[0x11u8; 32]);
+    let smt_root = zkcoins_program::hash::digest_from_bytes(&[0x22u8; 32]);
+    persist_state_tx(
+        &pool,
+        b"smt",
+        b"mmr",
+        &[0xCCu8; 32],
+        Some((&prev_root, &smt_root, 5)),
+    )
+    .await
+    .unwrap();
+    store_circuit_digest(&pool, b"OLD").await.unwrap();
+
+    // Sanity: everything present before the reset.
+    assert_eq!(load_all_accounts(&pool).await.unwrap().len(), 1);
+    assert!(load_smt(&pool).await.unwrap().is_some());
+    assert!(load_mmr(&pool).await.unwrap().is_some());
+    assert!(load_latest_block(&pool).await.unwrap().is_some());
+    assert_eq!(load_root_indices(&pool).await.unwrap().len(), 1);
+
+    reset_proof_dependent_state_tx(&pool, b"NEW").await.unwrap();
+
+    // All proof-dependent state gone, new digest stored, atomically.
+    assert!(load_all_accounts(&pool).await.unwrap().is_empty());
+    assert_eq!(load_smt(&pool).await.unwrap(), None);
+    assert_eq!(load_mmr(&pool).await.unwrap(), None);
+    assert_eq!(load_latest_block(&pool).await.unwrap(), None);
+    assert!(load_root_indices(&pool).await.unwrap().is_empty());
+    assert_eq!(
+        load_circuit_digest(&pool).await.unwrap(),
+        Some(b"NEW".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn reset_proof_dependent_state_tx_overwrites_existing_digest_row() {
+    // The reset's digest INSERT must hit the ON CONFLICT update arm when
+    // a digest row already exists (the common case: a build was running
+    // before, so a row is present).
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    store_circuit_digest(&pool, b"PREEXISTING").await.unwrap();
+    reset_proof_dependent_state_tx(&pool, b"AFTER-RESET")
+        .await
+        .unwrap();
+    assert_eq!(
+        load_circuit_digest(&pool).await.unwrap(),
+        Some(b"AFTER-RESET".to_vec())
+    );
 }
 
 #[tokio::test]
