@@ -123,7 +123,7 @@ by the REST API — flip it in the UI.
 ## Scaling out: adding more runner agents on the same host
 
 The host runs multiple runner agents under the same user account, one
-per directory + launchd plist. Pool today: **N agents** named
+per directory + launchd plist. Pool today: **6 agents** named
 `<runner-host>`, `<runner-host>-2`, …, all carrying the same labels
 (concrete host assignments live in the private ops config). Adding
 another follows the one-time setup with a different `--name` and a
