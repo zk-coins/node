@@ -152,8 +152,8 @@ The five constraints below are decided and apply across every PR on
    100% lines / functions / regions, 115 default-run tests (+ 2
    `#[ignore]`d `recursion_shape_probe` diagnostics). The authoritative
    coverage gate for `node` runs in CI on the self-hosted M3 Ultra
-   runner (`.github/workflows/ci.yaml`, `Coverage Gate` job, gated
-   behind the `ci:full` label on PRs). See `ROADMAP.md` § "Done" for
+   runner (`.github/workflows/ci.yaml`, `Tests + Coverage Gate` job,
+   gated behind the `ci:full` label on PRs). See `ROADMAP.md` § "Done" for
    the live test count and breakdown.
 5. **Plonky2 is bridge tech; Plonky3 is the long-term destination.**
    But we do not preemptively adopt BabyBear / Poseidon2 inside this
@@ -484,7 +484,7 @@ node/
 
 - **Open feature PRs against `staging`** (not `develop`) — `staging` is the integration buffer where multiple feature branches accumulate before being batched into a single `develop` promotion. This keeps `develop` clean for DEV-deploy churn and gives reviewers a smaller blast radius per merge.
 - **`develop` and `main` are protected** — direct pushes are rejected. `develop` accepts only the auto-PR from `staging`; `main` accepts only the auto-PR from `develop`. Hotfixes still go through `staging` so the same review path applies.
-- **`develop` is auto-PR'd from `staging`** by `auto-release-pr-staging.yaml` whenever new commits land on `staging`. Merge that PR to promote the batch to DEV. Promote PRs intentionally skip the `ci:full` label — heavy M3 Ultra tests stay reserved for the develop → main Release PR.
+- **`develop` is auto-PR'd from `staging`** by `auto-release-pr-staging.yaml` whenever new commits land on `staging`. Merge that PR to promote the batch to DEV. The Promote PR is created with the `ci:full` label applied automatically, so every promotion to `develop` is validated against the full M3 Ultra test + coverage gate.
 - **`main` is auto-PR'd from `develop`** by `auto-release-pr.yaml` (with `ci:full` applied automatically). Merge to release to PRD.
 - Never force-push, never amend.
 
@@ -888,33 +888,45 @@ See [docs.zkcoins.app/infrastructure/backend](https://docs.zkcoins.app/infrastru
 
 | Workflow | Trigger | Action |
 |---|---|---|
-| `ci.yaml` (Lint & Build) | Ready PR → develop, push to develop | `cargo fmt --check`, clippy (MVP + all-features + program lib), build (MVP + all-features) on `ubuntu-latest`. |
-| `ci.yaml` (Node + Shared Tests) | Ready PR → develop with `ci:full` label, push to develop | `cargo nextest run -p node -p shared --release --all-features --test-threads 8 -E 'not binary(api_remote)'` on the self-hosted M3 Ultra runner pool (issue #40). Parallel after #181 Opt A + Opt B (per-test Postgres-schema isolation + cross-process file lock around the shared `postgres:17` container in `node/src/test_db.rs`). |
-| `ci.yaml` (Coverage Gate) | Ready PR → develop with `ci:full` label, push to develop | `cargo llvm-cov nextest` with the 100% line + function gate, MVP scope, on the same runner pool. |
+| `ci.yaml` (Lint & Build) | Any ready PR, push to develop | `cargo fmt --check`, clippy (MVP + all-features + program lib), build (MVP + all-features) on `ubuntu-latest`. The default tier — runs on every ready PR regardless of label. |
+| `ci.yaml` (Tests + Coverage Gate) | Ready PR with `ci:full` label, push to develop | Single heavy job on the self-hosted M3 Ultra runner pool (issue #40): `cargo llvm-cov nextest --release -p node -p shared --all-features … --fail-under-lines 100 --fail-under-functions 100 --test-threads 8 -E 'not binary(api_remote)'` — runs the full node + shared suite under llvm-cov instrumentation, producing test execution AND the 100% line + function coverage gate (MVP scope) in a single binary run. Parallel-safe after #181 Opt A + Opt B (per-test Postgres-schema isolation + cross-process file lock around the shared `postgres:17` container in `node/src/test_db.rs`). |
 | `deploy-dev.yaml` | Push to develop | Docker build (ARM64) → push `zkcoins/node:beta` → deploy to DEV |
 | `deploy-prd.yaml` | Push to main | Docker build (ARM64) → push `zkcoins/node:latest` → deploy to PRD |
-| `auto-release-pr-staging.yaml` | Push to staging | Creates Promote PR (staging → develop) |
+| `auto-release-pr-staging.yaml` | Push to staging | Creates Promote PR (staging → develop) with `ci:full` label |
 | `auto-release-pr.yaml` | Push to develop | Creates Release PR (develop → main) with `ci:full` label |
+
+CI test gating is a **two-tier model**:
+
+- **Tier 1 — `Lint & Build`** (fast, GitHub-hosted, free) is the
+  default. It runs on every ready PR push and every `push to develop`,
+  with no label required.
+- **Tier 2 — `Tests + Coverage Gate`** (the authoritative ~60-90 min
+  M3 Ultra job) is opt-in via the `ci:full` label. It is the full
+  node + shared nextest suite under llvm-cov, including the 100% line +
+  function coverage gate, the Postgres `db_tests`, and the
+  Plonky2-heavy prover flows — a single job, no narrower subset tier.
 
 **Draft PRs** skip every `ci.yaml` job — the workflow fires once the
 PR is marked ready-for-review.
 
-**Heavy jobs** (`Node + Shared Tests`, `Coverage Gate`) additionally
-require the `ci:full` label on a ready PR. Apply the label when the
-PR is in shape to run against the authoritative ~60-90 min M3 Ultra
-gate; remove it before the next push to keep an agent free for other
-work. `Lint & Build` (fast, GitHub-hosted, free) keeps running on
-every ready-PR push.
+Apply the `ci:full` label when the PR is in shape to run against the
+authoritative gate; remove it before the next push to keep an M3 Ultra
+agent free for other work. `Lint & Build` keeps running on every
+ready-PR push regardless of the label.
 
 `push to develop` always runs the full gate — the post-merge run on
 `develop` is the source of truth, and `deploy-dev.yaml` consumes its
-result via the auto-release PR's check rollup.
+result via the auto-release PR's check rollup. Both auto-promote PRs
+(staging → develop and develop → main) are created with `ci:full`
+applied automatically, so every promotion is validated against the
+full gate.
 
-To stop a Heavy run that is already executing, removing the `ci:full`
-label is *not* enough — the workflow isolates label events into their
-own concurrency group so an unrelated label toggle doesn't cancel an
-in-flight 60-min run. If you need to free an agent immediately, use
-`gh run cancel <run-id>` (the run id is on the PR's checks tab).
+To stop a `ci:full` run that is already executing, removing the
+`ci:full` label is *not* enough — the workflow isolates label events
+into their own concurrency group so an unrelated label toggle doesn't
+cancel an in-flight 60-min run. If you need to free an agent
+immediately, use `gh run cancel <run-id>` (the run id is on the PR's
+checks tab).
 
 Build time is ~5 minutes (Rust compilation on ARM64).
 
