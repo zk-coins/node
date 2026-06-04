@@ -2949,7 +2949,14 @@ pub(crate) fn create_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods([Method::GET, Method::POST])
-        .allow_headers([header::CONTENT_TYPE]);
+        // `Idempotency-Key` is required by the jobs-API admit handlers
+        // (`POST /api/jobs/{mint,send}`). A browser sending it triggers a
+        // CORS preflight; without the header here the preflight fails and the
+        // web frontend cannot mint or send.
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::HeaderName::from_static("idempotency-key"),
+        ]);
 
     // MVP routes — always compiled in.
     let app = Router::new()

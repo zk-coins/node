@@ -123,6 +123,48 @@ async fn health_returns_ok() {
     assert_eq!(body, "ok");
 }
 
+// --- CORS preflight ---
+
+/// A browser calling `POST /api/jobs/mint` (or `/send`) sends the
+/// mandatory `Idempotency-Key` request header, which triggers a CORS
+/// preflight (`OPTIONS`). The router's `CorsLayer` must echo that header
+/// back in `Access-Control-Allow-Headers`, otherwise the browser blocks
+/// the request and the web frontend cannot mint or send. This guards the
+/// `allow_headers([CONTENT_TYPE, "idempotency-key"])` configuration.
+#[tokio::test]
+async fn cors_preflight_allows_idempotency_key_for_jobs_api() {
+    let request = Request::builder()
+        .method(Method::OPTIONS)
+        .uri("/api/jobs/mint")
+        .header("origin", "https://app.example")
+        .header("access-control-request-method", "POST")
+        .header("access-control-request-headers", "idempotency-key")
+        .body(Body::empty())
+        .unwrap();
+
+    let app = create_router(test_state());
+    let response = app.oneshot(request).await.unwrap();
+
+    let allow_headers = response
+        .headers()
+        .get("access-control-allow-headers")
+        .expect("preflight response must carry Access-Control-Allow-Headers")
+        .to_str()
+        .expect("Access-Control-Allow-Headers must be valid ASCII")
+        .to_ascii_lowercase();
+
+    assert!(
+        allow_headers
+            .split(',')
+            .any(|h| h.trim() == "idempotency-key"),
+        "Access-Control-Allow-Headers must allow `idempotency-key`, got `{allow_headers}`"
+    );
+    assert!(
+        allow_headers.split(',').any(|h| h.trim() == "content-type"),
+        "Access-Control-Allow-Headers must still allow `content-type`, got `{allow_headers}`"
+    );
+}
+
 // --- GET / (root) ---
 
 #[tokio::test]
