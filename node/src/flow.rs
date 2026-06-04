@@ -412,30 +412,65 @@ pub(crate) async fn mint_flow(state: &AppState, request: MintRequest) -> FlowRes
     let final_coin_proof = coin_proofs
         .pop()
         .expect("send_coins returns exactly one coin_proof for single-invoice mint");
-    let pis: [zkcoins_program::F; zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] =
-        final_coin_proof.proof.public_inputs
-            [..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
-            .try_into()
-            .expect("Plonky2 Proof emits N_PROOF_DATA_PUBLIC_INPUTS field elements");
-    let proof_data = ProofData::from_field_elements(&pis);
-    let ash_hex = hex::encode(digest_to_bytes(&proof_data.account_state_hash));
-    let ocr_hex = hex::encode(digest_to_bytes(&proof_data.output_coins_root));
+    let hashes = send_commit_hashes(&final_coin_proof);
     let proof_id = state.proof_store.add_proof(final_coin_proof);
     Ok((
         json!({
             "success": true,
             "proof_id": proof_id,
-            "account_state_hash": ash_hex,
-            "output_coins_root": ocr_hex,
+            "account_state_hash": hashes.account_state_hash,
+            "output_coins_root": hashes.output_coins_root,
         }),
         200,
     ))
 }
 
+/// Hashes the wallet must sign to authorise a `send`, derived from the
+/// send proof's public inputs.
+///
+/// A thin pure-TypeScript wallet cannot decode the binary bincode
+/// `CoinProof` that `GET /api/proof/{id}` serves, so the dispatcher
+/// surfaces these two digests as lowercase hex on the
+/// `awaiting_signature` job result instead — the same `account_state_hash`
+/// / `output_coins_root` hex the `mint` and `commit` completed results
+/// already carry. The wallet signs `SHA256(serialize(ash) ‖ serialize(ocr))`
+/// over them (see CONTRIBUTING "Trust model"). Bit-identical to the
+/// extraction in [`mint_flow`] / [`commit_flow`] so the value the wallet
+/// signs matches what `commit_flow` re-derives from the same proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SendCommitHashes {
+    /// `account_state_hash`, 32-byte digest as 64 lowercase hex chars.
+    pub account_state_hash: String,
+    /// `output_coins_root`, 32-byte digest as 64 lowercase hex chars.
+    pub output_coins_root: String,
+}
+
+/// Extract `account_state_hash` + `output_coins_root` as lowercase hex
+/// from a coin proof's Plonky2 public inputs.
+///
+/// Reuses the exact `ProofData::from_field_elements` path the
+/// `mint`/`commit` completed results use (and the `api_remote`
+/// `ash_ocr_from_send_proof` test helper mirrors), so the hex written
+/// onto the `awaiting_signature` result is byte-for-byte the value the
+/// wallet's `createCommitment` expects and `commit_flow` re-derives.
+pub(crate) fn send_commit_hashes(proof: &CoinProof) -> SendCommitHashes {
+    let pis: [zkcoins_program::F; zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] =
+        proof.proof.public_inputs[..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
+            .try_into()
+            .expect("Plonky2 Proof emits N_PROOF_DATA_PUBLIC_INPUTS field elements");
+    let proof_data = ProofData::from_field_elements(&pis);
+    SendCommitHashes {
+        account_state_hash: hex::encode(digest_to_bytes(&proof_data.account_state_hash)),
+        output_coins_root: hex::encode(digest_to_bytes(&proof_data.output_coins_root)),
+    }
+}
+
 /// Drive a `send` job up to and including proof generation. Returns
-/// the persisted `proof_id` so the dispatcher can transition the job
-/// to `awaiting_signature` and the wallet's `POST /api/jobs/:id/commit`
-/// can look the proof up.
+/// the persisted `proof_id` plus the [`SendCommitHashes`] the wallet
+/// must sign, so the dispatcher can transition the job to
+/// `awaiting_signature` with the `account_state_hash` /
+/// `output_coins_root` hex on its result and the wallet's
+/// `POST /api/jobs/:id/commit` can look the proof up.
 ///
 /// The post-signature broadcast leg lives in [`commit_flow`] — the
 /// dispatcher invokes it after the wallet signals on the per-job
@@ -443,7 +478,7 @@ pub(crate) async fn mint_flow(state: &AppState, request: MintRequest) -> FlowRes
 pub(crate) async fn send_flow(
     state: &AppState,
     request: SendCoinRequest,
-) -> Result<u64, FlowError> {
+) -> Result<(u64, SendCommitHashes), FlowError> {
     let (from_address_bytes, to_address_bytes) = validate_send_request(&request)?;
     let from_address = digest_from_bytes(&from_address_bytes);
     let to_address = digest_from_bytes(&to_address_bytes);
@@ -494,6 +529,11 @@ pub(crate) async fn send_flow(
     })??;
 
     let (coin_proof, updated_account_bytes) = result;
+    // Derive the commit hashes BEFORE the proof is moved into the
+    // store, from the same public-input path `commit_flow` re-derives —
+    // so the hex the wallet signs matches what the broadcast leg later
+    // verifies the commitment against.
+    let commit_hashes = send_commit_hashes(&coin_proof);
     let proof_id = state.proof_store.add_proof(coin_proof);
 
     let addr_bytes = digest_to_bytes(&from_address);
@@ -503,7 +543,7 @@ pub(crate) async fn send_flow(
     {
         eprintln!("Failed to upsert sender account after send: {}", e);
     }
-    Ok(proof_id)
+    Ok((proof_id, commit_hashes))
 }
 
 /// Parse + verify a `CommitRequest` and then broadcast the commitment
@@ -566,14 +606,9 @@ pub(crate) async fn commit_flow(state: &AppState, request: CommitRequest) -> Flo
 
     let mut updated_proof = coin_proof;
     updated_proof.commitment = Some(commitment);
-    let pis: [zkcoins_program::F; zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] =
-        updated_proof.proof.public_inputs
-            [..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
-            .try_into()
-            .expect("Plonky2 Proof emits N_PROOF_DATA_PUBLIC_INPUTS field elements");
-    let proof_data = ProofData::from_field_elements(&pis);
-    let ash_hex = hex::encode(digest_to_bytes(&proof_data.account_state_hash));
-    let ocr_hex = hex::encode(digest_to_bytes(&proof_data.output_coins_root));
+    let hashes = send_commit_hashes(&updated_proof);
+    let ash_hex = hashes.account_state_hash;
+    let ocr_hex = hashes.output_coins_root;
 
     let recipient = updated_proof.coin.recipient;
     let snapshot: Option<Vec<u8>> = {

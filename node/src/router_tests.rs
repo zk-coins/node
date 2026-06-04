@@ -123,6 +123,48 @@ async fn health_returns_ok() {
     assert_eq!(body, "ok");
 }
 
+// --- CORS preflight ---
+
+/// A browser calling `POST /api/jobs/mint` (or `/send`) sends the
+/// mandatory `Idempotency-Key` request header, which triggers a CORS
+/// preflight (`OPTIONS`). The router's `CorsLayer` must echo that header
+/// back in `Access-Control-Allow-Headers`, otherwise the browser blocks
+/// the request and the web frontend cannot mint or send. This guards the
+/// `allow_headers([CONTENT_TYPE, "idempotency-key"])` configuration.
+#[tokio::test]
+async fn cors_preflight_allows_idempotency_key_for_jobs_api() {
+    let request = Request::builder()
+        .method(Method::OPTIONS)
+        .uri("/api/jobs/mint")
+        .header("origin", "https://app.example")
+        .header("access-control-request-method", "POST")
+        .header("access-control-request-headers", "idempotency-key")
+        .body(Body::empty())
+        .unwrap();
+
+    let app = create_router(test_state());
+    let response = app.oneshot(request).await.unwrap();
+
+    let allow_headers = response
+        .headers()
+        .get("access-control-allow-headers")
+        .expect("preflight response must carry Access-Control-Allow-Headers")
+        .to_str()
+        .expect("Access-Control-Allow-Headers must be valid ASCII")
+        .to_ascii_lowercase();
+
+    assert!(
+        allow_headers
+            .split(',')
+            .any(|h| h.trim() == "idempotency-key"),
+        "Access-Control-Allow-Headers must allow `idempotency-key`, got `{allow_headers}`"
+    );
+    assert!(
+        allow_headers.split(',').any(|h| h.trim() == "content-type"),
+        "Access-Control-Allow-Headers must still allow `content-type`, got `{allow_headers}`"
+    );
+}
+
 // --- GET / (root) ---
 
 #[tokio::test]
@@ -173,6 +215,10 @@ async fn info_returns_network_name_capabilities_and_username_domain() {
     // The lazy_static defaults to "Mutinynet" when IS_MAINNET is unset
     assert!(!info.network.is_empty(), "network name must not be empty");
 
+    // The typed network identifier is derived from the same global; the
+    // test harness never sets IS_MAINNET=true, so it resolves to Mutinynet.
+    assert_eq!(info.bitcoin_network, BitcoinNetwork::Mutinynet);
+
     // Capabilities reflect the cargo feature set this binary was built with.
     // Same `cfg!(...)` evaluation as the handler, so the test passes both in
     // MVP builds (all false) and `--all-features` builds (all true).
@@ -204,10 +250,25 @@ async fn info_serialization_format_is_stable() {
     assert!(v["capabilities"].is_object());
     assert!(v["username_domain"].is_string());
 
+    // `bitcoin_network` serializes as a lowercase string enum.
+    let bn = v["bitcoin_network"]
+        .as_str()
+        .expect("bitcoin_network must be a string");
+    assert!(
+        bn == "mainnet" || bn == "mutinynet",
+        "bitcoin_network must be `mainnet` or `mutinynet`, got {bn}"
+    );
+
     let caps = &v["capabilities"];
     for key in ["address_list", "username_claim", "lnurl"] {
         assert!(caps[key].is_boolean(), "capability `{key}` must be bool");
     }
+}
+
+#[test]
+fn bitcoin_network_label_maps_both_arms() {
+    assert_eq!(bitcoin_network_label(true), BitcoinNetwork::Mainnet);
+    assert_eq!(bitcoin_network_label(false), BitcoinNetwork::Mutinynet);
 }
 
 // --- GET /api/balance ---
@@ -2778,9 +2839,18 @@ mod jobs_endpoint_tests {
             crate::job_store::CreateResult::Fresh(j) => j.public_id,
             _ => panic!(),
         };
+        let ash = "aa".repeat(32);
+        let ocr = "bb".repeat(32);
         state
             .job_store
-            .set_awaiting_signature(job_id, 42)
+            .set_awaiting_signature(
+                job_id,
+                42,
+                serde_json::json!({
+                    "account_state_hash": ash,
+                    "output_coins_root": ocr,
+                }),
+            )
             .await
             .expect("await sig");
 
@@ -2792,6 +2862,11 @@ mod jobs_endpoint_tests {
         let v: serde_json::Value = serde_json::from_str(&body).expect("json");
         assert_eq!(v["status"], "awaiting_signature");
         assert_eq!(v["proof_id"], 42i64);
+        // The ash/ocr hex the wallet signs surfaces in `result` on the
+        // `awaiting_signature` snapshot — this is the field the thin
+        // pure-TS wallet reads instead of decoding the binary proof.
+        assert_eq!(v["result"]["account_state_hash"], ash);
+        assert_eq!(v["result"]["output_coins_root"], ocr);
     }
 
     // ---- POST /api/jobs/:id/cancel ----
@@ -2904,7 +2979,7 @@ mod jobs_endpoint_tests {
         };
         state
             .job_store
-            .set_awaiting_signature(job_id, 7)
+            .set_awaiting_signature(job_id, 7, serde_json::json!({}))
             .await
             .expect("aw sig");
         let notifier = Arc::new(crate::job_dispatcher::JobNotifier::new());
@@ -2955,7 +3030,7 @@ mod jobs_endpoint_tests {
         };
         state
             .job_store
-            .set_awaiting_signature(job_id, 7)
+            .set_awaiting_signature(job_id, 7, serde_json::json!({}))
             .await
             .expect("aw sig");
         // No notify_map.insert — simulates the post-timeout state.
@@ -3163,7 +3238,7 @@ mod jobs_endpoint_tests {
         };
         state
             .job_store
-            .set_awaiting_signature(job_id, 7)
+            .set_awaiting_signature(job_id, 7, serde_json::json!({}))
             .await
             .expect("aw sig");
         let notifier = Arc::new(crate::job_dispatcher::JobNotifier::new());
@@ -3291,8 +3366,20 @@ mod jobs_endpoint_tests {
     }
 
     #[test]
-    fn initial_event_awaiting_signature_includes_proof_id() {
-        let job = make_job(JobStatus::AwaitingSignature, Some(42), None, None);
+    fn initial_event_awaiting_signature_includes_proof_id_and_result() {
+        // `awaiting_signature` carries the ash/ocr hex in `response_body`
+        // (set by `JobStore::set_awaiting_signature`); the SSE initial
+        // frame must surface both the `proof_id` and that `result` so a
+        // wallet reconnecting after a node restart gets the hex to sign.
+        let job = make_job(
+            JobStatus::AwaitingSignature,
+            Some(42),
+            Some(serde_json::json!({
+                "account_state_hash": "aa".repeat(32),
+                "output_coins_root": "bb".repeat(32),
+            })),
+            None,
+        );
         let event = crate::router::initial_event_from_job(&job);
         // Re-serialise to check the payload contents.
         let wire = format!("{:?}", event);
@@ -3300,6 +3387,11 @@ mod jobs_endpoint_tests {
         assert!(
             wire.contains("42"),
             "proof_id 42 must surface; wire: {}",
+            wire
+        );
+        assert!(
+            wire.contains("account_state_hash") && wire.contains("output_coins_root"),
+            "ash/ocr result must surface on the awaiting_signature frame; wire: {}",
             wire
         );
     }

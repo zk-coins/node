@@ -240,14 +240,22 @@ async fn set_awaiting_signature_persists_proof_id() {
     else {
         panic!("expected Fresh");
     };
+    let result = serde_json::json!({
+        "account_state_hash": "aa".repeat(32),
+        "output_coins_root": "bb".repeat(32),
+    });
     store
-        .set_awaiting_signature(job.public_id, 42)
+        .set_awaiting_signature(job.public_id, 42, result.clone())
         .await
         .expect("set_awaiting_signature");
     let after = store.load(job.public_id).await.unwrap().unwrap();
     assert_eq!(after.status, JobStatus::AwaitingSignature);
     assert_eq!(after.phase, "awaiting_signature");
     assert_eq!(after.proof_id, Some(42));
+    // The ash/ocr hex the wallet must sign is persisted on the row so
+    // `GET /api/jobs/:id` (and an SSE reconnect after a node restart)
+    // can surface it without re-deriving from the binary proof.
+    assert_eq!(after.response_body, Some(result));
 }
 
 #[tokio::test]
@@ -390,7 +398,7 @@ async fn queue_depth_counts_queued_and_proving_only() {
         panic!()
     };
     store
-        .set_awaiting_signature(asig.public_id, 1)
+        .set_awaiting_signature(asig.public_id, 1, serde_json::json!({}))
         .await
         .unwrap();
 
@@ -419,7 +427,7 @@ async fn list_non_terminal_for_resume_returns_queued_and_awaiting() {
         panic!()
     };
     store
-        .set_awaiting_signature(awaiting.public_id, 99)
+        .set_awaiting_signature(awaiting.public_id, 99, serde_json::json!({}))
         .await
         .unwrap();
     let CreateResult::Fresh(done) = store

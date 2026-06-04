@@ -170,6 +170,32 @@ fn info_response_carries_username_domain() {
 }
 
 #[test]
+fn info_response_carries_typed_bitcoin_network() {
+    // Drift guard for the typed `bitcoin_network` enum: the wallet/SDK
+    // switch behaviour on the lowercase `mainnet`/`mutinynet` identifier
+    // rather than the free-text `network` label, so the property must
+    // exist and the `BitcoinNetwork` schema must be registered.
+    let v = parse_spec();
+    let properties = v["components"]["schemas"]["InfoResponse"]["properties"]
+        .as_object()
+        .expect("`InfoResponse.properties` must be a JSON object");
+    assert!(
+        properties.contains_key("bitcoin_network"),
+        "`InfoResponse` is missing the `bitcoin_network` property — \
+         did someone drop the field from the Rust struct?"
+    );
+
+    let schemas = v["components"]["schemas"]
+        .as_object()
+        .expect("`components.schemas` must be a JSON object");
+    assert!(
+        schemas.contains_key("BitcoinNetwork"),
+        "`BitcoinNetwork` must be registered under components.schemas — \
+         clients depend on the typed network enum"
+    );
+}
+
+#[test]
 fn docs_html_loads_bundled_swagger_ui_assets() {
     let html = node::openapi::DOCS_HTML;
     // Same-origin relative URLs served by `swagger_asset_handler` from

@@ -782,9 +782,32 @@ pub struct CommitRequest {
     pub(crate) message: String,
 }
 
+/// Normalized, machine-readable Bitcoin network identifier exposed on
+/// `/api/info` as `bitcoin_network`. Serializes to the lowercase string
+/// `"mainnet"` or `"mutinynet"`.
+///
+/// This is the typed counterpart to the free-text `network` field
+/// (e.g. `"Mainnet"` / `"Mutinynet"` from `NETWORK_CONFIG.network_name`),
+/// which stays a human-readable, operator-overridable label. Clients
+/// switch behaviour on `bitcoin_network` to avoid the case-sensitivity
+/// foot-gun of matching the free-text string.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BitcoinNetwork {
+    Mainnet,
+    Mutinynet,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct InfoResponse {
+    /// Human-readable network label (e.g. `"Mainnet"` / `"Mutinynet"`),
+    /// sourced from `NETWORK_CONFIG.network_name`. Operator-overridable
+    /// and intended for display only — clients gate behaviour on
+    /// `bitcoin_network` instead.
     network: String,
+    /// Typed, lowercase network identifier derived from the node's
+    /// `is_mainnet` flag. One of `"mainnet"` or `"mutinynet"`.
+    bitcoin_network: BitcoinNetwork,
     capabilities: Capabilities,
     /// External hostname this node serves, used by the client to render
     /// `<hex|username>@<domain>`. DEV and PRD share the chain identifier
@@ -1596,7 +1619,13 @@ pub(crate) async fn get_job_handler(
         } else {
             None
         },
-        result: if job.status == JobStatus::Completed {
+        // `awaiting_signature` carries the ash/ocr hex the wallet must
+        // sign (persisted in `response_body` by
+        // `JobStore::set_awaiting_signature`); `completed` carries the
+        // cached terminal body. Both live in `response_body`, so the
+        // same field surfaces on either status.
+        result: if job.status == JobStatus::Completed || job.status == JobStatus::AwaitingSignature
+        {
             job.response_body.clone()
         } else {
             None
@@ -1853,7 +1882,13 @@ pub(crate) fn initial_event_from_job(job: &Job) -> Event {
         } else {
             serde_json::Value::Null
         },
-        "result": if job.status == JobStatus::Completed {
+        "result": if job.status == JobStatus::Completed
+            || job.status == JobStatus::AwaitingSignature
+        {
+            // `awaiting_signature` carries the ash/ocr hex the wallet
+            // signs; `completed` carries the terminal body. Both are in
+            // `response_body`, so the SSE initial frame mirrors the GET
+            // snapshot for either status.
             job.response_body.clone().unwrap_or(serde_json::Value::Null)
         } else {
             serde_json::Value::Null
@@ -2437,6 +2472,18 @@ pub(crate) async fn health_handler() -> &'static str {
     "ok"
 }
 
+/// Map the node's mainnet flag to the normalized, lowercase
+/// `bitcoin_network` enum exposed in `/api/info`. Pure so both arms are
+/// unit-testable without touching the env-derived `NETWORK_CONFIG`
+/// global.
+fn bitcoin_network_label(is_mainnet: bool) -> BitcoinNetwork {
+    if is_mainnet {
+        BitcoinNetwork::Mainnet
+    } else {
+        BitcoinNetwork::Mutinynet
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/api/info",
@@ -2450,6 +2497,7 @@ pub(crate) async fn health_handler() -> &'static str {
 pub(crate) async fn info_handler() -> impl IntoResponse {
     Json(InfoResponse {
         network: NETWORK_CONFIG.network_name.clone(),
+        bitcoin_network: bitcoin_network_label(NETWORK_CONFIG.is_mainnet),
         capabilities: Capabilities {
             address_list: cfg!(feature = "address-list"),
             username_claim: cfg!(feature = "username-claim"),
@@ -2949,7 +2997,14 @@ pub(crate) fn create_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods([Method::GET, Method::POST])
-        .allow_headers([header::CONTENT_TYPE]);
+        // `Idempotency-Key` is required by the jobs-API admit handlers
+        // (`POST /api/jobs/{mint,send}`). A browser sending it triggers a
+        // CORS preflight; without the header here the preflight fails and the
+        // web frontend cannot mint or send.
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::HeaderName::from_static("idempotency-key"),
+        ]);
 
     // MVP routes — always compiled in.
     let app = Router::new()
