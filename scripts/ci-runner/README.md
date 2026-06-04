@@ -123,15 +123,16 @@ by the REST API — flip it in the UI.
 ## Scaling out: adding more runner agents on the same host
 
 The host runs multiple runner agents under the same user account, one
-per directory + launchd plist. Pool today: **6 agents** named `dfx01`,
-`dfx01-2`, …, `dfx01-6`, all carrying the same labels. Adding another
-follows the one-time setup with a different `--name` and a unique
-directory.
+per directory + launchd plist. Pool today: **6 agents** named
+`<runner-host>`, `<runner-host>-2`, …, all carrying the same labels
+(concrete host assignments live in the private ops config). Adding
+another follows the one-time setup with a different `--name` and a
+unique directory.
 
 ```bash
-# Pick the next free index. Current pool tops out at 6.
+# Pick the next free index.
 NEW_IDX=7
-NEW_NAME="dfx01-${NEW_IDX}"
+NEW_NAME="<runner-host>-${NEW_IDX}"
 NEW_DIR="actions-runner-zk-coins-node-${NEW_IDX}"   # recommended naming
                                                     # for fresh installs
 
@@ -172,12 +173,12 @@ runners back-to-back. Looping a `for` over multiple `--name` values
 with `set -o pipefail` will SIGPIPE-abort if you also pipe `svc.sh
 status` through `head` — drop the pipe or wrap with `set +e`.
 
-> **Naming drift (2026-05-25):** the live agents `dfx01`, `dfx01-2`,
-> `dfx01-3` predate the `zk-coins/server` → `zk-coins/node` rename
-> and live under `~/actions-runner-zkcoins-server` /
-> `~/actions-runner-zk-coins-server-{2,3}`. `dfx01-4`/`-5`/`-6` were
-> added after the rename but still in `~/actions-runner-zk-coins-server-{4,5,6}`
-> for naming consistency with their siblings. New runners should use
+> **Naming drift (2026-05-25):** the earliest agents predate the
+> `zk-coins/server` → `zk-coins/node` rename and live under
+> `~/actions-runner-zkcoins-server` /
+> `~/actions-runner-zk-coins-server-{2,3}`. Agents added after the
+> rename still use `~/actions-runner-zk-coins-server-{4,5,6}` for
+> naming consistency with their siblings. New runners should use
 > `actions-runner-zk-coins-node-N`; clean-up of legacy paths happens
 > bundled with a re-register cycle. The substantive runner identity
 > (name + labels) is what GitHub routes against, not the directory
@@ -210,7 +211,7 @@ sudo -iu gh-runner bash -lc '
 
 # 3. For each agent in the pool: stop + uninstall it under the admin
 # user, then re-register it as gh-runner using the "Scaling out"
-# snippet above (substitute the existing agent name, e.g. dfx01-2).
+# snippet above (substitute the existing agent name, e.g. `<runner-host>-2`).
 ssh "$RUNNER_HOST" "cd ~/${RUNNER_DIR} && ./svc.sh stop && ./svc.sh uninstall && ./config.sh remove --token PASTE_REMOVAL_TOKEN"
 
 # 4. Repeat the "Register" + "Install + start" steps above as
@@ -263,9 +264,9 @@ for the naming-drift note):
 
 ```bash
 # Examples:
-RUNNER_DIR=actions-runner-zkcoins-server         # dfx01     (legacy)
-RUNNER_DIR=actions-runner-zk-coins-server-2      # dfx01-2   (legacy)
-RUNNER_DIR=actions-runner-zk-coins-server-6      # dfx01-6   (post-rename)
+RUNNER_DIR=actions-runner-zkcoins-server         # legacy (pre-rename)
+RUNNER_DIR=actions-runner-zk-coins-server-2      # legacy (pre-rename)
+RUNNER_DIR=actions-runner-zk-coins-server-6      # post-rename
 ```
 
 To act on every agent in the pool, loop:

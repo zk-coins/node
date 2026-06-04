@@ -796,7 +796,7 @@ instead of ~21 s; the cold-tax shifts from the first
 post-deploy user request to whichever request arrives during the
 warmup window.
 
-Empirical numbers (dfxdev R2 probe, 2026-05-31):
+Empirical numbers (DEV-host R2 probe, 2026-05-31):
 
 | Stage | Wall (ms) | Notes |
 |---|---|---|

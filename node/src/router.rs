@@ -2308,9 +2308,9 @@ pub struct ReadyResponse {
 /// re-using the configured `ESPLORA_URL`) and returns 503 if either
 /// fails. A load balancer / uptime monitor uses this to decide
 /// "should traffic flow?" without using it to decide "should this
-/// process die?". The Kuma monitor at
-/// <https://kuma.dfxserve.com> watches `api.zkcoins.app/health/ready`
-/// on a 60 s interval — separate alert from the liveness check.
+/// process die?". An external uptime monitor (Uptime-Kuma) watches
+/// `api.zkcoins.app/health/ready` on a 60 s interval — separate alert
+/// from the liveness check.
 ///
 /// No caching: each call issues a fresh DB round-trip plus an Esplora
 /// HEAD-equivalent. Both are sub-100 ms in steady state, and a cached

@@ -1365,7 +1365,7 @@ i.e. `{"track-tx": "<txid>"}` as a top-level key — exactly the
 shape `websocket-handler.ts` parses. The publisher's frame did
 not follow this convention.
 
-**Empirical verification (dfxdev, post-PR-#144 re-probe, May 2026).**
+**Empirical verification (DEV host, post-PR-#144 re-probe, May 2026).**
 A direct `websocat` probe against
 `ws://mempool-api-mutinynet:8999/api/v1/ws` with a live mempool
 txid:
@@ -1421,7 +1421,7 @@ neither the original one:
 
 ### 7.25 Bootstrap warmup: background over synchronous to preserve API availability — **codified**
 
-The dfxdev R2 probe (2026-05-31, see `node/src/bin/probe_r2.rs`)
+The DEV R2 probe (2026-05-31, see `node/src/bin/probe_r2.rs`)
 measured a ~7 s cold-prove tax on the first `prove_initial` after
 `Prover::new()` — paid in production by whichever user request
 arrived first after a container restart, surfacing as a ~12 s

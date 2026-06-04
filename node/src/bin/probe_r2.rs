@@ -23,7 +23,7 @@
 //!
 //! Run **locally** on the Mac Studio M3 Ultra (96 GB) — that is the
 //! reference machine ROADMAP step 9 budgets against. Do NOT run this
-//! on the dfx01 self-hosted CI runner: a single warm sweep dominates
+//! on the self-hosted CI runner: a single warm sweep dominates
 //! the m3-ultra runner slot for 5+ minutes and starves PR jobs.
 //!
 //! ```sh

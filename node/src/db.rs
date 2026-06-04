@@ -75,7 +75,7 @@ impl InscriptionKind {
 ///
 /// Retries the inner connect + migrate pair up to
 /// `CONNECT_AND_MIGRATE_MAX_ATTEMPTS` times for transient host-level
-/// failures. The shared m3-ultra CI runner (dfx01) sits next to ~20
+/// failures. The shared m3-ultra CI runner sits next to ~20
 /// production containers and is sometimes hit by manual
 /// `cargo nextest` runs from operators; under that load the kernel /
 /// Colima vNIC has surfaced two transient failure modes:
