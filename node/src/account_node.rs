@@ -860,7 +860,7 @@ impl AccountNode {
     /// the readiness endpoint to gate traffic during a rolling deploy
     /// without holding the API itself offline.
     ///
-    /// Empirical evidence (dfxdev R2 probe, 2026-05-31):
+    /// Empirical evidence (DEV-host R2 probe, 2026-05-31):
     /// - `circuit_build_wall_ms = 14214` — `Prover::new()` (paid in
     ///   `load_from_pg` already, before this call).
     /// - `prove_cold_wall_ms = 7012` — first prove call after build,

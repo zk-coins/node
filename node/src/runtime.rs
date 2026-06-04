@@ -264,7 +264,7 @@ pub async fn start_rest_node(
 
     // Background-warmup. A fresh `Prover` carries a cold Rayon worker
     // pool and uninitialised AOT-compiled Plonky2 evaluator caches;
-    // empirically (dfxdev R2 probe, 2026-05-31) the first
+    // empirically (DEV-host R2 probe, 2026-05-31) the first
     // `prove_initial` after `Prover::new()` takes ~7012 ms vs the
     // steady-state p50 of ~4777 ms for every subsequent call.
     //
