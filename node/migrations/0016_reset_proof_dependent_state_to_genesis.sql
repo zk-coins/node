@@ -1,0 +1,87 @@
+-- Genesis-reset of all proof-dependent state, DEV and PRD.
+--
+-- ## Incident
+--
+-- On 2026-06-05 (~11:26 UTC) the DEV node's mint prover started failing
+-- 100% of jobs with "prove failed" — admit succeeds, the job reaches
+-- `proving`, the recursive prove aborts. No node deploy or commit had
+-- happened (the circuit binary, and therefore its `circuit_digest`, was
+-- unchanged); identical mints succeeded minutes earlier. This is the
+-- digest-UNCHANGED staleness class documented in 0015: persisted
+-- `account.proof` blobs stop recursing through the live circuit while
+-- `Prover::verify` and a byte-for-byte digest comparison still pass —
+-- the only signal is the real recursive prove, exactly what the live
+-- jobs were failing.
+--
+-- The boot self-heal (`node::self_heal`) cannot catch this class in
+-- steady state: with a persisted digest equal to the live one it takes
+-- the `Keep` fast path and never runs the canary recursion (the canary
+-- is only consulted on the no-persisted-digest adoption branch). Closing
+-- that detection gap is a separate code change; THIS migration is the
+-- recovery for the state that is already stale.
+--
+-- ## Why a full genesis reset
+--
+-- Same rationale as `db::reset_proof_dependent_state_tx` (0015 /
+-- PR #204): staleness invalidates EVERY proof at once — each
+-- `account.proof`, every queued `CoinProof` source proof, every
+-- recipient-held proof — and the global SMT/MMR are append-only and
+-- shared across accounts, keyed by on-chain commitment pubkeys in
+-- MMR-append order. They cannot be partially unwound per account
+-- without exactly the global-vs-account mismatch that breaks soundness.
+-- A coordinated reset to genesis is the only provably-consistent
+-- recovery.
+--
+-- ## Scope: DEV *and* PRD
+--
+-- Both environments are closed test environments (CONTRIBUTING
+-- § "Closed test environment"); the operator has explicitly confirmed
+-- there is no data to preserve and authorized the PRD genesis wipe.
+-- sqlx applies a migration once per database (`_sqlx_migrations`), so
+-- the reset fires exactly once per environment, on the first deploy
+-- that carries it: develop → DEV, main → PRD. Re-deploys are no-ops
+-- (idempotent by the migration framework's bookkeeping).
+--
+-- ## Table set (mirrors `reset_proof_dependent_state_tx`)
+--
+-- * `accounts`       — per-address ledger (carries the stale `proof`).
+-- * `smt_state`      — global commitment Sparse Merkle Tree.
+-- * `mmr_state`      — global Merkle Mountain Range of SMT roots.
+-- * `mmr_root_index` — `prev_mmr_root → (smt_root, leaf_index)` map.
+-- * `latest_block`   — scanner resume cursor (re-derived from the tip).
+-- * `circuit_digest_meta` — cleared rather than re-written: a SQL
+--   migration cannot know the live circuit's digest (it is computed at
+--   runtime from the built circuit). Deleting the singleton row puts
+--   the database in the fresh-genesis shape the boot path already
+--   handles: no persisted digest → canary probe → `NoSample` on the
+--   empty `accounts` table → `Baseline` records the live digest. That
+--   is the existing, integration-tested `self_heal` flow — no new code
+--   path is introduced by this migration.
+--
+-- Deliberately preserved, mirroring `reset_proof_dependent_state_tx`:
+-- `usernames` (human-facing handles, not proof-dependent),
+-- `account_history` / `state_update_log` / `request_log` (append-only
+-- historical evidence, never feeds proof construction), `jobs`
+-- (terminal rows are history; the dispatcher only acts on non-terminal
+-- states), `coin_proof_store` (unused schema groundwork, no production
+-- INSERT — see migration 0008), `pending_inscriptions` (scanner-side
+-- bookkeeping outside the proof-dependent set, as in the existing
+-- reset).
+--
+-- ## On-disk proof files (PROOFS_DIR) are intentionally NOT handled here
+--
+-- SQL cannot remove files, and it does not need to: (a) after this
+-- wipe no surviving row references any proof file; (b)
+-- `ProofStore::new()` scans the directory and resumes `next_id` at
+-- `max_id + 1`, so a later proof id can never collide with an orphaned
+-- file; (c) the Jobs-API flow hands `CoinProof`s to the wallet via the
+-- job row and no longer writes to the file store at all (`add_proof`
+-- is vestigial). The orphans are inert and may be garbage-collected by
+-- the next self-heal reset, which does drop the directory.
+
+DELETE FROM accounts;
+DELETE FROM smt_state;
+DELETE FROM mmr_state;
+DELETE FROM mmr_root_index;
+DELETE FROM latest_block;
+DELETE FROM circuit_digest_meta;
