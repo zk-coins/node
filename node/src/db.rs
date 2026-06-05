@@ -908,6 +908,28 @@ pub async fn store_circuit_digest(pool: &PgPool, digest: &[u8]) -> Result<(), sq
     Ok(())
 }
 
+/// Delete the singleton circuit-digest row, WITHOUT touching any other
+/// state.
+///
+/// Used by the runtime prover-health watchdog: when the job dispatcher
+/// observes [`crate::prover_health::PROVE_FAILURE_THRESHOLD`] consecutive
+/// `prove failed` outcomes it clears the persisted digest to *arm* the
+/// boot self-heal. Removing the row makes the next boot's
+/// [`load_circuit_digest`] return `None`, which routes
+/// `heal_circuit_digest` through the canary-recursion branch instead of
+/// the steady-state `Keep` fast path — the restart then authoritatively
+/// re-checks whether the persisted proofs still recurse and resets to
+/// genesis IFF the canary says `Stale` (`Compatible` / `NoSample` just
+/// re-record the baseline: no reset, no data loss). Clearing the digest
+/// never wipes proof state itself; the destructive reset stays gated
+/// behind the canary. Idempotent: deleting an absent row is a no-op.
+pub async fn clear_circuit_digest(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM circuit_digest_meta WHERE id = 1")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Reset all proof-dependent state to genesis and store the new circuit
 /// digest, atomically, in a single transaction.
 ///

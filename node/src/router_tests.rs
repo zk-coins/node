@@ -85,6 +85,7 @@ fn test_state() -> AppState {
         // shape. The dedicated 503/warming-tag test below overrides
         // this back to `false` to exercise the gating arm.
         prover_warm: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        prover_health: Arc::new(crate::prover_health::ProverHealth::new()),
         job_store: Arc::new(crate::job_store::JobStore::new((*dead_pool()).clone())),
         job_tx: tokio::sync::mpsc::channel::<crate::job_dispatcher::JobEnvelope>(8).0,
         job_notify_map: Arc::new(dashmap::DashMap::new()),
@@ -2191,6 +2192,54 @@ async fn ready_returns_503_with_prover_warming_when_prover_not_warm() {
     );
 }
 
+/// A systemically failing prover gates `/health/ready` to 503 with
+/// `prover: failing` even though the boot warmup completed long ago
+/// (`prover_warm == true`). This is the gap the 2026-06-05 DEV outage
+/// exposed: persisted proofs went stale and 100% of mint jobs failed
+/// with `prove failed`, yet the readiness probe kept answering
+/// `prover: ready` (it only ever reflected the warmup flag), so neither
+/// the deploy smoke-test nor monitoring could see the outage. The
+/// failure streak is driven through the same `ProverHealth` calls the
+/// dispatcher makes. Esplora is mocked healthy; the dead DB contributes
+/// an ignored `db` failure (same shape as the warming test above).
+#[tokio::test]
+async fn ready_returns_503_with_prover_failing_when_proves_fail() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/height"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("123456"))
+        .mount(&mock_server)
+        .await;
+
+    let state = ready_state(dead_pool(), mock_server.uri());
+    // `ready_state` builds a warm prover; trip the runtime health signal
+    // the way the dispatcher would after a streak of `prove failed` jobs.
+    for _ in 0..crate::prover_health::PROVE_FAILURE_THRESHOLD {
+        state.prover_health.note_failure();
+    }
+
+    let req = Request::get("/health/ready").body(Body::empty()).unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body={}", body);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(v["ready"], false);
+    assert_eq!(v["prover"], "failing");
+    let failures: Vec<String> = v["failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        failures.contains(&"prover".to_string()),
+        "expected `prover` in failures after a prove-failure streak, got {failures:?}"
+    );
+}
+
 // =======================================================================
 // GET /health/publisher — operational preflight
 // =======================================================================
@@ -2358,6 +2407,7 @@ fn mint_test_state() -> AppState {
             ws_url: None,
         }),
         prover_warm: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        prover_health: Arc::new(crate::prover_health::ProverHealth::new()),
         job_store: Arc::new(crate::job_store::JobStore::new((*dead_pool()).clone())),
         job_tx: tokio::sync::mpsc::channel::<crate::job_dispatcher::JobEnvelope>(8).0,
         job_notify_map: Arc::new(dashmap::DashMap::new()),

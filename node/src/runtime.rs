@@ -118,6 +118,7 @@ pub async fn start_rest_node(
         // it points at the same `ESPLORA_URL` as the scanner / publisher.
         esplora_config: Arc::new(NETWORK_CONFIG.clone()),
         prover_warm: Arc::clone(&prover_warm),
+        prover_health: Arc::new(crate::prover_health::ProverHealth::new()),
         job_store: Arc::clone(&job_store),
         job_tx: job_tx.clone(),
         job_notify_map: Arc::clone(&job_notify_map),
