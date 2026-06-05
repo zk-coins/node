@@ -208,6 +208,30 @@ async fn heal_baseline_compatible_canary_stores_digest_without_wiping_state() {
 }
 
 #[tokio::test]
+async fn clear_circuit_digest_removes_the_persisted_row_idempotently() {
+    // The runtime prover-health watchdog clears the persisted digest to
+    // arm the boot self-heal. After clearing, `load_circuit_digest` must
+    // return `None` so the next boot routes through the canary branch
+    // (not the `Keep` fast path); a second clear is a no-op.
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+
+    db::store_circuit_digest(&pool, b"live-digest")
+        .await
+        .expect("store digest");
+    assert!(db::load_circuit_digest(&pool).await.unwrap().is_some());
+
+    db::clear_circuit_digest(&pool).await.expect("clear digest");
+    assert_eq!(db::load_circuit_digest(&pool).await.unwrap(), None);
+
+    // Idempotent: clearing an already-absent row succeeds and stays None.
+    db::clear_circuit_digest(&pool)
+        .await
+        .expect("clear digest (idempotent)");
+    assert_eq!(db::load_circuit_digest(&pool).await.unwrap(), None);
+}
+
+#[tokio::test]
 async fn heal_baseline_no_sample_records_digest() {
     // No persisted digest and the canary has no sample (truly fresh DB):
     // baseline. Drives the `NoSample` arm.

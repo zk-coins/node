@@ -149,6 +149,15 @@ pub struct AppState {
     /// listener binds, so container restart loops keyed on liveness
     /// are not triggered during the ~21 s warmup window.
     pub(crate) prover_warm: Arc<AtomicBool>,
+    /// Runtime prover-health signal: the count of consecutive
+    /// `prove failed` job outcomes (reset by the first success), updated
+    /// by the job dispatcher. Unlike `prover_warm` (a one-shot boot
+    /// flag), this reflects whether real mint/send proves are actually
+    /// succeeding. Consumed by `/health/ready` so a systemically failing
+    /// prover is reported as `prover: failing` + 503 instead of the
+    /// misleading `prover: ready`; the dispatcher also uses the same
+    /// threshold to arm the boot self-heal. See [`crate::prover_health`].
+    pub(crate) prover_health: Arc<crate::prover_health::ProverHealth>,
     /// Persistent state-layer wrapper around the `jobs` table.
     /// Routes admit through `JobStore::create`; the dispatcher
     /// reads + advances rows through it; `GET /api/jobs/:id`
@@ -2271,10 +2280,15 @@ pub struct ReadyResponse {
     /// `ready: bool` so a parsing consumer can branch on a short
     /// string without re-deriving it from the bool + failures shape.
     status: &'static str,
-    /// Background-warmup tag. `"warming"` while
-    /// `AppState::prover_warm == false`, `"ready"` afterwards.
-    /// Emitted on every response (regardless of overall readiness) so
-    /// a deploy dashboard can show the warmup progress separately
+    /// Prover health tag. `"warming"` while
+    /// `AppState::prover_warm == false` (one-shot boot warmup), `"ready"`
+    /// once warm and proving normally, and `"failing"` once the
+    /// dispatcher has seen `prover_health::PROVE_FAILURE_THRESHOLD`
+    /// consecutive `prove failed` job outcomes (a systemically failing
+    /// prover — e.g. digest-unchanged proof staleness). `"failing"` and
+    /// `"warming"` both also add `"prover"` to `failures` and force the
+    /// overall 503. Emitted on every response (regardless of overall
+    /// readiness) so a deploy dashboard can show prover health separately
     /// from the DB/Esplora probes.
     prover: &'static str,
 }
@@ -2288,7 +2302,8 @@ pub struct ReadyResponse {
             prover warm. `failures` is empty, `status = \"ready\"`, `prover = \"ready\"`.",
             body = ReadyResponse),
         (status = 503, description = "Node is not ready. `failures` carries one or more of \
-            `\"db\"`, `\"esplora\"`, `\"prover\"`. Load balancers / Kuma monitors gate traffic \
+            `\"db\"`, `\"esplora\"`, `\"prover\"` (`prover` covers both `\"warming\"` and the \
+            systemic-failure `\"failing\"` states). Load balancers / Kuma monitors gate traffic \
             on this status.",
             body = ReadyResponse),
     ),
@@ -2335,7 +2350,16 @@ pub(crate) async fn ready_handler(State(state): State<AppState>) -> impl IntoRes
     // the previous-gen pod by treating this readiness probe as the
     // gate, not the liveness probe.
     let prover_warm = state.prover_warm.load(Ordering::SeqCst);
-    if !prover_warm {
+    // Runtime prove-health gate. Unlike the one-shot warmup flag above,
+    // this reflects whether real mint/send proves are succeeding: the
+    // dispatcher counts consecutive `prove failed` outcomes and this
+    // trips at the `prover_health::PROVE_FAILURE_THRESHOLD`. Without it
+    // a node whose persisted proofs went stale (the digest-unchanged
+    // class — see `self_heal.rs`) kept reporting `prover: ready` while
+    // failing 100% of jobs, so neither the deploy smoke-test nor
+    // monitoring could see the outage.
+    let prover_failing = state.prover_health.is_failing();
+    if !prover_warm || prover_failing {
         failures.push("prover");
     }
 
@@ -2346,7 +2370,13 @@ pub(crate) async fn ready_handler(State(state): State<AppState>) -> impl IntoRes
         StatusCode::SERVICE_UNAVAILABLE
     };
     let lifecycle_status = if ready { "ready" } else { "starting" };
-    let prover_status = if prover_warm { "ready" } else { "warming" };
+    let prover_status = if prover_failing {
+        "failing"
+    } else if prover_warm {
+        "ready"
+    } else {
+        "warming"
+    };
     (
         status,
         Json(ReadyResponse {

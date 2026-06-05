@@ -316,6 +316,44 @@ async fn process_envelope(
     }
 }
 
+/// Feed a prove leg's outcome into the runtime prover-health signal.
+///
+/// `Ok(())` (any successful prove — a completed mint, or a send reaching
+/// `awaiting_signature`) clears the consecutive-failure streak. `Err` is
+/// only treated as a prove-health failure when the message is the
+/// collapsed `"prove failed"` — request-level errors (insufficient
+/// funds, unknown account, bad hex, …) have their own messages and must
+/// not move the streak, or a burst of bad client requests could falsely
+/// arm the self-heal. On the failure that first reaches
+/// [`crate::prover_health::PROVE_FAILURE_THRESHOLD`] this clears the
+/// persisted circuit digest, which *arms* the boot self-heal: the next
+/// restart runs the canary recursion and resets to genesis only if the
+/// persisted proofs are genuinely stale (so a transient prover blip that
+/// is over by the restart re-baselines with no reset). `/health/ready`
+/// reports `prover: failing` for the whole streak.
+async fn note_prove_outcome(app_state: &AppState, outcome: Result<(), &str>) {
+    match outcome {
+        Ok(()) => app_state.prover_health.note_success(),
+        Err("prove failed") => {
+            if app_state.prover_health.note_failure() {
+                if let Err(e) = crate::db::clear_circuit_digest(&app_state.pool).await {
+                    tracing::warn!(
+                        "prover-health: failed to clear circuit digest to arm boot self-heal: {}",
+                        e
+                    );
+                }
+                tracing::warn!(
+                    "prover-health: {} consecutive prove failures — /health/ready now reports \
+                     the prover failing; armed boot self-heal (cleared persisted circuit digest, \
+                     next restart's canary re-checks + resets iff the proofs are stale)",
+                    crate::prover_health::PROVE_FAILURE_THRESHOLD
+                );
+            }
+        }
+        Err(_) => { /* non-prove flow error: leave the failure streak unchanged */ }
+    }
+}
+
 /// Drive a mint job: validate → prove → broadcast → commit. The
 /// `flow::mint_flow` helper owns the actual work; the dispatcher
 /// is purely the state-machine driver.
@@ -363,6 +401,7 @@ async fn process_mint(
 
     match mint_flow(app_state, request).await {
         Ok((response_body, response_status)) => {
+            note_prove_outcome(app_state, Ok(())).await;
             job_store
                 .complete(public_id, response_body.clone(), response_status as i16)
                 .await?;
@@ -386,6 +425,7 @@ async fn process_mint(
                 status.as_u16(),
                 message
             );
+            note_prove_outcome(app_state, Err(message.as_str())).await;
             job_store.fail(public_id, &message).await?;
             publish_phase(
                 notify_map,
@@ -451,7 +491,11 @@ async fn process_send_initial(
     };
 
     let (proof_id, commit_hashes) = match send_flow(app_state, request).await {
-        Ok(out) => out,
+        Ok(out) => {
+            // The prove leg succeeded (the job reaches awaiting_signature).
+            note_prove_outcome(app_state, Ok(())).await;
+            out
+        }
         Err(FlowError { status, message }) => {
             tracing::warn!(
                 "Job dispatcher: send job {} prove leg failed ({}): {}",
@@ -459,6 +503,7 @@ async fn process_send_initial(
                 status.as_u16(),
                 message
             );
+            note_prove_outcome(app_state, Err(message.as_str())).await;
             job_store.fail(public_id, &message).await?;
             publish_phase(
                 notify_map,
