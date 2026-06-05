@@ -152,6 +152,7 @@ async fn build_state_with_pool() -> (AppState, SchemaScope) {
         pool: pool_arc.clone(),
         esplora_config: Arc::new(esplora_config),
         prover_warm: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        prover_health: Arc::new(crate::prover_health::ProverHealth::new()),
         // Job-API wiring (jobs PR #161): the audit middleware never
         // touches these slots, but `AppState` requires them. Use a
         // never-recv'd mpsc + empty notify map for shape parity.

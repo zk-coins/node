@@ -40,6 +40,7 @@ pub mod flow;
 pub mod job_dispatcher;
 pub mod job_store;
 pub mod openapi;
+pub mod prover_health;
 pub mod publisher;
 pub mod r2_probe;
 pub mod router;
