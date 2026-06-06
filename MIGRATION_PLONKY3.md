@@ -146,15 +146,25 @@ Contents: per-probe `supported / blocked / workaround` with code pointers; measu
 - **NO-GO (upstream-gated):** any probe blocked by a `p3-recursion` gap. STOP. Do not start Phase 1. File/link the upstream issue, set a re-check date, report to the operator. Do not patch or fork `p3-recursion` as part of this migration.
 
 > **Recorded Phase 0 result (2026-06-06, see `MIGRATION_PLONKY3_SPIKE_RESULT.md`):**
-> GO. All three §5 PASS items were exercised empirically with real proving + positive/
-> negative assertions (PI-threading binding, variable-active-count masking, vk-equality
-> connect-back), plus the IVC fixed point and fan-in composition. **One escalated,
-> non-upstream-blocking finding:** the high-level batch recursion does **not** propagate
-> public inputs across layers (`probe_d_multilayer_carry`: `air_public_targets = [0,0,0]`),
-> unlike Plonky2 cyclic recursion. This is a *construction* problem (a working primitive
-> at the uni-stark boundary), not a `p3-recursion` capability gap, so it does **not** flip
-> the gate to NO-GO. The **cross-layer PI-threading construction is left TBD and chosen at
-> Phase-1-authorize time** — see the §6 Phase-1-authorize decision and §10 P5-T1.
+> **CONDITIONAL GO.** All §5 PASS items were exercised empirically with real proving +
+> positive/negative assertions (PI-threading binding, variable-active-count masking,
+> vk-equality connect-back), plus the IVC fixed point and fan-in composition. Two
+> findings are now *resolved into hard constraints before Phase 1*:
+> 1. **Cross-layer PI threading — RESOLVED to Option 2 (mandatory).** The high-level
+>    batch recursion does **not** propagate public inputs across layers
+>    (`probe_d_multilayer_carry`: `air_public_targets = [0,0,0]`). Option 1 (carry the
+>    value as an AIR public value) is **not achievable on this rev** — proven by
+>    `probe_h_option1_air_public_values` (injecting a non-existent public input is
+>    rejected) and `probe_g_fanin_pi_passthrough` (a real aggregation surfaces 0 per-leaf
+>    values to the outer). So Option 2 (commit + hash/Merkle re-bind each layer) is the
+>    **only feasible path** for both the `prev_account` IVC carry and the source-aggregator
+>    per-leaf surfacing. Not a NO-GO (Option 2 is sound and expressible; the binding
+>    primitives are proven), but no longer a free choice.
+> 2. **Warm-prove budget at material risk.** A recursion layer over a real-sized
+>    (~2^16-gate) inner proof is ≈3.2 s / ≈1.4 GB (`probe_i_cost_projection`); Option 2
+>    adds per-layer hashing on top of the base prove (Plonky2 base is already 4.35 s).
+>    The ≤5 s warm budget must be measured on the real circuit early in Phase 5.
+> See the §6 Phase-1-authorize block and §10 P5-T1 / §10 budget note.
 
 ### Phase 0 abort/timebox
 - Hard timebox: **5 working days.** This is a feasibility probe, not a port.
@@ -166,29 +176,31 @@ Contents: per-probe `supported / blocked / workaround` with code pointers; measu
 
 Prereq: Phase 0 = GO.
 
-### Phase-1-authorize decision — cross-layer PI threading (DECIDE HERE, NOT EARLIER)
+### Phase-1-authorize decision — cross-layer PI threading → RESOLVED: Option 2
 
-The Phase 0 run (`MIGRATION_PLONKY3_SPIKE_RESULT.md` §"Escalated finding";
-`probe_d_multilayer_carry`) found that the high-level batch recursion does **not**
-auto-propagate public inputs across layers — a `CircuitBuilder` circuit's public
-inputs are not surfaced as `air_public_targets` in the next layer's verifier. zkCoins'
-`prev_account` / ProofData IVC carry therefore needs an explicit re-exposure
-construction. **The choice is made when Phase 1 is authorized — this document does NOT
-pre-commit to one:**
+This was an open choice (Option 1 AIR-public-values vs Option 2 commit+hash). **Phase 0
+resolved it empirically: Option 2 is the only feasible path.** The high-level batch
+recursion does **not** propagate public inputs across layers — a `CircuitBuilder`
+circuit's public inputs live in the committed Public *table*, never as AIR public values:
+- `probe_d_multilayer_carry`: verifying an inner batch proof exposes `air_public_targets = [0,0,0]`.
+- `probe_h_option1_air_public_values`: the only other Option-1 avenue — injecting a
+  non-empty `RecursionInput::BatchStark.table_public_inputs` — is **rejected** (you cannot
+  claim a public input the proof does not structurally have).
+- `probe_g_fanin_pi_passthrough`: a **real** 2-to-1 aggregation surfaces 0 per-leaf values
+  to the outer.
 
-- **Option 1 (fast):** structure each layer's threaded outputs as AIR public values so
-  the next layer's `air_public_targets` carries them (custom AIR-shaped layer, not a
-  plain `CircuitBuilder` circuit).
-- **Option 2 (sound):** commit the threaded value into the proof and re-bind it via a
-  Merkle/hash check each layer (more gates, clearly sound).
-- **Option 3 (passive, already armed):** the pinned `probe_d_multilayer_carry` catches a
-  future `Plonky3-recursion` rev that propagates public inputs natively; a rev bump that
-  turns that assertion red reopens the simplest path automatically and should trigger a
-  re-evaluation of Options 1/2.
+**Decision (no longer free): Option 2 — commit the carried value(s) into each layer's
+proof and re-bind them via an in-circuit hash/Merkle check on the next layer.** This
+applies to BOTH the `prev_account`/ProofData IVC carry (P5-T1) AND the source-aggregator
+per-leaf ProofData surfacing (P5-T2/T3). The threading/masking/vk *binding primitives*
+are proven (`probe_d_pi_threading`, `probe_e_active_masking`, `probe_f_vk_binding`), so
+Option 2 is construction, not a feasibility risk — but it adds gates per layer (see the
+§10 budget note).
 
-P5-T1 (§10) is written against whichever option is chosen here. The threading *binding
-primitive* itself is already proven (`probe_d_pi_threading`), so this is a topology
-decision, not a feasibility one.
+> **Option 3 (passive, still armed):** `probe_d_multilayer_carry` and
+> `probe_h_option1_air_public_values` are pinned. A future `Plonky3-recursion` rev that
+> propagates public inputs natively turns those assertions red — that would reopen the
+> cheaper Option 1 and should trigger a re-evaluation here.
 
 **P1-T1 — Create `program-plonky3` crate.**
 Files: `program-plonky3/{Cargo.toml,src/lib.rs}`; add to workspace `members`.
@@ -259,14 +271,27 @@ Verify: `cargo nextest run -p zkcoins-program-plonky3 prove_account_update`.
 
 This phase implements the patterns proven feasible in Phase 0. The concrete API choices follow the Go/No-Go memo (`MIGRATION_PLONKY3_SPIKE_RESULT.md`).
 
+> ⚠️ **Phase-5 budget risk (measure FIRST, before building P5-T2/T3).** A recursion
+> layer over a real-sized (~2^16-gate) inner proof is ≈3.2 s / ≈1.4 GB
+> (`probe_i_cost_projection`) — and that is the **single-layer lower bound** on an
+> *arithmetic* toy circuit. The mandatory Option-2 commit + hash/Merkle re-bind (below)
+> **adds Poseidon gates per layer** on top, and the real state-transition constraints are
+> Poseidon-heavy (the Plonky2 base prove is already 4.35 s). The ≤5 s warm-prove budget is
+> at material risk. **Build a minimal real-circuit + Option-2 prototype and measure warm-
+> prove p50 at the very start of Phase 5.** If it exceeds 5 s, apply design knobs (reduce
+> `MAX_IN_COINS`, drop in-coin recursion, folding) before porting the full aggregator —
+> never external hardware (`MIGRATION_RESEARCH.md §7.11`). A failed budget check here is a
+> real NO-GO trigger to revisit the topology.
+
 **P5-T1 — Cyclic/IVC for `prev_account`.**
 Replace `conditionally_verify_cyclic_proof_or_dummy` + `common_data_for_recursion_c` with the Phase-0-proven IVC construction (`p3-recursion` layer chain). Preserve the base-case (first transition, no predecessor).
-⚠️ **Cross-layer PI threading is TBD — implement against the Option (1 or 2) chosen at the §6 Phase-1-authorize decision.** The `prev_account` / ProofData value carry across the IVC chain is **not** auto-propagated by the high-level batch recursion (`MIGRATION_PLONKY3_SPIKE_RESULT.md` escalated finding); do **not** assume native public-input propagation. The threading binding primitive is proven (`probe_d_pi_threading`); only the per-layer re-exposure topology is open.
-Acceptance: a 2-transition account history proves and verifies; the cyclic vk binding holds; per-transition proof shape constant; **the threaded `prev_account` value is provably carried across both transitions** (the §6-chosen construction).
+⚠️ **Cross-layer PI threading is RESOLVED to Option 2 (§6).** The high-level batch recursion does **not** auto-propagate public inputs across layers, and Option 1 (AIR public values) is empirically dead (`probe_h_option1_air_public_values`, `probe_g_fanin_pi_passthrough`). Therefore carry the `prev_account`/ProofData value by **committing it into each layer's proof and re-binding it via an in-circuit hash/Merkle check on the next layer** (Option 2). The threading binding primitive is proven (`probe_d_pi_threading`); do **not** assume native public-input propagation.
+Acceptance: a 2-transition account history proves and verifies; the cyclic vk binding holds; per-transition proof shape constant; **the threaded `prev_account` value is provably carried across both transitions** via the Option-2 commit+re-bind.
 Verify: `cargo nextest run -p zkcoins-program-plonky3 cyclic`.
 
 **P5-T2 — Source aggregator (fan-in-8).**
-Port `source_aggregator.rs` semantics: bundle up to `MAX_IN_COINS = 8` source proofs, expose per-slot ProofData (20) + `active` bit, total PIs = `8·21 + 4 + cap`. Use the Phase-0-proven fan-in approach (2-to-1 tree or batch-stark).
+Port `source_aggregator.rs` semantics: bundle up to `MAX_IN_COINS = 8` source proofs, expose per-slot ProofData (20) + `active` bit, total PIs = `8·21 + 4 + cap`. Use the Phase-0-proven fan-in approach (2-to-1 tree, depth 3 — `probe_b_fanin`).
+⚠️ **Per-leaf ProofData does NOT auto-surface from the aggregation to the outer** (`probe_g_fanin_pi_passthrough`: aggregation output exposes 0 per-leaf values). Surface each slot's ProofData into the outer via the **same Option-2 commit+re-bind** as P5-T1 (commit the per-leaf ProofData, re-bind in the outer), then apply the per-slot `active`-bit masking (`probe_e_active_masking` proves the §7.17 masking primitive). Padding (inactive slots = cheap real proofs) is unchanged from the Plonky2 design.
 ⚠️ §7.21/§7.22: the Plonky2 single-`_or_dummy` limitation and the lazy-verifier-data connect-back were Plonky2-specific. Re-derive the equivalent fixed-point/binding under `p3-recursion`; do not copy the Plonky2 workaround blindly.
 Acceptance: aggregator smoke (all-inactive) + one-active-slot-with-real-source tests ported and green.
 Verify: `cargo nextest run -p zkcoins-program-plonky3 aggregator`.
