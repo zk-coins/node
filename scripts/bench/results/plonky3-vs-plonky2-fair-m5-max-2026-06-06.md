@@ -1,5 +1,15 @@
 # Plonky3 vs Plonky2 — FAIR prover-speed comparison (Probe S)
 
+> ⚠️ **CORRECTION (Probes V + W).** This file's numbers use a **degree-3 S-box** and
+> a **blowup-2 zk-PROXY**. Both understate the real production cost. Probe V measured
+> the cryptographic **degree-7** S-box = **1.66–1.69×** slower than degree-3 (low end of
+> the estimate below — confirmed). Probe W measured **true `HidingFriPcs`** = **2.9–3.0×**
+> slower than the blowup-2 proxy — i.e. the proxy was ~3× too fast, NOT a "small additive
+> term" as claimed in §caveat 4 below. Combined ≈ **5×** on the headline numbers here. Under
+> the true production config (degree-7 + HidingFriPcs) Plonky3 is **3.07× faster at the
+> ~2^13 hash-matched size but SLOWER at 2^16** (0.36×). Net circuit verdict pending Probe T.
+> See `MIGRATION_PLONKY3_SPIKE_RESULT.md` §"Fair Performance Comparison" + `probe_v_degree7_bench`/`probe_w_hiding_fri`.
+
 **Host:** Apple M5 Max, 128 GB unified memory, aarch64, macOS.
 **Date:** 2026-06-06.
 **Toolchain:** `cargo nextest run --release`, `RUSTFLAGS="-Ctarget-cpu=native"`.

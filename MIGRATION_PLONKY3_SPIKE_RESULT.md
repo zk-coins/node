@@ -18,38 +18,54 @@
 > headroom) — **within budget**, not yet incurred in Probe R's witness-gen-only link. The
 > probes below remain correct for the constructions they tested.
 
-## Fair Performance Comparison (Probe S)
+## Fair Performance Comparison (Probe S, corrected by V/W)
 
-**The performance thesis holds — decisively.** Probes I/R measured a *recursion
-overhead* in **Goldilocks** with **untuned (testing) FRI**; they were a
-feasibility check, not a production-prover timing, and so they do **not** answer
-whether Plonky3 is actually faster than Plonky2. **Probe S**
-(`spikes/plonky3-recursion-spike/tests/probe_s_fair_bench.rs`) measures that
-directly: a **BabyBear Poseidon2 STARK** (`p3_uni_stark::prove`/`verify`) under
-**production-tuned FRI**, Poseidon2-Merkle MMCS, parallel DFT, and confirmed
-**NEON SIMD packing** (`PackedMontyField31Neon`, 18 threads) — the field +
-packing + tuned-FRI levers the migration's speed thesis rests on.
+**Plonky3 wins at the real circuit's hash count, but the production-crypto config
+is far tighter than Probe S's first headline — and at full trace height it can be
+SLOWER. The net migration verdict is pending Probe T.** Probes I/R measured a
+*recursion overhead* in **Goldilocks** with **untuned (testing) FRI** — a
+feasibility check, not a production-prover timing. **Probe S**
+(`tests/probe_s_fair_bench.rs`) measured a **BabyBear Poseidon2 STARK** under
+tuned FRI, Poseidon2-Merkle MMCS, parallel DFT, confirmed **NEON packing**
+(`PackedMontyField31Neon`, 18 threads). But Probe S used a **degree-3 S-box** and
+a **blowup-2 zk-PROXY**, both of which understate the real production cost —
+**Probes V and W measured the true cost of each, and the correction is large.**
 
-**Result vs the measured Plonky2 baseline (4.35 s p50 / 3.9 GB RSS, real zkCoins
-state-transition, same M5 Max host):**
+**Probe S (degree-3, zk-proxy) — OPTIMISTIC, superseded for the zk rows by Probe W:**
 
-| Workload | FRI | Plonky3 p50 | Speedup | RSS ratio |
-|---|---|---:|---:|---:|
-| hash-matched (~4500 hashes, 2^13 rows) | non-zk (blowup 1) | **71 ms** | **61×** | 51× |
-| hash-matched | zk proxy (blowup 2) | **128 ms** | **34×** | 19× |
-| middle (2^15 rows) | non-zk | 303 ms | 14× | 13× |
-| middle | zk proxy | 522 ms | 8.3× | 9.3× |
-| hash-saturated (2^16, ~14× real hash work) | non-zk | 570 ms | 7.6× | 8.4× |
-| hash-saturated | zk proxy | 1042 ms | 4.2× | 5.6× |
+| Workload | FRI | Plonky3 p50 | Speedup |
+|---|---|---:|---:|
+| hash-matched (~4500 hashes, 2^13 rows) | non-zk (blowup 1) | 71 ms | 61× |
+| middle (2^15 rows) | non-zk | 303 ms | 14× |
+| hash-saturated (2^16) | non-zk | 570 ms | 7.6× |
+| *(zk rows used a blowup-2 proxy — see Probe W correction below)* | | | |
 
-Plonky3 is faster at **every** point — by 4–61× — with 5–51× lower peak RSS,
-even at a hash-saturated workload doing ~14× the real circuit's Poseidon work,
-and even under the blowup-2 zk-proxy FRI. **What it means for the migration:**
-the small-field + SIMD-packing + tuned-FRI move is a large net prover-speed win;
-the ≤5 s warm budget is cleared with one to two orders of magnitude of headroom
-at the real circuit's hash count. Full numbers, methodology, and the honest
-apples-to-apples caveats (hash-saturation, AIR shape, S-box degree, zk-proxy):
-`scripts/bench/results/plonky3-vs-plonky2-fair-m5-max-2026-06-06.md`.
+**Probe V — degree-7 (the cryptographic S-box) costs 1.66–1.69× over degree-3**
+(stable across sizes; at the low end of the 1.5–2.5× review estimate — confirmed,
+not refuted). **Probe W — true `HidingFriPcs` (real ZK with random masking rows)
+costs 2.9–3.0× over the blowup-2 proxy** — masking roughly TRIPLES prove time; the
+proxy was NOT a "small additive term" and Probe S's zk rows were ~3× too fast.
+
+**Corrected production config (degree-7 + true HidingFriPcs + Keccak MMCS),
+measured in Probe V/W vs Plonky2 4.35 s:**
+
+| Trace height | degree-7 + hiding p50 | vs Plonky2 4.35 s |
+|---|---:|---:|
+| 2^13 (hash-matched ~4500) | **1419 ms** | **3.07× faster** ✅ |
+| 2^15 | 5910 ms | 0.74× (slower) ⚠️ |
+| 2^16 (hash-saturated) | 12033 ms | 0.36× (much slower) 🔴 |
+
+**What it means:** the combined correction is ~1.67× (degree) × ~3× (hiding) ≈ **5×**
+on Probe S's optimistic numbers. Plonky3 still wins decisively at the real
+**hash count** (~2^13 height → 3.07× under full production crypto), but at a
+hash-saturated 2^16-height trace the production config is SLOWER than Plonky2. The
+real zkCoins circuit is a *batch* of a ~2^13-height hash table **plus** a ~2^16-height
+non-hash table — so the net result depends on the real table mix, which **Probe T**
+measures directly (degree-7 + HidingFriPcs, full multi-table). Until Probe T lands,
+the honest statement is: **promising at the real hash count, not a guaranteed win at
+full circuit size.** Methodology + caveats:
+`scripts/bench/results/plonky3-vs-plonky2-fair-m5-max-2026-06-06.md`;
+degree-7 = `probe_v_degree7_bench`, true-hiding = `probe_w_hiding_fri`.
 
 **Status (historical, superseded — see banner above):** 🛑 NO-GO for the migration *as
 specified* (replicating zkCoins' cross-layer state IVC on this `Plonky3-recursion` rev), as
