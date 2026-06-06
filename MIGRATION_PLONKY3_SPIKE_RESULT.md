@@ -35,7 +35,7 @@ yields two incompatible copies of the `p3-*` types. Use this exact pair.
 from the root zkcoins workspace so the heavy Plonky3 git deps never enter the
 `node`/`shared` build or CI. Throwaway; deleted once the real port lands.
 
-Tests (all 12 green, `cargo nextest run -p plonky3-recursion-spike`):
+Tests (all 17 green, `cargo nextest run -p plonky3-recursion-spike`):
 
 | Test | Proves (real proving, ✅ = pos+neg asserted) | Result |
 |---|---|---|
@@ -51,6 +51,11 @@ Tests (all 12 green, `cargo nextest run -p plonky3-recursion-spike`):
 | `probe_g_fanin_pi_passthrough` | **per-leaf PI passthrough dead** — a real 2-to-1 aggregation's leaf values are NOT exposed to the outer (`air_public_targets = 0`); integrated fan-in-8 blocked at the first hop | 🛑 pinned |
 | `probe_i_cost_projection` | **cost at real scale** — recursion layer over a ≈2^16-gate inner proof: ≈3.2 s/layer, witness_count 44 912, ≈1.4 GB | 📊 |
 | `probe_j_option2_rebind` | **Option 2 primitive works, cannot compose** — in-circuit Poseidon2 hash-bind binds `hash(V)`/rejects mismatches; but no committed digest is readable across a batch layer → multi-layer Option 2 impossible | 🛑 the NO-GO |
+| `probe_l_multi_air` | **multi-AIR coexistence** — two different AIRs (state-transition-like + aggregator-like) co-verify in one circuit, PIs distinct + bound; cross-wiring rejected | ✅ |
+| `probe_m_long_chain` | **long IVC chain (depth 50)** — fixed point holds CONSTANT (witness_count 107 957) to depth 50; every layer verifies; 232.8 s total (~4.66 s/layer), peak RSS ~1.39 GB (flat — no memory accumulation) | 📊 |
+| `probe_n_concurrent` | **concurrent load** — 4 independent prove+recurse+verify workloads on threads all succeed; peak RSS ~1.38 GB | ✅ |
+| `probe_o_soundness` | **soundness spot-check** — mismatched FRI private data (a different proof's Merkle paths) rejected; tampered public input rejected → the verifier is not vacuous | ✅ |
+| `probe_p_serialization` | **proof serialization** — recursion proof bincode round-trips byte-stable (~363 KB) + still verifies; truncated blob rejected | ✅ |
 
 Each `✅` test asserts BOTH a positive (correct → accepted) and a negative
 (tampered/wrong → rejected), and most add a CONTROL isolating the cause of the
@@ -194,6 +199,27 @@ constraints are heavier per row). So the warm-prove budget is at genuine risk an
 5 s, the design knobs are level (reduce MAX_IN_COINS, fewer in-coin recursions,
 folding), never external hardware (`MIGRATION_RESEARCH.md` §7.11). Not a definitive
 blow (base prove TBD, FRI params untuned), but not comfortable headroom either.
+
+## Mechanism robustness (Probes L–P) — recorded for a future re-evaluation
+
+Beyond the gate question, these validate that the `p3-recursion` mechanism is robust for
+the *non-threading* uses (aggregation, single-hop verification) that a redesigned
+architecture or a future upstream might still rely on:
+- **Multi-AIR coexistence** (`probe_l`): two heterogeneous AIRs verify in one circuit
+  with independently-bound public inputs (cross-wiring rejected).
+- **Depth** (`probe_m`): a 50-layer chain holds the constant-shape fixed point
+  (witness_count 107 957) with **flat ~1.39 GB RSS** (no per-layer memory accumulation);
+  latency is linear at ~4.66 s/layer.
+- **Concurrency** (`probe_n`): 4 simultaneous prove+verify workloads all succeed
+  (~1.38 GB peak) — the prover is usable under a service's concurrent load.
+- **Soundness** (`probe_o`): the in-circuit verifier genuinely rejects mismatched FRI
+  data and tampered public inputs — so every negative assertion in this suite is a real
+  rejection, not a vacuous accept.
+- **Serialization** (`probe_p`): a recursion proof bincode round-trips byte-stable
+  (~363 KB) and still verifies (node-persistence-ready).
+
+None of these change the NO-GO — they confirm the recursion *engine* is solid; what is
+missing is only the cross-layer value channel.
 
 ## Gate decision
 
