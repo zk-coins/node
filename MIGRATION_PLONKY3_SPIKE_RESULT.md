@@ -2,8 +2,10 @@
 
 **Status:** ⚠️ **CONDITIONAL GO.** All §5 PASS items exercised empirically (real
 proving, pos+neg). Two findings are now *resolved into hard constraints* before
-Phase 1 (Probes G/H/I): (1) cross-layer PI propagation via AIR public values is
-**impossible** → Phase-5 **must** use the commit+hash re-bind construction ("Option
+Phase 1 (Probes G/H/I): (1) cross-layer PI propagation via AIR public values is **not
+achievable on this rev** (the shipped table provers emit no AIR public values; the only
+theoretical avenue is a bespoke custom NPO-table prover, which is no cheaper or sounder
+than Option 2) → Phase-5 **must** use the commit+hash re-bind construction ("Option
 2"); the Phase-1-authorize choice is no longer free. (2) The recursion-layer cost at
 real circuit scale (≈3.2 s/layer) plus the mandatory Option-2 overhead puts the
 **≤5 s warm-prove budget at material risk** — measure on the real circuit early in
