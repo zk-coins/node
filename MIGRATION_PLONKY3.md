@@ -145,6 +145,17 @@ Contents: per-probe `supported / blocked / workaround` with code pointers; measu
 - **GO:** Probes A, B, C all PASS (or have a documented in-repo workaround needing no upstream change). Proceed to Phase 1.
 - **NO-GO (upstream-gated):** any probe blocked by a `p3-recursion` gap. STOP. Do not start Phase 1. File/link the upstream issue, set a re-check date, report to the operator. Do not patch or fork `p3-recursion` as part of this migration.
 
+> **Recorded Phase 0 result (2026-06-06, see `MIGRATION_PLONKY3_SPIKE_RESULT.md`):**
+> GO. All three §5 PASS items were exercised empirically with real proving + positive/
+> negative assertions (PI-threading binding, variable-active-count masking, vk-equality
+> connect-back), plus the IVC fixed point and fan-in composition. **One escalated,
+> non-upstream-blocking finding:** the high-level batch recursion does **not** propagate
+> public inputs across layers (`probe_d_multilayer_carry`: `air_public_targets = [0,0,0]`),
+> unlike Plonky2 cyclic recursion. This is a *construction* problem (a working primitive
+> at the uni-stark boundary), not a `p3-recursion` capability gap, so it does **not** flip
+> the gate to NO-GO. The **cross-layer PI-threading construction is left TBD and chosen at
+> Phase-1-authorize time** — see the §6 Phase-1-authorize decision and §10 P5-T1.
+
 ### Phase 0 abort/timebox
 - Hard timebox: **5 working days.** This is a feasibility probe, not a port.
 - Distinguish "holding it wrong" from "upstream gap": every FAIL must point to a concrete API location or an existing upstream issue.
@@ -154,6 +165,30 @@ Contents: per-probe `supported / blocked / workaround` with code pointers; measu
 ## 6. Phase 1 — New crate skeleton
 
 Prereq: Phase 0 = GO.
+
+### Phase-1-authorize decision — cross-layer PI threading (DECIDE HERE, NOT EARLIER)
+
+The Phase 0 run (`MIGRATION_PLONKY3_SPIKE_RESULT.md` §"Escalated finding";
+`probe_d_multilayer_carry`) found that the high-level batch recursion does **not**
+auto-propagate public inputs across layers — a `CircuitBuilder` circuit's public
+inputs are not surfaced as `air_public_targets` in the next layer's verifier. zkCoins'
+`prev_account` / ProofData IVC carry therefore needs an explicit re-exposure
+construction. **The choice is made when Phase 1 is authorized — this document does NOT
+pre-commit to one:**
+
+- **Option 1 (fast):** structure each layer's threaded outputs as AIR public values so
+  the next layer's `air_public_targets` carries them (custom AIR-shaped layer, not a
+  plain `CircuitBuilder` circuit).
+- **Option 2 (sound):** commit the threaded value into the proof and re-bind it via a
+  Merkle/hash check each layer (more gates, clearly sound).
+- **Option 3 (passive, already armed):** the pinned `probe_d_multilayer_carry` catches a
+  future `Plonky3-recursion` rev that propagates public inputs natively; a rev bump that
+  turns that assertion red reopens the simplest path automatically and should trigger a
+  re-evaluation of Options 1/2.
+
+P5-T1 (§10) is written against whichever option is chosen here. The threading *binding
+primitive* itself is already proven (`probe_d_pi_threading`), so this is a topology
+decision, not a feasibility one.
 
 **P1-T1 — Create `program-plonky3` crate.**
 Files: `program-plonky3/{Cargo.toml,src/lib.rs}`; add to workspace `members`.
@@ -226,7 +261,8 @@ This phase implements the patterns proven feasible in Phase 0. The concrete API 
 
 **P5-T1 — Cyclic/IVC for `prev_account`.**
 Replace `conditionally_verify_cyclic_proof_or_dummy` + `common_data_for_recursion_c` with the Phase-0-proven IVC construction (`p3-recursion` layer chain). Preserve the base-case (first transition, no predecessor).
-Acceptance: a 2-transition account history proves and verifies; the cyclic vk binding holds; per-transition proof shape constant.
+⚠️ **Cross-layer PI threading is TBD — implement against the Option (1 or 2) chosen at the §6 Phase-1-authorize decision.** The `prev_account` / ProofData value carry across the IVC chain is **not** auto-propagated by the high-level batch recursion (`MIGRATION_PLONKY3_SPIKE_RESULT.md` escalated finding); do **not** assume native public-input propagation. The threading binding primitive is proven (`probe_d_pi_threading`); only the per-layer re-exposure topology is open.
+Acceptance: a 2-transition account history proves and verifies; the cyclic vk binding holds; per-transition proof shape constant; **the threaded `prev_account` value is provably carried across both transitions** (the §6-chosen construction).
 Verify: `cargo nextest run -p zkcoins-program-plonky3 cyclic`.
 
 **P5-T2 — Source aggregator (fan-in-8).**
