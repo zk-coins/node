@@ -44,19 +44,29 @@ measured flat-8+1 aggregation. Costs: 1.76 MB proofs (vs Plonky2's ~100 KB class
 SDK/Schnorr-boundary change if BabyBear is chosen (Doc 2 — Goldilocks-on-Plonky3 avoids
 the SDK change but forfeits most of the field-driven speed win).
 
-## The decisive open lever — Probe X′ (recommended before any go/no-go on speed grounds)
+## The decisive lever — RESOLVED by Probe X′: batching does NOT rescue the send
 
 Probe X measured a **flat 8+1** (nine independent in-circuit verifiers, costs summed).
-The aggregation cost is the whole ballgame; the candidate reductions, in value order:
-1. **Batch the 8 source verifications into one shared verifier table / one FRI instance**
-   (amortise Merkle/FRI constraint work across slots).
-2. **Reduce `MAX_IN_COINS`** (8 → 4 halves the dominant term; protocol-visible — operator call).
-3. Cheaper inner-proof FRI profile (fewer queries on inner layers, full strength outer only).
-4. ZK only on the outermost layer (inner layers non-hiding; cuts the 6.7 s zk figure toward 4 s)
-   `[VERIFY: zk-soundness of non-hiding inner layers — auditor question, Doc 3]`.
-5. KoalaBear; circuit-level hash reduction.
-If X′ cuts aggregation ~3–4×, `/api/send` flips to a clear win and the migration's speed
-case is restored.
+**Probe X′ (`probe_x_prime_batched_aggregator`) tested the top lever empirically:**
+- **X′-a (co-proved sources, theoretical floor):** proving the 8 sources as ONE 8-instance
+  batch and verifying it in-circuit once = **978 ms non-zk / 1664 ms zk — a real 4.1× cut**.
+- **X′-b (independent sources, REALITY):** the 8 sources come from different prior
+  transactions, proved independently; `verify_batch_circuit` instantiates one full in-circuit
+  FRI verifier **per independent proof**, so no amortisation is possible — measured **1.00–1.01×
+  vs Probe X, exactly flat**. The protocol cannot retroactively co-prove sources without
+  re-proving them.
+
+**Conclusion: same-vk batching is NOT a live lever** (the floor it offers is unreachable in
+the real protocol). The remaining levers, in value order:
+1. **Reduce `MAX_IN_COINS`** (8 → 4 ≈ halves the dominant aggregation term) — **the only
+   effective live lever**, but **protocol-visible → operator decision**.
+2. ZK only on the outermost layer (inner layers non-hiding; cuts the zk figure toward the
+   non-zk one) `[VERIFY: zk-soundness of non-hiding inner layers — auditor question, Doc 3]`.
+3. Cheaper inner-proof FRI profile; KoalaBear; circuit-level hash reduction.
+4. Future upstream `p3-recursion` improvements (Doc 4 tracks this).
+**The send-side speed case is NOT recoverable without a protocol change (MAX_IN_COINS) or
+upstream improvement.** The migration's justification therefore rests on cold-start, memory,
+mint, and future-proofing — not on `/api/send` latency.
 
 ## Operator decisions now on the table
 

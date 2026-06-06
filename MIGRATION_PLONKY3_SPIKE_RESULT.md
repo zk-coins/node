@@ -119,10 +119,15 @@ node-side + per-recursion-layer.
 **Honest bottom line:** the migration is **not a uniform speed win**. It is a large win on
 **cold-start, memory, mint, and operational stability**, a **wash-or-loss on the user-facing
 `/api/send`** (recursion-dominated), at the cost of **larger proofs (1.76 MB)** and an SDK/field
-change if BabyBear is chosen (Doc 2). **The decisive lever** to flip `/api/send` to a win is
-**batching the 8 source-proof verifications into one shared FRI instance** (Probe X used a flat
-8+1 sum) and/or reducing `MAX_IN_COINS` — highest-value next probe (X′). Full numbers:
-`scripts/bench/results/plonky3-probe-{t,u}-*.md`; X = `probe_x_aggregator_recursion`,
+change if BabyBear is chosen (Doc 2). **The batching lever is now RESOLVED — Probe X′
+(`probe_x_prime_batched_aggregator`) ruled it out:** co-proving the 8 sources as one batch
+would cut the aggregation **4.1×** (978 ms non-zk / 1664 ms zk — the theoretical floor), but
+the protocol cannot retroactively batch sources proved by different prior transactions, and
+for 8 INDEPENDENT proofs the API instantiates one full in-circuit FRI verifier each — measured
+**1.00–1.01× vs Probe X, exactly flat**. So the only live send-side lever is **reducing
+`MAX_IN_COINS`** (protocol-visible — operator decision), or future upstream recursion
+improvements. Full numbers: `scripts/bench/results/plonky3-probe-{t,u}-*.md`;
+X = `probe_x_aggregator_recursion`, X′ = `probe_x_prime_batched_aggregator`,
 Y = `probe_y_cold_start`, Z = `probe_z_verifier`, AA = `probe_aa_sustained_load`.
 
 **Status (historical, superseded — see banner above):** 🛑 NO-GO for the migration *as
@@ -161,7 +166,7 @@ yields two incompatible copies of the `p3-*` types. Use this exact pair.
 from the root zkcoins workspace so the heavy Plonky3 git deps never enter the
 `node`/`shared` build or CI. Throwaway; deleted once the real port lands.
 
-Tests (all 28 green, `cargo nextest run -p plonky3-recursion-spike`):
+Tests (all 29 green, `cargo nextest run -p plonky3-recursion-spike`):
 
 | Test | Proves (real proving, ✅ = pos+neg asserted) | Result |
 |---|---|---|
@@ -193,6 +198,7 @@ Tests (all 28 green, `cargo nextest run -p plonky3-recursion-spike`):
 | `probe_y_cold_start` | **cold-start** — build+first-prove 372 ms vs Plonky2 14.4 s = 38.7× faster (no circuit-build step) | ✅📊 |
 | `probe_z_verifier` | **verifier asymmetry** — verify 9.6 ms, proof 1.76 MB, prove÷verify ≈ 33×; tamper rejected | ✅📊 |
 | `probe_aa_sustained_load` | **sustained-load soak** — 1000 proves / 5.43 min: +2.7 % latency drift (stable), RSS plateaus, no leak | ✅📊 |
+| `probe_x_prime_batched_aggregator` | **batching lever resolved** — co-proved sources would cut aggregation 4.1× (978 ms/1664 ms floor) but is protocol-unreachable; 8 INDEPENDENT proofs = 1.00–1.01× vs Probe X (flat) → only live lever is MAX_IN_COINS | ✅📊 |
 
 Each `✅` test asserts BOTH a positive (correct → accepted) and a negative
 (tampered/wrong → rejected), and most add a CONTROL isolating the cause of the
