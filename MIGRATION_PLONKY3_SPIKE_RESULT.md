@@ -1,17 +1,20 @@
 # Plonky3 Recursion Feasibility Spike — Result (Phase 0 Go/No-Go)
 
-> ⚠️ **PARTIALLY SUPERSEDED (2026-06-06, later same day).** The NO-GO below was **scoped
-> too narrowly** and is **overturned** by `probe_q_custom_public_value`: a custom AIR with
-> `num_public_values() > 0` DOES surface a soundly-bound per-instance value across a batch
-> layer (upstream PR #407, already in our pinned rev). The `[0,0,0]` finding held only for
-> the primitive tables / `CircuitBuilder` public inputs that probes D/G/H/J tested — **the
-> cross-layer value channel EXISTS** via a public-value-emitting AIR. See
-> **`MIGRATION_PLONKY3_SOLUTIONS_RESEARCH.md`** for the revised gate (GO via custom
-> public-value-emitting tables; folding/Sonobe as the native-IVC alternative) and the
-> 9-path solution analysis. The probes below remain correct for the constructions they tested.
+> 🟢 **SUPERSEDED — gate is GO (2026-06-06, later same day).** The NO-GO below was **scoped
+> too narrowly** and is **overturned**. `probe_q_custom_public_value` proved a custom AIR
+> with `num_public_values() > 0` surfaces a soundly-bound per-instance value across a batch
+> layer (upstream PR #407, already in our pinned rev), and **`probe_r_carrier_chain` then
+> threaded a counter end-to-end across a real depth-4 IVC chain** via that channel
+> (`V_3 == V_0 + 3`; wrong forwarded value rejected; wrong carrier bind rejected). The
+> `[0,0,0]` finding held only for the primitive tables / `CircuitBuilder` public inputs that
+> probes D/G/H/J tested. **CHOSEN DIRECTION: Path 1+5 — custom public-value-emitting (carrier)
+> tables** (stays in the Plonky3-STARK family, minimal delta from the Plonky2 IVC model, no
+> protocol change). Rationale + 9-path analysis: **`MIGRATION_PLONKY3_SOLUTIONS_RESEARCH.md`**;
+> end-to-end proof: PR #214. The probes below remain correct for the constructions they tested.
 
-**Status:** 🛑 **NO-GO** for the migration *as specified* (replicating zkCoins'
-cross-layer state IVC on this `Plonky3-recursion` rev). Probe J + an adversarial review
+**Status (historical, superseded — see banner above):** 🛑 NO-GO for the migration *as
+specified* (replicating zkCoins' cross-layer state IVC on this `Plonky3-recursion` rev), as
+read before Probe Q/R. Probe J + an adversarial review
 of all escape routes confirm that **neither Option 1 (AIR public values) nor Option 2
 (commit + hash re-bind) can thread a value across a batch-recursion layer** — there is
 no per-instance value channel; only whole-trace Merkle-cap commitments are exposed, and
