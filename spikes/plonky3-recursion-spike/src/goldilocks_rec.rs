@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use p3_batch_stark::ProverData;
+use p3_circuit::Circuit;
 use p3_circuit::CircuitBuilder;
 use p3_circuit::CircuitRunner;
 use p3_circuit::NonPrimitiveOpId;
@@ -232,7 +233,9 @@ fn create_config(fp: &FriParams, security_level: usize) -> MyConfig {
     MyConfig::new(pcs, challenger)
 }
 
-fn create_fri_verifier_params(fp: &FriParams) -> FriVerifierParams {
+/// FRI verifier params for the given FRI params — used by the lower-level batch
+/// verifier path (Probe D's multi-layer carry experiment).
+pub fn create_fri_verifier_params(fp: &FriParams) -> FriVerifierParams {
     FriVerifierParams::with_mmcs(
         fp.log_blowup,
         fp.log_final_poly_len,
@@ -313,6 +316,51 @@ pub fn aggregate_two(
         &li, &ri, config, backend, params, None,
     )
     .expect("2-to-1 aggregation")
+}
+
+/// Run + batch-stark-prove + verify an arbitrary NPO-free `CircuitBuilder` circuit
+/// (over the Goldilocks base field) with the given public inputs. Returns Err if
+/// witness generation (constraint check) OR proving/verification fails — so a
+/// caller can assert on real proving success/failure. Used by Probe E.
+pub fn prove_and_verify_no_npo(
+    circuit: &Circuit<F>,
+    public_inputs: &[F],
+    config: &ConfigWithFriParams,
+    fp: &FriParams,
+) -> Result<(), String> {
+    let table_packing =
+        TablePacking::new(1, 1).with_fri_params(fp.log_final_poly_len, fp.log_blowup);
+
+    let traces = {
+        let mut runner = circuit.runner();
+        runner
+            .set_public_inputs(public_inputs)
+            .map_err(|e| format!("set pub: {e:?}"))?;
+        runner.run().map_err(|e| format!("run: {e:?}"))?
+    };
+
+    let (airs_degrees, primitive_columns, non_primitive_columns) =
+        get_airs_and_degrees_with_prep::<ConfigWithFriParams, F, 1>(
+            circuit,
+            &table_packing,
+            &[],
+            &[],
+            ConstraintProfile::Standard,
+        )
+        .map_err(|e| format!("airs and degrees: {e:?}"))?;
+    let (airs, degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
+    let ext_degrees: Vec<usize> = degrees.iter().map(|&d| d + config.is_zk()).collect();
+    let prover_data = ProverData::from_airs_and_degrees(config, &airs, &ext_degrees);
+    let circuit_prover_data =
+        CircuitProverData::new(prover_data, primitive_columns, non_primitive_columns);
+    let prover = BatchStarkProver::new(config.clone()).with_table_packing(table_packing);
+    let proof = prover
+        .prove_all_tables(&traces, &circuit_prover_data)
+        .map_err(|e| format!("prove: {e:?}"))?;
+    prover
+        .verify_all_tables(&proof)
+        .map_err(|e| format!("verify: {e:?}"))?;
+    Ok(())
 }
 
 /// Prove a base "counter" circuit (`acc = 0; acc += 1` × `steps`, committed to a

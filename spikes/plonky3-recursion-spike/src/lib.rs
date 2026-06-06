@@ -26,7 +26,7 @@ pub mod goldilocks_rec;
 use p3_poseidon2_circuit_air as _;
 
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
-use p3_field::{PrimeCharacteristicRing, PrimeField64};
+use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
 use p3_matrix::dense::RowMajorMatrix;
 
 /// A minimal counter AIR over a single column `c`, enforcing `next = cur + 1`.
@@ -86,6 +86,51 @@ pub fn generate_counter_trace<F: PrimeField64>(start: u64, n: usize) -> RowMajor
 /// The public inputs a counter proof of `n` rows starting at `start` commits to.
 pub fn counter_public_inputs<F: PrimeField64>(start: u64, n: usize) -> Vec<F> {
     vec![F::from_u64(start), F::from_u64(start + (n as u64 - 1))]
+}
+
+/// A minimal AIR WITH a preprocessed column whose constant value `k` IS the
+/// verification key (the preprocessed commitment is a function of `k`). Used by
+/// Probe F: two instances with different `k` have different preprocessed
+/// commitments (= different vks), so binding the inner vk = binding `k`.
+///
+/// Layout: one main column `m`, one preprocessed column `p` (constant `k`).
+/// Constraint: `m == p` on every row (so a valid main trace is all-`k`).
+#[derive(Clone, Copy, Debug)]
+pub struct ConstPrepAir {
+    pub k: u64,
+    pub rows: usize,
+}
+
+impl<F: Field> BaseAir<F> for ConstPrepAir {
+    fn width(&self) -> usize {
+        1
+    }
+
+    fn preprocessed_width(&self) -> usize {
+        1
+    }
+
+    fn preprocessed_trace(&self) -> Option<RowMajorMatrix<F>> {
+        Some(RowMajorMatrix::new(vec![F::from_u64(self.k); self.rows], 1))
+    }
+}
+
+impl<AB: AirBuilder> Air<AB> for ConstPrepAir
+where
+    AB::F: Field,
+{
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let prep = builder.preprocessed();
+        let m = main.current_slice()[0];
+        let p = prep.current_slice()[0];
+        builder.assert_eq(m, p);
+    }
+}
+
+/// The (all-`k`, `rows`×1) main trace that satisfies `ConstPrepAir { k, rows }`.
+pub fn generate_const_main_trace<F: Field>(k: u64, rows: usize) -> RowMajorMatrix<F> {
+    RowMajorMatrix::new(vec![F::from_u64(k); rows], 1)
 }
 
 #[cfg(test)]
