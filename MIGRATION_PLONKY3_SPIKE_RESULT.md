@@ -10,7 +10,13 @@
 > probes D/G/H/J tested. **CHOSEN DIRECTION: Path 1+5 — custom public-value-emitting (carrier)
 > tables** (stays in the Plonky3-STARK family, minimal delta from the Plonky2 IVC model, no
 > protocol change). Rationale + 9-path analysis: **`MIGRATION_PLONKY3_SOLUTIONS_RESEARCH.md`**;
-> end-to-end proof: PR #214. The probes below remain correct for the constructions they tested.
+> end-to-end proof: PR #214. **Cost (`probe_r_cost`):** the carrier threading + in-circuit
+> two-proof verification adds **no** measurable overhead on top of the bare recursion floor —
+> at the real `2^16`-row inner scale the base carrier `prove_batch` is ≈271 ms/layer and the
+> IVC link's witness-gen ≈2 ms, peak RSS ≈91 MB. The number that actually gates the ≤5 s warm
+> budget is the eventual STARK-*prove* of the link circuit (Probe I's ≈3.2 s class, ~1.8 s
+> headroom) — **within budget**, not yet incurred in Probe R's witness-gen-only link. The
+> probes below remain correct for the constructions they tested.
 
 **Status (historical, superseded — see banner above):** 🛑 NO-GO for the migration *as
 specified* (replicating zkCoins' cross-layer state IVC on this `Plonky3-recursion` rev), as
@@ -48,7 +54,7 @@ yields two incompatible copies of the `p3-*` types. Use this exact pair.
 from the root zkcoins workspace so the heavy Plonky3 git deps never enter the
 `node`/`shared` build or CI. Throwaway; deleted once the real port lands.
 
-Tests (all 17 green, `cargo nextest run -p plonky3-recursion-spike`):
+Tests (all 20 green, `cargo nextest run -p plonky3-recursion-spike`):
 
 | Test | Proves (real proving, ✅ = pos+neg asserted) | Result |
 |---|---|---|
@@ -69,6 +75,9 @@ Tests (all 17 green, `cargo nextest run -p plonky3-recursion-spike`):
 | `probe_n_concurrent` | **concurrent load** — 4 independent prove+recurse+verify workloads on threads all succeed; peak RSS ~1.38 GB | ✅ |
 | `probe_o_soundness` | **soundness spot-check** — mismatched FRI private data (a different proof's Merkle paths) rejected; tampered public input rejected → the verifier is not vacuous | ✅ |
 | `probe_p_serialization` | **proof serialization** — recursion proof bincode round-trips byte-stable (~363 KB) + still verifies; truncated blob rejected | ✅ |
+| `probe_q_custom_public_value` | **overturns the NO-GO** — a custom AIR with `num_public_values()>0` surfaces a soundly-bound per-instance value across a batch layer (`air_public_targets[0].len()==1`); value 42 verifies, 999 rejected (BabyBear, upstream PR #407) | ✅ |
+| `probe_r_carrier_chain` | **chosen direction, end-to-end** — depth-4 carrier-table IVC chain threads a counter `V_3 == V_0+3`; each link verifies both adjacent carriers in-circuit + `connect`s the carry; wrong forwarded value rejected (WitnessConflict, w/ control), wrong carrier bind rejected (OodEvaluationMismatch) | ✅ |
+| `probe_r_cost` | **cost @ real scale** — carrier chain at `2^16`-row inner size: base ≈271 ms/layer, IVC-link witness-gen ≈2 ms, peak RSS ≈91 MB; per-transition floor ≈273 ms; budget-gating link STARK-prove ≈3.2 s class (within ≤5 s warm, ~1.8 s headroom) | ✅ |
 
 Each `✅` test asserts BOTH a positive (correct → accepted) and a negative
 (tampered/wrong → rejected), and most add a CONTROL isolating the cause of the
