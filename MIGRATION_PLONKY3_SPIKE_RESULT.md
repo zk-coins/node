@@ -20,9 +20,12 @@
 
 ## Fair Performance Comparison (Probe S, corrected by V/W)
 
-**Plonky3 wins at the real circuit's hash count, but the production-crypto config
-is far tighter than Probe S's first headline — and at full trace height it can be
-SLOWER. The net migration verdict is pending Probe T.** Probes I/R measured a
+**RESOLVED (T/X/X′/U): a mixed verdict — big wins on cold-start/memory/mint, a wash-or-loss
+on `/api/send`.** Probe S's first headline (4–61×) was ~5× too optimistic (degree-3 + zk-proxy;
+corrected by V/W); the real single transition is 10–14× faster (T), but the 8-way source
+aggregation dominates the full send and is NOT reducible by batching (X′) — so `/api/send` is a
+wash (non-zk) / loss (zk), while mint is ~2× and cold-start 38.7×. The full picture is built up
+below and summarised in `docs/migration/PLONKY3_MIGRATION_AUDIT_SUMMARY.md`. Probes I/R measured a
 *recursion overhead* in **Goldilocks** with **untuned (testing) FRI** — a
 feasibility check, not a production-prover timing. **Probe S**
 (`tests/probe_s_fair_bench.rs`) measured a **BabyBear Poseidon2 STARK** under
