@@ -61,6 +61,8 @@ rand = { version = "0.10.0", default-features = false }
 bincode = "1.3"
 # Probe S: peak-RSS measurement via getrusage(RUSAGE_SELF).
 libc = "0.2"
+# Probe T: report the active rayon thread-pool width alongside the bench.
+rayon = "1.10"
 
 # Reuse the upstream Goldilocks param bundle (F, Perm, MyHash, MyMmcs,
 # MyConfig, DIGEST_ELEMS, WIDTH, RATE, …) so the spike's config matches
