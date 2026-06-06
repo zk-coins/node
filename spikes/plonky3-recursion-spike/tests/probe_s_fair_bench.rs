@@ -113,11 +113,17 @@ use rand::rngs::SmallRng;
 // under the plain `TwoAdicFriPcs` + Poseidon2-MMCS + `DuplexChallenger` path
 // (the working upstream degree-7 example uses the *vectorized* AIR + Keccak
 // MMCS + `HidingFriPcs`). Verified by bisection: degree-3 verifies on both FRI
-// configs; degree-7 does not. This is a benchmark of *prover speed*, and the
-// dominant prover cost (DFT / Merkle commit / FRI folding) is essentially
-// independent of the S-box degree — the S-box only changes the per-row column
-// count and the quotient degree slightly. So degree-3 is a faithful proxy for
-// prove-time; the headline numbers would shift only marginally at degree-7.
+// configs; degree-7 does not. This is a benchmark of *prover speed*. Honest
+// magnitude: the S-box degree sets the constraint (hence quotient) degree —
+// degree-3 uses 2 quotient chunks (quotient domain 2N), degree-7 would use 8
+// (8N), inflating ONLY the quotient stage ~4x while leaving trace commit + FRI
+// untouched, i.e. a worst-case total prove inflation of ~1.5-2.5x (up to ~3x).
+// That is NOT negligible, but it does not threaten the verdict: a full 3x on the
+// weakest (4.2x) point still leaves Plonky3 ~1.4x ahead, and the fair
+// hash-matched point degrades only from 61x/34x to ~20x/~11x. Plonky2's own
+// baseline uses Goldilocks-Poseidon's degree-7 S-box, so this gap flatters
+// Plonky3 in one bounded direction. degree-3 is a prover-speed proxy whose
+// speedup is an over-estimate by at most ~3x, verdict robust across that range.
 // The matching round count for the degree-3 width-16 BabyBear AIR is 20
 // partial rounds (KoalaBear's, as in the upstream test).
 const WIDTH: usize = 16;

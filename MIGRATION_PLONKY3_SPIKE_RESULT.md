@@ -87,7 +87,7 @@ yields two incompatible copies of the `p3-*` types. Use this exact pair.
 from the root zkcoins workspace so the heavy Plonky3 git deps never enter the
 `node`/`shared` build or CI. Throwaway; deleted once the real port lands.
 
-Tests (all 20 green, `cargo nextest run -p plonky3-recursion-spike`):
+Tests (all 21 green, `cargo nextest run -p plonky3-recursion-spike`):
 
 | Test | Proves (real proving, ✅ = pos+neg asserted) | Result |
 |---|---|---|
@@ -111,6 +111,7 @@ Tests (all 20 green, `cargo nextest run -p plonky3-recursion-spike`):
 | `probe_q_custom_public_value` | **overturns the NO-GO** — a custom AIR with `num_public_values()>0` surfaces a soundly-bound per-instance value across a batch layer (`air_public_targets[0].len()==1`); value 42 verifies, 999 rejected (BabyBear, upstream PR #407) | ✅ |
 | `probe_r_carrier_chain` | **chosen direction, end-to-end** — depth-4 carrier-table IVC chain threads a counter `V_3 == V_0+3`; each link verifies both adjacent carriers in-circuit + `connect`s the carry; wrong forwarded value rejected (WitnessConflict, w/ control), wrong carrier bind rejected (OodEvaluationMismatch) | ✅ |
 | `probe_r_cost` | **cost @ real scale** — carrier chain at `2^16`-row inner size: base ≈271 ms/layer, IVC-link witness-gen ≈2 ms, peak RSS ≈91 MB; per-transition floor ≈273 ms; budget-gating link STARK-prove ≈3.2 s class (within ≤5 s warm, ~1.8 s headroom) | ✅ |
+| `probe_s_fair_bench` | **fair Plonky3-vs-Plonky2 prover speed** — BabyBear Poseidon2 STARK, tuned FRI, Poseidon2-MMCS, NEON packing: 4–61× faster than Plonky2 (4.35 s) at every size/FRI point, 5–51× lower RSS; proof verifies (see §"Fair Performance Comparison") | ✅📊 |
 
 Each `✅` test asserts BOTH a positive (correct → accepted) and a negative
 (tampered/wrong → rejected), and most add a CONTROL isolating the cause of the

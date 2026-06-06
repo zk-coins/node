@@ -97,10 +97,21 @@ config / round-constant / PCS construction is setup and excluded.
    cryptographic degree-7 S-box fails verification (`OodEvaluationMismatch`)
    under the plain `TwoAdicFriPcs` + Poseidon2-MMCS + `DuplexChallenger` path
    (the working upstream degree-7 example uses the *vectorized* AIR + Keccak
-   MMCS + `HidingFriPcs`). Verified by bisection. The S-box degree only changes
-   per-row column count and quotient degree slightly; the prove-time headline
-   (DFT / Merkle / FRI dominated) shifts only marginally — so degree-3 is a
-   faithful prover-speed proxy.
+   MMCS + `HidingFriPcs`). Verified by bisection. **Honest magnitude:** the
+   S-box degree sets the constraint degree, hence the quotient-polynomial degree
+   (`log_num_quotient_chunks = log2_ceil(deg-1)`): degree-3 → 2 quotient chunks
+   (quotient domain 2N), degree-7 → 8 chunks (8N). With `SBOX_REGISTERS=0` the
+   column count is unchanged, so degree-7 inflates ONLY the quotient stage
+   (quotient-domain LDE + constraint eval + chunk Merkle commit) ~4×, leaving the
+   trace commit and FRI untouched — a worst-case total prove inflation of roughly
+   **1.5–2.5× (up to ~3× if quotient eval dominates more than estimated)**, NOT
+   "negligible". This does not threaten the conclusion: applying a full 3× to the
+   weakest point (the 4.2× zk-saturated row) still leaves Plonky3 ~1.4× ahead, and
+   the fair hash-matched point degrades only from 61×/34× to ~20×/~11×. Note the
+   Plonky2 baseline uses Goldilocks-Poseidon's own degree-7 S-box, so this gap
+   flatters Plonky3 in exactly one (bounded-above) direction. Degree-3 is thus a
+   prover-speed proxy whose headline is an over-estimate of the speedup by at most
+   ~3×, with the migration verdict robust across that whole range.
 4. **ZK-ness.** zkCoins proofs are zero-knowledge. The `new_benchmark_zk`
    (blowup 2) rows are the zk-apples-to-apples FRI point, run on the plain
    `TwoAdicFriPcs` as a *timing proxy* (blowup 2 drives the dominant FRI/Merkle
