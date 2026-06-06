@@ -73,10 +73,30 @@ fn probe_a_ivc() {
     eprintln!("probe_a witness_counts = {witness_counts:?}");
 
     // PASS criterion 2: shape stabilises (constant per-layer shape => true IVC).
+    // A genuine *reached* fixed point requires BOTH that the shape grew at some
+    // point (so it is not trivially constant from layer 1) AND that the tail is
+    // constant — otherwise "equal last two" could be satisfied by a degenerate
+    // never-growing chain. Recorded: [25567, 104630, 107957, 107957].
     let n = witness_counts.len();
     assert!(
-        witness_counts[n - 1] == witness_counts[n - 2],
-        "IVC verifier-circuit shape must reach a constant fixed point; \
-         per-layer witness_counts = {witness_counts:?}"
+        witness_counts[0] != witness_counts[n - 1],
+        "expected the verifier-circuit shape to grow before stabilising (genuine \
+         fixed point, not constant-from-start); witness_counts = {witness_counts:?}"
     );
+    assert_eq!(
+        witness_counts[n - 1],
+        witness_counts[n - 2],
+        "IVC verifier-circuit shape must reach a constant fixed point (no unbounded \
+         growth); per-layer witness_counts = {witness_counts:?}"
+    );
+
+    // NOTE (P0-T2 criterion 2, "counter PI provably threaded from base"): the
+    // high-level chain via `into_recursion_input::<BatchOnly>()` carries EMPTY
+    // table_public_inputs, so this probe proves the IVC *structure* (each layer
+    // cryptographically verifies its predecessor) and constant shape, but does
+    // NOT thread a constrained counter PI across layers. The primitive that makes
+    // threading possible — binding an inner proof's public inputs as constrained
+    // outer targets — is proven separately in `probe_c_vk_binding`. Explicit
+    // cross-layer PI propagation (the zkCoins ProofData/prev_account value carry)
+    // is Phase-5 construction, not claimed as demonstrated here.
 }
