@@ -4,11 +4,19 @@
 **Scope:** 13 empirical probes (T, U, V, W, X, X′, Y, Z, AA + recursion-reduction AB/AC/AD/AE —
 all real proving except U, a labelled projection) + 5 engineering docs. **33 spike tests green.**
 
-> **HEADLINE (revised by the AB–AE recursion-reduction research):** at today's protocol
-> (MAX_IN_COINS=8, full-strength FRI) `/api/send` is a **wash**. But two levers recover it:
-> **MAX_IN_COINS=4 alone (protocol decision, no soundness question) → send-prove 1.9× faster /
-> e2e 1.27×**; **+ 64-bit inner FRI (auditor sign-off) → 3.32× / 1.45× (6.91 s)**. The wash is
-> NOT the final word — the speed case is recoverable. Field decision resolved: **BabyBear**.
+> **HEADLINE + APPLIED RESOLUTIONS.** Three design decisions are resolved here (heuristic:
+> the variant most consistent with the existing project), not left open:
+> 1. **Field = BabyBear** (KoalaBear ruled out by AD).
+> 2. **MAX_IN_COINS stays 8** — reducing a user-facing feature for prove-time is NOT consistent
+>    with the project (Plonky2-Prod runs 8; all wallets/SDK are calibrated to 8; a UX regression
+>    for speed is not professional). The N=4 lever is therefore **not pursued**.
+> 3. **Port (Phases 1–8) = HOLD** — this engagement is research-only by mandate; no port started.
+>
+> With MAX_IN_COINS kept at 8, the recommended config is **N=8 + 64-bit inner FRI**: `/api/send`
+> send-prove **1.93 s = 2.25× faster** than Plonky2 (4.35 s), e2e **~7.5 s ≈ 1.3× faster** than
+> the ~10 s live. The 64-bit inner FRI is a **port-phase conditional gate** (queued auditor
+> recursion-composition sign-off — consistent with Plonky2-Goldilocks's own 64-bit posture);
+> in research mode it is not a blocker. So the wash recovers **without any UX regression**.
 
 ## The honest verdict in one table
 
@@ -16,10 +24,10 @@ all real proving except U, a labelled projection) + 5 engineering docs. **33 spi
 |---|---:|---:|---|
 | Single state-transition warm prove | 4.35 s | **0.31 s** (T, production crypto) | **10–14× faster** ✅ |
 | Recursion/aggregation 8+1, q=100 (in-circuit STARK-prove) | (included in 4.35 s) | **4.0 s** non-zk (X) | dominates 🔴 |
-| `/api/send` prove, **N=8 q=100** (today) | 4.35 s | **4.25 s** | wash 🟡 |
-| `/api/send` prove, **N=4 q=100** (MAX_IN_COINS=4) | 4.35 s | **2.26 s** | **1.9× faster** ✅ |
-| `/api/send` prove, **N=4 q=48** (+ 64-bit inner, AE) | 4.35 s | **1.31 s** | **3.32× faster** ✅ |
-| `/api/send` **e2e** (recommended config) | ~10 s | **6.91 s** | **1.45× faster** ✅ |
+| `/api/send` prove, **N=8 q=100** (today, no change) | 4.35 s | **4.25 s** | wash 🟡 |
+| `/api/send` prove, **N=8 q=48** (RECOMMENDED — keep 8 + 64-bit inner) | 4.35 s | **1.93 s** | **2.25× faster** ✅ |
+| `/api/send` **e2e** (recommended config) | ~10 s | **~7.5 s** | **~1.3× faster** ✅ |
+| *(N=4 q=48 = 1.31 s / 3.32× — NOT pursued: rejects MAX_IN_COINS=8→4 UX regression)* | | | |
 | Full `/api/mint` populated e2e | ~7 s | **~3–5 s** (U, projection) | **~2× faster** ✅ |
 | Cold start (build + first prove) | 14.4 s | **0.37 s** (Y) | **38.7× faster** ✅ |
 | Circuit build | 8.2 s | **1.5 ms** (Y) | ~5600× ✅ |
@@ -28,13 +36,15 @@ all real proving except U, a labelled projection) + 5 engineering docs. **33 spi
 | 1000-prove soak | — | +2.7 % drift, no leak (AA) | **stable** ✅ |
 | Field: KoalaBear vs BabyBear | — | aggregation 2.1× slower (AD) | **stay BabyBear** |
 
-**Why the send was a wash — and how it recovers:** the recursion verifier is hash-dominated
-(in-circuit FRI/Merkle), so the per-transition small-field win doesn't carry. The fix is to
-shrink the recursion work itself: **fewer inner FRI queries** (q=48 → 2.4×, the inner-soundness
-`[VERIFY]`) and **fewer source slots** (MAX_IN_COINS=4 → ~2×, near-linear, a protocol decision).
-Probe X is a **lower bound** (carrier-proxy inner proofs are lighter than the real circuit), so
-real-circuit figures may be higher; the recommended config has headroom (1.45× e2e) but should
-be re-measured on the ported circuit.
+**Why the send was a wash — and how it recovers (without a UX regression):** the recursion
+verifier is hash-dominated (in-circuit FRI/Merkle), so the per-transition small-field win
+doesn't carry. The applied fix shrinks the recursion work via **fewer inner FRI queries**
+(q=100→48 = 2.4×, inner soundness 116→64 bits, a port-phase auditor gate) while **keeping
+MAX_IN_COINS=8** (the N=4 slot-reduction lever is rejected — it would degrade user UX for
+speed). That alone lifts `/api/send` from wash to **2.25× faster prove / ~1.3× e2e**. Probe X is
+a **lower bound** (carrier-proxy inner proofs are lighter than the real circuit), so
+real-circuit figures may be higher; the recommended config should be re-measured on the ported
+circuit during Phase 5.
 
 ## Feasibility (unchanged GO)
 
@@ -48,12 +58,13 @@ mixed-degree multi-table `prove_batch` under HidingFriPcs (probe_t). Public-API-
 **Buys:** 38.7× cold-start (operational restarts, scaling, dev velocity), ~2× memory,
 ~2× faster mint, no-leak stability, an actively-developed backend (future GPU/perf),
 and the carrier construction proven sound (audit spec: Doc 3).
-**Buys conditionally (AB–AE):** a faster `/api/send` — **1.9× prove / 1.27× e2e with
-MAX_IN_COINS=4 alone**, **3.32× / 1.45× adding 64-bit inner FRI** (auditor sign-off).
-At today's protocol unchanged it stays a wash. Costs: 1.76 MB proofs (vs Plonky2's ~100 KB
-class `[VERIFY: exact Plonky2 proof size]`), an unaudited upstream in the TCB (Doc 4), and an
-SDK/Schnorr-boundary change for BabyBear (Doc 2 — Goldilocks-on-Plonky3 avoids the SDK change
-but forfeits most of the field-driven speed win; KoalaBear ruled out by Probe AD).
+**Buys (with the applied resolutions — keep MAX_IN_COINS=8, 64-bit inner FRI as a port-phase
+gate):** a faster `/api/send` — **2.25× prove / ~1.3× e2e**, with NO UX regression. (The richer
+3.32× tier would need MAX_IN_COINS=4, which is rejected.) At today's protocol fully unchanged
+(q=100) it stays a wash. Costs: 1.76 MB proofs (vs Plonky2's ~100 KB class `[VERIFY: exact
+Plonky2 proof size]`), an unaudited upstream in the TCB (Doc 4), and an SDK/Schnorr-boundary
+change for BabyBear (Doc 2 — Goldilocks-on-Plonky3 avoids the SDK change but forfeits most of
+the field-driven speed win; KoalaBear ruled out by Probe AD).
 
 ## The lever analysis — RESOLVED (Probes X′, AB, AC, AD, AE)
 
@@ -73,23 +84,29 @@ Full detail: `scripts/bench/results/plonky3-recursion-reduction-m5-max-2026-06-0
   e2e **6.91 s (1.45×)**. Residual e2e floor = the **~5.6 s prover-agnostic node overhead**
   (out of prover scope — a separate optimization workstream).
 
-**Conclusion: the send-side speed case IS recoverable** — fully via a protocol decision
-(MAX_IN_COINS=4, 1.9× prove) and further via an auditor sign-off (64-bit inner FRI, 3.32×).
-The earlier "wash" holds only at today's unchanged protocol.
+**Conclusion: the send-side speed case IS recoverable WITHOUT a UX regression** — via the
+64-bit inner-FRI lever alone (2.25× prove / ~1.3× e2e), keeping MAX_IN_COINS=8. The earlier
+"wash" holds only at today's fully-unchanged protocol (q=100).
 
-## Operator decisions now on the table
+## Applied resolutions (heuristic: most consistent with the existing project)
 
-1. **Field: BabyBear** (resolved — KoalaBear ruled out by AD; Goldilocks-on-Plonky3 only avoids
-   the SDK bump but forfeits the win). BabyBear needs a coordinated `zk-coins/sdk`/Schnorr bump
-   (Doc 2); on-chain `4242` format is unaffected.
-2. **MAX_IN_COINS reduction (8 → 4):** the primary send-speed lever, no soundness question,
-   but **protocol-visible → explicit operator approval**. Quantified UX cost: sends cap at 4
-   in-coins (wallets consolidate first / split the send).
-3. **64-bit inner FRI:** needs a cryptographer's recursion-composition sign-off before it can
-   ship (`[VERIFY-1]`, Doc 3 auditor checklist). Adds the 3.32× tier on top of the protocol lever.
-4. **Proceed/hold on the port (Phases 1–8):** the audit now supports proceeding on BOTH the
-   operational wins (cold-start/memory/mint/stability) AND a conditional send-latency win — no
-   further pre-port probe is outstanding; the open items are the two `[VERIFY]` decisions above.
+These are **decided**, not open escalations:
+
+1. **Field: BabyBear** — KoalaBear ruled out by AD (aggregation 2.1× slower). Goldilocks-on-Plonky3
+   avoids the SDK bump but forfeits the win. BabyBear needs a coordinated `zk-coins/sdk`/Schnorr
+   bump (Doc 2); on-chain `4242` format is unaffected.
+2. **MAX_IN_COINS: KEEP 8** — reducing a user-facing feature for prove-time is inconsistent with
+   the project (Plonky2-Prod runs 8; wallets/SDK calibrated to 8). The N=4 lever (3.32×) is **not
+   pursued**; a speed-for-UX trade is not professional here.
+3. **64-bit inner FRI: conditional gate, queued to the port phase.** It needs a cryptographer's
+   recursion-composition sign-off (`[VERIFY-1]`, Doc 3 auditor checklist) — but it is consistent
+   with Plonky2-Goldilocks's own 64-bit security posture, so it is the recommended target, gated
+   on that sign-off at port time. In research mode it is **not a blocker**.
+4. **Port (Phases 1–8): HOLD.** This engagement is research-only by explicit mandate ("we don't
+   start a migration, only research"). No port was started; HOLD is the only consistent answer.
+   When/if a port is authorized later, it proceeds on the operational wins
+   (cold-start/memory/mint/stability) plus the no-UX-regression 2.25× send-prove win, with the
+   64-bit inner-FRI sign-off as its first gate.
 
 ## Artefact index
 

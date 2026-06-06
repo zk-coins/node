@@ -122,7 +122,7 @@ node-side + per-recursion-layer.
 **Honest bottom line:** the migration is **not a uniform speed win**. It is a large win on
 **cold-start, memory, mint, and operational stability**, a **wash-or-loss on the user-facing
 `/api/send`** (recursion-dominated), at the cost of **larger proofs (1.76 MB)** and an SDK/field
-change if BabyBear is chosen (Doc 2). **RECOVERY (Probes AB–AE, see `scripts/bench/results/plonky3-recursion-reduction-m5-max-2026-06-06.md`): cheaper-inner-FRI (2.4×, 64-bit `[VERIFY]`) + MAX_IN_COINS=4 (~2×, protocol decision) compose to send-prove 1.31 s = 3.32× faster / e2e 1.45× (Probe AE) — the wash holds only at today's unchanged protocol. KoalaBear ruled out (AD).** The batching lever is RESOLVED — Probe X′
+change if BabyBear is chosen (Doc 2). **RECOVERY — APPLIED RESOLUTIONS (Probes AB–AE, `scripts/bench/results/plonky3-recursion-reduction-m5-max-2026-06-06.md`): MAX_IN_COINS stays 8 (UX regression rejected); the recommended config is N=8 + 64-bit inner FRI (q=48) → send-prove 1.93 s = 2.25× faster / e2e ~1.3× — the inner-FRI setting is a port-phase auditor gate (consistent with Plonky2-Goldilocks's 64-bit posture), not a research blocker. Field = BabyBear (KoalaBear ruled out, AD). Port = HOLD (research-only mandate). The wash holds only at the fully-unchanged q=100 config.** The batching lever is RESOLVED — Probe X′
 (`probe_x_prime_batched_aggregator`) ruled it out:** co-proving the 8 sources as one batch
 would cut the aggregation **4.1×** (978 ms non-zk / 1664 ms zk — the theoretical floor), but
 the protocol cannot retroactively batch sources proved by different prior transactions, and
