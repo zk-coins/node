@@ -18,6 +18,39 @@
 > headroom) — **within budget**, not yet incurred in Probe R's witness-gen-only link. The
 > probes below remain correct for the constructions they tested.
 
+## Fair Performance Comparison (Probe S)
+
+**The performance thesis holds — decisively.** Probes I/R measured a *recursion
+overhead* in **Goldilocks** with **untuned (testing) FRI**; they were a
+feasibility check, not a production-prover timing, and so they do **not** answer
+whether Plonky3 is actually faster than Plonky2. **Probe S**
+(`spikes/plonky3-recursion-spike/tests/probe_s_fair_bench.rs`) measures that
+directly: a **BabyBear Poseidon2 STARK** (`p3_uni_stark::prove`/`verify`) under
+**production-tuned FRI**, Poseidon2-Merkle MMCS, parallel DFT, and confirmed
+**NEON SIMD packing** (`PackedMontyField31Neon`, 18 threads) — the field +
+packing + tuned-FRI levers the migration's speed thesis rests on.
+
+**Result vs the measured Plonky2 baseline (4.35 s p50 / 3.9 GB RSS, real zkCoins
+state-transition, same M5 Max host):**
+
+| Workload | FRI | Plonky3 p50 | Speedup | RSS ratio |
+|---|---|---:|---:|---:|
+| hash-matched (~4500 hashes, 2^13 rows) | non-zk (blowup 1) | **71 ms** | **61×** | 51× |
+| hash-matched | zk proxy (blowup 2) | **128 ms** | **34×** | 19× |
+| middle (2^15 rows) | non-zk | 303 ms | 14× | 13× |
+| middle | zk proxy | 522 ms | 8.3× | 9.3× |
+| hash-saturated (2^16, ~14× real hash work) | non-zk | 570 ms | 7.6× | 8.4× |
+| hash-saturated | zk proxy | 1042 ms | 4.2× | 5.6× |
+
+Plonky3 is faster at **every** point — by 4–61× — with 5–51× lower peak RSS,
+even at a hash-saturated workload doing ~14× the real circuit's Poseidon work,
+and even under the blowup-2 zk-proxy FRI. **What it means for the migration:**
+the small-field + SIMD-packing + tuned-FRI move is a large net prover-speed win;
+the ≤5 s warm budget is cleared with one to two orders of magnitude of headroom
+at the real circuit's hash count. Full numbers, methodology, and the honest
+apples-to-apples caveats (hash-saturation, AIR shape, S-box degree, zk-proxy):
+`scripts/bench/results/plonky3-vs-plonky2-fair-m5-max-2026-06-06.md`.
+
 **Status (historical, superseded — see banner above):** 🛑 NO-GO for the migration *as
 specified* (replicating zkCoins' cross-layer state IVC on this `Plonky3-recursion` rev), as
 read before Probe Q/R. Probe J + an adversarial review

@@ -150,6 +150,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "libc"
+version = "0.2.186"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -749,7 +755,9 @@ name = "plonky3-recursion-spike"
 version = "0.0.0"
 dependencies = [
  "bincode",
+ "libc",
  "p3-air",
+ "p3-baby-bear",
  "p3-batch-stark",
  "p3-challenger",
  "p3-circuit",
@@ -762,6 +770,8 @@ dependencies = [
  "p3-lookup",
  "p3-matrix",
  "p3-merkle-tree",
+ "p3-poseidon2",
+ "p3-poseidon2-air",
  "p3-poseidon2-circuit-air",
  "p3-recursion",
  "p3-symmetric",
