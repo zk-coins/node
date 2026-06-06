@@ -5,6 +5,12 @@ members = [
     "node",
     "shared",
 ]
+# Phase 0 Plonky3 recursion spike is its own workspace with heavy git-pinned
+# Plonky3 dependencies (MIGRATION_PLONKY3.md §5). Excluded so it is never built
+# by the main `node`/`shared` CI; build it explicitly from its own directory.
+exclude = [
+    "spikes/plonky3-recursion-spike",
+]
 resolver = "2"
 
 [workspace.dependencies]
