@@ -243,7 +243,7 @@ architecture or a future upstream might still rely on:
 None of these change the NO-GO — they confirm the recursion *engine* is solid; what is
 missing is only the cross-layer value channel.
 
-## Gate decision
+## Gate decision (historical, superseded — see top banner; the live decision is 🟢 GO via Path 1+5)
 
 🛑 **NO-GO for the migration as specified.** Every §5 *binding primitive* is empirically
 proven (PI threading binding, active-count masking, vk-equality connect-back, IVC fixed

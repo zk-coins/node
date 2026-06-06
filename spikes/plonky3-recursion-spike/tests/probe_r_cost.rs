@@ -332,15 +332,28 @@ fn probe_r_cost() {
     );
 
     // --- VERDICT against the ≤5 s warm-prove budget ------------------------
-    if transition_ms <= WARM_BUDGET_MS {
+    // The budget-gating quantity is NOT the witness-gen floor (`transition_ms`)
+    // — it is the eventual STARK-*prove* of the link circuit, whose cost is the
+    // Probe-I recursion-layer-prove class (≈3.2 s), plus the inner carrier prove.
+    // So gate the verdict on `base_avg + PROBE_I_LAYER_MS`, and report the
+    // witness-gen floor only as a separate (much smaller) lower bound.
+    let prove_gated_ms = base_avg + PROBE_I_LAYER_MS;
+    eprintln!(
+        "probe_r_cost: witness-gen floor per-transition (inner prove + link witness-gen) = {transition_ms} ms (NOT the budget gate)"
+    );
+    eprintln!(
+        "probe_r_cost: budget-gating estimate per-transition (inner prove {base_avg} ms + link STARK-prove ≈{PROBE_I_LAYER_MS} ms class) = {prove_gated_ms} ms"
+    );
+    if prove_gated_ms <= WARM_BUDGET_MS {
         eprintln!(
-            "probe_r_cost: VERDICT = WITHIN BUDGET — per-transition {transition_ms} ms <= {WARM_BUDGET_MS} ms warm budget"
+            "probe_r_cost: VERDICT = WITHIN BUDGET — gating estimate {prove_gated_ms} ms <= {WARM_BUDGET_MS} ms warm budget (~{} ms headroom; re-measure vs the real Poseidon-heavy circuit in Phase 5)",
+            WARM_BUDGET_MS - prove_gated_ms
         );
     } else {
         eprintln!(
-            "probe_r_cost: VERDICT = !!! BLOWS BUDGET !!! — per-transition {transition_ms} ms > {WARM_BUDGET_MS} ms warm budget (over by {} ms / {:.2}x)",
-            transition_ms - WARM_BUDGET_MS,
-            transition_ms as f64 / WARM_BUDGET_MS as f64
+            "probe_r_cost: VERDICT = !!! BLOWS BUDGET !!! — gating estimate {prove_gated_ms} ms > {WARM_BUDGET_MS} ms warm budget (over by {} ms / {:.2}x)",
+            prove_gated_ms - WARM_BUDGET_MS,
+            prove_gated_ms as f64 / WARM_BUDGET_MS as f64
         );
     }
 
