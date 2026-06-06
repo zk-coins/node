@@ -46,6 +46,9 @@ p3-dft = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a6298
 p3-field = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
 p3-fri = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
 p3-goldilocks = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
+# Probe V/W: degree-7 cryptographic S-box path uses the Keccak byte-hash MMCS
+# (the working upstream `prove_poseidon2_baby_bear_keccak_zk.rs` recipe).
+p3-keccak = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
 p3-lookup = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
 p3-matrix = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
 p3-merkle-tree = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
