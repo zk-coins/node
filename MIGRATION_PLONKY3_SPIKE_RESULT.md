@@ -1,7 +1,141 @@
 # Plonky3 Recursion Feasibility Spike — Result (Phase 0 Go/No-Go)
 
-**Status:** 🛑 **NO-GO** for the migration *as specified* (replicating zkCoins'
-cross-layer state IVC on this `Plonky3-recursion` rev). Probe J + an adversarial review
+> 🟢 **SUPERSEDED — gate is GO (2026-06-06, later same day).** The NO-GO below was **scoped
+> too narrowly** and is **overturned**. `probe_q_custom_public_value` proved a custom AIR
+> with `num_public_values() > 0` surfaces a soundly-bound per-instance value across a batch
+> layer (upstream PR #407, already in our pinned rev), and **`probe_r_carrier_chain` then
+> threaded a counter end-to-end across a real depth-4 IVC chain** via that channel
+> (`V_3 == V_0 + 3`; wrong forwarded value rejected; wrong carrier bind rejected). The
+> `[0,0,0]` finding held only for the primitive tables / `CircuitBuilder` public inputs that
+> probes D/G/H/J tested. **CHOSEN DIRECTION: Path 1+5 — custom public-value-emitting (carrier)
+> tables** (stays in the Plonky3-STARK family, minimal delta from the Plonky2 IVC model, no
+> protocol change). Rationale + 9-path analysis: **`MIGRATION_PLONKY3_SOLUTIONS_RESEARCH.md`**;
+> end-to-end proof: PR #214. **Cost (`probe_r_cost`):** the carrier threading + in-circuit
+> two-proof verification adds **no** measurable overhead on top of the bare recursion floor —
+> at the real `2^16`-row inner scale the base carrier `prove_batch` is ≈271 ms/layer and the
+> IVC link's witness-gen ≈2 ms, peak RSS ≈91 MB. The number that actually gates the ≤5 s warm
+> budget is the eventual STARK-*prove* of the link circuit (Probe I's ≈3.2 s class, ~1.8 s
+> headroom) — **within budget**, not yet incurred in Probe R's witness-gen-only link. The
+> probes below remain correct for the constructions they tested.
+
+## Fair Performance Comparison (Probe S, corrected by V/W)
+
+**RESOLVED (T/X/X′/U): a mixed verdict — big wins on cold-start/memory/mint, a wash-or-loss
+on `/api/send`.** Probe S's first headline (4–61×) was ~5× too optimistic (degree-3 + zk-proxy;
+corrected by V/W); the real single transition is 10–14× faster (T), but the 8-way source
+aggregation dominates the full send and is NOT reducible by batching (X′) — so `/api/send` is a
+wash (non-zk) / loss (zk), while mint is ~2× and cold-start 38.7×. The full picture is built up
+below and summarised in `docs/migration/PLONKY3_MIGRATION_AUDIT_SUMMARY.md`. Probes I/R measured a
+*recursion overhead* in **Goldilocks** with **untuned (testing) FRI** — a
+feasibility check, not a production-prover timing. **Probe S**
+(`tests/probe_s_fair_bench.rs`) measured a **BabyBear Poseidon2 STARK** under
+tuned FRI, Poseidon2-Merkle MMCS, parallel DFT, confirmed **NEON packing**
+(`PackedMontyField31Neon`, 18 threads). But Probe S used a **degree-3 S-box** and
+a **blowup-2 zk-PROXY**, both of which understate the real production cost —
+**Probes V and W measured the true cost of each, and the correction is large.**
+
+**Probe S (degree-3, zk-proxy) — OPTIMISTIC, superseded for the zk rows by Probe W:**
+
+| Workload | FRI | Plonky3 p50 | Speedup |
+|---|---|---:|---:|
+| hash-matched (~4500 hashes, 2^13 rows) | non-zk (blowup 1) | 71 ms | 61× |
+| middle (2^15 rows) | non-zk | 303 ms | 14× |
+| hash-saturated (2^16) | non-zk | 570 ms | 7.6× |
+| *(zk rows used a blowup-2 proxy — see Probe W correction below)* | | | |
+
+**Probe V — degree-7 (the cryptographic S-box) costs 1.66–1.69× over degree-3**
+(stable across sizes; at the low end of the 1.5–2.5× review estimate — confirmed,
+not refuted). **Probe W — true `HidingFriPcs` (real ZK with random masking rows)
+costs 2.9–3.0× over the blowup-2 proxy** — masking roughly TRIPLES prove time; the
+proxy was NOT a "small additive term" and Probe S's zk rows were ~3× too fast.
+
+**Corrected production config (degree-7 + true HidingFriPcs + Keccak MMCS),
+measured in Probe V/W vs Plonky2 4.35 s:**
+
+| Trace height | degree-7 + hiding p50 | vs Plonky2 4.35 s |
+|---|---:|---:|
+| 2^13 (hash-matched ~4500) | **1419 ms** | **3.07× faster** ✅ |
+| 2^15 | 5910 ms | 0.74× (slower) ⚠️ |
+| 2^16 (hash-saturated) | 12033 ms | 0.36× (much slower) 🔴 |
+
+**What it means:** the combined correction is ~1.67× (degree) × ~3× (hiding) ≈ **5×**
+on Probe S's optimistic numbers. Plonky3 still wins decisively at the real
+**hash count** (~2^13 height → 3.07× under full production crypto), but at a
+hash-saturated 2^16-height trace the production config is SLOWER than Plonky2. The
+real zkCoins circuit is a *batch* of a ~2^13-height hash table **plus** a ~2^16-height
+non-hash table — so the net result depends on the real table mix, which **Probe T**
+measures directly (degree-7 + HidingFriPcs, full multi-table). Until Probe T lands,
+the honest statement is: **promising at the real hash count, not a guaranteed win at
+full circuit size.** Methodology + caveats:
+`scripts/bench/results/plonky3-vs-plonky2-fair-m5-max-2026-06-06.md`;
+degree-7 = `probe_v_degree7_bench`, true-hiding = `probe_w_hiding_fri`.
+
+### Probe T resolution — the real circuit IS faster (V/W "2^16 slower" was hash-saturation)
+
+`probe_t_real_circuit_bench` resolves the pending verdict by modelling the REAL circuit's
+*actual* cost mix under TRUE production crypto — a real multi-table `prove_batch` (which
+**does** work with HidingFriPcs + mixed degree, an empirical finding) of a degree-7 Poseidon2
+hash table sized to ~4500 hashes (~175 ms standalone) **plus** a degree-3 arithmetic table for
+the ~50k non-hash gates (those are real-circuit-faithfully degree 2–3: comparisons, range,
+boolean, field-mul — the high-degree cost lives only in the hash S-box, correctly placed in
+the hash table). Result vs Plonky2 **4.35 s warm**:
+
+| Non-hash table | constraints | warm p50 | net vs Plonky2 | RSS |
+|---|---:|---:|---:|---:|
+| 2^13 (realistic — already >50k gates) | 98 304 | **312 ms** | **13.95× faster** | 1.1 GB |
+| 2^14 | 196 608 | 449 ms | 9.69× | 1.7 GB |
+| 2^15 | 393 216 | 735 ms | 5.92× | 1.9 GB |
+| 2^16 (inflated ceiling) | 786 432 | 1307 ms | 3.33× | 2.1 GB |
+
+Config/AIR build = **0.07 ms** (vs Plonky2's 8.2 s cold circuit-build — a ~10⁵× setup win).
+**Why this differs from V/W's "2^16 = 12 s slower":** V/W ran the WHOLE 2^16-height trace as the
+degree-7 `VectorizedPoseidon2Air` (8 lanes → ~2^19 Poseidon perms — hash-SATURATED, ~115× the
+real hash work). The real circuit has only ~4500 hashes (a ~1024-row table) plus a cheap
+degree-3 arithmetic bulk — so V/W's 2^16 point was never the real circuit. **Honest
+qualification:** Probe T is the **single state-transition** prove cost. The full populated
+`/api/send` prove additionally verifies the predecessor proof in-circuit (IVC carrier) and the
+up-to-8-way source aggregator — that recursion overhead is **Probe X**, and the end-to-end node
+number is **Probe U**; both sit on TOP of these figures. Net so far: **the core transition is
+~10–14× faster under true production crypto; the full-pipeline verdict follows X + U.**
+
+### Full-pipeline net verdict (Probes X / Y / Z / AA / U) — honest, mixed
+
+**Probe X (recursion/aggregation, 8 sources + 1 IVC, REAL in-circuit STARK-prove via the
+low-level `prove_all_tables` path — #436 is NOT a blocker):** the in-circuit verification of
+the 8-way source aggregator + IVC predecessor costs **4.0 s (non-zk) / 6.7 s (zk)** warm — it
+**dominates** the prove (the single transition is ~7% of it). The recursion verifier is
+hash-heavy (in-circuit FRI/Merkle), and hashing benefits far less from BabyBear's small field
+than raw arithmetic does — so the per-transition win does NOT carry into recursion.
+
+**Composed `/api/send` (T+X+node-overhead, Probe U projection):** **~9.9 s non-zk (≈ wash vs
+Plonky2's ~10 s) / ~12.6 s zk (slower).** With the real Poseidon-heavy inner circuit (heavier
+than the carrier proxy, so Probe X is a *lower bound*), the full send likely tips **slower**.
+**`/api/mint`** (recursion-light, no 8-way aggregation) projects **~2× faster**. 
+
+**The unambiguous wins:** **Probe Y cold-start = 38.7× faster** (372 ms vs Plonky2's 14.4 s —
+Plonky3 has ~no circuit-build: 1.46 ms vs 8.2 s); **peak RSS** consistently **1–2 GB vs 3.9 GB**;
+**Probe AA** 1000-prove soak shows **+2.7 % latency drift (stable), no memory leak**, RSS
+plateaus. **Probe Z:** native verify 9.6 ms, proof **1.76 MB** (large — a STARK-size cost),
+prove÷verify ≈ 33×; zkCoins verifies nothing on-chain (Schnorr-only, Doc 2), so verify cost is
+node-side + per-recursion-layer.
+
+**Honest bottom line:** the migration is **not a uniform speed win**. It is a large win on
+**cold-start, memory, mint, and operational stability**, a **wash-or-loss on the user-facing
+`/api/send`** (recursion-dominated), at the cost of **larger proofs (1.76 MB)** and an SDK/field
+change if BabyBear is chosen (Doc 2). **RECOVERY — APPLIED RESOLUTIONS (Probes AB–AE, `scripts/bench/results/plonky3-recursion-reduction-m5-max-2026-06-06.md`): MAX_IN_COINS stays 8 (UX regression rejected); the recommended config is N=8 + 64-bit inner FRI (q=48) → send-prove 1.93 s = 2.25× faster / e2e ~1.3× — the inner-FRI setting is a port-phase auditor gate (consistent with Plonky2-Goldilocks's 64-bit posture), not a research blocker. Field = BabyBear (KoalaBear ruled out, AD). Port = HOLD (research-only mandate). The wash holds only at the fully-unchanged q=100 config.** The batching lever is RESOLVED — Probe X′
+(`probe_x_prime_batched_aggregator`) ruled it out:** co-proving the 8 sources as one batch
+would cut the aggregation **4.1×** (978 ms non-zk / 1664 ms zk — the theoretical floor), but
+the protocol cannot retroactively batch sources proved by different prior transactions, and
+for 8 INDEPENDENT proofs the API instantiates one full in-circuit FRI verifier each — measured
+**1.00–1.01× vs Probe X, exactly flat**. So the only live send-side lever is **reducing
+`MAX_IN_COINS`** (protocol-visible — operator decision), or future upstream recursion
+improvements. Full numbers: `scripts/bench/results/plonky3-probe-{t,u}-*.md`;
+X = `probe_x_aggregator_recursion`, X′ = `probe_x_prime_batched_aggregator`,
+Y = `probe_y_cold_start`, Z = `probe_z_verifier`, AA = `probe_aa_sustained_load`.
+
+**Status (historical, superseded — see banner above):** 🛑 NO-GO for the migration *as
+specified* (replicating zkCoins' cross-layer state IVC on this `Plonky3-recursion` rev), as
+read before Probe Q/R. Probe J + an adversarial review
 of all escape routes confirm that **neither Option 1 (AIR public values) nor Option 2
 (commit + hash re-bind) can thread a value across a batch-recursion layer** — there is
 no per-instance value channel; only whole-trace Merkle-cap commitments are exposed, and
@@ -35,7 +169,7 @@ yields two incompatible copies of the `p3-*` types. Use this exact pair.
 from the root zkcoins workspace so the heavy Plonky3 git deps never enter the
 `node`/`shared` build or CI. Throwaway; deleted once the real port lands.
 
-Tests (all 17 green, `cargo nextest run -p plonky3-recursion-spike`):
+Tests (all 33 green, `cargo nextest run -p plonky3-recursion-spike`):
 
 | Test | Proves (real proving, ✅ = pos+neg asserted) | Result |
 |---|---|---|
@@ -56,6 +190,22 @@ Tests (all 17 green, `cargo nextest run -p plonky3-recursion-spike`):
 | `probe_n_concurrent` | **concurrent load** — 4 independent prove+recurse+verify workloads on threads all succeed; peak RSS ~1.38 GB | ✅ |
 | `probe_o_soundness` | **soundness spot-check** — mismatched FRI private data (a different proof's Merkle paths) rejected; tampered public input rejected → the verifier is not vacuous | ✅ |
 | `probe_p_serialization` | **proof serialization** — recursion proof bincode round-trips byte-stable (~363 KB) + still verifies; truncated blob rejected | ✅ |
+| `probe_q_custom_public_value` | **overturns the NO-GO** — a custom AIR with `num_public_values()>0` surfaces a soundly-bound per-instance value across a batch layer (`air_public_targets[0].len()==1`); value 42 verifies, 999 rejected (BabyBear, upstream PR #407) | ✅ |
+| `probe_r_carrier_chain` | **chosen direction, end-to-end** — depth-4 carrier-table IVC chain threads a counter `V_3 == V_0+3`; each link verifies both adjacent carriers in-circuit + `connect`s the carry; wrong forwarded value rejected (WitnessConflict, w/ control), wrong carrier bind rejected (OodEvaluationMismatch) | ✅ |
+| `probe_r_cost` | **cost @ real scale** — carrier chain at `2^16`-row inner size: base ≈271 ms/layer, IVC-link witness-gen ≈2 ms, peak RSS ≈91 MB; per-transition floor ≈273 ms; budget-gating link STARK-prove ≈3.2 s class (within ≤5 s warm, ~1.8 s headroom) | ✅ |
+| `probe_s_fair_bench` | **fair Plonky3-vs-Plonky2 prover speed** — BabyBear Poseidon2 STARK, tuned FRI, Poseidon2-MMCS, NEON packing: degree-3/zk-proxy headline (corrected by V/W below) (see §"Fair Performance Comparison") | ✅📊 |
+| `probe_v_degree7_bench` | **degree-7 (cryptographic) S-box cost** — real degree-7÷degree-3 ratio = 1.66–1.69× (stable); confirms the review estimate | ✅📊 |
+| `probe_w_hiding_fri` | **true HidingFriPcs vs zk-proxy** — real ZK masking costs 2.9–3.0× over the blowup-2 proxy; the Probe S zk-proxy was ~3× too fast | ✅📊 |
+| `probe_t_real_circuit_bench` | **real-circuit cost estimate** — multi-table `prove_batch` (degree-7 hash + degree-3 arith + HidingFriPcs): single transition ~312 ms = 10–14× faster; build 0.07 ms | ✅📊 |
+| `probe_x_aggregator_recursion` | **recursion overhead, 8+1 fan-in** — real in-circuit STARK-prove 4.0 s (non-zk) / 6.7 s (zk); dominates the prove, ≈erases the per-transition win on `/api/send` (#436 not a blocker) | ✅📊 |
+| `probe_y_cold_start` | **cold-start** — build+first-prove 372 ms vs Plonky2 14.4 s = 38.7× faster (no circuit-build step) | ✅📊 |
+| `probe_z_verifier` | **verifier asymmetry** — verify 9.6 ms, proof 1.76 MB, prove÷verify ≈ 33×; tamper rejected | ✅📊 |
+| `probe_aa_sustained_load` | **sustained-load soak** — 1000 proves / 5.43 min: +2.7 % latency drift (stable), RSS plateaus, no leak | ✅📊 |
+| `probe_x_prime_batched_aggregator` | **batching lever resolved** — co-proved sources would cut aggregation 4.1× (978 ms/1664 ms floor) but is protocol-unreachable; 8 INDEPENDENT proofs = 1.00–1.01× vs Probe X (flat) → only live lever is MAX_IN_COINS | ✅📊 |
+| `probe_ab_recursion_friendly` | **recursion levers** — cheaper-inner-FRI q48 = 2.4× (64-bit, `[VERIFY]`); Poseidon2-inner-MMCS already baseline (Keccak-inner unverifiable in-circuit); ZK-only-outer ≈ 0 | ✅📊 |
+| `probe_ac_max_in_coins_sweep` | **fan-in sweep 1/2/4/8** — aggregation ≈ 448 ms/coin + 350 ms base, near-linear; N=4 halves it (protocol lever, no soundness question) | ✅📊 |
+| `probe_ad_koalabear` | **field comparison** — KoalaBear transition 1.26× faster BUT aggregation 2.1× SLOWER (20 vs 13 partial rounds) → stay BabyBear | ✅📊 |
+| `probe_ae_best_config` | **composed best config** — N=4 + q48: send-prove **1.31 s = 3.32× faster** than Plonky2; e2e 6.91 s = 1.45×; conditional on 2 `[VERIFY]`s | ✅📊 |
 
 Each `✅` test asserts BOTH a positive (correct → accepted) and a negative
 (tampered/wrong → rejected), and most add a CONTROL isolating the cause of the
@@ -221,7 +371,7 @@ architecture or a future upstream might still rely on:
 None of these change the NO-GO — they confirm the recursion *engine* is solid; what is
 missing is only the cross-layer value channel.
 
-## Gate decision
+## Gate decision (historical, superseded — see top banner; the live decision is 🟢 GO via Path 1+5)
 
 🛑 **NO-GO for the migration as specified.** Every §5 *binding primitive* is empirically
 proven (PI threading binding, active-count masking, vk-equality connect-back, IVC fixed
@@ -240,8 +390,11 @@ Merkle/single non-recursive state-transition) would still port, but they are not
 without the recursion they feed.
 
 **Decision is the operator's** (`MIGRATION_PLONKY3.md` §16 — protocol-touching). Options:
-1. **Hold** — keep the spike + pinned probes; revisit when `Plonky3-recursion` exposes
-   cross-layer public inputs (the pinned probes auto-detect it). Recommended default.
+1. ~~**Hold** — revisit when `Plonky3-recursion` exposes cross-layer public inputs.~~
+   **SUPERSEDED:** the capability is already present (PR #407, on the pinned rev) — it was
+   not missing upstream, it was simply not exercised by the stock-table probes. See the
+   banner at the top and `MIGRATION_PLONKY3_SOLUTIONS_RESEARCH.md` (Path 1+5: GO via custom
+   public-value-emitting tables).
 2. **Protocol redesign** — re-architect to avoid cross-layer state threading. Out of
    scope for a backend port; a separate design effort the operator must commission.
 3. **Fork upstream** — explicitly excluded by §16.

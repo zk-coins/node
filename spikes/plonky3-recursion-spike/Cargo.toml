@@ -33,6 +33,11 @@ p3-circuit-prover = { git = "https://github.com/Plonky3/Plonky3-recursion", rev 
 p3-poseidon2-circuit-air = { git = "https://github.com/Plonky3/Plonky3-recursion", rev = "524665d0c2e1d294722c064786ae11dff8d9f33b" }
 
 # Plonky3 core crates @ the exact rev Plonky3-recursion is built against.
+# Probe S (fair BabyBear prover-speed benchmark) deps, same Plonky3-main rev.
+p3-baby-bear = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
+p3-poseidon2 = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
+p3-poseidon2-air = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
+
 p3-air = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
 p3-batch-stark = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
 p3-challenger = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
@@ -41,6 +46,13 @@ p3-dft = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a6298
 p3-field = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
 p3-fri = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
 p3-goldilocks = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
+# Probe AD (KoalaBear-vs-BabyBear field comparison): KoalaBear is the other
+# candidate 31-bit Plonky3 field (p = 2^31 - 2^24 + 1, 2-adicity 24, native
+# Poseidon2 S-box DEGREE 3 — vs BabyBear's degree 7). Same pinned Plonky3 rev.
+p3-koala-bear = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
+# Probe V/W: degree-7 cryptographic S-box path uses the Keccak byte-hash MMCS
+# (the working upstream `prove_poseidon2_baby_bear_keccak_zk.rs` recipe).
+p3-keccak = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
 p3-lookup = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
 p3-matrix = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
 p3-merkle-tree = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
@@ -51,6 +63,10 @@ p3-util = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a629
 rand = { version = "0.10.0", default-features = false }
 # Proof serialization round-trip (Probe P) — the node persists proof blobs.
 bincode = "1.3"
+# Probe S: peak-RSS measurement via getrusage(RUSAGE_SELF).
+libc = "0.2"
+# Probe T: report the active rayon thread-pool width alongside the bench.
+rayon = "1.10"
 
 # Reuse the upstream Goldilocks param bundle (F, Perm, MyHash, MyMmcs,
 # MyConfig, DIGEST_ELEMS, WIDTH, RATE, …) so the spike's config matches
