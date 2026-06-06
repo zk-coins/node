@@ -1,0 +1,64 @@
+# Phase 0 recursion-feasibility spike (MIGRATION_PLONKY3.md §5).
+#
+# THROWAWAY crate: it exists only to prove that `Plonky3/Plonky3-recursion`
+# can express the three composition patterns zkCoins depends on (IVC/cyclic
+# with a base case, fan-in-8 with a variable active count, vk/PI binding),
+# in Goldilocks, using trivial counter AIRs — NOT the real circuit.
+#
+# It is its own workspace (note the empty `[workspace]` table) and is
+# `exclude`d from the root zkcoins workspace, so the heavy Plonky3 git
+# dependencies are NEVER pulled into the main `node`/`shared` build or CI.
+#
+# Pins (record these in the PR body, never use a floating branch):
+#   Plonky3/Plonky3-recursion @ 524665d0c2e1d294722c064786ae11dff8d9f33b (HEAD 2026-06-06)
+#   Plonky3/Plonky3           @ 56952503e1401a62982ceaf952c5e4a829b61803
+# The Plonky3-main rev is dictated by what Plonky3-recursion was built
+# against (its workspace pins exactly this rev); using any other rev would
+# give two incompatible copies of the p3-* types and break unification.
+
+[package]
+name = "plonky3-recursion-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+resolver = "2"
+
+[dependencies]
+# Recursion crates (git-only, not on crates.io) @ Plonky3-recursion HEAD.
+p3-recursion = { git = "https://github.com/Plonky3/Plonky3-recursion", rev = "524665d0c2e1d294722c064786ae11dff8d9f33b" }
+p3-circuit = { git = "https://github.com/Plonky3/Plonky3-recursion", rev = "524665d0c2e1d294722c064786ae11dff8d9f33b" }
+p3-circuit-prover = { git = "https://github.com/Plonky3/Plonky3-recursion", rev = "524665d0c2e1d294722c064786ae11dff8d9f33b" }
+p3-poseidon2-circuit-air = { git = "https://github.com/Plonky3/Plonky3-recursion", rev = "524665d0c2e1d294722c064786ae11dff8d9f33b" }
+
+# Plonky3 core crates @ the exact rev Plonky3-recursion is built against.
+p3-air = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
+p3-batch-stark = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
+p3-challenger = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
+p3-commit = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
+p3-dft = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
+p3-field = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
+p3-fri = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
+p3-goldilocks = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
+p3-lookup = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
+p3-matrix = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
+p3-merkle-tree = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
+p3-symmetric = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
+p3-uni-stark = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
+p3-util = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
+
+rand = { version = "0.10.0", default-features = false }
+# Proof serialization round-trip (Probe P) — the node persists proof blobs.
+bincode = "1.3"
+
+# Reuse the upstream Goldilocks param bundle (F, Perm, MyHash, MyMmcs,
+# MyConfig, DIGEST_ELEMS, WIDTH, RATE, …) so the spike's config matches
+# byte-for-byte what p3-recursion's own Goldilocks tests use. Used by the
+# `goldilocks_rec` harness at lib level, so it is a normal dependency.
+p3-test-utils = { git = "https://github.com/Plonky3/Plonky3-recursion", rev = "524665d0c2e1d294722c064786ae11dff8d9f33b" }
+
+# opt-level 3 even in dev: the probes actually prove STARKs; unoptimized
+# field arithmetic makes them unbearably slow.
+[profile.dev]
+opt-level = 3
