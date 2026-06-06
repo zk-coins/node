@@ -29,7 +29,7 @@ Tests (all 8 green, `cargo nextest run -p plonky3-recursion-spike`):
 | Test | Proves (real proving, ✅ = pos+neg asserted) | Result |
 |---|---|---|
 | `base_air_round_trips` (P0-T1) | counter AIR proves+verifies via p3-uni-stark / Goldilocks | ✅ |
-| `probe_a_ivc` (P0-T2) | IVC structure (layer verifies predecessor) + constant-shape fixed point | ✅ |
+| `probe_a_ivc` (P0-T2 crit. 1) | IVC structure (layer verifies predecessor) + constant-shape fixed point — does NOT itself thread a PI (that is crit. 2, below) | ✅ |
 | `probe_b_fanin` (P0-T3) | 2-to-1 aggregation composes into a fixed-shape fan-in tree | ✅ |
 | `probe_c_vk_binding` | inner-proof public-input binding (accept correct / reject mismatched) | ✅ |
 | `probe_d_pi_threading` (P0-T2 crit. 2) | **cross-layer PI threading binding** — inner PI threaded to an outer carried value with an IVC relation; wrong value rejected | ✅ |
