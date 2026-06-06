@@ -49,6 +49,8 @@ p3-uni-stark = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e140
 p3-util = { git = "https://github.com/Plonky3/Plonky3", rev = "56952503e1401a62982ceaf952c5e4a829b61803" }
 
 rand = { version = "0.10.0", default-features = false }
+# Proof serialization round-trip (Probe P) — the node persists proof blobs.
+bincode = "1.3"
 
 # Reuse the upstream Goldilocks param bundle (F, Perm, MyHash, MyMmcs,
 # MyConfig, DIGEST_ELEMS, WIDTH, RATE, …) so the spike's config matches

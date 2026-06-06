@@ -22,6 +22,7 @@ use p3_circuit::NonPrimitiveOpId;
 use p3_circuit::ops::{
     GoldilocksD2Width8, Poseidon2Params, generate_poseidon2_trace, generate_recompose_trace,
 };
+use p3_circuit_prover::batch_stark_prover::BatchStarkProof;
 use p3_circuit_prover::common::get_airs_and_degrees_with_prep;
 use p3_circuit_prover::{BatchStarkProver, CircuitProverData, ConstraintProfile, TablePacking};
 use p3_commit::Pcs;
@@ -297,6 +298,21 @@ pub fn verify_recursion_output(
     prover.register_recompose_table::<2>(false);
     prover
         .verify_all_tables(&output.0)
+        .map_err(|e| format!("verify_all_tables failed: {e:?}"))
+}
+
+/// Verify a bare batch proof (e.g. one round-tripped through (de)serialization).
+pub fn verify_batch_proof(
+    proof: &BatchStarkProof<ConfigWithFriParams>,
+    config: &ConfigWithFriParams,
+    table_packing: &TablePacking,
+) -> Result<(), String> {
+    let mut prover =
+        BatchStarkProver::new(config.clone()).with_table_packing(table_packing.clone());
+    prover.register_poseidon2_table::<2>(Poseidon2Config::GOLDILOCKS_D2_W8);
+    prover.register_recompose_table::<2>(false);
+    prover
+        .verify_all_tables(proof)
         .map_err(|e| format!("verify_all_tables failed: {e:?}"))
 }
 
