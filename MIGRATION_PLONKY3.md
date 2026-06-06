@@ -146,29 +146,35 @@ Contents: per-probe `supported / blocked / workaround` with code pointers; measu
 - **NO-GO (upstream-gated):** any probe blocked by a `p3-recursion` gap. STOP. Do not start Phase 1. File/link the upstream issue, set a re-check date, report to the operator. Do not patch or fork `p3-recursion` as part of this migration.
 
 > **Recorded Phase 0 result (2026-06-06, see `MIGRATION_PLONKY3_SPIKE_RESULT.md`):**
-> 🛑 **NO-GO for the migration as specified.** All §5 *binding primitives* were exercised
-> empirically with real proving + positive/negative assertions (PI-threading binding,
-> active-count masking, vk-equality connect-back, IVC fixed point, fan-in composition) —
-> but they all work only **within a layer or across the single uni-stark hop**. The thing
-> the recursion contract requires and this rev cannot provide is a **per-instance value
-> channel across a batch-recursion layer**:
-> - **Option 1 (AIR public values) — dead** (`probe_h_option1_air_public_values`,
->   `probe_g_fanin_pi_passthrough`, `probe_d_multilayer_carry`: `air_public_targets = [0,0,0]`;
->   CircuitBuilder public inputs live in the committed Public *table*, never as AIR values).
-> - **Option 2 (commit + hash re-bind) — also dead** (`probe_j_option2_rebind` + an
->   adversarial review of all six escape routes): the per-layer hash-bind *primitive* works,
->   but layer N+1 cannot READ layer N's committed digest (batch proofs expose only
->   whole-trace Merkle commitments; FRI openings are FS-random; vk is per-circuit-static;
->   NPO `public_values` are hardcoded empty with no public registration path).
+> 🟢 **GO via Path 1+5 — custom public-value-emitting (carrier) tables.** An initial reading
+> was NO-GO, but it was **scoped too narrowly**: it tested only primitive tables and
+> `CircuitBuilder` public inputs (which surface `air_public_targets = [0,0,0]`). The
+> solution-space search (`MIGRATION_PLONKY3_SOLUTIONS_RESEARCH.md`, 9 paths) surfaced that a
+> **custom AIR with `num_public_values() > 0` DOES expose a soundly-bound per-instance value
+> across a batch-recursion layer** (upstream PR #407, already in our pinned rev). Two probes
+> confirm this empirically end-to-end:
+> - **`probe_q_custom_public_value`** — a `PublicValueAir` (`num_public_values()=1`, first-row
+>   bind) surfaces its value across a batch layer (`air_public_targets[0].len()==1`); value 42
+>   verifies, 999 rejected. This is the per-instance value channel the earlier reading missed.
+> - **`probe_r_carrier_chain`** — the chosen-direction construction proven end-to-end: a
+>   **depth-4 carrier-table IVC chain** where each layer is a real `prove_batch` `CarrierAir`
+>   proof carrying `[v_in, v_out]` (AIR enforces `v_out == v_in + 1`, both bound to committed
+>   trace cells), and each IVC link verifies BOTH adjacent carriers in one `CircuitBuilder`
+>   (`verify_batch_circuit` — their PVs surface as length-2 `air_public_targets`) and
+>   `connect`s `v_out(N) == v_in(N+1)`. POSITIVE: `V_3 == V_0 + 3`. NEGATIVE: wrong forwarded
+>   value → WitnessConflict (with a control that isolates the cause); wrong carrier bind →
+>   OodEvaluationMismatch. **Public-API-only — no fork.** It also dodges upstream issue #436
+>   by avoiding the high-level `prove_next_layer` aggregation API.
 >
-> So `prev_account`/ProofData threading across the IVC chain is **structurally unbuildable**
-> here, and **Phases 4–5 cannot be completed** on this rev. The non-recursive parts
-> (field/hash/Merkle/single state-transition) would still port but are useless without the
-> recursion they feed. **Do not start the port.** Escape routes (operator decision, §6):
-> (1) an upstream rev that exposes cross-layer public inputs — the pinned probes auto-detect
-> it; (2) a protocol redesign without cross-layer state threading; (3) fork — excluded by §16.
-> A would-be cost note for if Option 2 ever composed: a real-scale recursion layer is ≈3.2 s
-> / ≈1.4 GB (`probe_i`), so the ≤5 s warm budget would also be at risk.
+> So `prev_account`/ProofData threading across the IVC chain **is buildable** on this rev via
+> carrier tables, and **Phases 4–5 can proceed.** Cost (`probe_r_cost`, `2^16`-row inner
+> scale): the carrier threading + in-circuit two-proof verification add **no** measurable
+> overhead on the bare recursion floor (base ≈271 ms/layer, link witness-gen ≈2 ms, peak RSS
+> ≈91 MB); the budget-gating cost remains the eventual STARK-*prove* of the link circuit
+> (Probe I's ≈3.2 s / ≈1.4 GB class) — **within the ≤5 s warm budget** with ~1.8 s headroom,
+> to be re-measured against the real Poseidon-heavy circuit early in Phase 5.
+> **CHOSEN DIRECTION: Path 1+5** (rationale + alternatives in `MIGRATION_PLONKY3_SOLUTIONS_RESEARCH.md`;
+> end-to-end proof: PR #214). **The port is authorized to start.**
 
 ### Phase 0 abort/timebox
 - Hard timebox: **5 working days.** This is a feasibility probe, not a port.
@@ -178,46 +184,52 @@ Contents: per-probe `supported / blocked / workaround` with code pointers; measu
 
 ## 6. Phase 1 — New crate skeleton
 
-**Prereq: Phase 0 = GO. Phase 0 is NO-GO (see below) — DO NOT START Phase 1.**
+**Prereq: Phase 0 = GO. Phase 0 is GO via Path 1+5 (carrier tables, see below) — Phase 1 is authorized.**
 
-### 🛑 Phase 0 outcome — cross-layer PI threading is unbuildable → NO-GO
+### 🟢 Phase 0 outcome — cross-layer state threading IS buildable via carrier tables → GO (Path 1+5)
 
-This was an open choice (Option 1 AIR-public-values vs Option 2 commit+hash). **Phase 0
-resolved it empirically: NEITHER option works.** The high-level batch recursion does
-**not** propagate public inputs across layers, and there is no per-instance value channel
-across a batch-recursion layer at all:
-- **Option 1 dead.** A `CircuitBuilder` circuit's public inputs live in the committed
-  Public *table*, never as AIR public values: `probe_d_multilayer_carry`
-  (`air_public_targets = [0,0,0]`), `probe_h_option1_air_public_values` (injecting
-  `table_public_inputs` is rejected), `probe_g_fanin_pi_passthrough` (a real aggregation
-  surfaces 0 per-leaf values).
-- **Option 2 dead.** `probe_j_option2_rebind`: the in-circuit Poseidon2 hash-bind
-  *primitive* works, but layer N+1 cannot READ layer N's committed digest — batch proofs
-  expose only whole-trace Merkle commitments; FRI openings are FS-random; vk is
-  per-circuit-static; NPO `public_values` are hardcoded empty. An adversarial review of all
-  six escape routes confirmed no value binds across a batch layer without a fork/redesign.
+The cross-layer state channel was the open feasibility question. An initial reading was
+NO-GO because it tested only **primitive tables and `CircuitBuilder` public inputs** (which
+surface `air_public_targets = [0,0,0]`). The solution-space search
+(`MIGRATION_PLONKY3_SOLUTIONS_RESEARCH.md`) overturned that: a **custom AIR with
+`num_public_values() > 0` exposes a soundly-bound per-instance value across a
+batch-recursion layer** (upstream PR #407, already in our pinned rev). The construction is
+a **carrier table**: a small custom AIR whose public values carry the threaded state, bound
+to its committed trace cells, and re-verified in the next layer via `verify_batch_circuit`.
+- **`probe_q_custom_public_value`** proves the channel exists: a `PublicValueAir`'s value
+  surfaces across a batch layer (`air_public_targets[0].len()==1`), correct value accepted,
+  wrong value rejected.
+- **`probe_r_carrier_chain`** proves the full construction end-to-end: a depth-4 carrier-table
+  IVC chain threading a counter `V_3 == V_0 + 3`; each link verifies both adjacent carriers
+  in-circuit and `connect`s the carry; wrong forwarded value and wrong carrier bind both
+  rejected (with a control isolating the cause). **Public-API-only, no fork**; dodges upstream
+  issue #436 by staying on the low-level `prove_batch` / `verify_batch_circuit` API.
+- **`probe_r_cost`** (`2^16`-row inner scale): carrier threading adds no measurable overhead
+  on the bare recursion floor; per-transition cost stays within the ≤5 s warm budget
+  (~1.8 s headroom), gated by the link-circuit STARK-prove (Probe I's ≈3.2 s class).
 
 **Consequence:** `prev_account`/ProofData threading across the IVC chain (and the
-source-aggregator per-leaf surfacing) is **structurally unbuildable** on this rev. Phases
-4–5 cannot be completed; the binding primitives below (`probe_d_pi_threading`,
-`probe_e_active_masking`, `probe_f_vk_binding`) are necessary but not sufficient. **The
-crate skeletons (P1-T1/T2) and Phases 2–3 would build, but produce nothing usable without
-the recursion they feed — so the migration does not start.**
+source-aggregator per-leaf surfacing) **is buildable** on this rev via carrier tables. The
+binding primitives below (`probe_d_pi_threading`, `probe_e_active_masking`,
+`probe_f_vk_binding`) compose with the carrier channel to build Phases 4–5. **Phase 1 is
+authorized.**
 
-**Operator decision (`MIGRATION_PLONKY3.md` §16 — protocol-touching):**
-1. **Hold** — keep the spike + pinned probes; revisit when upstream exposes cross-layer
-   public inputs (the pinned probes auto-detect it). Recommended default.
-2. **Protocol redesign** — re-architect to avoid cross-layer state threading (a separate
-   design effort, not a backend port).
-3. **Fork** — excluded by §16.
+**Implementation direction for Phases 4–5 (Path 1+5):** model each `prev_account`/ProofData
+state element as a carrier table public value, bind it to the committed state-transition
+trace, and re-verify the predecessor carrier in each IVC layer via `verify_batch_circuit`,
+`connect`ing the carry across layers exactly as `probe_r_carrier_chain` does. Full rationale
+and the 8 alternatives considered (Sonobe/Nova folding, off-circuit continuity, zkVMs,
+ProtoStar/Boojum/Lasso): `MIGRATION_PLONKY3_SOLUTIONS_RESEARCH.md`. End-to-end proof: PR #214.
 
-> **Option 3 (passive, still armed):** `probe_d_multilayer_carry`,
-> `probe_h_option1_air_public_values`, and `probe_g_fanin_pi_passthrough` are pinned (`= 0`).
-> A future `Plonky3-recursion` rev that propagates public inputs natively turns those
-> assertions red — that reopens a GO and should trigger a full re-evaluation here.
+> **Pinned regression guards (still armed):** `probe_d_multilayer_carry`,
+> `probe_h_option1_air_public_values`, and `probe_g_fanin_pi_passthrough` remain pinned (`= 0`)
+> — they document that the *primitive-table* path does NOT carry state, so the port must use
+> the carrier-table construction, not raw `CircuitBuilder` public inputs. If a future rev
+> changes the primitive-table behavior these turn red and the carrier approach should be
+> re-evaluated against the (then simpler) native path.
 
-The remainder of §6–§14 below is the *would-be* plan, kept intact for the day an escape
-route opens; it is **not** authorized to start under the current NO-GO.
+The remainder of §6–§14 below is the authorized plan; Phases 4–5 follow the carrier-table
+direction recorded above.
 
 **P1-T1 — Create `program-plonky3` crate.**
 Files: `program-plonky3/{Cargo.toml,src/lib.rs}`; add to workspace `members`.
@@ -288,27 +300,29 @@ Verify: `cargo nextest run -p zkcoins-program-plonky3 prove_account_update`.
 
 This phase implements the patterns proven feasible in Phase 0. The concrete API choices follow the Go/No-Go memo (`MIGRATION_PLONKY3_SPIKE_RESULT.md`).
 
-> ⚠️ **Phase-5 budget note (moot under the §6 NO-GO; relevant only if an escape route
-> reopens cross-layer threading).** A recursion layer over a real-sized (~2^16-gate) inner
-> proof is ≈3.2 s / ≈1.4 GB (`probe_i_cost_projection`) — a **single-layer lower bound** on
-> an *arithmetic* toy circuit. A would-be Option-2 commit + hash/Merkle re-bind (dead on
-> this rev — see §6) **would add Poseidon gates per layer** on top, and the real
-> state-transition constraints are Poseidon-heavy (the Plonky2 base prove is already
-> 4.35 s). So **if** an escape route ever reopens threading, the ≤5 s warm-prove budget is
-> itself at material risk: build a minimal real-circuit + re-bind prototype and measure
-> warm-prove p50 FIRST, and apply design knobs (reduce `MAX_IN_COINS`, drop in-coin
-> recursion, folding) — never external hardware (`MIGRATION_RESEARCH.md §7.11`) — before
-> porting the full aggregator. A failed budget check there would be a second NO-GO trigger.
+> ⚠️ **Phase-5 budget note (carrier-table direction).** A recursion layer over a real-sized
+> (~2^16-gate) inner proof is ≈3.2 s / ≈1.4 GB (`probe_i_cost_projection`) — a **single-layer
+> lower bound** on an *arithmetic* toy circuit. `probe_r_cost` showed the carrier-table
+> threading + in-circuit two-proof verification add **no measurable overhead** on that floor
+> (base ≈271 ms/layer, link witness-gen ≈2 ms, RSS ≈91 MB), so the per-transition cost is
+> gated by the link-circuit STARK-prove (Probe I's ≈3.2 s class) — within the ≤5 s warm
+> budget with ~1.8 s headroom. BUT the real state-transition constraints are Poseidon-heavy
+> (the Plonky2 base prove is already 4.35 s), and the synthetic carrier rows are lighter per
+> row than the real circuit. So **measure warm-prove p50 against a minimal REAL-circuit +
+> carrier prototype FIRST**, early in Phase 5, before porting the full aggregator. If it
+> misses budget, apply design knobs (reduce `MAX_IN_COINS`, drop in-coin recursion, folding)
+> — never external hardware (`MIGRATION_RESEARCH.md §7.11`). A failed budget check there is a
+> Phase-5 STOP trigger (escalate, per §16), not a silent overrun.
 
 **P5-T1 — Cyclic/IVC for `prev_account`.**
 Replace `conditionally_verify_cyclic_proof_or_dummy` + `common_data_for_recursion_c` with the Phase-0-proven IVC construction (`p3-recursion` layer chain). Preserve the base-case (first transition, no predecessor).
-🛑 **BLOCKED — cross-layer PI threading is unbuildable (§6 NO-GO).** Phase 0 proved that BOTH Option 1 (AIR public values: `probe_h`/`probe_g`/`probe_d_multilayer_carry`) AND Option 2 (commit + hash re-bind: `probe_j` + adversarial review) cannot thread `prev_account`/ProofData across a batch-recursion layer — there is no per-instance value channel. P5-T1 **cannot be built** on this rev. This task is parked until an escape route (§6) opens. The threading *binding primitive* is proven (`probe_d_pi_threading`) but is insufficient on its own.
-Acceptance (NOT reachable on this rev — only if an escape route per §6 reopens cross-layer threading): a 2-transition account history proves and verifies; the cyclic vk binding holds; per-transition proof shape constant; the threaded `prev_account` value is provably carried across both transitions.
+✅ **Buildable via the carrier-table construction (§6 GO, Path 1+5).** Model `prev_account`/ProofData as carrier-table public values bound to the committed state-transition trace, and re-verify the predecessor carrier in each IVC layer via `verify_batch_circuit`, `connect`ing the carry across layers — exactly the depth-4 chain proven end-to-end in `probe_r_carrier_chain` (`V_3 == V_0+3`, sound negatives). The threading binding primitive (`probe_d_pi_threading`) composes with this carrier channel. Note: do NOT route state through primitive-table / raw `CircuitBuilder` public inputs (`probe_d_multilayer_carry`/`probe_h`/`probe_g` pin those to `[0,0,0]`) — the value must live on a custom public-value-emitting AIR.
+Acceptance: a 2-transition account history proves and verifies; the cyclic vk binding holds; per-transition proof shape constant; the threaded `prev_account` value is provably carried across both transitions (carrier `connect`).
 Verify: `cargo nextest run -p zkcoins-program-plonky3 cyclic`.
 
 **P5-T2 — Source aggregator (fan-in-8).**
 Port `source_aggregator.rs` semantics: bundle up to `MAX_IN_COINS = 8` source proofs, expose per-slot ProofData (20) + `active` bit, total PIs = `8·21 + 4 + cap`. Use the Phase-0-proven fan-in approach (2-to-1 tree, depth 3 — `probe_b_fanin`).
-🛑 **BLOCKED — same NO-GO as P5-T1 (§6).** Per-leaf ProofData does NOT auto-surface from the aggregation to the outer (`probe_g_fanin_pi_passthrough`: aggregation output exposes 0 per-leaf values), and the would-be cross-layer carry is dead (both Option 1 and Option 2). This cannot be built on this rev. **Were an escape route (§6) to open:** surface each slot's ProofData into the outer via the would-be Option-2 commit+re-bind as P5-T1, then apply the per-slot `active`-bit masking (`probe_e_active_masking` proves the §7.17 masking primitive); padding (inactive slots = cheap real proofs) is unchanged from the Plonky2 design.
+✅ **Buildable via carrier tables (§6 GO, Path 1+5).** Per-leaf ProofData does NOT auto-surface from a stock aggregation (`probe_g_fanin_pi_passthrough`: aggregation output exposes 0 per-leaf values), so each slot's ProofData must be carried on a **carrier-table public value** and re-verified into the outer via `verify_batch_circuit` (same channel as P5-T1), then masked by the per-slot `active` bit (`probe_e_active_masking` proves the §7.17 masking primitive); padding (inactive slots = cheap real proofs) is unchanged from the Plonky2 design.
 ⚠️ §7.21/§7.22: the Plonky2 single-`_or_dummy` limitation and the lazy-verifier-data connect-back were Plonky2-specific. Re-derive the equivalent fixed-point/binding under `p3-recursion`; do not copy the Plonky2 workaround blindly.
 Acceptance: aggregator smoke (all-inactive) + one-active-slot-with-real-source tests ported and green.
 Verify: `cargo nextest run -p zkcoins-program-plonky3 aggregator`.
