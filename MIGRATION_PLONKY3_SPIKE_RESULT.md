@@ -122,7 +122,7 @@ node-side + per-recursion-layer.
 **Honest bottom line:** the migration is **not a uniform speed win**. It is a large win on
 **cold-start, memory, mint, and operational stability**, a **wash-or-loss on the user-facing
 `/api/send`** (recursion-dominated), at the cost of **larger proofs (1.76 MB)** and an SDK/field
-change if BabyBear is chosen (Doc 2). **The batching lever is now RESOLVED — Probe X′
+change if BabyBear is chosen (Doc 2). **RECOVERY (Probes AB–AE, see `scripts/bench/results/plonky3-recursion-reduction-m5-max-2026-06-06.md`): cheaper-inner-FRI (2.4×, 64-bit `[VERIFY]`) + MAX_IN_COINS=4 (~2×, protocol decision) compose to send-prove 1.31 s = 3.32× faster / e2e 1.45× (Probe AE) — the wash holds only at today's unchanged protocol. KoalaBear ruled out (AD).** The batching lever is RESOLVED — Probe X′
 (`probe_x_prime_batched_aggregator`) ruled it out:** co-proving the 8 sources as one batch
 would cut the aggregation **4.1×** (978 ms non-zk / 1664 ms zk — the theoretical floor), but
 the protocol cannot retroactively batch sources proved by different prior transactions, and
@@ -169,7 +169,7 @@ yields two incompatible copies of the `p3-*` types. Use this exact pair.
 from the root zkcoins workspace so the heavy Plonky3 git deps never enter the
 `node`/`shared` build or CI. Throwaway; deleted once the real port lands.
 
-Tests (all 29 green, `cargo nextest run -p plonky3-recursion-spike`):
+Tests (all 33 green, `cargo nextest run -p plonky3-recursion-spike`):
 
 | Test | Proves (real proving, ✅ = pos+neg asserted) | Result |
 |---|---|---|
@@ -202,6 +202,10 @@ Tests (all 29 green, `cargo nextest run -p plonky3-recursion-spike`):
 | `probe_z_verifier` | **verifier asymmetry** — verify 9.6 ms, proof 1.76 MB, prove÷verify ≈ 33×; tamper rejected | ✅📊 |
 | `probe_aa_sustained_load` | **sustained-load soak** — 1000 proves / 5.43 min: +2.7 % latency drift (stable), RSS plateaus, no leak | ✅📊 |
 | `probe_x_prime_batched_aggregator` | **batching lever resolved** — co-proved sources would cut aggregation 4.1× (978 ms/1664 ms floor) but is protocol-unreachable; 8 INDEPENDENT proofs = 1.00–1.01× vs Probe X (flat) → only live lever is MAX_IN_COINS | ✅📊 |
+| `probe_ab_recursion_friendly` | **recursion levers** — cheaper-inner-FRI q48 = 2.4× (64-bit, `[VERIFY]`); Poseidon2-inner-MMCS already baseline (Keccak-inner unverifiable in-circuit); ZK-only-outer ≈ 0 | ✅📊 |
+| `probe_ac_max_in_coins_sweep` | **fan-in sweep 1/2/4/8** — aggregation ≈ 448 ms/coin + 350 ms base, near-linear; N=4 halves it (protocol lever, no soundness question) | ✅📊 |
+| `probe_ad_koalabear` | **field comparison** — KoalaBear transition 1.26× faster BUT aggregation 2.1× SLOWER (20 vs 13 partial rounds) → stay BabyBear | ✅📊 |
+| `probe_ae_best_config` | **composed best config** — N=4 + q48: send-prove **1.31 s = 3.32× faster** than Plonky2; e2e 6.91 s = 1.45×; conditional on 2 `[VERIFY]`s | ✅📊 |
 
 Each `✅` test asserts BOTH a positive (correct → accepted) and a negative
 (tampered/wrong → rejected), and most add a CONTROL isolating the cause of the
