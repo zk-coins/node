@@ -67,6 +67,34 @@ full circuit size.** Methodology + caveats:
 `scripts/bench/results/plonky3-vs-plonky2-fair-m5-max-2026-06-06.md`;
 degree-7 = `probe_v_degree7_bench`, true-hiding = `probe_w_hiding_fri`.
 
+### Probe T resolution — the real circuit IS faster (V/W "2^16 slower" was hash-saturation)
+
+`probe_t_real_circuit_bench` resolves the pending verdict by modelling the REAL circuit's
+*actual* cost mix under TRUE production crypto — a real multi-table `prove_batch` (which
+**does** work with HidingFriPcs + mixed degree, an empirical finding) of a degree-7 Poseidon2
+hash table sized to ~4500 hashes (~175 ms standalone) **plus** a degree-3 arithmetic table for
+the ~50k non-hash gates (those are real-circuit-faithfully degree 2–3: comparisons, range,
+boolean, field-mul — the high-degree cost lives only in the hash S-box, correctly placed in
+the hash table). Result vs Plonky2 **4.35 s warm**:
+
+| Non-hash table | constraints | warm p50 | net vs Plonky2 | RSS |
+|---|---:|---:|---:|---:|
+| 2^13 (realistic — already >50k gates) | 98 304 | **312 ms** | **13.95× faster** | 1.1 GB |
+| 2^14 | 196 608 | 449 ms | 9.69× | 1.7 GB |
+| 2^15 | 393 216 | 735 ms | 5.92× | 1.9 GB |
+| 2^16 (inflated ceiling) | 786 432 | 1307 ms | 3.33× | 2.1 GB |
+
+Config/AIR build = **0.07 ms** (vs Plonky2's 8.2 s cold circuit-build — a ~10⁵× setup win).
+**Why this differs from V/W's "2^16 = 12 s slower":** V/W ran the WHOLE 2^16-height trace as the
+degree-7 `VectorizedPoseidon2Air` (8 lanes → ~2^19 Poseidon perms — hash-SATURATED, ~115× the
+real hash work). The real circuit has only ~4500 hashes (a ~1024-row table) plus a cheap
+degree-3 arithmetic bulk — so V/W's 2^16 point was never the real circuit. **Honest
+qualification:** Probe T is the **single state-transition** prove cost. The full populated
+`/api/send` prove additionally verifies the predecessor proof in-circuit (IVC carrier) and the
+up-to-8-way source aggregator — that recursion overhead is **Probe X**, and the end-to-end node
+number is **Probe U**; both sit on TOP of these figures. Net so far: **the core transition is
+~10–14× faster under true production crypto; the full-pipeline verdict follows X + U.**
+
 **Status (historical, superseded — see banner above):** 🛑 NO-GO for the migration *as
 specified* (replicating zkCoins' cross-layer state IVC on this `Plonky3-recursion` rev), as
 read before Probe Q/R. Probe J + an adversarial review
