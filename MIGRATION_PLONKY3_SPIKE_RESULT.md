@@ -1,5 +1,15 @@
 # Plonky3 Recursion Feasibility Spike — Result (Phase 0 Go/No-Go)
 
+> ⚠️ **PARTIALLY SUPERSEDED (2026-06-06, later same day).** The NO-GO below was **scoped
+> too narrowly** and is **overturned** by `probe_q_custom_public_value`: a custom AIR with
+> `num_public_values() > 0` DOES surface a soundly-bound per-instance value across a batch
+> layer (upstream PR #407, already in our pinned rev). The `[0,0,0]` finding held only for
+> the primitive tables / `CircuitBuilder` public inputs that probes D/G/H/J tested — **the
+> cross-layer value channel EXISTS** via a public-value-emitting AIR. See
+> **`MIGRATION_PLONKY3_SOLUTIONS_RESEARCH.md`** for the revised gate (GO via custom
+> public-value-emitting tables; folding/Sonobe as the native-IVC alternative) and the
+> 9-path solution analysis. The probes below remain correct for the constructions they tested.
+
 **Status:** 🛑 **NO-GO** for the migration *as specified* (replicating zkCoins'
 cross-layer state IVC on this `Plonky3-recursion` rev). Probe J + an adversarial review
 of all escape routes confirm that **neither Option 1 (AIR public values) nor Option 2
@@ -240,8 +250,11 @@ Merkle/single non-recursive state-transition) would still port, but they are not
 without the recursion they feed.
 
 **Decision is the operator's** (`MIGRATION_PLONKY3.md` §16 — protocol-touching). Options:
-1. **Hold** — keep the spike + pinned probes; revisit when `Plonky3-recursion` exposes
-   cross-layer public inputs (the pinned probes auto-detect it). Recommended default.
+1. ~~**Hold** — revisit when `Plonky3-recursion` exposes cross-layer public inputs.~~
+   **SUPERSEDED:** the capability is already present (PR #407, on the pinned rev) — it was
+   not missing upstream, it was simply not exercised by the stock-table probes. See the
+   banner at the top and `MIGRATION_PLONKY3_SOLUTIONS_RESEARCH.md` (Path 1+5: GO via custom
+   public-value-emitting tables).
 2. **Protocol redesign** — re-architect to avoid cross-layer state threading. Out of
    scope for a backend port; a separate design effort the operator must commission.
 3. **Fork upstream** — explicitly excluded by §16.

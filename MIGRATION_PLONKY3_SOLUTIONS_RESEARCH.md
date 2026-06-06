@@ -122,6 +122,17 @@ Pointers: [sonobe](https://github.com/privacy-scaling-explorations/sonobe),
 [docs](https://sonobe.pse.dev/). This is the cleanest architectural fit and the only option
 where IVC state-threading is the *native* primitive rather than re-derived.
 
+**Folding sub-schemes (all inside Sonobe, same `FCircuit` state-threading contract):**
+- **Nova / CycleFold** — most mature; the audit-in-progress targets these. Recommended entry point.
+- **ProtoStar / ProtoGalaxy** ([eprint 2023/1106](https://eprint.iacr.org/2023/1106.pdf)) —
+  cheaper multi-instance folding (log field-ops + constant hashes recursive overhead); in
+  Sonobe but **less mature and NOT covered by the audit**. A perf upgrade to evaluate only
+  after Nova clears the latency gate; do not start here.
+- **SuperNova** — non-uniform IVC (a distinct circuit per step → ideal if mint/send/commit
+  are separate transition relations) — **not yet wired in Sonobe** ([#144](https://github.com/privacy-scaling-explorations/sonobe/issues/144)); a gap to track if zkCoins needs per-op circuits.
+- **Lasso** (a16z lookup argument) is a *component* (it powers Jolt, Path 7), not an IVC
+  framework — it does not by itself provide cross-layer state threading; no separate adoption path.
+
 ## Path 4 — Hybrid (Plonky2 recursion + Plonky3 components)
 
 Keep Plonky2's working cyclic recursion; use Plonky3 only for non-recursive components.
@@ -181,6 +192,12 @@ upstream merges.
   are research-grade (~300 s prover — far over budget); you'd re-build what Sonobe packages.
 - **Binius64**: recursion unshipped + Intel-GFNI-centric (weak on Apple Silicon).
 - **WHIR**: a PCS, not a stack — a future component, not adoptable as an IVC framework.
+- **Boojum** (zkSync, [era-boojum](https://github.com/matter-labs/era-boojum)): a recursion-centric
+  **Goldilocks** STARK (Poseidon2 custom gate, FRI/Redshift) with a multi-layer aggregation tree
+  wrapped to Plonk+KZG — *same field family as our stack*, which is appealing. But it is a
+  **purpose-built EraVM proving pipeline** (15 fixed circuits), not a general account-IVC library;
+  state threading is internal to that pipeline and not exposed as a reusable `z_i→z_{i+1}` API.
+  Impractical to repurpose for a custom account model (heavy, EraVM-specific, CPU). Not recommended.
 
 ---
 

@@ -141,12 +141,9 @@ fn verify_with_claimed_pv(claimed_pv: F) -> Result<(), String> {
         &air_public_counts,
     );
 
-    // The public value IS surfaced as a constrainable target across the batch layer.
-    assert_eq!(
-        vi.air_public_targets,
-        vec![vec![vi.air_public_targets[0][0]]],
-        "air_public_counts=[1] must yield exactly one per-instance public target"
-    );
+    // The public value IS surfaced as a constrainable target across the batch layer:
+    // exactly one instance, with exactly one per-instance public target (NOT [0,0,0]).
+    assert_eq!(vi.air_public_targets.len(), 1, "one instance");
     assert_eq!(
         vi.air_public_targets[0].len(),
         1,
