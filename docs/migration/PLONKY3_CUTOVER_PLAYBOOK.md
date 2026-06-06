@@ -402,10 +402,10 @@ does not strand the scanner.
 
 ---
 
-## 7. dfxdev dry-run rehearsal (DEV ONLY — never PRD/dfx01)
+## 7. DEV dry-run rehearsal (DEV ONLY — never PRD)
 
-Rehearse the **entire** cutover on **DEV (dfxdev, `dev-api.zkcoins.app`, Mutinynet)** before
-touching PRD. **Never target PRD (dfxprd) or dfx01 in the rehearsal.** The branch flow is
+Rehearse the **entire** cutover on **DEV (`dev-api.zkcoins.app`, Mutinynet)** before
+touching PRD. **Never target PRD or any other production host in the rehearsal.** The branch flow is
 `feature → staging → develop (→DEV deploy) → main (→PRD deploy)`.
 
 ### 7.1 Deploy mechanism (real, from `.github/workflows/`)
