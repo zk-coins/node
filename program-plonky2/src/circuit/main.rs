@@ -1,8 +1,8 @@
 //! Monolithic state-transition circuit for zkCoins (Plonky2 backend).
 //!
 //! Mirrors `program/src/main.rs` (the SP1 entrypoint), but built as a
-//! Plonky2 cyclic-recursive circuit per [`SPEC.md`] §8 / §10 and the
-//! `ROADMAP.md` Step 5 plan.
+//! Plonky2 cyclic-recursive circuit per the protocol specification
+//! §8 / §10 (<https://docs.zkcoins.app/specification>).
 //!
 //! ## Stage status
 //!
