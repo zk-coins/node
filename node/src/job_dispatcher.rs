@@ -58,7 +58,7 @@ use dashmap::DashMap;
 use tokio::sync::{broadcast, mpsc, Notify};
 use uuid::Uuid;
 
-use crate::flow::{commit_flow, mint_flow, send_flow, FlowError};
+use crate::flow::{commit_flow, mint_commit_flow, mint_flow, send_flow, FlowError};
 use crate::job_store::{Job, JobKind, JobStatus, JobStore};
 use crate::router::{AppState, CommitRequest, MintRequest, SendCoinRequest};
 
@@ -283,7 +283,24 @@ async fn process_envelope(
 
     match (job.kind, job.status) {
         (JobKind::Mint, JobStatus::Queued) => {
-            process_mint(job_store, app_state, notify_map, job).await
+            process_mint(
+                job_store,
+                app_state,
+                notify_map,
+                awaiting_signature_timeout,
+                job,
+            )
+            .await
+        }
+        (JobKind::Mint, JobStatus::AwaitingSignature) => {
+            process_mint_resume(
+                job_store,
+                app_state,
+                notify_map,
+                awaiting_signature_timeout,
+                job,
+            )
+            .await
         }
         (JobKind::Send, JobStatus::Queued) => {
             process_send_initial(
@@ -354,13 +371,17 @@ async fn note_prove_outcome(app_state: &AppState, outcome: Result<(), &str>) {
     }
 }
 
-/// Drive a mint job: validate → prove → broadcast → commit. The
-/// `flow::mint_flow` helper owns the actual work; the dispatcher
-/// is purely the state-machine driver.
+/// Drive a mint job from `queued` through the issuer-mint prove leg to
+/// `awaiting_signature`, then park on the per-job `Notify` channel
+/// until the wallet returns the creator-signed commitment (or the
+/// timeout fires). Two-phase, mirroring [`process_send_initial`]: the
+/// neutral, permissionless mint is creator-signed, so the wallet — not
+/// the node — supplies the commitment.
 async fn process_mint(
     job_store: &JobStore,
     app_state: &AppState,
     notify_map: &JobNotifyMap,
+    awaiting_signature_timeout: Duration,
     job: Job,
 ) -> anyhow::Result<()> {
     let public_id = job.public_id;
@@ -399,28 +420,14 @@ async fn process_mint(
         }
     };
 
-    match mint_flow(app_state, request).await {
-        Ok((response_body, response_status)) => {
+    let (proof_id, commit_hashes) = match mint_flow(app_state, request).await {
+        Ok(out) => {
             note_prove_outcome(app_state, Ok(())).await;
-            job_store
-                .complete(public_id, response_body.clone(), response_status as i16)
-                .await?;
-            publish_phase(
-                notify_map,
-                public_id,
-                JobPhaseEvent {
-                    status: JobStatus::Completed,
-                    phase: "completed".to_string(),
-                    proof_id: None,
-                    result: Some(response_body),
-                    error: None,
-                },
-            );
-            tracing::info!("Job dispatcher: mint job {} completed", public_id);
+            out
         }
         Err(FlowError { status, message }) => {
             tracing::warn!(
-                "Job dispatcher: mint job {} failed ({}): {}",
+                "Job dispatcher: mint job {} prove leg failed ({}): {}",
                 public_id,
                 status.as_u16(),
                 message
@@ -438,9 +445,95 @@ async fn process_mint(
                     error: Some(message),
                 },
             );
+            return Ok(());
         }
-    }
-    Ok(())
+    };
+
+    let notifier = notify_map
+        .entry(public_id)
+        .or_insert_with(|| Arc::new(JobNotifier::new()))
+        .clone();
+
+    let result = serde_json::json!({
+        "account_state_hash": commit_hashes.account_state_hash,
+        "output_coins_root": commit_hashes.output_coins_root,
+    });
+    job_store
+        .set_awaiting_signature(public_id, proof_id as i64, result.clone())
+        .await?;
+    publish_phase(
+        notify_map,
+        public_id,
+        JobPhaseEvent {
+            status: JobStatus::AwaitingSignature,
+            phase: "awaiting_signature".to_string(),
+            proof_id: Some(proof_id as i64),
+            result: Some(result),
+            error: None,
+        },
+    );
+    tracing::info!(
+        "Job dispatcher: mint job {} reached awaiting_signature (proof_id={})",
+        public_id,
+        proof_id
+    );
+
+    wait_for_commit(
+        job_store,
+        app_state,
+        notify_map,
+        awaiting_signature_timeout,
+        public_id,
+        JobKind::Mint,
+        notifier,
+    )
+    .await
+}
+
+/// Resume a mint job that was already `awaiting_signature` when the
+/// process restarted. Note: the staged-mint proof lives in process
+/// memory ([`crate::router::MintStore`]) and is lost across a restart,
+/// so the wallet's commit will fail with "Unknown or expired mint
+/// proof_id" and the creator must re-submit — the same boot-resume
+/// semantics a send has when its `ProofStore` entry survives but the
+/// timestamp window has lapsed.
+async fn process_mint_resume(
+    job_store: &JobStore,
+    app_state: &AppState,
+    notify_map: &JobNotifyMap,
+    awaiting_signature_timeout: Duration,
+    job: Job,
+) -> anyhow::Result<()> {
+    let public_id = job.public_id;
+    let notifier = notify_map
+        .entry(public_id)
+        .or_insert_with(|| Arc::new(JobNotifier::new()))
+        .clone();
+    tracing::info!(
+        "Job dispatcher: resuming mint job {} in awaiting_signature",
+        public_id
+    );
+    publish_phase(
+        notify_map,
+        public_id,
+        JobPhaseEvent {
+            status: JobStatus::AwaitingSignature,
+            phase: "awaiting_signature".to_string(),
+            proof_id: job.proof_id,
+            result: job.response_body.clone(),
+            error: None,
+        },
+    );
+    wait_for_commit(
+        job_store,
+        app_state,
+        notify_map,
+        awaiting_signature_timeout,
+        public_id,
+        JobKind::Mint,
+        notifier,
+    )
+    .await
 }
 
 /// Drive a send job from `queued` through the prove leg to
@@ -564,6 +657,7 @@ async fn process_send_initial(
         notify_map,
         awaiting_signature_timeout,
         public_id,
+        JobKind::Send,
         notifier,
     )
     .await
@@ -613,6 +707,7 @@ async fn process_send_resume(
         notify_map,
         awaiting_signature_timeout,
         public_id,
+        JobKind::Send,
         notifier,
     )
     .await
@@ -621,13 +716,16 @@ async fn process_send_resume(
 /// Park on the `notify` channel for the given `public_id`. On wake,
 /// load the (now-updated) job, parse the `CommitRequest` the
 /// commit-route persisted into the job's `request_body`, and drive
-/// the broadcast leg via `commit_flow`. On timeout, fail the job.
+/// the broadcast leg via the kind-appropriate flow: [`mint_commit_flow`]
+/// for a `Mint` job (which runs the soundness gate), [`commit_flow`]
+/// for a `Send`. On timeout, fail the job.
 async fn wait_for_commit(
     job_store: &JobStore,
     app_state: &AppState,
     notify_map: &JobNotifyMap,
     awaiting_signature_timeout: Duration,
     public_id: Uuid,
+    kind: JobKind,
     notifier: Arc<JobNotifier>,
 ) -> anyhow::Result<()> {
     let outcome = tokio::select! {
@@ -720,7 +818,11 @@ async fn wait_for_commit(
         },
     );
 
-    match commit_flow(app_state, commit_request).await {
+    let commit_outcome = match kind {
+        JobKind::Mint => mint_commit_flow(app_state, commit_request).await,
+        JobKind::Send => commit_flow(app_state, commit_request).await,
+    };
+    match commit_outcome {
         Ok((response_body, response_status)) => {
             job_store
                 .complete(public_id, response_body.clone(), response_status as i16)

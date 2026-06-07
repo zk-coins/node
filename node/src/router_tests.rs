@@ -30,22 +30,27 @@ fn dead_pool() -> Arc<sqlx::PgPool> {
 /// type system is satisfied, but we seed it with a minting account so that
 /// balance / address queries work without needing the minting_secret.bin
 /// flow.
+/// A deterministic, non-zero test asset id (neutral model — no native
+/// asset). The router-test owner below holds this single asset.
+fn test_asset_id() -> zkcoins_program::types::AssetId {
+    zkcoins_program::hash::hash_bytes(b"router-test-asset")
+}
+
+/// A deterministic owner address for the seeded test account.
+fn test_owner_address() -> zkcoins_program::hash::HashDigest {
+    zkcoins_program::hash::digest_from_bytes(&[0x11u8; 32])
+}
+
 fn test_state() -> AppState {
     let state = Arc::new(Mutex::new(State::new()));
     let mut account_node = AccountNode::new(Arc::clone(&state));
 
-    // Seed a minting account with max balance (mirrors production setup)
-    let mut minting_account = Account::new();
-    minting_account.balance = 1_000_000;
-    account_node.import_account(*zkcoins_program::types::MINTING_ADDRESS, minting_account);
-
-    // Create a dummy minting ClientAccount from a deterministic key
-    let minting_client = {
-        let secret = include_bytes!("../minting_secret.bin");
-        let private_key = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Signet, secret)
-            .expect("Failed to create test private key");
-        shared::ClientAccount::new(private_key)
-    };
+    // Seed a funded `(owner, asset_id)` account. Neutral model: there
+    // is no privileged minting account — this is just an ordinary
+    // ledger so balance / history queries have something to read.
+    let mut funded = Account::new_for_asset(test_asset_id());
+    funded.balance = 1_000_000;
+    account_node.import_account(test_owner_address(), funded);
 
     // Per-test scratch dir for the ProofStore. Issue #181 Opt A flips
     // the CI to `--test-threads=8`, which means several `test_state()`
@@ -65,7 +70,7 @@ fn test_state() -> AppState {
         proof_store: Arc::new(ProofStore::new(
             proofs_dir.to_str().expect("proofs tempdir utf-8"),
         )),
-        minting_account: Arc::new(Mutex::new(minting_client)),
+        mint_store: Arc::new(crate::router::MintStore::new()),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
         pool: dead_pool(),
         // Most tests don't exercise the readiness probe and so don't
@@ -274,11 +279,21 @@ fn bitcoin_network_label_maps_both_arms() {
 
 // --- GET /api/balance ---
 
+/// `&asset_id=<test_asset_id>` query-string fragment. The single-asset
+/// `/api/balance?address=` endpoint requires an explicit asset_id under
+/// the neutral multi-asset model.
+fn asset_q() -> String {
+    format!(
+        "&asset_id={}",
+        hex::encode(zkcoins_program::hash::digest_to_bytes(&test_asset_id()))
+    )
+}
+
 #[tokio::test]
 async fn balance_unknown_address_returns_ok_with_zero() {
     // 32 zero bytes in hex = 64 hex chars
     let address_hex = "00".repeat(32);
-    let uri = format!("/api/balance?address={}", address_hex);
+    let uri = format!("/api/balance?address={}{}", address_hex, asset_q());
     let req = Request::get(&uri).body(Body::empty()).unwrap();
     let (status, body) = send_request(req).await;
 
@@ -307,7 +322,11 @@ async fn balance_unknown_address_with_claimed_username_returns_username() {
         store.insert_for_test("alice", address);
     }
 
-    let uri = format!("/api/balance?address={}", hex::encode(address_bytes));
+    let uri = format!(
+        "/api/balance?address={}{}",
+        hex::encode(address_bytes),
+        asset_q()
+    );
     let req = Request::get(&uri).body(Body::empty()).unwrap();
     let (status, body) = send_request_with_state(state, req).await;
 
@@ -319,11 +338,13 @@ async fn balance_unknown_address_with_claimed_username_returns_username() {
 }
 
 #[tokio::test]
-async fn balance_minting_address_returns_max() {
-    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(
-        &zkcoins_program::types::MINTING_ADDRESS,
-    ));
-    let uri = format!("/api/balance?address={}", address_hex);
+async fn balance_seeded_account_returns_funded_balance() {
+    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
+    let asset_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_asset_id()));
+    let uri = format!(
+        "/api/balance?address={}&asset_id={}",
+        address_hex, asset_hex
+    );
     let req = Request::get(&uri).body(Body::empty()).unwrap();
     let (status, body) = send_request(req).await;
 
@@ -331,10 +352,8 @@ async fn balance_minting_address_returns_max() {
 
     let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
     assert_eq!(resp.balance, 1_000_000u64);
-    // The bootstrap-seeded minting account has not produced any send
-    // yet via the test fixture, so num_sends is 0 here. (The api_remote
-    // suite exercises the post-mint num_sends > 0 path against the
-    // live DEV server — see `balance_response_num_sends_*`.)
+    // The seeded account has not produced any send yet via the test
+    // fixture, so num_sends is 0 here.
     assert_eq!(resp.num_sends, 0);
 }
 
@@ -453,9 +472,7 @@ async fn resolve_unknown_username_returns_404() {
 async fn resolve_minting_address_by_hex_prefix() {
     // The minting address starts with "af53a1" — a short prefix is enough
     // for resolve_identifier to match via hex-prefix fallback.
-    let full_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(
-        &zkcoins_program::types::MINTING_ADDRESS,
-    ));
+    let full_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
     let prefix = &full_hex[..8]; // first 8 hex chars
 
     let uri = format!("/api/username/resolve/{}", prefix);
@@ -515,9 +532,7 @@ async fn lnurlp_unknown_user_returns_404() {
 #[tokio::test]
 async fn lnurlp_known_address_returns_pay_request() {
     // The minting address is resolvable by hex prefix through resolve_identifier.
-    let full_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(
-        &zkcoins_program::types::MINTING_ADDRESS,
-    ));
+    let full_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
     let prefix = &full_hex[..8];
 
     let uri = format!("/.well-known/lnurlp/{}", prefix);
@@ -550,9 +565,7 @@ async fn lnurlp_localhost_host_returns_http_callback() {
     // the dev node. The api.zkcoins.app path (covered by
     // `lnurlp_known_address_returns_pay_request`) already pins the
     // `https://` arm.
-    let full_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(
-        &zkcoins_program::types::MINTING_ADDRESS,
-    ));
+    let full_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
     let prefix = &full_hex[..8];
 
     let uri = format!("/.well-known/lnurlp/{}", prefix);
@@ -597,10 +610,8 @@ async fn lnurl_pay_callback_returns_phase2_error() {
 
 #[tokio::test]
 async fn balance_minting_address_has_no_username() {
-    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(
-        &zkcoins_program::types::MINTING_ADDRESS,
-    ));
-    let uri = format!("/api/balance?address={}", address_hex);
+    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
+    let uri = format!("/api/balance?address={}{}", address_hex, asset_q());
     let req = Request::get(&uri).body(Body::empty()).unwrap();
     let (status, body) = send_request(req).await;
 
@@ -623,13 +634,11 @@ async fn balance_includes_username_when_claimed() {
     // claims via the /api/username/claim handler).
     {
         let mut username_store = state.username_store.lock().unwrap();
-        username_store.insert_for_test("satoshi", *zkcoins_program::types::MINTING_ADDRESS);
+        username_store.insert_for_test("satoshi", test_owner_address());
     }
 
-    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(
-        &zkcoins_program::types::MINTING_ADDRESS,
-    ));
-    let uri = format!("/api/balance?address={}", address_hex);
+    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
+    let uri = format!("/api/balance?address={}{}", address_hex, asset_q());
     let req = Request::get(&uri).body(Body::empty()).unwrap();
     let (status, body) = send_request_with_state(state, req).await;
 
@@ -678,13 +687,17 @@ async fn balance_response_emits_num_sends_from_account() {
     // which exercises the real bump path through `send_coins_inner`.)
     {
         let mut node = state.account_node.lock().unwrap();
-        let mut acct = crate::account_node::Account::new();
+        let mut acct = crate::account_node::Account::new_for_asset(test_asset_id());
         acct.balance = 42_000;
         acct.num_sends = 3;
         node.import_account(address, acct);
     }
 
-    let uri = format!("/api/balance?address={}", hex::encode(address_bytes));
+    let uri = format!(
+        "/api/balance?address={}{}",
+        hex::encode(address_bytes),
+        asset_q()
+    );
     let req = Request::get(&uri).body(Body::empty()).unwrap();
     let (status, body) = send_request_with_state(state, req).await;
 
@@ -702,10 +715,8 @@ async fn balance_response_emits_num_sends_from_account() {
 #[tokio::test]
 async fn concurrent_balance_reads_are_consistent() {
     let state = test_state();
-    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(
-        &zkcoins_program::types::MINTING_ADDRESS,
-    ));
-    let uri = format!("/api/balance?address={}", address_hex);
+    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
+    let uri = format!("/api/balance?address={}{}", address_hex, asset_q());
 
     // Spawn many concurrent balance requests against the same shared state.
     let mut handles = vec![];
@@ -734,16 +745,14 @@ async fn concurrent_balance_reads_are_consistent() {
 #[tokio::test]
 async fn concurrent_reads_with_username_claim() {
     let state = test_state();
-    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(
-        &zkcoins_program::types::MINTING_ADDRESS,
-    ));
+    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
 
     // Claim a username through the store directly (bypasses both
     // signature validation and the async Postgres path; production
     // claims go through the /api/username/claim handler).
     {
         let mut store = state.username_store.lock().unwrap();
-        store.insert_for_test("testuser", *zkcoins_program::types::MINTING_ADDRESS);
+        store.insert_for_test("testuser", test_owner_address());
     }
 
     // Spawn concurrent balance + resolve requests
@@ -755,7 +764,7 @@ async fn concurrent_reads_with_username_claim() {
         handles.push(tokio::spawn(async move {
             if i % 2 == 0 {
                 // Balance request
-                let req = Request::get(format!("/api/balance?address={}", hex))
+                let req = Request::get(format!("/api/balance?address={}{}", hex, asset_q()))
                     .body(Body::empty())
                     .unwrap();
                 let (status, body) = send_request_with_state(s, req).await;
@@ -2366,26 +2375,11 @@ async fn health_publisher_returns_503_when_esplora_unreachable() {
 /// (callers swap it for a live pool via the second return value).
 fn mint_test_state() -> AppState {
     let state_inner = Arc::new(Mutex::new(State::new()));
-    let mut account_node = AccountNode::new(Arc::clone(&state_inner));
+    let account_node = AccountNode::new(Arc::clone(&state_inner));
 
-    // The Plonky2 state-transition circuit packs the running balance
-    // as `balance_hi * 2^32 + balance_lo`; keeping the seed below 2^48
-    // matches the production bootstrap in `start_rest_node`.
-    let mut minting_account = Account::new();
-    minting_account.balance = 1u64 << 48;
-    account_node.import_account(*zkcoins_program::types::MINTING_ADDRESS, minting_account);
-
-    // Mirror the production bootstrap: the wallet's address is forced
-    // to the canonical `MINTING_ADDRESS` constant, regardless of what
-    // `ClientAccount::new` would otherwise derive from the secret.
-    let minting_client = {
-        let secret = include_bytes!("../minting_secret.bin");
-        let private_key = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Signet, secret)
-            .expect("Failed to create test private key");
-        let mut c = shared::ClientAccount::new(private_key);
-        c.address = *zkcoins_program::types::MINTING_ADDRESS;
-        c
-    };
+    // Neutral model: a mint creates the creator's own
+    // `(owner, asset_id)` account on demand, so there is nothing to
+    // pre-seed here (and no privileged minting account / client).
 
     // Per-test scratch dir for the ProofStore — see the canonical
     // comment on the first call-site in `test_state()` above for
@@ -2397,7 +2391,7 @@ fn mint_test_state() -> AppState {
         proof_store: Arc::new(ProofStore::new(
             proofs_dir.to_str().expect("proofs tempdir utf-8"),
         )),
-        minting_account: Arc::new(Mutex::new(minting_client)),
+        mint_store: Arc::new(crate::router::MintStore::new()),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
         pool: dead_pool(),
         esplora_config: Arc::new(crate::publisher::EsploraConfig {
@@ -5404,4 +5398,208 @@ fn pending_inscription_status_from_db_str_round_trips_every_variant() {
         Some(PendingInscriptionStatus::Failed)
     );
     assert_eq!(PendingInscriptionStatus::from_db_str("unknown"), None);
+}
+
+// ===========================================================================
+// Milestone 2: neutral, permissionless multi-asset router surface.
+// ===========================================================================
+
+use bitcoin::secp256k1::{
+    Keypair as TestKeypair, Secp256k1 as TestSecp, SecretKey as TestSecretKey,
+};
+
+/// Build a deterministic creator keypair for mint-signature tests.
+fn mint_creator_keypair() -> (TestSecretKey, bitcoin::secp256k1::PublicKey) {
+    let secp = TestSecp::new();
+    let sk = TestSecretKey::from_slice(&[7u8; 32]).expect("valid secret key");
+    let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk);
+    (sk, pk)
+}
+
+/// Sign a `MintRequest` over the canonical mint message and return the
+/// fully-populated request.
+fn signed_mint_request(name: &str, decimals: u8, amount: u64, timestamp: u64) -> MintRequest {
+    let secp = TestSecp::new();
+    let (sk, pk) = mint_creator_keypair();
+    let mut hasher = Sha256::new();
+    hasher.update(pk.serialize());
+    hasher.update(name.as_bytes());
+    hasher.update([decimals]);
+    hasher.update(amount.to_le_bytes());
+    hasher.update(timestamp.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    let msg = Message::from_digest(hash);
+    let keypair = TestKeypair::from_secret_key(&secp, &sk);
+    let sig = secp.sign_schnorr(&msg, &keypair);
+    MintRequest {
+        creator_pubkey: pk,
+        name: name.to_string(),
+        decimals,
+        amount,
+        signature: hex::encode(sig.serialize()),
+        timestamp,
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+#[test]
+fn parse_hex_digest_accepts_valid_and_rejects_malformed() {
+    let good = "0x".to_string() + &"ab".repeat(32);
+    assert!(parse_hex_digest(&good).is_some());
+    // Without 0x prefix also accepted.
+    assert!(parse_hex_digest(&"cd".repeat(32)).is_some());
+    // Bad hex.
+    assert!(parse_hex_digest("0xZZ").is_none());
+    // Wrong length.
+    assert!(parse_hex_digest(&"ab".repeat(16)).is_none());
+}
+
+#[test]
+fn verify_mint_signature_accepts_valid_signature() {
+    let req = signed_mint_request("TestToken", 8, 50_000, now_secs());
+    verify_mint_signature_pub(&req).expect("valid mint signature must verify");
+}
+
+#[test]
+fn verify_mint_signature_rejects_tampered_amount() {
+    let mut req = signed_mint_request("TestToken", 8, 50_000, now_secs());
+    // Flip the amount after signing — the signature no longer matches.
+    req.amount = 50_001;
+    assert!(verify_mint_signature_pub(&req).is_err());
+}
+
+#[test]
+fn verify_mint_signature_rejects_wrong_creator_key() {
+    let mut req = signed_mint_request("TestToken", 8, 50_000, now_secs());
+    // Swap to a different creator pubkey the signature was not made for.
+    let secp = TestSecp::new();
+    let other_sk = TestSecretKey::from_slice(&[9u8; 32]).unwrap();
+    req.creator_pubkey = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &other_sk);
+    assert!(verify_mint_signature_pub(&req).is_err());
+}
+
+#[test]
+fn verify_mint_signature_rejects_malformed_signature_hex() {
+    let mut req = signed_mint_request("TestToken", 8, 50_000, now_secs());
+    req.signature = "not-hex".to_string();
+    assert!(verify_mint_signature_pub(&req).is_err());
+}
+
+#[tokio::test]
+async fn balance_missing_asset_id_returns_unprocessable() {
+    // Under the multi-asset model the single-balance endpoint requires
+    // an explicit asset_id.
+    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
+    let uri = format!("/api/balance?address={}", address_hex);
+    let req = Request::get(&uri).body(Body::empty()).unwrap();
+    let (status, _body) = send_request(req).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn balance_invalid_asset_id_returns_unprocessable() {
+    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
+    let uri = format!("/api/balance?address={}&asset_id=ZZ", address_hex);
+    let req = Request::get(&uri).body(Body::empty()).unwrap();
+    let (status, _body) = send_request(req).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn owner_balance_lists_assets_for_owner() {
+    let state = test_state();
+    // Seed a second asset for the same owner so the aggregation has two
+    // entries.
+    {
+        let mut node = state.account_node.lock().unwrap();
+        let other_asset = zkcoins_program::hash::hash_bytes(b"router-test-asset-2");
+        let mut acct = crate::account_node::Account::new_for_asset(other_asset);
+        acct.balance = 250;
+        acct.name = Some("SECOND".to_string());
+        acct.decimals = Some(6);
+        node.import_account(test_owner_address(), acct);
+    }
+    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
+    let uri = format!("/api/balance/{}", address_hex);
+    let req = Request::get(&uri).body(Body::empty()).unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let resp: OwnerBalanceResponse = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(resp.assets.len(), 2);
+    let total: u64 = resp.assets.iter().map(|a| a.balance).sum();
+    assert_eq!(total, 1_000_250);
+    let second = resp
+        .assets
+        .iter()
+        .find(|a| a.name.as_deref() == Some("SECOND"))
+        .expect("second asset present");
+    assert_eq!(second.balance, 250);
+    assert_eq!(second.decimals, Some(6));
+}
+
+#[tokio::test]
+async fn owner_balance_empty_for_unknown_owner() {
+    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(
+        &zkcoins_program::hash::digest_from_bytes(&[0x55u8; 32]),
+    ));
+    let uri = format!("/api/balance/{}", address_hex);
+    let req = Request::get(&uri).body(Body::empty()).unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::OK);
+    let resp: OwnerBalanceResponse = serde_json::from_str(&body).expect("valid JSON");
+    assert!(resp.assets.is_empty());
+}
+
+#[tokio::test]
+async fn owner_balance_rejects_malformed_address() {
+    let uri = "/api/balance/not-hex".to_string();
+    let req = Request::get(&uri).body(Body::empty()).unwrap();
+    let (status, _body) = send_request(req).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn info_advertises_multi_asset_capability() {
+    let req = Request::get("/api/info").body(Body::empty()).unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(v["capabilities"]["multi_asset"], true);
+}
+
+#[tokio::test]
+async fn jobs_mint_unsigned_request_is_rejected() {
+    // A mint request with a stale timestamp + signature that does not
+    // match must be rejected at admit time (401) without burning a job
+    // row — exercising the `validate_mint_request` gate end-to-end.
+    let mut req = signed_mint_request("TestToken", 8, 50_000, now_secs());
+    req.signature = hex::encode([0u8; 64]); // invalid signature
+    let body = serde_json::to_vec(&req).unwrap();
+    let http = Request::post("/api/jobs/mint")
+        .header("content-type", "application/json")
+        .header("idempotency-key", "k-mint-unsigned")
+        .body(Body::from(body))
+        .unwrap();
+    let (status, _b) = send_request(http).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn jobs_mint_stale_timestamp_is_rejected() {
+    // Timestamp far in the past → outside the freshness window → 401.
+    let req = signed_mint_request("TestToken", 8, 50_000, 1);
+    let body = serde_json::to_vec(&req).unwrap();
+    let http = Request::post("/api/jobs/mint")
+        .header("content-type", "application/json")
+        .header("idempotency-key", "k-mint-stale")
+        .body(Body::from(body))
+        .unwrap();
+    let (status, _b) = send_request(http).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

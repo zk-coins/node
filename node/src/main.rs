@@ -152,37 +152,21 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // The canary recurses a persisted proof through the live circuit's
     // AccountUpdate branch. The §8(b)/(c) state-continuity constraints
     // fix the witnessed account-state pubkey to the key the producing
-    // transition rotated TO (== the NEXT transition's `public_key`), NOT
-    // the persisted `commitment_public_key`. For the minting account that
-    // key is `generate_public_key(derive_num_pubkeys_from_smt(..))` — the
-    // exact value `mint_flow` derives. Reconstruct the minting wallet from
-    // the same compile-time secret `start_rest_node` uses and resolve the
-    // current key off the loaded SMT. (Non-minting accounts never carry a
-    // server-held proof today; for any future multi-proof DB the resolver
-    // returns None and the canary skips that sample — a state-derivation
-    // gap is not circuit staleness. See `AccountNode::canary_recursion`.)
-    let minting_client = {
-        let secret = include_bytes!("../minting_secret.bin");
-        let private_key = bitcoin::bip32::Xpriv::new_master(NETWORK_CONFIG.network(), secret)
-            .expect("Failed to create minting private key");
-        let mut c = shared::ClientAccount::new(private_key);
-        c.address = *zkcoins_program::types::MINTING_ADDRESS;
-        c
-    };
-    // The SMT is supplied by `canary_recursion` (which already holds the
-    // `state` guard). Resolving off this borrowed SMT — instead of
-    // re-locking `state` — is REQUIRED: the canary holds `self.state`
-    // (the same Arc) for its whole body, so a re-lock here would deadlock
-    // the boot thread on the non-reentrant std Mutex.
+    // transition rotated TO (== the NEXT transition's `public_key`).
+    //
+    // Neutral model (Milestone 2): there is NO server-held minting key,
+    // so the node cannot derive any account's current key. The resolver
+    // therefore returns `None` for every account — the canary then
+    // skips each sample (a state-derivation gap, not circuit staleness)
+    // and degrades to `NoSample` → `Baseline` (the data-loss-safe
+    // direction; no genesis wipe). The boot self-heal's digest fast
+    // path (`circuit_digest_meta`) remains the primary staleness signal;
+    // the canary is a secondary probe that simply has no usable sample
+    // under the neutral model. See `AccountNode::canary_recursion`.
     let current_pubkey_for =
-        |addr: &zkcoins_program::hash::HashDigest,
-         smt: &zkcoins_program::merkle::sparse_merkle_tree::SparseMerkleTree| {
-            if *addr == *zkcoins_program::types::MINTING_ADDRESS {
-                let n = node::state::derive_num_pubkeys_from_smt(&minting_client.private_key, smt);
-                Some(minting_client.generate_public_key(n))
-            } else {
-                None
-            }
+        |_addr: &zkcoins_program::hash::HashDigest,
+         _smt: &zkcoins_program::merkle::sparse_merkle_tree::SparseMerkleTree| {
+            None::<bitcoin::secp256k1::PublicKey>
         };
     let heal_decision =
         node::self_heal::heal_circuit_digest(&pool, &live_digest, &proofs_dir, &|| {

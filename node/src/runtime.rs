@@ -17,14 +17,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
-use crate::account_node::persist_account;
 use crate::job_dispatcher::{self, JobNotifier, DEFAULT_AWAITING_SIGNATURE_TIMEOUT};
 use crate::job_store::{JobStatus, JobStore};
 use crate::publisher::resume_pending_inscriptions;
 use crate::NETWORK_CONFIG;
-
-use bitcoin::bip32::Xpriv;
-use shared::ClientAccount;
 
 use crate::account_node::AccountNode;
 use crate::router::{create_router, AppState, ProofStore};
@@ -55,40 +51,12 @@ pub async fn start_rest_node(
     // env var.
     let proof_store = Arc::new(ProofStore::new(proofs_dir));
 
-    let minting_account = {
-        let secret = include_bytes!("../minting_secret.bin");
-        let private_key = Xpriv::new_master(NETWORK_CONFIG.network(), secret)
-            .expect("Failed to create private key.");
-        println!(
-            "Set MINTING_ADDRESS to {:?}",
-            *zkcoins_program::types::MINTING_ADDRESS
-        );
-        let mut minting_client = ClientAccount::new(private_key);
-        // Phase D: `num_pubkeys` is no longer carried in the shared
-        // ClientAccount as boot state. Each `/api/mint` derives the
-        // count fresh from the SMT via
-        // `state::derive_num_pubkeys_from_smt`, which is the canonical
-        // source of truth (the SMT is loaded from Postgres at boot and
-        // mutated by the scanner on every inscription). The in-memory
-        // field stays at 0 here; mint_handler reads N off the SMT
-        // before deriving pubkeys and signs with a transient clone at
-        // `num_pubkeys = N + 1` exactly as before.
-        //
-        // Plonky2 migration (D11 in MIGRATION_RESEARCH.md): MINTING_ADDRESS
-        // is a well-known constant derived from `hash_bytes(b"zkcoins:
-        // minting-address:placeholder:v1")`, NOT from minting_secret.bin.
-        // ClientAccount::new derives `address` from the privkey's first
-        // child pubkey for ordinary wallets; for the minting wallet that
-        // derivation is meaningless — only the wallet's commitment-signing
-        // side is used. Force the address to the canonical constant so
-        // the rest of the node (which reads minting_account.address as
-        // the on-chain identity of the minting wallet) is internally
-        // consistent. The test harness already constructs the minting
-        // account this way (see
-        // router_tests.rs::TestAccountData::new_minting_account).
-        minting_client.address = *zkcoins_program::types::MINTING_ADDRESS;
-        Arc::new(Mutex::new(minting_client))
-    };
+    // Neutral, permissionless model (Milestone 2): there is NO central
+    // minting authority. The node holds no minting key and bootstraps
+    // no privileged minting account — anyone creates their own asset
+    // and mints their own supply via the creator-signed two-phase mint
+    // flow. The legacy `minting_secret.bin` + `MINTING_ADDRESS`
+    // bootstrap is therefore gone.
 
     let shared_username_store = Arc::new(Mutex::new(username_store));
 
@@ -111,7 +79,7 @@ pub async fn start_rest_node(
     let state = AppState {
         account_node: Arc::clone(&shared_account_node),
         proof_store,
-        minting_account,
+        mint_store: Arc::new(crate::router::MintStore::new()),
         username_store: shared_username_store,
         pool: Arc::clone(&pool),
         // The readiness probe uses this to ping Esplora; in production
@@ -124,54 +92,10 @@ pub async fn start_rest_node(
         job_notify_map: Arc::clone(&job_notify_map),
     };
 
-    // Bootstrap the minting account if it isn't already in the DB.
-    // The snapshot pattern mirrors the handler sites: take the
-    // mutation under the sync guard, then drop the guard before the
-    // async upsert.
-    let bootstrap_snapshot: Option<(zkcoins_program::hash::HashDigest, Vec<u8>)> = {
-        let mut account_node_guard = state.account_node.lock().unwrap();
-        if account_node_guard.get_minting_account_address().is_err() {
-            let mut minting_node_account = crate::account_node::Account::new();
-            // The Plonky2 state-transition circuit packs the running
-            // balance as a Goldilocks field element via
-            // `balance_hi * 2^32 + balance_lo`. Values >= p (the
-            // Goldilocks prime ≈ 2^64 - 2^32 + 1) reduce mod p inside
-            // the circuit but stay full-width in the witness setter,
-            // which trips a "wire set twice" partition error. Stay
-            // safely below 2^48 so the circuit-vs-witness sides agree
-            // even after many mint operations.
-            minting_node_account.balance = 1u64 << 48;
-            account_node_guard.import_account(
-                *zkcoins_program::types::MINTING_ADDRESS,
-                minting_node_account,
-            );
-            account_node_guard
-                .get_account(&zkcoins_program::types::MINTING_ADDRESS)
-                .map(AccountNode::serialize_account)
-                .map(|bytes| (*zkcoins_program::types::MINTING_ADDRESS, bytes))
-        } else {
-            None
-        }
-    };
-    if let Some((address, _bytes)) = bootstrap_snapshot.as_ref() {
-        // Look the account up once more through `persist_account` so
-        // the helper's error variants are wired in the same way as the
-        // handler sites. The address + (re-fetched) account go through
-        // the lock again only briefly; the second snapshot reads the
-        // same row we just inserted so it is guaranteed to be present.
-        let acct_clone = {
-            let guard = state.account_node.lock().unwrap();
-            guard.get_account(address).and_then(|a| {
-                let b = AccountNode::serialize_account(a);
-                bincode::deserialize::<crate::account_node::Account>(&b).ok()
-            })
-        };
-        if let Some(account) = acct_clone {
-            if let Err(e) = persist_account(&pool, address, &account).await {
-                eprintln!("Failed to upsert bootstrap minting account: {}", e);
-            }
-        }
-    }
+    // No minting-account bootstrap: the neutral model has no
+    // privileged minting account. Accounts come into existence lazily
+    // — an issuer's first mint creates their `(owner, asset_id)`
+    // account; a recipient's first receive creates theirs.
 
     // Phase D removed the startup `check_minting_state_invariant`:
     // `num_pubkeys` is now derived from SMT membership at runtime

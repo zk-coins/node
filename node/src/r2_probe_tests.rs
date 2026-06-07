@@ -80,13 +80,12 @@ async fn detect_returns_a_host_struct() {
         "cpu_cores must be at least 1 on any host that runs this test, got {}",
         info.cpu_cores,
     );
-    match info.total_ram_gb {
-        Some(g) => assert!(
+    if let Some(g) = info.total_ram_gb {
+        assert!(
             g >= 1,
             "total_ram_gb Some(_) must be >= 1 (zero is collapsed to None), got {}",
             g,
-        ),
-        None => {}
+        );
     }
 }
 
