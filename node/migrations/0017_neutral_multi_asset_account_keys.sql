@@ -53,11 +53,26 @@ ALTER TABLE accounts
 -- owner prefix of the composite `accounts.address` so the existing
 -- 32-byte `account_history_address_length` CHECK still holds and the
 -- history endpoint continues to resolve by owner.
-CREATE OR REPLACE FUNCTION account_history_capture() RETURNS TRIGGER AS $$
+--
+-- NOTE on the function name: migration 0010 renamed this function
+-- `account_history_capture()` → `accounts_history_capture()` (plural,
+-- matching the table noun) and re-pointed the `accounts_history_trigger`
+-- at the new name. The live trigger therefore executes
+-- `accounts_history_capture()`; replacing the obsolete singular name
+-- here would leave the live trigger writing `NEW.address` (the 64-byte
+-- composite), which violates the 32-byte `account_history_address_length`
+-- CHECK on every account upsert. We CREATE OR REPLACE the *plural*
+-- function so the owner-prefix change actually takes effect, preserving
+-- 0010's full body (the `zkcoins.request_log_id` GUC read +
+-- `triggering_request_log_id` column) and only swapping `NEW.address`
+-- for its 32-byte owner prefix.
+CREATE OR REPLACE FUNCTION accounts_history_capture() RETURNS TRIGGER AS $$
 DECLARE
     src TEXT := COALESCE(NULLIF(current_setting('zkcoins.account_source', TRUE), ''), 'scanner');
     commit_txid_hex TEXT := NULLIF(current_setting('zkcoins.account_commit_txid', TRUE), '');
     commit_txid_bytes BYTEA := NULL;
+    req_log_id_text TEXT := NULLIF(current_setting('zkcoins.request_log_id', TRUE), '');
+    req_log_id BIGINT := NULL;
     owner_address BYTEA := substring(NEW.address FROM 1 FOR 32);
 BEGIN
     -- Skip when row content didn't change (UPDATEs that touch only
@@ -74,14 +89,23 @@ BEGIN
         END;
     END IF;
 
+    IF req_log_id_text IS NOT NULL THEN
+        BEGIN
+            req_log_id := req_log_id_text::BIGINT;
+        EXCEPTION WHEN OTHERS THEN
+            req_log_id := NULL;
+        END;
+    END IF;
+
     INSERT INTO account_history
-        (address, prev_data, new_data, source, triggering_commit_txid)
+        (address, prev_data, new_data, source, triggering_commit_txid, triggering_request_log_id)
     VALUES
         (owner_address,
          CASE WHEN TG_OP = 'UPDATE' THEN OLD.data ELSE NULL END,
          NEW.data,
          src,
-         commit_txid_bytes);
+         commit_txid_bytes,
+         req_log_id);
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
