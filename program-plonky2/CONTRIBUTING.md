@@ -5,10 +5,17 @@ machine. This crate is **excluded from the parent workspace** and
 carries its own toolchain pin.
 
 > **Fresh contributor?** Read [`../CONTRIBUTING.md`](../CONTRIBUTING.md)
-> § "Working on the Plonky2 Migration" first for the project invariants
-> and reading order. This file is the operational *how* for the migration
-> crate, but the rules in the repo-root CONTRIBUTING constrain what you
-> may change here.
+> first for the trust model, coding standards, and PR flow. This file is the
+> operational *how* for the circuit crate, but the rules in the repo-root
+> CONTRIBUTING constrain what you may change here.
+>
+> **Design-doc references.** Comments in this crate cite `SPEC.md` (the
+> circuit/single-asset spec) and `MIGRATION_RESEARCH.md`/`ROADMAP.md`. Those
+> documents were archived out of the node repo into
+> [`zk-coins/research` → `zkcoins-design/`](https://github.com/zk-coins/research/tree/develop/zkcoins-design)
+> (verbatim, same section numbers); the published protocol spec and roadmap live
+> at [docs.zkcoins.app/specification](https://docs.zkcoins.app/specification) and
+> [docs.zkcoins.app/roadmap](https://docs.zkcoins.app/roadmap).
 
 ## Toolchain
 
@@ -186,7 +193,7 @@ tests × 3–15 min each) is NOT in CI — `Node + Shared Tests` runs
 in CI is tracked in [issue #50](https://github.com/zk-coins/node/issues/50);
 until that lands, contributors run the sweep locally before opening /
 updating a PR that touches this crate (see
-[`../CONTRIBUTING.md`](../CONTRIBUTING.md) § "Pre-push checklist").
+[`../CONTRIBUTING.md`](../CONTRIBUTING.md) § "Setup").
 
 ## Common pitfalls
 

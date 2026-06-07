@@ -268,7 +268,7 @@ Per-module coverage (CI-gated):
 
 ## Running
 
-Requires access to a Bitcoin node. See [Backend docs](https://docs.zkcoins.app/infrastructure/backend).
+Requires access to a Bitcoin node with an Esplora-compatible indexer (electrs) — see [Docker](#docker) and [CONTRIBUTING.md](./CONTRIBUTING.md) for setup.
 
 ```bash
 cargo run -p node
@@ -337,17 +337,17 @@ Build time: ~5 minutes (Rust compilation on ARM64).
 
 ## Proving Strategy
 
-zkCoins is **node-heavy**: a single trusted node generates all proofs, the wallet holds only the private key and signs BIP-340 Schnorr over `SHA256(serialize(asth) ‖ serialize(ocr))`. There is no in-browser Poseidon, no wasm-Plonky2 verifier, no in-app ZK gadget. See [`SPEC.md`](./SPEC.md) §13 + the memory `feedback_zkcoins_server_side_compute` for the full rationale.
+zkCoins is **node-heavy**: a single trusted node generates all proofs, the wallet holds only the private key and signs BIP-340 Schnorr over `SHA256(serialize(asth) ‖ serialize(ocr))`. There is no in-browser Poseidon, no wasm-Plonky2 verifier, no in-app ZK gadget. See the [protocol specification](https://docs.zkcoins.app/specification) for the full rationale.
 
 **Hardware target: Mac Studio M3 Ultra** (96 GB unified RAM, single host). All on-box compute is available: Performance + Efficiency cores, the integrated Apple Silicon GPU (via Metal — currently unused because Plonky2 ships CPU + CUDA backends only), Neural Engine, AMX. **Not available**: external GPU accelerators (no NVIDIA, no CUDA), no cloud prover services (no Succinct Prover Network, no AWS GPU). Performance budget is what the M3 Ultra delivers; if a design overshoots, the design changes — we do not add external hardware.
 
-Current cyclic-recursion proof times at production parameters (`MAX_IN_COINS = MAX_OUT_COINS = 8`, `INNER_PAD_BITS = 14`): 3–15 min wall per `prove_*` call. See [`program-plonky2/SESSION_STATE.md`](./program-plonky2/SESSION_STATE.md) for the detailed test-time table.
+Current cyclic-recursion proof times at production parameters (`MAX_IN_COINS = MAX_OUT_COINS = 8`, `INNER_PAD_BITS = 14`): 3–15 min wall per `prove_*` call. The detailed test-time table is archived in [zk-coins/research](https://github.com/zk-coins/research/tree/develop/zkcoins-design/program-plonky2-sessions).
 
 ## Open Tasks
 
 - [ ] Step 9: signet end-to-end roundtrip against `dev.zkcoins.app` (create account → mint → send → receive)
 - [ ] Step 9: R2 performance measurement on the M3 Ultra (warm proof ≤ 5 s target ≤ 1 s; cold ≤ 30 s; peak mem < 64 GB)
-- [ ] Pre-mainnet hardening: D2/D10 (hiding recipient), D7 (reorg safety), D8 (per-coin nullifier-accum) — see `SPEC.md` §15
+- [ ] Pre-mainnet hardening: D2/D10 (hiding recipient), D7 (reorg safety), D8 (per-coin nullifier-accum) — see the [protocol specification](https://docs.zkcoins.app/specification) divergence list
 - [ ] Explorer endpoints (`/api/stats`, `/api/nullifiers`)
 - [ ] Light client support
 
@@ -361,16 +361,12 @@ Current cyclic-recursion proof times at production parameters (`MAX_IN_COINS = M
 
 ## Design Documents
 
-| Document                                                | Scope                                                                                                          | Status |
-| ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ------ |
-| [`LIGHTNING_ATOMIC_SWAP.md`](./LIGHTNING_ATOMIC_SWAP.md) | Trustless LN ↔ zkCoins atomic swap design (HTLC on inscription funding tx)                                     | Draft  |
-| [`BITVM_BRIDGE.md`](./BITVM_BRIDGE.md)                  | BTC ↔ zkCoins trustless mint/burn bridge — landscape, BitVM2 / Glock / Mosaic comparison, N=100 federation target | Draft  |
-| [`BRIDGE_MVP.md`](./BRIDGE_MVP.md)                      | Engineering spec for the bridge MVP — 8 phases, file-by-file, 5–7 months effort estimate                       | Draft  |
-
-These documents describe the bridge and swap roadmap. They build on
-the Plonky2 migration that landed via PR [#17](https://github.com/zk-coins/node/pull/17)
-on 2026-05-18 and cross-reference `SPEC.md`, `MIGRATION_RESEARCH.md`,
-and `ROADMAP.md`.
+Protocol design drafts (LN atomic swap, BitVM/Glock bridge, multi-asset, Arkade
+integration, migration research) and the circuit/single-asset spec live in the
+research repo under [`zk-coins/research` → `zkcoins-design/`](https://github.com/zk-coins/research/tree/develop/zkcoins-design).
+The target-design protocol specification and the roadmap are published on the docs
+site: [docs.zkcoins.app/specification](https://docs.zkcoins.app/specification) and
+[docs.zkcoins.app/roadmap](https://docs.zkcoins.app/roadmap).
 
 ## Protocol
 
