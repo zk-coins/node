@@ -310,6 +310,66 @@ pub struct HistoryErrorResponse {
     pub error: &'static str,
 }
 
+/// Per-transaction detail returned by `GET /api/history/{id}`.
+///
+/// Extends the [`HistoryItem`] list shape with everything else the node
+/// can derive for one `account_history` row **without a schema change**:
+/// the decoded account-state snapshot the mutation produced (usable
+/// balance before/after, the post-mutation send counter and commitment
+/// public key), the verifier circuit digest every proof on this node is
+/// checked against, and the on-chain commit output value when a
+/// publisher inscription exists. Fields the current schema cannot
+/// populate stay `null` — the same honesty contract as [`HistoryItem`]
+/// (`txid` / `block_height` / `commit_output_value` light up only once
+/// the publisher threads `triggering_commit_txid`).
+#[derive(Serialize, ToSchema)]
+pub struct TxDetail {
+    // --- identity / core (mirrors HistoryItem) ---
+    /// Server-internal monotonic id (`account_history.id`).
+    pub id: i64,
+    /// The queried address, echoed as lower-case hex (32 bytes, no `0x`).
+    pub address: String,
+    /// Commit-inscription txid (lower-case hex), or `null` while unlinked.
+    pub txid: Option<String>,
+    /// Unix epoch in seconds of the state change.
+    pub timestamp: i64,
+    /// `"send"`, `"receive"`, or `"mint"`.
+    pub direction: &'static str,
+    /// Absolute balance delta in sats (`|balance_after − balance_before|`).
+    pub amount: u64,
+    /// Counterparty address — always `null` in the current schema.
+    pub counterparty: Option<String>,
+    /// `"pending"`, `"confirmed"`, or `"failed"`.
+    pub status: &'static str,
+    /// Bitcoin block height of the commit, or `null` while unconfirmed.
+    pub block_height: Option<i64>,
+    /// Free-text memo — always `null` (no memo column exists).
+    pub memo: Option<String>,
+    // --- decoded account-state snapshot for this mutation ---
+    /// Usable balance (settled + queued) AFTER this mutation, in sats.
+    pub balance_after: u64,
+    /// Usable balance BEFORE this mutation; `null` for the first row of
+    /// an address (no prior state to decode).
+    pub balance_before: Option<u64>,
+    /// The account's own-send counter after this mutation — the wallet's
+    /// authoritative BIP-32 child index (see `BalanceResponse.num_sends`).
+    pub num_sends_after: u32,
+    /// The account's commitment public key after this mutation
+    /// (compressed secp256k1, 33-byte lower-case hex); `null` before the
+    /// account has ever sent (genesis / mint-only state).
+    pub commitment_public_key: Option<String>,
+    // --- proof / verification ---
+    /// The verifier circuit digest (lower-case hex) every proof on this
+    /// node is checked against — the proof-system identity. `null` only
+    /// before the node has stored its digest (pre-first-proof boot).
+    pub circuit_digest: Option<String>,
+    // --- on-chain ---
+    /// Value (sats) locked in the commit inscription's output, when a
+    /// publisher inscription row exists for this mutation; `null`
+    /// otherwise (e.g. a faucet mint before broadcast).
+    pub commit_output_value: Option<i64>,
+}
+
 /// Decode the 64-char (or 64 char + 0x prefix) hex `address` argument
 /// into the raw 32-byte form `account_history.address` is keyed on.
 /// Reuses the exact decode + length rules `get_balance_handler` applies
@@ -496,6 +556,64 @@ pub(crate) fn history_row_to_item(row: &crate::db::AccountHistoryRow) -> Option<
         status,
         block_height: row.block_height,
         memo: None,
+    })
+}
+
+/// Decode the post-mutation `num_sends` + `commitment_public_key` out of
+/// an `accounts.data` bincode blob, for the transaction-detail endpoint.
+/// Returns `None` on a decode failure (the caller maps that to a 500 — a
+/// corrupt blob is a server fault, not a user error). Mirrors
+/// [`balance_from_account_blob`], which handles the balance half.
+pub(crate) fn account_meta_from_blob(blob: &[u8]) -> Option<(u32, Option<String>)> {
+    let a = bincode::deserialize::<crate::account_node::Account>(blob).ok()?;
+    // `commitment_public_key` is a secp256k1 `PublicKey`; serialize to its
+    // 33-byte compressed form before hex-encoding (matches the wire form
+    // the wallet derives and sends in `prev_commitment_pubkey`).
+    let cpk = a
+        .commitment_public_key
+        .as_ref()
+        .map(|pk| hex::encode(pk.serialize()));
+    Some((a.num_sends, cpk))
+}
+
+/// Build a [`TxDetail`] from one history row + the node's circuit digest.
+///
+/// Reuses [`history_row_to_item`] for the shared list fields
+/// (direction / amount / status / txid …) so the two endpoints can never
+/// disagree on the core shape, then layers on the decoded account-state
+/// snapshot. Returns `None` when the row's source is internal or any
+/// state blob fails to decode — both map to a 500 at the call site (the
+/// db query already filtered to user-facing sources, so in practice only
+/// a corrupt blob reaches the `None` arm).
+pub(crate) fn tx_detail_from_row(
+    row: &crate::db::AccountHistoryRow,
+    address_hex: String,
+    circuit_digest: Option<Vec<u8>>,
+) -> Option<TxDetail> {
+    let item = history_row_to_item(row)?;
+    let balance_after = balance_from_account_blob(&row.new_data)?;
+    let balance_before = match row.prev_data.as_deref() {
+        None => None,
+        Some(blob) => Some(balance_from_account_blob(blob)?),
+    };
+    let (num_sends_after, commitment_public_key) = account_meta_from_blob(&row.new_data)?;
+    Some(TxDetail {
+        id: item.id,
+        address: address_hex,
+        txid: item.txid,
+        timestamp: item.timestamp,
+        direction: item.direction,
+        amount: item.amount,
+        counterparty: item.counterparty,
+        status: item.status,
+        block_height: item.block_height,
+        memo: item.memo,
+        balance_after,
+        balance_before,
+        num_sends_after,
+        commitment_public_key,
+        circuit_digest: circuit_digest.map(hex::encode),
+        commit_output_value: row.commit_output_value,
     })
 }
 
@@ -1119,6 +1237,136 @@ pub(crate) async fn get_history_handler(
         }),
     )
         .into_response()
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/history/{id}",
+    tag = "Accounts",
+    params(
+        ("id" = i64, Path,
+            description = "Server-internal `account_history.id` of the row (from a `HistoryItem.id`)."),
+        ("address" = String, Query,
+            description = "Account address (32-byte hex, with or without `0x` prefix) the row must belong to."),
+    ),
+    responses(
+        (status = 200, description = "Full per-transaction detail.", body = TxDetail),
+        (status = 404, description = "No user-facing row with that id for the address.",
+            body = HistoryErrorResponse),
+        (status = 422, description = "Missing/malformed `address` or non-integer `id`.",
+            body = HistoryErrorResponse),
+        (status = 500, description = "Database error / undecodable state blob.",
+            body = HistoryErrorResponse),
+    ),
+)]
+/// `GET /api/history/{id}?address=<hex>` — full detail for one
+/// transaction (one `account_history` row), scoped to `address`.
+///
+/// The list endpoint (`GET /api/history`) returns the lean per-row
+/// shape; this returns [`TxDetail`] — the same core fields plus the
+/// decoded account-state snapshot (balance before/after, post-mutation
+/// `num_sends` + commitment pubkey), the verifier circuit digest, and
+/// the on-chain commit output value when present.
+///
+/// Scoping: the row must both have `id` AND belong to `address`, and its
+/// source must be user-facing (`mint`/`send`/`receive`). A mismatch (or
+/// an internal `scanner`/`recovery` row) returns 404 — a caller cannot
+/// read another address's rows or the node's internal mutations by
+/// guessing ids.
+///
+/// Validation: missing/malformed `address` → 422; a non-integer `id` →
+/// 422 (parsed from the path as a string so the contract matches the
+/// list endpoint's 422-on-bad-input rather than axum's default 400).
+pub(crate) async fn get_history_item_handler(
+    State(state): State<AppState>,
+    Path(id_raw): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    // --- validation: address (required) ---
+    let address_hex = match params.get("address") {
+        Some(s) if !s.is_empty() => s.as_str(),
+        _ => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(HistoryErrorResponse {
+                    error: "Missing required `address` query parameter",
+                }),
+            )
+                .into_response();
+        }
+    };
+    let address_bytes = match decode_history_address(address_hex) {
+        Ok(b) => b,
+        Err(msg) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(HistoryErrorResponse { error: msg }),
+            )
+                .into_response();
+        }
+    };
+    // --- validation: id (positive integer) ---
+    let id = match id_raw.parse::<i64>() {
+        Ok(n) if n > 0 => n,
+        _ => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(HistoryErrorResponse {
+                    error: "id must be a positive integer",
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // --- DB read: the scoped row ---
+    let row = match db::get_account_history_item(&state.pool, &address_bytes, id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(HistoryErrorResponse {
+                    error: "Transaction not found",
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::warn!("get_history_item_handler: row query failed: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(HistoryErrorResponse {
+                    error: "Database error while reading transaction",
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // The verifier circuit digest is node-global (single row). A read
+    // failure degrades the field to `null` rather than failing the whole
+    // detail — it is metadata, not the row itself.
+    let circuit_digest = db::load_circuit_digest(&state.pool).await.ok().flatten();
+
+    // Echo the normalised (lower-case, no `0x`) address so the wire form
+    // is canonical regardless of how the caller spelled it.
+    let address_norm = hex::encode(address_bytes);
+    match tx_detail_from_row(&row, address_norm, circuit_digest) {
+        Some(detail) => (StatusCode::OK, Json(detail)).into_response(),
+        None => {
+            tracing::warn!(
+                "get_history_item_handler: row {} for address could not be decoded",
+                id
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(HistoryErrorResponse {
+                    error: "Database error while reading transaction",
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[utoipa::path(
@@ -3045,6 +3293,9 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/api/info", get(info_handler))
         .route("/api/balance", get(get_balance_handler))
         .route("/api/history", get(get_history_handler))
+        // axum 0.7 path-param syntax (`:id`); the OpenAPI annotation uses
+        // the spec's `{id}` form — both name the same segment.
+        .route("/api/history/:id", get(get_history_item_handler))
         .route("/api/receive", post(receive_coin_handler))
         .route("/api/proof/:id", get(get_proof_handler))
         // Job-API routes — the only path through which a wallet

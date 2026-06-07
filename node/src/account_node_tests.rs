@@ -1582,6 +1582,7 @@ fn history_row_to_item_balance_from_coin_queue_only() {
         commit_txid: None,
         block_height: None,
         pending_status: None,
+        commit_output_value: None,
     };
     let item = crate::router::history_row_to_item(&row).expect("item produced");
     assert_eq!(item.id, 7);

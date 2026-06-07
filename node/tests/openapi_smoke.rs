@@ -80,6 +80,7 @@ fn spec_lists_every_always_on_route() {
         "/api/info",
         "/api/balance",
         "/api/history",
+        "/api/history/{id}",
         "/api/jobs/mint",
         "/api/jobs/send",
         "/api/jobs/{job_id}",
@@ -131,7 +132,12 @@ fn spec_registers_critical_schemas() {
     // page contract (issue #153). The wallet's transaction list reads
     // this shape directly; a missing schema here means a wallet build
     // would have no compile-time check against drift.
-    for name in ["HistoryResponse", "HistoryItem", "HistoryErrorResponse"] {
+    for name in [
+        "HistoryResponse",
+        "HistoryItem",
+        "HistoryErrorResponse",
+        "TxDetail",
+    ] {
         assert!(
             schemas.contains_key(name),
             "`{name}` must be registered under components.schemas — \

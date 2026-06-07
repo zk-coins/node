@@ -4782,6 +4782,254 @@ async fn history_pagination_walks_mixed_source_dataset_consistently() {
     assert_eq!(seen_directions, vec!["receive", "send", "receive", "mint"]);
 }
 
+// =======================================================================
+// GET /api/history/{id} — per-transaction detail (TxDetail)
+//
+// Validation branches run against the dead pool (`send_request`); the
+// found / not-found / decoded-snapshot branches run against the live
+// Postgres container, mirroring the list-endpoint tests above.
+// =======================================================================
+
+#[tokio::test]
+async fn history_item_missing_address_returns_422() {
+    let req = Request::get("/api/history/1").body(Body::empty()).unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert!(
+        v["error"].as_str().unwrap_or("").contains("address"),
+        "expected address-related error, got {}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn history_item_empty_address_returns_422() {
+    let req = Request::get("/api/history/1?address=")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _body) = send_request(req).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn history_item_invalid_hex_returns_422() {
+    let req = Request::get("/api/history/1?address=not_hex")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert!(v["error"]
+        .as_str()
+        .unwrap_or("")
+        .to_lowercase()
+        .contains("hex"));
+}
+
+#[tokio::test]
+async fn history_item_non_integer_id_returns_422() {
+    // The id is parsed from the path as a string so a malformed id is a
+    // 422 like every other bad input on the read surface — not axum's
+    // default 400 for a failed typed-Path extraction.
+    let address = "00".repeat(32);
+    let req = Request::get(format!("/api/history/not_a_number?address={}", address))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert!(v["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("positive integer"));
+}
+
+#[tokio::test]
+async fn history_item_zero_or_negative_id_returns_422() {
+    let address = "00".repeat(32);
+    for bad in ["0", "-3"] {
+        let req = Request::get(format!("/api/history/{}?address={}", bad, address))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _body) = send_request(req).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "id={bad} must 422"
+        );
+    }
+}
+
+#[tokio::test]
+async fn history_item_db_error_returns_500() {
+    // Dead pool: validation passes, the row query fails -> 500 with the
+    // documented error envelope.
+    let address = "00".repeat(32);
+    let req = Request::get(format!("/api/history/1?address={}", address))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert!(v["error"]
+        .as_str()
+        .unwrap_or("")
+        .to_lowercase()
+        .contains("database"));
+}
+
+#[tokio::test]
+async fn history_item_unknown_id_returns_404() {
+    let (pool, _pg) = history_live_pool().await;
+    let state = live_test_state(pool);
+    let address = "ab".repeat(32);
+    let req = Request::get(format!("/api/history/424242?address={}", address))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body={}", body);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(v["error"], "Transaction not found");
+}
+
+#[tokio::test]
+async fn history_item_wrong_address_returns_404() {
+    // Scoping / IDOR guard: a real row id fetched with a different
+    // address must look identical to a missing row.
+    let (pool, _pg) = history_live_pool().await;
+    let address: [u8; 32] = [21u8; 32];
+    seed_account_history(&pool, &address, 100, "mint").await;
+    let (rows, _) = crate::db::list_account_history(&pool, &address[..], 10, 0)
+        .await
+        .unwrap();
+    let id = rows[0].id;
+
+    let state = live_test_state(pool);
+    let other = "cd".repeat(32);
+    let req = Request::get(format!("/api/history/{}?address={}", id, other))
+        .body(Body::empty())
+        .unwrap();
+    let (status, _body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn history_item_happy_path_returns_decoded_snapshot() {
+    let (pool, _pg) = history_live_pool().await;
+    let address: [u8; 32] = [23u8; 32];
+
+    // Two mutations: 0 -> 100 (mint), then 100 -> 40 (send) so the
+    // detail of the send row carries both balance_before and
+    // balance_after plus the post-mutation num_sends.
+    seed_account_history(&pool, &address, 100, "mint").await;
+    let mut sent = Account::new();
+    sent.balance = 40;
+    sent.num_sends = 1;
+    let bytes = bincode::serialize(&sent).expect("Account serializable");
+    crate::db::upsert_account_with_source(&pool, address.as_slice(), &bytes, "send")
+        .await
+        .expect("upsert send mutation");
+
+    let (rows, _) = crate::db::list_account_history(&pool, &address[..], 10, 0)
+        .await
+        .unwrap();
+    let send_id = rows[0].id; // newest first
+
+    let state = live_test_state(pool);
+    let req = Request::get(format!(
+        "/api/history/{}?address=0x{}",
+        send_id,
+        hex::encode(address)
+    ))
+    .body(Body::empty())
+    .unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::OK, "body={}", body);
+
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(v["id"].as_i64(), Some(send_id));
+    assert_eq!(
+        v["address"],
+        hex::encode(address),
+        "address echoed normalised (0x stripped, lower-case)"
+    );
+    assert_eq!(v["direction"], "send");
+    assert_eq!(v["amount"], 60, "|40 - 100|");
+    assert_eq!(v["status"], "pending", "no inscription link yet");
+    assert_eq!(v["balance_after"], 40);
+    assert_eq!(v["balance_before"], 100);
+    assert_eq!(v["num_sends_after"], 1);
+    // The seed path sets no commitment pubkey and the fresh schema has
+    // no circuit digest row / inscription rows.
+    assert!(v["commitment_public_key"].is_null());
+    assert!(v["circuit_digest"].is_null());
+    assert!(v["commit_output_value"].is_null());
+    assert!(v["txid"].is_null());
+    assert!(v["block_height"].is_null());
+    assert!(v["counterparty"].is_null());
+    assert!(v["memo"].is_null());
+}
+
+#[tokio::test]
+async fn history_item_surfaces_circuit_digest_when_stored() {
+    let (pool, _pg) = history_live_pool().await;
+    let address: [u8; 32] = [27u8; 32];
+    seed_account_history(&pool, &address, 100, "mint").await;
+    crate::db::store_circuit_digest(&pool, &[0xCD; 32])
+        .await
+        .expect("store digest");
+    let (rows, _) = crate::db::list_account_history(&pool, &address[..], 10, 0)
+        .await
+        .unwrap();
+    let id = rows[0].id;
+
+    let state = live_test_state(pool);
+    let req = Request::get(format!(
+        "/api/history/{}?address={}",
+        id,
+        hex::encode(address)
+    ))
+    .body(Body::empty())
+    .unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::OK, "body={}", body);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(
+        v["circuit_digest"].as_str(),
+        Some(hex::encode([0xCD; 32]).as_str())
+    );
+}
+
+#[tokio::test]
+async fn history_item_corrupt_blob_returns_500() {
+    // A row whose new_data is not a valid bincode Account decodes to
+    // None in tx_detail_from_row — the handler maps that to a 500, never
+    // a fabricated detail.
+    let (pool, _pg) = history_live_pool().await;
+    let address: [u8; 32] = [29u8; 32];
+    let (id,): (i64,) = sqlx::query_as(
+        "INSERT INTO account_history (address, prev_data, new_data, source) \
+         VALUES ($1, NULL, $2, 'mint') RETURNING id",
+    )
+    .bind(&address[..])
+    .bind(vec![0xFFu8; 4])
+    .fetch_one(&*pool)
+    .await
+    .expect("insert corrupt row");
+
+    let state = live_test_state(pool);
+    let req = Request::get(format!(
+        "/api/history/{}?address={}",
+        id,
+        hex::encode(address)
+    ))
+    .body(Body::empty())
+    .unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={}", body);
+}
+
 // --- Pure-function coverage for the helpers --------------------------------
 
 #[test]
@@ -4847,6 +5095,7 @@ fn history_row_to_item_handles_first_row_with_no_prev_data() {
         commit_txid: None,
         block_height: None,
         pending_status: None,
+        commit_output_value: None,
     };
     let item = history_row_to_item(&row).expect("item produced");
     assert_eq!(item.id, 42);
@@ -4875,6 +5124,7 @@ fn history_row_to_item_drops_unknown_source() {
         commit_txid: None,
         block_height: None,
         pending_status: None,
+        commit_output_value: None,
     };
     assert!(history_row_to_item(&row).is_none());
 }
@@ -4890,6 +5140,7 @@ fn history_row_to_item_drops_undecodable_new_data() {
         commit_txid: None,
         block_height: None,
         pending_status: None,
+        commit_output_value: None,
     };
     assert!(history_row_to_item(&row).is_none());
 }
@@ -4908,6 +5159,7 @@ fn history_row_to_item_maps_pending_status_to_wire_status() {
         commit_txid: Some(vec![0xab; 32]),
         block_height,
         pending_status: status.map(str::to_string),
+        commit_output_value: None,
     };
     // Every enum variant the migration-0003 CHECK constraint allows.
     assert_eq!(
@@ -4980,11 +5232,151 @@ fn history_row_to_item_drops_undecodable_prev_data() {
         commit_txid: None,
         block_height: None,
         pending_status: None,
+        commit_output_value: None,
     };
     assert!(
         history_row_to_item(&row).is_none(),
         "un-decodable prev_data must drop the row, not pretend prev_balance = 0"
     );
+}
+
+// ── GET /api/history/{id} — TxDetail conversion (issue: tx-detail) ──────
+
+#[test]
+fn account_meta_from_blob_reads_num_sends_and_commitment_pubkey() {
+    use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+
+    // Fresh account: num_sends = 0, no commitment pubkey yet.
+    let fresh = Account::new();
+    let (n, cpk) = account_meta_from_blob(&bincode::serialize(&fresh).unwrap()).unwrap();
+    assert_eq!(n, 0);
+    assert!(cpk.is_none(), "genesis account has no commitment pubkey");
+
+    // Account that has sent: num_sends > 0 and a commitment pubkey set.
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(&[7u8; 32]).unwrap();
+    let pk = PublicKey::from_secret_key(&secp, &sk);
+    let mut sent = Account::new();
+    sent.num_sends = 3;
+    sent.commitment_public_key = Some(pk);
+    let (n, cpk) = account_meta_from_blob(&bincode::serialize(&sent).unwrap()).unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(
+        cpk.as_deref(),
+        Some(hex::encode(pk.serialize()).as_str()),
+        "commitment pubkey is the 33-byte compressed form, hex-encoded"
+    );
+
+    // Garbage bytes -> None (decode failure → caller 500s).
+    assert!(account_meta_from_blob(&[0xff; 3]).is_none());
+}
+
+#[test]
+fn tx_detail_from_row_builds_full_detail_with_decoded_snapshot() {
+    let mut prev = Account::new();
+    prev.balance = 10_000;
+    let mut new = Account::new();
+    new.balance = 4_000;
+    new.num_sends = 1;
+
+    let row = crate::db::AccountHistoryRow {
+        id: 99,
+        timestamp_secs: 1_700_000_500,
+        source: "send".to_string(),
+        prev_data: Some(bincode::serialize(&prev).unwrap()),
+        new_data: bincode::serialize(&new).unwrap(),
+        commit_txid: Some(vec![0xab; 32]),
+        block_height: Some(900_001),
+        pending_status: Some("complete".to_string()),
+        commit_output_value: Some(546),
+    };
+    let digest = vec![0xcd; 32];
+    let detail = tx_detail_from_row(&row, "ee".repeat(32), Some(digest.clone()))
+        .expect("detail produced for a user-facing row");
+
+    // Core fields mirror history_row_to_item.
+    assert_eq!(detail.id, 99);
+    assert_eq!(detail.address, "ee".repeat(32));
+    assert_eq!(detail.direction, "send");
+    assert_eq!(detail.amount, 6_000, "|4000 - 10000|");
+    assert_eq!(
+        detail.status, "confirmed",
+        "complete inscription -> confirmed"
+    );
+    assert_eq!(detail.txid.as_deref(), Some("ab".repeat(32).as_str()));
+    assert_eq!(detail.block_height, Some(900_001));
+    // Decoded snapshot.
+    assert_eq!(detail.balance_after, 4_000);
+    assert_eq!(detail.balance_before, Some(10_000));
+    assert_eq!(detail.num_sends_after, 1);
+    // Proof + on-chain extras.
+    assert_eq!(
+        detail.circuit_digest.as_deref(),
+        Some(hex::encode(&digest).as_str())
+    );
+    assert_eq!(detail.commit_output_value, Some(546));
+}
+
+#[test]
+fn tx_detail_from_row_first_row_has_no_balance_before() {
+    let mut new = Account::new();
+    new.balance = 5_000;
+    let row = crate::db::AccountHistoryRow {
+        id: 1,
+        timestamp_secs: 0,
+        source: "mint".to_string(),
+        prev_data: None,
+        new_data: bincode::serialize(&new).unwrap(),
+        commit_txid: None,
+        block_height: None,
+        pending_status: None,
+        commit_output_value: None,
+    };
+    let detail = tx_detail_from_row(&row, "11".repeat(32), None).unwrap();
+    assert_eq!(detail.balance_after, 5_000);
+    assert_eq!(detail.amount, 5_000, "from-zero mint credits full balance");
+    assert!(
+        detail.balance_before.is_none(),
+        "first row has no prior state"
+    );
+    assert!(detail.circuit_digest.is_none(), "no digest passed -> null");
+    assert!(detail.commit_output_value.is_none());
+    assert_eq!(detail.num_sends_after, 0);
+    assert!(detail.commitment_public_key.is_none());
+}
+
+#[test]
+fn tx_detail_from_row_internal_source_returns_none() {
+    let mut new = Account::new();
+    new.balance = 1;
+    let row = crate::db::AccountHistoryRow {
+        id: 5,
+        timestamp_secs: 0,
+        source: "scanner".to_string(), // internal — must not surface
+        prev_data: None,
+        new_data: bincode::serialize(&new).unwrap(),
+        commit_txid: None,
+        block_height: None,
+        pending_status: None,
+        commit_output_value: None,
+    };
+    assert!(tx_detail_from_row(&row, "22".repeat(32), None).is_none());
+}
+
+#[test]
+fn tx_detail_from_row_undecodable_new_data_returns_none() {
+    let row = crate::db::AccountHistoryRow {
+        id: 5,
+        timestamp_secs: 0,
+        source: "mint".to_string(),
+        prev_data: None,
+        new_data: vec![0xff; 4], // corrupt -> caller 500s
+        commit_txid: None,
+        block_height: None,
+        pending_status: None,
+        commit_output_value: None,
+    };
+    assert!(tx_detail_from_row(&row, "33".repeat(32), None).is_none());
 }
 
 #[test]
