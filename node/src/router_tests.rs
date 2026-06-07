@@ -2474,13 +2474,55 @@ mod jobs_endpoint_tests {
 
     // ---- POST /api/jobs/mint ----
 
+    /// Build a fully valid creator-signed mint request body (neutral
+    /// multi-asset model). The owner (`H(creator_pubkey)`) and asset_id
+    /// are derived node-side; the BIP-340 Schnorr signature is over
+    /// `SHA256(creator_pubkey ‖ name ‖ [decimals] ‖ amount_le ‖
+    /// timestamp_le)` so `flow::validate_mint_request` accepts it. The
+    /// key/name/decimals are fixed test values; vary `amount` per call.
+    fn signed_mint_body(amount: u64) -> serde_json::Value {
+        use bitcoin::secp256k1::{Keypair, PublicKey, SecretKey};
+        use sha2::{Digest, Sha256};
+        let secp = secp::Secp256k1::new();
+        let sk = SecretKey::from_slice(&[9u8; 32]).expect("valid sk");
+        let pk: PublicKey = sk.public_key(&secp);
+        let kp = Keypair::from_secret_key(&secp, &sk);
+        // Rotation target for the post-mint transition — any distinct
+        // valid pubkey works for the admit-level tests here.
+        let next_sk = SecretKey::from_slice(&[10u8; 32]).expect("valid next sk");
+        let next_pk: PublicKey = next_sk.public_key(&secp);
+        let name = "TestCoin";
+        let decimals: u8 = 8;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut hasher = Sha256::new();
+        hasher.update(pk.serialize());
+        hasher.update(name.as_bytes());
+        hasher.update([decimals]);
+        hasher.update(amount.to_le_bytes());
+        hasher.update(timestamp.to_le_bytes());
+        let hash: [u8; 32] = hasher.finalize().into();
+        let msg = Message::from_digest(hash);
+        let sig = secp.sign_schnorr(&msg, &kp);
+        serde_json::json!({
+            "creator_pubkey": hex::encode(pk.serialize()),
+            "name": name,
+            "decimals": decimals,
+            "amount": amount,
+            "next_public_key": hex::encode(next_pk.serialize()),
+            "signature": hex::encode(sig.serialize()),
+            "timestamp": timestamp,
+        })
+    }
+
     #[tokio::test]
     async fn jobs_mint_without_idempotency_key_returns_400() {
         let (state, _pool, _c) = jobs_test_state().await;
-        let body = serde_json::json!({
-            "account_address": "0x".to_string() + &hex::encode([1u8; 32]),
-            "amount": 1u64,
-        });
+        // Body is a valid creator-signed mint so the `Json<MintRequest>`
+        // extractor passes and we reach the idempotency-key check.
+        let body = signed_mint_body(1);
         let req = Request::post("/api/jobs/mint")
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
@@ -2494,10 +2536,7 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn jobs_mint_with_empty_idempotency_key_returns_400() {
         let (state, _pool, _c) = jobs_test_state().await;
-        let body = serde_json::json!({
-            "account_address": "0x".to_string() + &hex::encode([1u8; 32]),
-            "amount": 1u64,
-        });
+        let body = signed_mint_body(1);
         let req = Request::post("/api/jobs/mint")
             .header("content-type", "application/json")
             .header("idempotency-key", "")
@@ -2510,16 +2549,20 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn jobs_mint_with_invalid_hex_returns_422() {
         let (state, _pool, _c) = jobs_test_state().await;
-        let body = serde_json::json!({"account_address": "not_hex", "amount": 1u64});
+        // A `creator_pubkey` that is not valid pubkey hex fails the
+        // `Json<MintRequest>` extractor (secp256k1 PublicKey serde)
+        // before the handler body runs — axum surfaces the rejection
+        // as a 422. The rejection body is axum's, not our `{error}`
+        // envelope, so only the status is asserted.
+        let mut body = signed_mint_body(1);
+        body["creator_pubkey"] = serde_json::Value::String("not_hex".to_string());
         let req = Request::post("/api/jobs/mint")
             .header("content-type", "application/json")
             .header("idempotency-key", "k1")
             .body(Body::from(body.to_string()))
             .unwrap();
-        let (status, _h, body) = run(state, req).await;
+        let (status, _h, _body) = run(state, req).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
-        assert_eq!(v["error"], "account_address is not valid hex");
     }
 
     #[tokio::test]
@@ -2541,10 +2584,7 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn jobs_mint_admits_returns_202_with_job_id() {
         let (state, _pool, _c) = jobs_test_state().await;
-        let body = serde_json::json!({
-            "account_address": "0x".to_string() + &hex::encode([1u8; 32]),
-            "amount": 1u64,
-        });
+        let body = signed_mint_body(1);
         let req = Request::post("/api/jobs/mint")
             .header("content-type", "application/json")
             .header("Idempotency-Key", "k-mint-1")
@@ -2566,10 +2606,7 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn jobs_mint_idempotent_replay_returns_existing_job_id() {
         let (state, _pool, _c) = jobs_test_state().await;
-        let body = serde_json::json!({
-            "account_address": "0x".to_string() + &hex::encode([2u8; 32]),
-            "amount": 1u64,
-        });
+        let body = signed_mint_body(1);
         let key = "k-replay";
         let first = run(
             state.clone(),
@@ -2605,10 +2642,7 @@ mod jobs_endpoint_tests {
         let (state, _pool, _c) = jobs_test_state().await;
         // Admit a job, then flip it to `completed` directly via the
         // JobStore so the second admit surfaces the cached response.
-        let body = serde_json::json!({
-            "account_address": "0x".to_string() + &hex::encode([3u8; 32]),
-            "amount": 1u64,
-        });
+        let body = signed_mint_body(1);
         let first = run(
             state.clone(),
             Request::post("/api/jobs/mint")
@@ -3119,13 +3153,10 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn jobs_admit_returns_500_when_db_unavailable() {
         // Targets the `JobStore::create` Err arm in `admit_and_enqueue`
-        // (~router.rs Z889-898). Body is otherwise valid so we sail
-        // past `validate_mint_request` and reach the store call.
+        // (~router.rs Z889-898). Body is a valid creator-signed mint so
+        // we sail past `validate_mint_request` and reach the store call.
         let state = jobs_test_state_dead_db();
-        let body = serde_json::json!({
-            "account_address": "0x".to_string() + &hex::encode([1u8; 32]),
-            "amount": 1u64,
-        });
+        let body = signed_mint_body(1);
         let req = Request::post("/api/jobs/mint")
             .header("content-type", "application/json")
             .header("idempotency-key", "k-db-admit")
@@ -3219,10 +3250,7 @@ mod jobs_endpoint_tests {
         drop(rx);
         state.job_notify_map = Arc::new(dashmap::DashMap::new());
 
-        let body = serde_json::json!({
-            "account_address": "0x".to_string() + &hex::encode([13u8; 32]),
-            "amount": 1u64,
-        });
+        let body = signed_mint_body(1);
         let req = Request::post("/api/jobs/mint")
             .header("content-type", "application/json")
             .header("idempotency-key", "k-dispatcher-down")
@@ -4399,7 +4427,17 @@ async fn seed_account_history(
     let mut acct = Account::new();
     acct.balance = balance;
     let bytes = bincode::serialize(&acct).expect("Account serializable");
-    crate::db::upsert_account_with_source(pool, address.as_slice(), &bytes, source)
+    // Since migration 0017 `accounts.address` is the 64-byte
+    // `owner ‖ asset_id` composite key (`accounts_address_length` CHECK
+    // = 64). History stays OWNER-keyed: the `accounts_history_capture`
+    // trigger writes only the 32-byte owner prefix into
+    // `account_history`, so `GET /api/history?address=<owner>` still
+    // resolves. Seed under a deterministic composite so repeated calls
+    // for the same `address` hit the same row (UPDATE → history chain).
+    let owner = zkcoins_program::hash::digest_from_bytes(address);
+    let asset_id = zkcoins_program::hash::ZERO_HASH;
+    let key = crate::account_node::account_key_bytes(&owner, &asset_id);
+    crate::db::upsert_account_with_source(pool, key.as_slice(), &bytes, source)
         .await
         .expect("upsert seeded account");
     bytes
@@ -5431,11 +5469,16 @@ fn signed_mint_request(name: &str, decimals: u8, amount: u64, timestamp: u64) ->
     let msg = Message::from_digest(hash);
     let keypair = TestKeypair::from_secret_key(&secp, &sk);
     let sig = secp.sign_schnorr(&msg, &keypair);
+    // Rotation target for the post-mint transition; any distinct valid
+    // pubkey works for the signature-level tests this helper feeds.
+    let next_sk = TestSecretKey::from_slice(&[8u8; 32]).expect("valid next secret key");
+    let next_public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &next_sk);
     MintRequest {
         creator_pubkey: pk,
         name: name.to_string(),
         decimals,
         amount,
+        next_public_key,
         signature: hex::encode(sig.serialize()),
         timestamp,
     }

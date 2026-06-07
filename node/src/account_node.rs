@@ -951,6 +951,7 @@ impl AccountNode {
         name: &str,
         decimals: u8,
         amount: u64,
+        next_public_key: &zkcoins_program::types::PublicKey,
     ) -> Result<MintingPrepared, &'static str> {
         use zkcoins_program::hash::hash_bytes;
         use zkcoins_program::types::{calculate_asset_id, calculate_name_hash};
@@ -993,8 +994,18 @@ impl AccountNode {
         let history_root_extended = state.mmr.root_extended(MMR_PROOF_PATH_LEN);
 
         // No out-coins, no in-coins: the mint only increases the
-        // creator's own balance. `next_public_key == creator_pubkey`
-        // (no rotation on a mint — the same key signs the commitment).
+        // creator's own balance. The commitment itself is signed by the
+        // creator key (the issuer gate binds `account.public_key ==
+        // creator_pubkey`), but `next_public_key` MUST rotate to a
+        // fresh wallet key exactly like a send: the global commitment
+        // SMT is keyed by `sha256(public_key)` and is insert-only, so a
+        // mint that declared `next == creator_pubkey` would force the
+        // next send to re-commit under the creator key and collide
+        // ("Key already exists in the tree with different value").
+        // The recursive AccountUpdate copy-constrains the inner proof's
+        // `next_public_key` to the follow-up transition's current key,
+        // so rotation declared here is what makes the post-mint send
+        // provable AND ingestible.
         let proof: Proof = match &snapshot.proof {
             Some(account_proof) => {
                 // The creator already holds this asset: chain an
@@ -1017,15 +1028,34 @@ impl AccountNode {
                 let _ = prev_cmp;
                 return Err("Re-mint into an existing asset account is not supported");
             }
-            None => self
-                .prover
-                .prove_initial(
-                    &account_state_for_prove,
-                    history_root_extended,
-                    asset_id,
-                    Some(mint_witness),
-                )
-                .map_err(|_| "prove_initial failed")?,
+            None => {
+                // All coin slots inactive — the `_with_in_and_out_coins`
+                // variant is used (instead of the slotless
+                // `prove_initial`) solely because it is the Initial-
+                // branch entry point that accepts an explicit
+                // `next_public_key` rotation target.
+                let dummy_nip = Self::dummy_nip();
+                let dummy_coin = Self::dummy_coin();
+                let in_coin_slots: Vec<(bool, &Coin, &NonInclusionProof)> = (0
+                    ..zkcoins_program::circuit::main::MAX_IN_COINS)
+                    .map(|_| (false, &dummy_coin, &dummy_nip))
+                    .collect();
+                let out_coin_slots: Vec<(bool, HashDigest, u64, &NonInclusionProof)> = (0
+                    ..zkcoins_program::circuit::main::MAX_OUT_COINS)
+                    .map(|_| (false, ZERO_HASH, 0u64, &dummy_nip))
+                    .collect();
+                self.prover
+                    .prove_initial_with_in_and_out_coins(
+                        &account_state_for_prove,
+                        history_root_extended,
+                        &in_coin_slots,
+                        &out_coin_slots,
+                        next_public_key,
+                        asset_id,
+                        Some(mint_witness),
+                    )
+                    .map_err(|_| "prove_initial failed")?
+            }
         };
         drop(state);
 
