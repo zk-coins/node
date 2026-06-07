@@ -230,7 +230,6 @@ pub(crate) async fn mint_flow(
     // here beyond the validation side-effect.
     let _identity = validate_mint_request(&request)?;
     let creator_pubkey = request.creator_pubkey.serialize();
-    let next_public_key = request.next_public_key.serialize();
     let name = request.name.clone();
     let decimals = request.decimals;
     let amount = request.amount;
@@ -240,7 +239,7 @@ pub(crate) async fn mint_flow(
         move || -> Result<crate::account_node::MintingPrepared, FlowError> {
             let guard = lock_or_recover(&account_node_clone);
             guard
-                .prepare_mint(&creator_pubkey, &name, decimals, amount, &next_public_key)
+                .prepare_mint(&creator_pubkey, &name, decimals, amount)
                 .map_err(flow_err_from_send_coins)
         },
     )

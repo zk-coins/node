@@ -707,16 +707,6 @@ pub struct MintRequest {
     pub(crate) decimals: u8,
     /// Amount to mint into the creator's own balance, atomic units.
     pub(crate) amount: u64,
-    /// Compressed secp256k1 public key (33 bytes, hex) the wallet will
-    /// sign its NEXT transition with. The mint commitment itself is
-    /// signed by `creator_pubkey` (the issuer gate demands it), but the
-    /// rotation target must be a FRESH key exactly like a send: the
-    /// commitment SMT is keyed by `sha256(public_key)` and insert-only,
-    /// so re-declaring the creator key would make the first post-mint
-    /// send collide at ingest. Bound through the two-phase flow — the
-    /// wallet only countersigns the staged proof that committed to it.
-    #[schema(value_type = String, example = "03c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5")]
-    pub(crate) next_public_key: bitcoin::secp256k1::PublicKey,
     /// Hex-encoded BIP-340 Schnorr signature (64 bytes) over
     /// `SHA256(creator_pubkey || name || [decimals] || amount_le ||
     /// timestamp_le)`.

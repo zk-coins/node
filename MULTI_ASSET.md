@@ -29,6 +29,8 @@ ongoing mint authority, transactions stay single-asset, asset
 metadata is name + decimals. Implementation tracking lands in
 [`ROADMAP.md`](./ROADMAP.md) once the maintainer approves this draft.
 
+> **Implementation note (PR [#220](https://github.com/zk-coins/node/pull/220)) — the as-built design diverges from this draft, and has a KNOWN gating blocker.** PR #220 implements "Model B": per-`(owner, asset_id)` accounts, an in-circuit **issuer-gated** mint (not the off-circuit Schnorr of §5.3), and `asset_id = Poseidon(genesis ‖ creator_pubkey ‖ name_hash ‖ decimals)` (no timestamp; §4.2/§12.1 superseded). See §17 below for the full divergence + the create→mint→send soundness/SMT blocker that must be resolved at the circuit layer before the flow works end-to-end.
+
 ---
 
 ## 1. Motivation
@@ -1196,3 +1198,80 @@ So nobody scope-creeps:
 | Date | Change |
 | ---- | ------ |
 | 2026-05-22 | Initial draft. |
+| 2026-06-07 | Added §17 — as-built (PR #220) divergence from this draft + the create→mint→send circuit blocker. |
+
+---
+
+## 17. As-built divergence + the create→mint→send blocker (PR #220)
+
+PR [#220](https://github.com/zk-coins/node/pull/220) implements a stronger
+trust model than §5.3's "v1: off-circuit Schnorr verify", and the
+as-built shape diverges from this draft in several places. It also
+surfaced a **fundamental blocker** in the core create→mint→send loop
+that this section records.
+
+### 17.1 Divergences from the draft
+
+- **Model B accounts.** Accounts are keyed per `(owner, asset_id)`
+  (one balance + proof chain per asset), not a single account with a
+  `BTreeMap<AssetId, u64>` (§4.1). On disk the `accounts.address`
+  column holds the 64-byte composite `owner(32) ‖ asset_id(32)`.
+- **In-circuit issuer gate (not off-circuit).** Value creation is
+  authorised inside the circuit: `asset_id ==
+  calculate_asset_id(creator_pubkey, name_hash, decimals)` **AND**
+  `owner == H(creator_pubkey)` **AND** `creator_pubkey ==
+  account.public_key`, via a threaded `MintWitness`. §5.3's option 1
+  (off-circuit verify) is superseded by option 2's direction.
+- **AssetId preimage drops `timestamp`.** `asset_id = Poseidon(genesis
+  ‖ creator_pubkey ‖ name_hash ‖ decimals)` — fixed-width so it is
+  re-derivable in-circuit. §4.2 / §12.1's timestamp is gone.
+- **No `/api/asset/{create,list,info}` endpoints.** Asset creation is
+  the first **mint** (`POST /api/jobs/mint`, two-phase, creator-signed)
+  on the creator's own `(owner, asset_id)` account; `name`/`decimals`
+  are display metadata cached at mint time. `GET /api/balance/:address`
+  aggregates per-asset.
+
+### 17.2 The create→mint→send blocker (gating)
+
+The neutral model's soundness rests on a commit-leg gate
+(`account_node::commitment_binds_account_state`): the on-chain
+commitment must verify under the key bound into the proof's
+`account_state_hash` (ProofData PI[0]) — that is what stops a forger
+from witnessing a victim's public `(owner, asset_id)` values and
+signing the mint commitment with their own key.
+
+Empirically (`account_node_tests::
+commitment_binds_account_state_checks_creator_verifying_key`) the
+circuit commits **PI[0] with the transition's `next_public_key`**, not
+its current `account_state.public_key`. So the gate binds the creator
+key **only when the mint does not rotate** (`next_public_key ==
+creator_pubkey`). Rotating the mint to a fresh key (attempted and
+reverted) makes PI[0] carry that fresh key, so the gate would accept a
+commitment signed by an attacker-chosen rotation key — a **silent
+soundness break**. No-rotation is therefore mandatory.
+
+But the global commitment SMT is keyed by `sha256(public_key)` and is
+**insert-only** (idempotent only for identical values). With a
+no-rotation mint, the creator's FIRST send is forced by the recursion
+(`next_public_key` copy-constraint) to re-commit under
+`sha256(creator_pubkey)`, where the mint already wrote a different
+value → `state.update` fails with *"Key already exists in the tree with
+different value"*. So **create → mint → send cannot complete**, and no
+value can enter circulation.
+
+The two constraints are mutually exclusive at the current circuit
+layer; this is **not** fixable in a node-only patch:
+
+- **Soundness** ⟹ PI[0] (hence `next_public_key`) == `creator_pubkey`
+  ⟹ no rotation.
+- **SMT non-collision** ⟹ the post-mint send must rotate to a fresh
+  key ⟹ the mint must declare a fresh `next_public_key`.
+
+**Required fix (circuit-level, tracked for a follow-up):** expose a
+dedicated `creator_pubkey` public input on the mint branch that the
+issuer gate constrains, and have `commitment_binds_account_state` bind
+the commitment against **that** input rather than PI[0]'s rotated
+state key. The mint can then rotate normally (fresh `next_public_key`,
+no SMT collision) while the commitment stays bound to the creator. This
+needs a `program-plonky2` change + recursion-shape re-verification and
+is out of scope for the node-side heal in PR #220.
