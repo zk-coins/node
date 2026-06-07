@@ -1536,3 +1536,95 @@ async fn list_account_history_filters_scanner_and_recovery_in_sql() {
         "no scanner / recovery rows leak past the SQL filter"
     );
 }
+
+// ---- get_account_history_item (tx-detail endpoint) -------------------------
+
+#[tokio::test]
+async fn get_account_history_item_fetches_scoped_row_with_inscription_join() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let address = [0x1au8; 32];
+    let commit_txid = [0x77u8; 32];
+
+    // Plant an account_history row that carries a commit_txid, plus the
+    // matching pending_inscriptions row (commit_output_value = 12_345 via
+    // `seed_pending_row`) so the detail-only join column lights up.
+    let mut a = crate::account_node::Account::new();
+    a.balance = 9_000;
+    let new_data = bincode::serialize(&a).expect("serialize account");
+    let (id,): (i64,) = sqlx::query_as(
+        "INSERT INTO account_history \
+         (address, prev_data, new_data, source, triggering_commit_txid) \
+         VALUES ($1, NULL, $2, 'mint', $3) RETURNING id",
+    )
+    .bind(&address[..])
+    .bind(&new_data)
+    .bind(&commit_txid[..])
+    .fetch_one(&pool)
+    .await
+    .expect("insert history row");
+    seed_pending_row(&pool, &commit_txid, PENDING_STATUS_REVEAL_BROADCAST).await;
+
+    let row = get_account_history_item(&pool, &address[..], id)
+        .await
+        .expect("query ok")
+        .expect("row found");
+    assert_eq!(row.id, id);
+    assert_eq!(row.source, "mint");
+    assert_eq!(row.commit_txid.as_deref(), Some(&commit_txid[..]));
+    assert_eq!(
+        row.commit_output_value,
+        Some(12_345),
+        "detail query surfaces pending_inscriptions.commit_output_value"
+    );
+    assert_eq!(row.pending_status.as_deref(), Some("reveal_broadcast"));
+    let decoded: crate::account_node::Account =
+        bincode::deserialize(&row.new_data).expect("decode Account");
+    assert_eq!(decoded.balance, 9_000);
+}
+
+#[tokio::test]
+async fn get_account_history_item_scopes_by_address_and_filters_internal() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let address = [0x2bu8; 32];
+    let other = [0x3cu8; 32];
+
+    plant_history_row(&pool, &address[..], "mint", 100, 10).await;
+    plant_history_row(&pool, &address[..], "scanner", 110, 5).await;
+    let (rows, _) = list_account_history(&pool, &address[..], 10, 0)
+        .await
+        .unwrap();
+    let mint_id = rows[0].id;
+
+    // Fetch with the right address — found.
+    assert!(get_account_history_item(&pool, &address[..], mint_id)
+        .await
+        .unwrap()
+        .is_some());
+    // Same id, different address — scoped out (IDOR guard).
+    assert!(get_account_history_item(&pool, &other[..], mint_id)
+        .await
+        .unwrap()
+        .is_none());
+    // Unknown id — None.
+    assert!(
+        get_account_history_item(&pool, &address[..], mint_id + 9_999)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // The scanner row exists in the table but is internal — fetch its id
+    // directly and assert the item query refuses to surface it.
+    let (scanner_id,): (i64,) =
+        sqlx::query_as("SELECT id FROM account_history WHERE address = $1 AND source = 'scanner'")
+            .bind(&address[..])
+            .fetch_one(&pool)
+            .await
+            .expect("scanner row id");
+    assert!(get_account_history_item(&pool, &address[..], scanner_id)
+        .await
+        .unwrap()
+        .is_none());
+}

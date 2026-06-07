@@ -45,7 +45,7 @@ use crate::router::{
     BalanceResponse, BitcoinNetwork, Capabilities, CommitRequest, HistoryErrorResponse,
     HistoryItem, HistoryResponse, InfoResponse, JobErrorResponse, JobStatusResponse,
     LnurlErrorResponse, MintRequest, PublisherHealthErrorResponse, PublisherHealthResponse,
-    ReadyResponse, RootEndpoints, RootResponse, SendCoinRequest, SendCoinResponse,
+    ReadyResponse, RootEndpoints, RootResponse, SendCoinRequest, SendCoinResponse, TxDetail,
     UsernameResponse,
 };
 
@@ -115,6 +115,7 @@ pub const DOCS_HTML: &str = concat!(
         crate::router::info_handler,
         crate::router::get_balance_handler,
         crate::router::get_history_handler,
+        crate::router::get_history_item_handler,
         crate::router::jobs_mint_handler,
         crate::router::jobs_send_handler,
         crate::router::jobs_commit_handler,
@@ -139,6 +140,7 @@ pub const DOCS_HTML: &str = concat!(
         HistoryResponse,
         HistoryItem,
         HistoryErrorResponse,
+        TxDetail,
         SendCoinRequest,
         SendCoinResponse,
         MintRequest,
