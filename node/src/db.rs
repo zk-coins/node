@@ -1544,6 +1544,65 @@ pub struct AccountHistoryRow {
     /// `commit_broadcast`, `reveal_broadcast`, `complete`, `failed`).
     /// `None` while `commit_txid` is `None`.
     pub pending_status: Option<String>,
+    /// `pending_inscriptions.commit_output_value` for the matching
+    /// commit — the on-chain value (sats) locked in the commit output,
+    /// if a publisher inscription row exists. `None` for the list
+    /// (`list_account_history` does not select it to keep the page query
+    /// lean); populated only by [`get_account_history_item`], which the
+    /// transaction-detail endpoint uses.
+    pub commit_output_value: Option<i64>,
+}
+
+/// Fetch a single user-facing `account_history` row by its `id`, scoped
+/// to `address` so a caller can only read rows for an address it already
+/// knows (the same scoping `/api/history` applies to the list). Returns
+/// `Ok(None)` when no row matches `(id, address)` *or* the row's source
+/// is internal (`scanner` / `recovery`) — the detail endpoint treats
+/// both as "not found" so internal mutations stay unexposed.
+///
+/// Unlike [`list_account_history`] this also selects
+/// `pending_inscriptions.commit_output_value` (the detail endpoint
+/// surfaces it; the list does not).
+pub async fn get_account_history_item(
+    pool: &PgPool,
+    address: &[u8],
+    id: i64,
+) -> sqlx::Result<Option<AccountHistoryRow>> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT ah.id, \
+                EXTRACT(EPOCH FROM ah.changed_at)::BIGINT AS ts_secs, \
+                ah.source, ah.prev_data, ah.new_data, \
+                ah.triggering_commit_txid, \
+                oi.block_height, \
+                pi.status AS pending_status, \
+                pi.commit_output_value \
+         FROM account_history ah \
+         LEFT JOIN observed_inscriptions oi \
+             ON oi.commit_txid = ah.triggering_commit_txid \
+         LEFT JOIN pending_inscriptions pi \
+             ON pi.commit_txid = ah.triggering_commit_txid \
+         WHERE ah.id = $1 \
+           AND ah.address = $2 \
+           AND ah.source IN ('mint','send','receive') \
+         LIMIT 1",
+    )
+    .bind(id)
+    .bind(address)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|r| AccountHistoryRow {
+        id: r.get("id"),
+        timestamp_secs: r.get("ts_secs"),
+        source: r.get("source"),
+        prev_data: r.get("prev_data"),
+        new_data: r.get("new_data"),
+        commit_txid: r.get("triggering_commit_txid"),
+        block_height: r.get("block_height"),
+        pending_status: r.get("pending_status"),
+        commit_output_value: r.get("commit_output_value"),
+    }))
 }
 
 /// Fetch the `limit` most recent user-facing `account_history` rows for
@@ -1651,6 +1710,9 @@ pub async fn list_account_history(
                 commit_txid: r.get("triggering_commit_txid"),
                 block_height: r.get("block_height"),
                 pending_status: r.get("pending_status"),
+                // The list query omits commit_output_value to stay lean;
+                // only the detail endpoint surfaces it.
+                commit_output_value: None,
             })
         })
         .collect();

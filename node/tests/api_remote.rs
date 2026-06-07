@@ -645,6 +645,121 @@ async fn history_after_mint_records_mint_row() {
     assert!(head["memo"].is_null());
 }
 
+/// Live contract round-trip for the per-transaction detail endpoint
+/// (`GET /api/history/{id}`): mint, read the history list to learn the
+/// row id, then fetch the detail and assert it carries the list fields
+/// plus the decoded account-state snapshot. State-mutating like
+/// `history_after_mint_records_mint_row`; uses a fresh wallet so it is
+/// race-free against parallel runs.
+#[tokio::test]
+async fn history_item_after_mint_returns_full_detail() {
+    let client = http_client();
+    let alice = TestWallet::new();
+    assert_minting_balance_in_bounds(&client).await;
+
+    let mint_result = mint_via_job(&client, &alice.address_hex(), MINT_AMOUNT).await;
+    assert_eq!(mint_result["success"], Value::Bool(true));
+    let _ = poll_balance_at_least(&client, &alice.address_hex(), MINT_AMOUNT).await;
+
+    // Learn the row id from the list.
+    let list: Value = client
+        .get(url(&format!(
+            "/api/history?address={}",
+            alice.address_hex()
+        )))
+        .send()
+        .await
+        .expect("GET /api/history")
+        .json()
+        .await
+        .expect("history JSON");
+    let id = list["items"][0]["id"].as_i64().expect("row id");
+
+    // Fetch the detail.
+    let resp = client
+        .get(url(&format!(
+            "/api/history/{}?address={}",
+            id,
+            alice.address_hex()
+        )))
+        .send()
+        .await
+        .expect("GET /api/history/{id}");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let d: Value = resp.json().await.expect("detail JSON");
+
+    // Core fields (consistent with the list head).
+    assert_eq!(d["id"].as_i64(), Some(id));
+    assert_eq!(d["direction"], "mint");
+    assert_eq!(d["amount"], MINT_AMOUNT);
+    assert_eq!(d["address"], alice.address_hex().trim_start_matches("0x"));
+    // Decoded account-state snapshot: a from-genesis mint credits the
+    // full balance, leaves num_sends at 0, and sets no commitment pubkey.
+    assert_eq!(d["balance_after"].as_u64(), Some(MINT_AMOUNT));
+    assert!(
+        d["balance_before"].is_null(),
+        "first row has no prior state"
+    );
+    assert_eq!(d["num_sends_after"].as_u64(), Some(0));
+    assert!(
+        d["commitment_public_key"].is_null(),
+        "mint-only account has no commitment pubkey"
+    );
+    // The node has warmed a prover, so a verifier circuit digest exists.
+    assert!(
+        d["circuit_digest"].is_string(),
+        "circuit_digest should be populated post-warmup, got {}",
+        d["circuit_digest"]
+    );
+}
+
+/// `GET /api/history/{id}` validation + scoping contract (read-only, no
+/// state mutation — safe to run unconditionally).
+#[tokio::test]
+async fn history_item_validation_and_scoping() {
+    let client = http_client();
+    let some_addr = format!("0x{}", "ab".repeat(32));
+
+    // Missing address -> 422.
+    let r = client
+        .get(url("/api/history/1"))
+        .send()
+        .await
+        .expect("GET no-address");
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Non-integer id -> 422 (parsed as string, not axum's default 400).
+    let r = client
+        .get(url(&format!(
+            "/api/history/not_a_number?address={}",
+            some_addr
+        )))
+        .send()
+        .await
+        .expect("GET bad-id");
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Bad address hex -> 422.
+    let r = client
+        .get(url("/api/history/1?address=not_hex"))
+        .send()
+        .await
+        .expect("GET bad-address");
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Well-formed but never-minted address + arbitrary id -> 404.
+    let fresh = TestWallet::new();
+    let r = client
+        .get(url(&format!(
+            "/api/history/999999999?address={}",
+            fresh.address_hex()
+        )))
+        .send()
+        .await
+        .expect("GET unknown");
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn balance_wrong_length_returns_422() {
     // 16 bytes = 32 hex chars, the handler requires exactly 32 bytes
