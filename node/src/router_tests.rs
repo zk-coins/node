@@ -4996,7 +4996,17 @@ async fn history_item_happy_path_returns_decoded_snapshot() {
     sent.balance = 40;
     sent.num_sends = 1;
     let bytes = bincode::serialize(&sent).expect("Account serializable");
-    crate::db::upsert_account_with_source(&pool, address.as_slice(), &bytes, "send")
+    // Mutate the SAME `(owner, asset_id)` account `seed_account_history`
+    // created: since migration 0017 `accounts.address` is the 64-byte
+    // `owner ‖ asset_id` composite, so upsert under the composite (not the
+    // raw 32-byte owner) or the `accounts_address_length` = 64 CHECK trips.
+    // The capture trigger writes the 32-byte owner prefix into
+    // `account_history`, so the send row chains onto the mint row and
+    // `list_account_history(&address)` still resolves it.
+    let owner = zkcoins_program::hash::digest_from_bytes(&address);
+    let asset_id = zkcoins_program::hash::ZERO_HASH;
+    let key = crate::account_node::account_key_bytes(&owner, &asset_id);
+    crate::db::upsert_account_with_source(&pool, key.as_slice(), &bytes, "send")
         .await
         .expect("upsert send mutation");
 
