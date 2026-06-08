@@ -228,18 +228,40 @@ pub(crate) async fn mint_flow(
     // at prove time. `prepare_mint` re-derives owner/asset_id from the
     // pubkey + name + decimals, so the derived identity is not needed
     // here beyond the validation side-effect.
-    let _identity = validate_mint_request(&request)?;
+    let identity = validate_mint_request(&request)?;
     let creator_pubkey = request.creator_pubkey.serialize();
+    let next_public_key = request.next_public_key.serialize();
     let name = request.name.clone();
     let decimals = request.decimals;
     let amount = request.amount;
+
+    // Off-circuit creator binding (MULTI_ASSET.md §5.3): reject a mint
+    // of an `asset_id` already claimed by a DIFFERENT creator before
+    // paying for the prove. A matching (or absent) creator passes.
+    if db::asset_creator_conflict(
+        &state.pool,
+        &digest_to_bytes(&identity.asset_id),
+        &creator_pubkey,
+    )
+    .await
+    .map_err(|e| {
+        FlowError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("asset_creator lookup failed: {}", e),
+        )
+    })? {
+        return Err(FlowError::new(
+            StatusCode::CONFLICT,
+            "asset_id is registered to a different creator",
+        ));
+    }
 
     let account_node_clone = state.account_node.clone();
     let prepared = tokio::task::spawn_blocking(
         move || -> Result<crate::account_node::MintingPrepared, FlowError> {
             let guard = lock_or_recover(&account_node_clone);
             guard
-                .prepare_mint(&creator_pubkey, &name, decimals, amount)
+                .prepare_mint(&creator_pubkey, &name, decimals, amount, &next_public_key)
                 .map_err(flow_err_from_send_coins)
         },
     )
@@ -257,13 +279,12 @@ pub(crate) async fn mint_flow(
     let commit_hashes = mint_proof_commit_hashes(&prepared.proof);
 
     // Stage the mint for the wallet-signed commit leg.
-    let balance = prepared.mutated_account.balance;
     let proof_id = state.mint_store.add(crate::router::StagedMint {
         proof: prepared.proof,
         owner: prepared.owner,
         asset_id: prepared.asset_id,
-        balance,
         mutated_account: prepared.mutated_account,
+        creator_pubkey: request.creator_pubkey,
     });
 
     Ok((proof_id, commit_hashes))
@@ -285,17 +306,19 @@ pub(crate) fn mint_proof_commit_hashes(proof: &zkcoins_prover::Proof) -> SendCom
 }
 
 /// Drive the COMMIT leg of a two-phase mint (phase 2): verify the
-/// creator's signed `Commitment`, ENFORCE the soundness gate
-/// (`commitment.public_key == account.public_key`), broadcast the
-/// inscription, advance global state, and swap the minted account in.
+/// creator's signed `Commitment`, ENFORCE the off-circuit creator
+/// binding (`commitment.public_key == staged.creator_pubkey`), broadcast
+/// the inscription, advance global state, swap the minted account in,
+/// and register the asset_id -> creator_pubkey row.
 ///
-/// SOUNDNESS GATE (the whole point of the neutral model): because the
-/// circuit binds `account.public_key == creator_pubkey`, requiring the
-/// commitment's signing key to equal the proven account's key makes the
-/// on-chain commitment provably signed by the asset's creator. Without
-/// it, a forger could witness `owner = H(victim_pk)` + a victim's
-/// asset_id (public values) and sign with their OWN key, forging
-/// inflation / theft of a foreign asset.
+/// CREATOR BINDING (MULTI_ASSET.md §5.3): the per-asset creator binding
+/// lives off-circuit now (the mint rotates `next_public_key`, so it can
+/// no longer ride on the commitment key). Requiring the commitment's
+/// signing key to equal the creator key the prove leg derived owner /
+/// asset_id from makes the on-chain commitment provably signed by the
+/// asset's creator. Without it, a forger could witness `owner =
+/// H(victim_pk)` + a victim's asset_id (public values) and sign with
+/// their OWN key, forging inflation / theft of a foreign asset.
 pub(crate) async fn mint_commit_flow(state: &AppState, request: CommitRequest) -> FlowResult {
     let staged = match state.mint_store.take(request.proof_id) {
         Some(s) => s,
@@ -337,18 +360,15 @@ pub(crate) async fn mint_commit_flow(state: &AppState, request: CommitRequest) -
         ));
     }
 
-    // 2. SOUNDNESS GATE — bind the commitment key to the proven
-    //    account's key. MANDATORY for mint.
-    if !crate::account_node::commitment_binds_account_state(
-        &staged.proof,
-        &staged.owner,
-        staged.balance,
-        &staged.asset_id,
-        &commitment.public_key,
-    ) {
+    // 2. OFF-CIRCUIT CREATOR BINDING — the wallet-signed commitment
+    //    must be signed by the asset creator's key. MANDATORY for mint.
+    //    `staged.creator_pubkey` is the key the prove leg derived owner
+    //    and asset_id from; binding the commitment key to it makes the
+    //    on-chain commitment provably signed by the asset's creator.
+    if commitment.public_key != staged.creator_pubkey {
         return Err(FlowError::new(
             StatusCode::UNAUTHORIZED,
-            "Commitment public key does not match the asset creator's account key",
+            "Commitment must be signed by the asset creator's key",
         ));
     }
 
@@ -439,6 +459,19 @@ pub(crate) async fn mint_commit_flow(state: &AppState, request: CommitRequest) -
         {
             eprintln!("Failed to upsert minted creator account: {}", e);
         }
+    }
+
+    // Record the off-circuit creator binding (MULTI_ASSET.md §5.3) so a
+    // later mint of the same asset_id by a different key is rejected.
+    // Log-and-continue on error, like the sibling account upsert.
+    if let Err(e) = db::register_asset_creator(
+        &state.pool,
+        &digest_to_bytes(&asset_id),
+        &staged.creator_pubkey.serialize(),
+    )
+    .await
+    {
+        eprintln!("Failed to register asset creator: {}", e);
     }
 
     let hashes = mint_proof_commit_hashes(&staged.proof);

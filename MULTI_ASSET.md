@@ -29,7 +29,7 @@ ongoing mint authority, transactions stay single-asset, asset
 metadata is name + decimals. Implementation tracking lands in
 [`ROADMAP.md`](./ROADMAP.md) once the maintainer approves this draft.
 
-> **Implementation note (PR [#220](https://github.com/zk-coins/node/pull/220)) — the as-built design diverges from this draft, and has a KNOWN gating blocker.** PR #220 implements "Model B": per-`(owner, asset_id)` accounts, an in-circuit **issuer-gated** mint (not the off-circuit Schnorr of §5.3), and `asset_id = Poseidon(genesis ‖ creator_pubkey ‖ name_hash ‖ decimals)` (no timestamp; §4.2/§12.1 superseded). See §17 below for the full divergence + the create→mint→send soundness/SMT blocker that must be resolved at the circuit layer before the flow works end-to-end.
+> **Implementation note (PR [#220](https://github.com/zk-coins/node/pull/220)) — the as-built design diverges from this draft.** PR #220 implements "Model B": per-`(owner, asset_id)` accounts and `asset_id = Poseidon(genesis ‖ creator_pubkey ‖ name_hash ‖ decimals)` (no timestamp; §4.2/§12.1 superseded). The per-asset creator binding is **node-side / off-circuit** (an `asset_creators` mapping table consulted at mint time), matching §5.3's v1 "off-circuit verify" choice. An earlier in-circuit-only attempt made create→mint→send unworkable (the no-rotation commitment key collided in the insert-only commitment SMT on the creator's first send); §17 records the divergence and how moving the binding off-circuit + letting the mint rotate resolved it.
 
 ---
 
@@ -1231,7 +1231,31 @@ that this section records.
   are display metadata cached at mint time. `GET /api/balance/:address`
   aggregates per-asset.
 
-### 17.2 The create→mint→send blocker (gating)
+### 17.2 The create→mint→send issue — RESOLVED (node-side creator binding)
+
+**Resolution (PR #220):** the per-asset creator binding now lives in a
+node-side `asset_creators (asset_id → creator_pubkey)` table (migration
+`0018`), and the issuer mint **rotates** `next_public_key` to a fresh
+wallet key exactly like a send. So the mint's first follow-up send
+commits under a fresh key — no commitment-SMT collision — while the
+binding is enforced off-circuit:
+
+- `mint_flow` rejects (409) a mint of an `asset_id` already registered
+  to a different `creator_pubkey`, before paying the prove cost.
+- `mint_commit_flow` requires the wallet-signed `commitment.public_key`
+  to equal `staged.creator_pubkey`, then registers the
+  `asset_id → creator_pubkey` row.
+- The mint request is itself authenticated by a BIP-340 signature over
+  the mint fields, verifiable against `creator_pubkey`.
+
+This matches the trust model in `CONTRIBUTING.md` (validation that
+reduces trust in the node lives node-side) and §5.3's documented v1
+choice. Verified locally: the full `node`+`shared` suite is 495/495
+green at 100% line+function coverage, including the create→mint→send
+fixtures (`test_wallet_operations`, `test_send_coins_twice_*`, the
+mint-invoice tests) and the new `asset_creators` db tests.
+
+#### 17.2.1 Why the earlier in-circuit-only shape did not work (historical)
 
 The neutral model's soundness rests on a commit-leg gate
 (`account_node::commitment_binds_account_state`): the on-chain

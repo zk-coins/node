@@ -700,6 +700,13 @@ pub struct MintRequest {
     /// is `calculate_asset_id(creator_pubkey, H(name), decimals)`.
     #[schema(value_type = String, example = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")]
     pub(crate) creator_pubkey: bitcoin::secp256k1::PublicKey,
+    /// Compressed secp256k1 public key (33 bytes) the mint rotates to,
+    /// hex-encoded. The mint's transition commits under
+    /// `sha256(next_public_key)` so the creator's first follow-up send
+    /// does not collide with the creator key in the insert-only
+    /// commitment SMT.
+    #[schema(value_type = String, example = "03c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5")]
+    pub(crate) next_public_key: bitcoin::secp256k1::PublicKey,
     /// Human-facing asset name. Folded into the asset_id via
     /// `calculate_name_hash`; also cached as display metadata.
     pub(crate) name: String,
@@ -839,7 +846,7 @@ impl ProofStore {
 /// of the two-phase mint). Built by `flow::mint_flow`'s prove leg and
 /// consumed by `flow::mint_commit_flow` once the wallet returns a
 /// signed `Commitment`. Carries everything the commit leg needs to run
-/// the soundness gate and apply the balance increase.
+/// the off-circuit creator binding and apply the balance increase.
 pub(crate) struct StagedMint {
     /// The issuer-mint proof (no out-coins; increases the creator's own
     /// balance). The wallet signs its `account_state_hash ||
@@ -849,11 +856,12 @@ pub(crate) struct StagedMint {
     pub(crate) owner: zkcoins_program::hash::HashDigest,
     /// Derived asset_id of the asset being minted.
     pub(crate) asset_id: zkcoins_program::types::AssetId,
-    /// Post-mint balance witnessed into the proof (used to re-derive
-    /// the account_state_hash for the soundness gate).
-    pub(crate) balance: u64,
     /// The tentative mutated creator account to swap in on commit.
     pub(crate) mutated_account: crate::account_node::Account,
+    /// The asset creator's secp256k1 pubkey. The commit leg requires the
+    /// wallet-signed `commitment.public_key` to equal this (off-circuit
+    /// creator binding) and registers the asset_id -> creator_pubkey row.
+    pub(crate) creator_pubkey: bitcoin::secp256k1::PublicKey,
 }
 
 /// In-memory store of staged mints keyed by `proof_id`. Mirrors the

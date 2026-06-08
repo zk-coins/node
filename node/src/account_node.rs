@@ -177,8 +177,9 @@ impl Account {
 /// coin — the supply lands in the creator's account. The two-phase
 /// flow returns the proof's `account_state_hash` / `output_coins_root`
 /// to the wallet (which signs them as a `Commitment`), then the
-/// commit leg enforces `commitment.public_key == account.public_key`
-/// (the soundness gate) before swapping the mutated account in.
+/// commit leg enforces `commitment.public_key == creator_pubkey` (the
+/// off-circuit creator binding) and registers the asset_id ->
+/// creator_pubkey row before swapping the mutated account in.
 #[derive(Debug)]
 pub struct MintingPrepared {
     /// The creator's `(owner, asset_id)` account after the mint, NOT
@@ -195,6 +196,11 @@ pub struct MintingPrepared {
     /// re-derives those from `proof` and verifies the creator's
     /// signature against `account.public_key`.
     pub proof: Proof,
+    /// The asset creator's compressed pubkey (`[u8; 33]`). The commit
+    /// leg checks the wallet-signed `commitment.public_key` equals this
+    /// (off-circuit creator binding) and registers it in the node-side
+    /// `asset_creators` table.
+    pub creator_pubkey: zkcoins_program::types::PublicKey,
 }
 
 impl Account {
@@ -945,12 +951,14 @@ impl AccountNode {
     /// a unit test would have to pay a full prove. Exercised end-to-end
     /// by the `router_tests` mint integration suite.
     #[cfg_attr(coverage_nightly, coverage(off))]
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_mint(
         &self,
         creator_pubkey: &zkcoins_program::types::PublicKey,
         name: &str,
         decimals: u8,
         amount: u64,
+        next_public_key: &zkcoins_program::types::PublicKey,
     ) -> Result<MintingPrepared, &'static str> {
         use zkcoins_program::hash::hash_bytes;
         use zkcoins_program::types::{calculate_asset_id, calculate_name_hash};
@@ -993,25 +1001,15 @@ impl AccountNode {
         let history_root_extended = state.mmr.root_extended(MMR_PROOF_PATH_LEN);
 
         // No out-coins, no in-coins: the mint only increases the
-        // creator's own balance. `next_public_key == creator_pubkey`
-        // (no rotation on a mint — the same key signs the commitment).
-        //
-        // KNOWN BLOCKER (zk-coins/node#220, mint->send): this no-rotation
-        // shape is REQUIRED for the issuer soundness gate — the circuit
-        // commits `account_state_hash` (ProofData PI[0]) with the
-        // transition's `next_public_key`, and `commitment_binds_account_state`
-        // only binds the on-chain commitment to the asset creator when
-        // that committed key IS the creator key (verified by
-        // `commitment_binds_account_state_checks_creator_verifying_key`).
-        // But the same no-rotation makes the creator's FIRST send re-commit
-        // under `sha256(creator_pubkey)`, which the insert-only commitment
-        // SMT rejects ("Key already exists in the tree with different
-        // value"). So create -> mint -> send cannot complete without a
-        // circuit-level change (e.g. a dedicated `creator_pubkey` public
-        // input the gate binds against, decoupled from the rotated state
-        // key). Tracked in MULTI_ASSET.md; rotating here instead would
-        // SILENTLY break soundness (a forger could sign with their own
-        // rotation key) and is therefore NOT a valid fix.
+        // creator's own balance. The mint rotates `next_public_key` to a
+        // fresh wallet key (exactly like a normal send), so the creator's
+        // FIRST follow-up send commits under `sha256(next_public_key)` —
+        // a fresh map key — rather than colliding with the creator key in
+        // the insert-only commitment SMT. The per-asset creator binding
+        // no longer rides on the commitment key: it is enforced
+        // off-circuit by the node-side `asset_creators` table plus a
+        // direct `commitment.public_key == creator_pubkey` equality check
+        // at commit time (MULTI_ASSET.md §5.3). The circuit is unchanged.
         let proof: Proof = match &snapshot.proof {
             Some(account_proof) => {
                 // The creator already holds this asset: chain an
@@ -1034,15 +1032,33 @@ impl AccountNode {
                 let _ = prev_cmp;
                 return Err("Re-mint into an existing asset account is not supported");
             }
-            None => self
-                .prover
-                .prove_initial(
-                    &account_state_for_prove,
-                    history_root_extended,
-                    asset_id,
-                    Some(mint_witness),
-                )
-                .map_err(|_| "prove_initial failed")?,
+            None => {
+                // Build the fixed-shape inactive in/out coin slot vecs —
+                // a mint has no in-coins and no out-coins, only a balance
+                // increase — and rotate to the fresh `next_public_key`.
+                const MAX_IN_COINS: usize = zkcoins_program::circuit::main::MAX_IN_COINS;
+                const MAX_OUT_COINS: usize = zkcoins_program::circuit::main::MAX_OUT_COINS;
+                let dummy_nip = Self::dummy_nip();
+                let dummy_coin = Self::dummy_coin();
+                let in_coin_slots: Vec<(bool, &Coin, &NonInclusionProof)> = (0..MAX_IN_COINS)
+                    .map(|_| (false, &dummy_coin, &dummy_nip))
+                    .collect();
+                let out_coin_slots: Vec<(bool, HashDigest, u64, &NonInclusionProof)> = (0
+                    ..MAX_OUT_COINS)
+                    .map(|_| (false, ZERO_HASH, 0u64, &dummy_nip))
+                    .collect();
+                self.prover
+                    .prove_initial_with_in_and_out_coins(
+                        &account_state_for_prove,
+                        history_root_extended,
+                        &in_coin_slots,
+                        &out_coin_slots,
+                        next_public_key,
+                        asset_id,
+                        Some(mint_witness),
+                    )
+                    .map_err(|_| "prove_initial_with_in_and_out_coins failed")?
+            }
         };
         drop(state);
 
@@ -1060,6 +1076,7 @@ impl AccountNode {
             owner,
             asset_id,
             proof,
+            creator_pubkey: *creator_pubkey,
         })
     }
 
@@ -1575,60 +1592,6 @@ pub fn account_key_bytes(owner: &Address, asset_id: &AssetId) -> [u8; 64] {
     out
 }
 
-/// Extract a proof's committed `account_state_hash` from its Plonky2
-/// public inputs, returning `None` if the input vector is too short
-/// (a corrupt / incompatible proof blob).
-pub fn proof_account_state_hash(proof: &Proof) -> Option<HashDigest> {
-    let pis: [zkcoins_program::F; zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] =
-        proof
-            .public_inputs
-            .get(..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS)?
-            .try_into()
-            .ok()?;
-    Some(ProofData::from_field_elements(&pis).account_state_hash)
-}
-
-/// SOUNDNESS GATE (the whole point of the neutral, permissionless
-/// model). Returns `true` iff a `commitment.public_key` is the key the
-/// proof's `AccountState` was built with.
-///
-/// The circuit commits `account_state_hash = H(owner || balance ||
-/// public_key || asset_id)` as a public input and (for a mint) binds
-/// `account.public_key == creator_pubkey`. By recomputing that hash
-/// with the COMMITMENT's public key substituted for `public_key` and
-/// comparing it to the proof's PI, we verify that the on-chain
-/// commitment was signed by exactly the key bound into the proven
-/// account state — i.e. by the asset's creator.
-///
-/// Without this check a forger could witness `owner = H(victim_pk)` and
-/// `asset_id = victim's asset` (both public values) and sign the
-/// commitment with their OWN key, forging inflation / theft of a
-/// foreign asset. The wallet's self-attested `commitment.verify()`
-/// alone does NOT prevent that — it only proves the signer holds the
-/// key they signed with, not that it is the account's key.
-///
-/// `owner` / `balance` / `asset_id` are the values the node itself
-/// staged for the proof (it built the `AccountState`); only
-/// `commitment_pubkey` is attacker-controlled.
-pub fn commitment_binds_account_state(
-    proof: &Proof,
-    owner: &Address,
-    balance: u64,
-    asset_id: &AssetId,
-    commitment_pubkey: &PublicKey,
-) -> bool {
-    let Some(committed_hash) = proof_account_state_hash(proof) else {
-        return false;
-    };
-    let candidate = AccountState {
-        owner: *owner,
-        balance,
-        public_key: commitment_pubkey.serialize(),
-        asset_id: *asset_id,
-    };
-    candidate.hash() == committed_hash
-}
-
 /// Error type for `persist_account`. Wraps the single failure mode
 /// (database write — connect, transaction, decode). Bincode encoding
 /// of the in-memory `Account` is infallible for the current shape and
@@ -1767,32 +1730,6 @@ mod inline_tests {
         let node = fresh_node();
         let unknown = zkcoins_program::hash::digest_from_bytes(&[9u8; 32]);
         assert!(node.assets_for_owner(&unknown).is_empty());
-    }
-
-    #[test]
-    fn commitment_binds_account_state_helpers_handle_short_proof() {
-        // A proof with too-few public inputs yields None / false rather
-        // than panicking — the corrupt-blob guard in the soundness gate.
-        // We cannot cheaply construct a real Proof here, so this only
-        // exercises the early-return shape via the public helpers being
-        // callable; the positive path is covered in router_tests with a
-        // real prove fixture.
-        let owner = zkcoins_program::hash::digest_from_bytes(&[1u8; 32]);
-        let asset_id = test_asset_id();
-        // Build an AccountState and check the expected-hash recompute is
-        // deterministic (the load-bearing arithmetic of the gate).
-        let pk = {
-            let mut p = [0u8; 33];
-            p[0] = 0x02;
-            p
-        };
-        let s = AccountState {
-            owner,
-            balance: 7,
-            public_key: pk,
-            asset_id,
-        };
-        assert_eq!(s.hash(), s.clone().hash());
     }
 
     #[test]
@@ -2011,35 +1948,6 @@ mod inline_tests {
         // Distinct (owner, asset) pairs produce distinct keys.
         let other = account_key_bytes(&owner, &test_asset_id());
         assert_ne!(key, other);
-    }
-
-    #[test]
-    fn proof_account_state_hash_none_on_short_input() {
-        // A proof whose public-input vector is shorter than
-        // N_PROOF_DATA_PUBLIC_INPUTS yields None rather than panicking.
-        // We cannot cheaply build a real `Proof`, so assert the helper
-        // is total over the guarded branch via a hand-built proof shape
-        // is not possible here; instead pin the companion arithmetic
-        // (expected-hash recompute) the soundness gate relies on.
-        let owner = zkcoins_program::hash::digest_from_bytes(&[3u8; 32]);
-        let asset = test_asset_id();
-        let mut pk = [0u8; 33];
-        pk[0] = 0x02;
-        let s = AccountState {
-            owner,
-            balance: 100,
-            public_key: pk,
-            asset_id: asset,
-        };
-        // Substituting a different pubkey changes the hash — the
-        // property the gate exploits to bind the commitment key.
-        let mut pk2 = pk;
-        pk2[1] = 0x01;
-        let s2 = AccountState {
-            public_key: pk2,
-            ..s.clone()
-        };
-        assert_ne!(s.hash(), s2.hash());
     }
 
     #[test]

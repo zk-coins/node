@@ -2417,26 +2417,31 @@ fn mint_test_state() -> AppState {
 fn mint_store_add_take_roundtrips_and_consumes() {
     let node = AccountNode::new(Arc::new(Mutex::new(State::new())));
     let secp = secp::Secp256k1::new();
-    let creator = bitcoin::secp256k1::SecretKey::from_slice(&[3u8; 32])
+    let creator_obj = bitcoin::secp256k1::SecretKey::from_slice(&[3u8; 32])
+        .expect("valid sk")
+        .public_key(&secp);
+    let creator = creator_obj.serialize();
+    // Distinct fresh key the mint rotates `next_public_key` to.
+    let next = bitcoin::secp256k1::SecretKey::from_slice(&[4u8; 32])
         .expect("valid sk")
         .public_key(&secp)
         .serialize();
     let prepared = node
-        .prepare_mint(&creator, "StoreCoin", 8, 1234)
+        .prepare_mint(&creator, "StoreCoin", 8, 1234, &next)
         .expect("prepare_mint");
     let staged = crate::router::StagedMint {
         proof: prepared.proof,
         owner: prepared.owner,
         asset_id: prepared.asset_id,
-        balance: prepared.mutated_account.balance,
         mutated_account: prepared.mutated_account,
+        creator_pubkey: creator_obj,
     };
 
     let store = crate::router::MintStore::new();
     let id = store.add(staged);
     assert!(id >= 1, "staged-mint ids are 1-based");
     let taken = store.take(id).expect("staged mint present after add");
-    assert_eq!(taken.balance, 1234);
+    assert_eq!(taken.mutated_account.balance, 1234);
     assert!(store.take(id).is_none(), "take consumes the staged mint");
 }
 
@@ -2519,6 +2524,10 @@ mod jobs_endpoint_tests {
         let sk = SecretKey::from_slice(&[9u8; 32]).expect("valid sk");
         let pk: PublicKey = sk.public_key(&secp);
         let kp = Keypair::from_secret_key(&secp, &sk);
+        // Distinct fresh key the mint rotates `next_public_key` to.
+        let next_pk: PublicKey = SecretKey::from_slice(&[10u8; 32])
+            .expect("valid sk")
+            .public_key(&secp);
         let name = "TestCoin";
         let decimals: u8 = 8;
         let timestamp = std::time::SystemTime::now()
@@ -2536,6 +2545,7 @@ mod jobs_endpoint_tests {
         let sig = secp.sign_schnorr(&msg, &kp);
         serde_json::json!({
             "creator_pubkey": hex::encode(pk.serialize()),
+            "next_public_key": hex::encode(next_pk.serialize()),
             "name": name,
             "decimals": decimals,
             "amount": amount,
@@ -5496,8 +5506,12 @@ fn signed_mint_request(name: &str, decimals: u8, amount: u64, timestamp: u64) ->
     let msg = Message::from_digest(hash);
     let keypair = TestKeypair::from_secret_key(&secp, &sk);
     let sig = secp.sign_schnorr(&msg, &keypair);
+    // Distinct fresh key the mint rotates `next_public_key` to.
+    let next_sk = TestSecretKey::from_slice(&[8u8; 32]).expect("valid secret key");
+    let next_public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &next_sk);
     MintRequest {
         creator_pubkey: pk,
+        next_public_key,
         name: name.to_string(),
         decimals,
         amount,

@@ -165,11 +165,12 @@ impl TestAccountData {
 /// Drives the same prove → commit → state-advance → apply sequence as
 /// `flow::{mint_flow, mint_commit_flow}`: builds the issuer-mint proof
 /// (`prepare_mint`), signs the commitment with the creator key
-/// (index 0 — the soundness gate binds `commitment.public_key ==
-/// account.public_key == creator_pubkey`), advances the global SMT/MMR,
+/// (index 0 — the commit leg binds `commitment.public_key ==
+/// creator_pubkey` off-circuit), advances the global SMT/MMR,
 /// and installs the funded account (`commit_mint`). Bumps
-/// `acct.num_pubkeys` to 1 (the mint consumed the index-0 creator key,
-/// so the next `execute_send_coins` rotates to index 1). Returns the
+/// `acct.num_pubkeys` to 1 (the mint consumed the index-0 creator key
+/// as the commitment key and rotated `next_public_key` to index 1, so
+/// the next `execute_send_coins` derives index 1). Returns the
 /// DERIVED `asset_id` — callers must use it for that account's invoices
 /// and assertions (it is not `test_asset_id()`).
 fn mint_funded_asset(
@@ -185,8 +186,11 @@ fn mint_funded_asset(
     // object as the account's commitment key. Keep both forms.
     let creator_pk_obj = generate_test_public_key(&acct.xpriv, 0);
     let creator_pk = creator_pk_obj.serialize();
+    // The mint rotates to a fresh wallet key (index 1) so the creator's
+    // first follow-up send commits under a fresh map key.
+    let next_pk = generate_test_public_key(&acct.xpriv, 1).serialize();
     let prepared = node
-        .prepare_mint(&creator_pk, name, decimals, amount)
+        .prepare_mint(&creator_pk, name, decimals, amount, &next_pk)
         .expect("prepare_mint should succeed for a fresh issuer account");
 
     // Re-derive the hashes the creator signs (same path the commit leg
@@ -209,15 +213,10 @@ fn mint_funded_asset(
 
     let asset_id = prepared.asset_id;
     node.commit_mint(prepared.owner, prepared.mutated_account, creator_pk_obj);
-    // The issuer mint does NOT rotate (next_public_key == creator_pubkey,
-    // index 0) — required for the soundness gate. `num_pubkeys` therefore
-    // stays at 0; the creator key is the account's commitment key.
-    //
-    // NOTE: a subsequent `execute_send_coins` on this same account will
-    // hit the create->mint->send SMT-collision blocker (see
-    // `prepare_mint` and MULTI_ASSET.md). Helper callers that drive a
-    // post-mint send are `#[ignore]`d until the circuit fix lands.
-    acct.num_pubkeys = 0;
+    // The mint consumed index 0 as the commitment key and rotated
+    // `next_public_key` to index 1, so the next `execute_send_coins` on
+    // this account derives index 1.
+    acct.num_pubkeys = 1;
     asset_id
 }
 
@@ -237,7 +236,8 @@ fn prepare_mint_rejects_remint_into_existing_asset_account() {
     mint_funded_asset(&mut node, &state_arc, &mut minting, "TestCoin", 8, 10_000);
 
     let creator_pk = generate_test_public_key(&minting.xpriv, 0).serialize();
-    let result = node.prepare_mint(&creator_pk, "TestCoin", 8, 5_000);
+    let next_pk = generate_test_public_key(&minting.xpriv, 1).serialize();
+    let result = node.prepare_mint(&creator_pk, "TestCoin", 8, 5_000, &next_pk);
     assert_eq!(
         result.err(),
         Some("Re-mint into an existing asset account is not supported"),
@@ -252,77 +252,6 @@ fn prepare_mint_rejects_remint_into_existing_asset_account() {
 #[test]
 fn zero_asset_id_default_is_zero_hash() {
     assert_eq!(zero_asset_id(), ZERO_HASH);
-}
-
-/// Verifies WHICH key the soundness gate checks the on-chain commitment
-/// against: the committed `account_state_hash` (ProofData PI[0]) of an
-/// issuer-mint proof must be the CREATOR key, so only the asset's
-/// creator can countersign the mint commitment. This is the
-/// load-bearing property of the neutral model — the in-circuit issuer
-/// gate alone is a value-equality check that anyone could witness with
-/// a victim's public values; what stops the forgery is that the
-/// commitment must verify under the key bound into PI[0]. The mint's
-/// no-rotation shape (`next_public_key == creator_pubkey`) is exactly
-/// what makes PI[0] carry the creator key — a rotated mint would bind
-/// the gate to the (attacker-choosable) rotation key instead.
-///
-/// In production these helpers are called only from
-/// `flow::mint_commit_flow` (coverage-excluded), so this unit test is
-/// the only thing that exercises them.
-#[test]
-fn commitment_binds_account_state_checks_creator_verifying_key() {
-    let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut node = AccountNode::new(Arc::clone(&state_arc));
-    let mut minting = TestAccountData::new_minting_account();
-    let asset_id = mint_funded_asset(&mut node, &state_arc, &mut minting, "TestCoin", 8, 10_000);
-    let owner = minting.address;
-    let creator_pk = generate_test_public_key(&minting.xpriv, 0);
-    let proof = node
-        .get_account(&owner, &asset_id)
-        .expect("minted account present")
-        .proof
-        .clone()
-        .expect("mint proof present");
-
-    // `proof_account_state_hash`: Some on a well-formed proof.
-    assert!(proof_account_state_hash(&proof).is_some());
-
-    // The gate verifies against the CREATOR key (the key the mint's
-    // no-rotation account state was committed with), at the minted
-    // balance.
-    assert!(commitment_binds_account_state(
-        &proof,
-        &owner,
-        10_000,
-        &asset_id,
-        &creator_pk
-    ));
-    // Any other verifying key is rejected — the forgery the gate stops.
-    let forger_pk = generate_test_public_key(&minting.xpriv, 5);
-    assert!(!commitment_binds_account_state(
-        &proof, &owner, 10_000, &asset_id, &forger_pk
-    ));
-    // A wrong balance is rejected (account_state_hash mismatch).
-    assert!(!commitment_binds_account_state(
-        &proof,
-        &owner,
-        9_999,
-        &asset_id,
-        &creator_pk
-    ));
-
-    // A truncated public-input vector → `proof_account_state_hash`
-    // None, and the gate short-circuits to false.
-    let mut short = proof.clone();
-    short.public_inputs.truncate(3);
-    assert!(proof_account_state_hash(&short).is_none());
-    assert!(!commitment_binds_account_state(
-        &short,
-        &owner,
-        10_000,
-        &asset_id,
-        &creator_pk
-    ));
 }
 
 #[test]
