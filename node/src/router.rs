@@ -13,7 +13,6 @@ use bitcoin::secp256k1::{self as secp, schnorr::Signature as SchnorrSignature, M
 use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use shared::ClientAccount;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -101,6 +100,40 @@ fn verify_send_signature(request: &SendCoinRequest) -> Result<(), &'static str> 
         .or(Err("Signature verification failed"))
 }
 
+/// Verify the BIP-340 Schnorr signature on a [`MintRequest`].
+///
+/// Mirrors [`verify_send_signature_pub`]. The signed message is
+/// `SHA256(creator_pubkey.serialize() || name.as_bytes() || [decimals]
+/// || amount.to_le_bytes() || timestamp.to_le_bytes())`, verified
+/// against the x-only form of `creator_pubkey`. Callers MUST run
+/// [`check_timestamp_window`] first so a stale timestamp surfaces as
+/// its own status rather than collapsing into a generic crypto failure.
+///
+/// This authenticates that the mint was authorised by the holder of
+/// `creator_pubkey`; the circuit's issuer gate + the commit-leg
+/// soundness check then bind that same key into the on-chain
+/// commitment so nobody can forge or inflate a foreign asset.
+pub(crate) fn verify_mint_signature_pub(request: &MintRequest) -> Result<(), &'static str> {
+    let mut hasher = Sha256::new();
+    hasher.update(request.creator_pubkey.serialize());
+    hasher.update(request.name.as_bytes());
+    hasher.update([request.decimals]);
+    hasher.update(request.amount.to_le_bytes());
+    hasher.update(request.timestamp.to_le_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+
+    let msg = Message::from_digest(hash);
+    let sig_bytes = hex::decode(&request.signature).or(Err("Invalid signature hex"))?;
+    let sig =
+        SchnorrSignature::from_slice(&sig_bytes).or(Err("Invalid Schnorr signature format"))?;
+
+    let (xonly, _parity) = request.creator_pubkey.x_only_public_key();
+    let secp = secp::Secp256k1::verification_only();
+
+    secp.verify_schnorr(&sig, &msg, &xonly)
+        .or(Err("Signature verification failed"))
+}
+
 /// Lock a mutex, recovering from poison if a previous holder panicked.
 /// This prevents cascade failures where one panic takes down all handlers.
 pub(crate) fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -115,7 +148,10 @@ pub(crate) fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct AppState {
     pub(crate) account_node: Arc<Mutex<AccountNode>>,
     pub(crate) proof_store: Arc<ProofStore>,
-    pub(crate) minting_account: Arc<Mutex<ClientAccount>>,
+    /// In-memory staged-mint store for the two-phase, creator-signed
+    /// mint (phase 1 builds the proof + stages it here; phase 2 — the
+    /// wallet-signed commit — consumes it). See [`MintStore`].
+    pub(crate) mint_store: Arc<MintStore>,
     pub(crate) username_store: Arc<Mutex<UsernameStore>>,
     /// Postgres pool for per-account upserts (accounts table); the
     /// minting account's `num_pubkeys` is derived from SMT membership
@@ -648,12 +684,43 @@ pub struct SendCoinRequest {
     pub(crate) asset_id: Option<String>,
 }
 
+/// Creator-signed mint request (Milestone 2).
+///
+/// Neutral, permissionless model: anyone creates their own asset and
+/// mints their own supply. The `account_address` (owner) and `asset_id`
+/// are DERIVED server-side from `creator_pubkey` + `name` + `decimals`
+/// — they are NOT accepted from the wire (which would let a forger
+/// claim a foreign owner/asset). The request is authenticated by a
+/// BIP-340 Schnorr signature over the mint fields, verified against
+/// `creator_pubkey` (see [`verify_mint_signature_pub`]).
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
 pub struct MintRequest {
-    pub(crate) account_address: String,
+    /// Compressed secp256k1 public key (33 bytes) of the asset creator,
+    /// hex-encoded. The owner is `H(creator_pubkey)` and the asset_id
+    /// is `calculate_asset_id(creator_pubkey, H(name), decimals)`.
+    #[schema(value_type = String, example = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")]
+    pub(crate) creator_pubkey: bitcoin::secp256k1::PublicKey,
+    /// Compressed secp256k1 public key (33 bytes) the mint rotates to,
+    /// hex-encoded. The mint's transition commits under
+    /// `sha256(next_public_key)` so the creator's first follow-up send
+    /// does not collide with the creator key in the insert-only
+    /// commitment SMT.
+    #[schema(value_type = String, example = "03c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5")]
+    pub(crate) next_public_key: bitcoin::secp256k1::PublicKey,
+    /// Human-facing asset name. Folded into the asset_id via
+    /// `calculate_name_hash`; also cached as display metadata.
+    pub(crate) name: String,
+    /// Asset decimals. Part of the asset_id derivation.
+    pub(crate) decimals: u8,
+    /// Amount to mint into the creator's own balance, atomic units.
     pub(crate) amount: u64,
-    #[serde(default)]
-    pub(crate) asset_id: Option<String>,
+    /// Hex-encoded BIP-340 Schnorr signature (64 bytes) over
+    /// `SHA256(creator_pubkey || name || [decimals] || amount_le ||
+    /// timestamp_le)`.
+    pub(crate) signature: String,
+    /// Unix epoch seconds the signature was produced at. Subject to the
+    /// same freshness window as a send ([`check_timestamp_window`]).
+    pub(crate) timestamp: u64,
 }
 
 // `ReceiveCoinRequest` was the SP1-era POST body shape for a coin
@@ -772,6 +839,64 @@ impl ProofStore {
         let path = self.proof_path(id)?;
         let bytes = std::fs::read(&path).ok()?;
         bincode::deserialize(&bytes).ok()
+    }
+}
+
+/// A staged issuer-mint awaiting the creator's signature (phase 1 → 2
+/// of the two-phase mint). Built by `flow::mint_flow`'s prove leg and
+/// consumed by `flow::mint_commit_flow` once the wallet returns a
+/// signed `Commitment`. Carries everything the commit leg needs to run
+/// the off-circuit creator binding and apply the balance increase.
+pub(crate) struct StagedMint {
+    /// The issuer-mint proof (no out-coins; increases the creator's own
+    /// balance). The wallet signs its `account_state_hash ||
+    /// output_coins_root`.
+    pub(crate) proof: Proof,
+    /// Owner address `H(creator_pubkey)` of the creator account.
+    pub(crate) owner: zkcoins_program::hash::HashDigest,
+    /// Derived asset_id of the asset being minted.
+    pub(crate) asset_id: zkcoins_program::types::AssetId,
+    /// The tentative mutated creator account to swap in on commit.
+    pub(crate) mutated_account: crate::account_node::Account,
+    /// The asset creator's secp256k1 pubkey. The commit leg requires the
+    /// wallet-signed `commitment.public_key` to equal this (off-circuit
+    /// creator binding) and registers the asset_id -> creator_pubkey row.
+    pub(crate) creator_pubkey: bitcoin::secp256k1::PublicKey,
+}
+
+/// In-memory store of staged mints keyed by `proof_id`. Mirrors the
+/// role `ProofStore` plays for sends, but mints carry no on-disk
+/// `CoinProof` (there is no out-coin), so the staged state lives in
+/// process memory until the commit leg consumes it. A restart between
+/// the prove and commit legs drops the staged mint; the wallet's job
+/// then times out at `awaiting_signature` and the creator re-submits
+/// (same boot-resume semantics as a send).
+#[derive(Default)]
+pub(crate) struct MintStore {
+    next_id: AtomicU64,
+    staged: Mutex<HashMap<u64, StagedMint>>,
+}
+
+impl MintStore {
+    pub(crate) fn new() -> Self {
+        MintStore {
+            // Start at 1 so a `proof_id` of 0 is never a valid staged
+            // mint (mirrors `ProofStore`'s 1-based ids).
+            next_id: AtomicU64::new(1),
+            staged: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Stage a mint, returning its `proof_id`.
+    pub(crate) fn add(&self, staged: StagedMint) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        lock_or_recover(&self.staged).insert(id, staged);
+        id
+    }
+
+    /// Remove + return a staged mint by id (consumed by the commit leg).
+    pub(crate) fn take(&self, id: u64) -> Option<StagedMint> {
+        lock_or_recover(&self.staged).remove(&id)
     }
 }
 
@@ -1020,77 +1145,7 @@ pub(crate) async fn get_balance_handler(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let account_node = lock_or_recover(&state.account_node);
-
-    // Check if an address parameter was provided
-    if let Some(address_hex) = params.get("address") {
-        // Convert hex string to Address type
-        let address_vec = match hex::decode(address_hex.trim_start_matches("0x")) {
-            Ok(addr) => addr,
-            Err(_) => {
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(BalanceResponse {
-                        balance: 0,
-                        username: None,
-                        num_sends: 0,
-                    }),
-                )
-            }
-        };
-
-        // Convert Vec<u8> to [u8; 32], then to Poseidon HashDigest.
-        let mut address_bytes = [0u8; 32];
-        if address_vec.len() == 32 {
-            address_bytes.copy_from_slice(&address_vec);
-        } else {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(BalanceResponse {
-                    balance: 0,
-                    username: None,
-                    num_sends: 0,
-                }),
-            );
-        }
-        let address = digest_from_bytes(&address_bytes);
-
-        // Get balance for the specific account
-        let username = {
-            let username_store = lock_or_recover(&state.username_store);
-            username_store.get_username(&address).map(String::from)
-        };
-        // Read the per-account send counter so the wallet can hydrate
-        // its `numPubkeys` from the server (the authoritative source —
-        // see `BalanceResponse::num_sends` doc). Defaults to `0` for
-        // an unobserved address, matching `Account::new()`.
-        let num_sends = account_node
-            .get_account(&address)
-            .map(|a| a.num_sends)
-            .unwrap_or(0);
-        match account_node.get_account_balance(&address) {
-            Ok(balance) => (
-                StatusCode::OK,
-                Json(BalanceResponse {
-                    balance,
-                    username,
-                    num_sends,
-                }),
-            ),
-            // Unobserved address: canonical zero-balance state, not a not-found condition.
-            Err(_) => (
-                StatusCode::OK,
-                Json(BalanceResponse {
-                    balance: 0,
-                    username,
-                    num_sends,
-                }),
-            ),
-        }
-    } else {
-        // Missing required `address` query parameter — malformed request,
-        // not a routing miss. Matches the 422 returned by the invalid-hex
-        // and wrong-length branches above.
+    let err_422 = || {
         (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(BalanceResponse {
@@ -1099,7 +1154,148 @@ pub(crate) async fn get_balance_handler(
                 num_sends: 0,
             }),
         )
-    }
+    };
+
+    // `address` (required) + `asset_id` (required under the multi-asset
+    // model — balance is per-(owner, asset_id); the list endpoint
+    // `GET /api/balance/:address` aggregates across assets).
+    let Some(address_hex) = params.get("address") else {
+        return err_422();
+    };
+    let address = match parse_hex_digest(address_hex) {
+        Some(a) => a,
+        None => return err_422(),
+    };
+    let Some(asset_hex) = params.get("asset_id") else {
+        return err_422();
+    };
+    let asset_id = match parse_hex_digest(asset_hex) {
+        Some(a) => a,
+        None => return err_422(),
+    };
+
+    let account_node = lock_or_recover(&state.account_node);
+    let username = {
+        let username_store = lock_or_recover(&state.username_store);
+        username_store.get_username(&address).map(String::from)
+    };
+    let num_sends = account_node
+        .get_account(&address, &asset_id)
+        .map(|a| a.num_sends)
+        .unwrap_or(0);
+    let balance = account_node
+        .get_account_balance(&address, &asset_id)
+        .unwrap_or(0);
+    (
+        StatusCode::OK,
+        Json(BalanceResponse {
+            balance,
+            username,
+            num_sends,
+        }),
+    )
+}
+
+/// Parse a `0x`-optional 32-byte hex string into a Poseidon
+/// [`HashDigest`]. Returns `None` on bad hex or wrong length.
+pub(crate) fn parse_hex_digest(s: &str) -> Option<zkcoins_program::hash::HashDigest> {
+    let raw = hex::decode(s.trim_start_matches("0x")).ok()?;
+    let arr: [u8; 32] = raw.as_slice().try_into().ok()?;
+    Some(digest_from_bytes(&arr))
+}
+
+/// One asset entry in the [`OwnerBalanceResponse`] list.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct AssetBalance {
+    /// Asset identifier, 32-byte digest as 64 lowercase hex chars.
+    pub asset_id: String,
+    /// Human-facing asset name, if the node learned it at mint time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Asset decimals, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decimals: Option<u8>,
+    /// Spendable balance of this asset for the owner, atomic units.
+    pub balance: u64,
+    /// Per-(owner, asset) BIP-32 child-index counter (number of sends).
+    pub num_sends: u32,
+}
+
+/// Aggregated per-asset balance list for `GET /api/balance/:address`.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct OwnerBalanceResponse {
+    /// Owner address echoed back, 64 lowercase hex chars.
+    pub address: String,
+    /// Username bound to the owner, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// One entry per asset the owner holds. Empty for an unobserved
+    /// address (canonical, not a 404).
+    pub assets: Vec<AssetBalance>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/balance/{address}",
+    tag = "Accounts",
+    params(
+        ("address" = String, Path, description = "Owner address as `0x`-prefixed 32-byte hex"),
+    ),
+    responses(
+        (status = 200, description = "Per-asset balance list for the owner. An unobserved \
+            address returns `assets: []` (canonical), not 404.",
+            body = OwnerBalanceResponse),
+        (status = 422, description = "Malformed address (bad hex, wrong length).",
+            body = OwnerBalanceResponse),
+    ),
+)]
+/// `GET /api/balance/:address` — list every asset the owner holds with
+/// its per-asset balance, num_sends, and (where known) display
+/// metadata. The multi-asset replacement for the single-balance
+/// `GET /api/balance?address=` query.
+pub(crate) async fn get_owner_balance_handler(
+    State(state): State<AppState>,
+    Path(address_hex): Path<String>,
+) -> impl IntoResponse {
+    let empty = |code: StatusCode, address: String| {
+        (
+            code,
+            Json(OwnerBalanceResponse {
+                address,
+                username: None,
+                assets: vec![],
+            }),
+        )
+    };
+    let address = match parse_hex_digest(&address_hex) {
+        Some(a) => a,
+        None => return empty(StatusCode::UNPROCESSABLE_ENTITY, address_hex),
+    };
+
+    let account_node = lock_or_recover(&state.account_node);
+    let username = {
+        let username_store = lock_or_recover(&state.username_store);
+        username_store.get_username(&address).map(String::from)
+    };
+    let assets = account_node
+        .assets_for_owner(&address)
+        .into_iter()
+        .map(|a| AssetBalance {
+            asset_id: hex::encode(digest_to_bytes(&a.asset_id)),
+            name: a.name,
+            decimals: a.decimals,
+            balance: a.balance,
+            num_sends: a.num_sends,
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(OwnerBalanceResponse {
+            address: hex::encode(digest_to_bytes(&address)),
+            username,
+            assets,
+        }),
+    )
 }
 
 #[utoipa::path(
@@ -1444,6 +1640,7 @@ pub(crate) async fn receive_coin_handler(
         }
     };
     let recipient = coin_proof.coin.recipient;
+    let asset_id = coin_proof.coin.asset_id;
     // Snapshot the recipient's mutated account inside the (sync) lock
     // scope so the post-receive Postgres upsert runs without holding
     // the guard across an `.await` point.
@@ -1451,14 +1648,14 @@ pub(crate) async fn receive_coin_handler(
         let mut account_node = lock_or_recover(&state.account_node);
         match account_node.receive_coin(coin_proof) {
             Ok(_) => account_node
-                .get_account(&recipient)
+                .get_account(&recipient, &asset_id)
                 .map(AccountNode::serialize_account),
             Err(_) => None,
         }
     };
     match snapshot {
         Some(bytes) => {
-            let addr_bytes = digest_to_bytes(&recipient);
+            let addr_bytes = crate::account_node::account_key_bytes(&recipient, &asset_id);
             if let Err(e) =
                 db::upsert_account_with_source(&state.pool, &addr_bytes, &bytes, "receive").await
             {
@@ -1637,11 +1834,15 @@ pub(crate) async fn jobs_mint_handler(
         Err((code, body)) => return (code, body).into_response(),
     };
 
-    // Pre-flight validation: returns 4xx without burning a job row.
-    let account_bytes = match flow::validate_mint_request(&request) {
-        Ok(b) => b,
+    // Pre-flight validation: signature + timestamp gate + derive the
+    // owner/asset identity. Returns 401/4xx without burning a job row.
+    // The job is scoped to the DERIVED owner address (`H(creator_pubkey)`)
+    // — never a wire-supplied address.
+    let identity = match flow::validate_mint_request(&request) {
+        Ok(id) => id,
         Err(e) => return job_flow_error(e).into_response(),
     };
+    let account_bytes = digest_to_bytes(&identity.owner);
 
     // `MintRequest` derives `Serialize` over a fixed set of strings /
     // primitives; `serde_json::to_value` on such a shape cannot fail
@@ -2780,7 +2981,10 @@ pub(crate) async fn info_handler() -> impl IntoResponse {
             address_list: cfg!(feature = "address-list"),
             username_claim: cfg!(feature = "username-claim"),
             lnurl: cfg!(feature = "lnurl"),
-            multi_asset: false,
+            // Milestone 2: the node is a neutral, permissionless
+            // multi-asset protocol — accounts are per-(owner, asset_id)
+            // and the balance surface is per-asset.
+            multi_asset: true,
         },
         username_domain: USERNAME_DOMAIN.clone(),
     })
@@ -3292,6 +3496,7 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/health/publisher", get(publisher_health_handler))
         .route("/api/info", get(info_handler))
         .route("/api/balance", get(get_balance_handler))
+        .route("/api/balance/:address", get(get_owner_balance_handler))
         .route("/api/history", get(get_history_handler))
         // axum 0.7 path-param syntax (`:id`); the OpenAPI annotation uses
         // the spec's `{id}` form — both name the same segment.

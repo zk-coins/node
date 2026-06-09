@@ -51,8 +51,17 @@ use shared::ProofData;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS;
 use zkcoins_program::hash::digest_to_bytes;
-use zkcoins_program::types::MINTING_ADDRESS;
 use zkcoins_program::F;
+
+/// Local stand-in for the removed `MINTING_ADDRESS` constant. The
+/// neutral, permissionless model (Milestone 2) has no privileged
+/// minting account; this remote suite runs against the live DEV server
+/// and is excluded from the unit gate (`-E 'not binary(api_remote)'`).
+/// The helpers below are retained for the pre-M2 deployed server and
+/// will be migrated to the creator-signed mint flow when DEV adopts M2.
+fn minting_address() -> zkcoins_program::hash::HashDigest {
+    zkcoins_program::hash::hash_bytes(b"zkcoins:minting-address:placeholder:v1")
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -2899,7 +2908,7 @@ async fn poll_balance_at_most(client: &reqwest::Client, address: &str, target: u
 /// roundtrips to detect a dirty DEV state (prior mint residue or a
 /// missed `reset_state` run).
 async fn fetch_minting_balance(client: &reqwest::Client) -> u64 {
-    let minting_hex = format!("0x{}", hex::encode(digest_to_bytes(&MINTING_ADDRESS)));
+    let minting_hex = format!("0x{}", hex::encode(digest_to_bytes(&minting_address())));
     let resp = client
         .get(url(&format!("/api/balance?address={}", minting_hex)))
         .send()

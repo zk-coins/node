@@ -152,7 +152,14 @@ fn reset_proof_store_dir_propagates_non_notfound_error() {
 /// Seed one account + an SMT/MMR snapshot so the Reset path has
 /// something to actually wipe.
 async fn seed_proof_dependent_state(pool: &sqlx::PgPool) {
-    db::upsert_account(pool, &[7u8; 32], b"stale-account-blob")
+    // `accounts.address` stores the 64-byte `owner ‖ asset_id` composite
+    // key since migration 0017 (`accounts_address_length` CHECK = 64);
+    // the synthetic blob does not need to decode, but the key must be a
+    // well-formed composite.
+    let owner = zkcoins_program::hash::digest_from_bytes(&[7u8; 32]);
+    let asset_id = zkcoins_program::hash::digest_from_bytes(&[8u8; 32]);
+    let key = crate::account_node::account_key_bytes(&owner, &asset_id);
+    db::upsert_account(pool, &key, b"stale-account-blob")
         .await
         .expect("seed account");
     let prev_root = zkcoins_program::hash::digest_from_bytes(&[0x10u8; 32]);
