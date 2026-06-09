@@ -1,0 +1,48 @@
+# cargo-nextest configuration.
+#
+# Discovered from the workspace root (the directory holding the
+# top-level `[workspace]` `Cargo.toml`), so it applies to both
+# `cargo nextest run` (local runs) and `cargo llvm-cov nextest` (the
+# CI `Tests + Coverage Gate` job) — both drive the suite through
+# nextest and honour this file. It carries NO coverage semantics of
+# its own, so the 100% line/function gate is unaffected.
+
+[test-groups]
+# Concurrency cap for the heaviest Postgres-touching test module.
+#
+# Every test in `router::tests::jobs_endpoint_tests` runs
+# `crate::test_db::setup_pool()`, which CREATEs a fresh per-test schema
+# and replays the full migration suite (16 DDL files: tables, triggers,
+# views) into it. Postgres serialises concurrent DDL on shared system
+# catalogs, so when the post-#181 `--test-threads 8` default lets eight
+# of these migration replays run at once against the single shared
+# `postgres:17` container, each `setup_pool()` stretches from <1 s to
+# tens of seconds. The SSE `jobs_stream_*` tests additionally hold their
+# pool across deliberate `sleep`/`timeout` windows, so under that
+# contention their `JobStore`/`setup_pool` connection acquisition can
+# exceed the pool's 60 s `acquire_timeout` and surface as
+# `create: PoolTimedOut`.
+#
+# This was invisible at the `--test-threads 1` default. Capping the
+# group keeps the `Tests + Coverage Gate` (the single `ci:full` job,
+# `--test-threads 8`) safe: the `jobs_endpoint_tests` are interleaved
+# across ~440 tests there, but the cap still guarantees no more than
+# two migration replays race at once regardless of how the scheduler
+# packs the run. The cap originally surfaced under the now-removed
+# "DB Subset Tests" job, which selected `test(/^router::tests::jobs_/)`
+# alongside `db::tests` / `job_store::tests` etc. so the
+# migration-replaying tests clustered and the contention tipped over;
+# the cap is retained because it is the general guard for this group
+# in the full gate, not specific to that subset.
+#
+# Capping this group at 2 concurrent threads keeps useful parallelism
+# while bounding simultaneous migration replays so connection
+# acquisition stays well under the 60 s timeout. It touches no test
+# pool, so the deliberately-narrow error-path pools (`dead_pool`'s
+# `max_connections(1)` / 50 ms `acquire_timeout`) keep exercising their
+# `PoolTimedOut` arms verbatim.
+jobs-endpoint = { max-threads = 2 }
+
+[[profile.default.overrides]]
+filter = 'test(/^router::tests::jobs_endpoint_tests::/)'
+test-group = 'jobs-endpoint'

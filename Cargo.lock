@@ -5231,6 +5231,7 @@ name = "zkcoins-prover-plonky2"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bincode",
  "plonky2",
  "zkcoins-program-plonky2",
 ]

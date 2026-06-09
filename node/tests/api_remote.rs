@@ -199,6 +199,9 @@ async fn fetch_capabilities(client: &reqwest::Client) -> Capabilities {
         lnurl: body["capabilities"]["lnurl"].as_bool().expect(
             "/api/info capabilities.lnurl must be a bool — missing field is a contract regression",
         ),
+        multi_asset: body["capabilities"]["multi_asset"].as_bool().expect(
+            "/api/info capabilities.multi_asset must be a bool — missing field is a contract regression",
+        ),
     };
     if let Ok(force) = std::env::var("ZKCOINS_FORCE_DISABLE_FEATURES") {
         for flag in force.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -206,6 +209,7 @@ async fn fetch_capabilities(client: &reqwest::Client) -> Capabilities {
                 "address_list" | "address-list" => caps.address_list = false,
                 "username_claim" | "username-claim" => caps.username_claim = false,
                 "lnurl" => caps.lnurl = false,
+                "multi_asset" | "multi-asset" => caps.multi_asset = false,
                 other => {
                     eprintln!(
                         "ZKCOINS_FORCE_DISABLE_FEATURES: unknown flag `{}` — ignored",
@@ -414,6 +418,18 @@ async fn info_returns_well_formed_response() {
             .is_some_and(|v| !v.is_empty()),
         "username_domain must be a non-empty string, got {:?}",
         body["username_domain"]
+    );
+
+    // `bitcoin_network` is the typed, lowercase network identifier the
+    // wallet/SDK switch behaviour on. No fallback: a missing field or a
+    // value outside the two-variant enum is a contract regression.
+    let bitcoin_network = body["bitcoin_network"].as_str().expect(
+        "/api/info bitcoin_network must be a string — missing field is a contract regression",
+    );
+    assert!(
+        bitcoin_network == "mainnet" || bitcoin_network == "mutinynet",
+        "/api/info bitcoin_network must be `mainnet` or `mutinynet`, got {bitcoin_network:?} \
+         — value outside the enum is a contract regression"
     );
 
     for cap in ["address_list", "username_claim", "lnurl"] {
@@ -627,6 +643,121 @@ async fn history_after_mint_records_mint_row() {
     // Spec contract — these are nullable on the wire.
     assert!(head["counterparty"].is_null() || head["counterparty"].is_string());
     assert!(head["memo"].is_null());
+}
+
+/// Live contract round-trip for the per-transaction detail endpoint
+/// (`GET /api/history/{id}`): mint, read the history list to learn the
+/// row id, then fetch the detail and assert it carries the list fields
+/// plus the decoded account-state snapshot. State-mutating like
+/// `history_after_mint_records_mint_row`; uses a fresh wallet so it is
+/// race-free against parallel runs.
+#[tokio::test]
+async fn history_item_after_mint_returns_full_detail() {
+    let client = http_client();
+    let alice = TestWallet::new();
+    assert_minting_balance_in_bounds(&client).await;
+
+    let mint_result = mint_via_job(&client, &alice.address_hex(), MINT_AMOUNT).await;
+    assert_eq!(mint_result["success"], Value::Bool(true));
+    let _ = poll_balance_at_least(&client, &alice.address_hex(), MINT_AMOUNT).await;
+
+    // Learn the row id from the list.
+    let list: Value = client
+        .get(url(&format!(
+            "/api/history?address={}",
+            alice.address_hex()
+        )))
+        .send()
+        .await
+        .expect("GET /api/history")
+        .json()
+        .await
+        .expect("history JSON");
+    let id = list["items"][0]["id"].as_i64().expect("row id");
+
+    // Fetch the detail.
+    let resp = client
+        .get(url(&format!(
+            "/api/history/{}?address={}",
+            id,
+            alice.address_hex()
+        )))
+        .send()
+        .await
+        .expect("GET /api/history/{id}");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let d: Value = resp.json().await.expect("detail JSON");
+
+    // Core fields (consistent with the list head).
+    assert_eq!(d["id"].as_i64(), Some(id));
+    assert_eq!(d["direction"], "mint");
+    assert_eq!(d["amount"], MINT_AMOUNT);
+    assert_eq!(d["address"], alice.address_hex().trim_start_matches("0x"));
+    // Decoded account-state snapshot: a from-genesis mint credits the
+    // full balance, leaves num_sends at 0, and sets no commitment pubkey.
+    assert_eq!(d["balance_after"].as_u64(), Some(MINT_AMOUNT));
+    assert!(
+        d["balance_before"].is_null(),
+        "first row has no prior state"
+    );
+    assert_eq!(d["num_sends_after"].as_u64(), Some(0));
+    assert!(
+        d["commitment_public_key"].is_null(),
+        "mint-only account has no commitment pubkey"
+    );
+    // The node has warmed a prover, so a verifier circuit digest exists.
+    assert!(
+        d["circuit_digest"].is_string(),
+        "circuit_digest should be populated post-warmup, got {}",
+        d["circuit_digest"]
+    );
+}
+
+/// `GET /api/history/{id}` validation + scoping contract (read-only, no
+/// state mutation — safe to run unconditionally).
+#[tokio::test]
+async fn history_item_validation_and_scoping() {
+    let client = http_client();
+    let some_addr = format!("0x{}", "ab".repeat(32));
+
+    // Missing address -> 422.
+    let r = client
+        .get(url("/api/history/1"))
+        .send()
+        .await
+        .expect("GET no-address");
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Non-integer id -> 422 (parsed as string, not axum's default 400).
+    let r = client
+        .get(url(&format!(
+            "/api/history/not_a_number?address={}",
+            some_addr
+        )))
+        .send()
+        .await
+        .expect("GET bad-id");
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Bad address hex -> 422.
+    let r = client
+        .get(url("/api/history/1?address=not_hex"))
+        .send()
+        .await
+        .expect("GET bad-address");
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Well-formed but never-minted address + arbitrary id -> 404.
+    let fresh = TestWallet::new();
+    let r = client
+        .get(url(&format!(
+            "/api/history/999999999?address={}",
+            fresh.address_hex()
+        )))
+        .send()
+        .await
+        .expect("GET unknown");
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -1331,6 +1462,38 @@ async fn send_commit_roundtrip_moves_balance() {
     assert!(
         ocr_bytes.iter().any(|&b| b != 0),
         "output_coins_root must be non-zero"
+    );
+
+    // ---- Thin-client contract: ash/ocr hex on the awaiting_signature
+    // result ----
+    // A pure-TypeScript wallet cannot decode the binary bincode
+    // `CoinProof` from `GET /api/proof/{id}`, so the node surfaces the
+    // hashes it must sign directly on the job result as hex. Assert the
+    // `awaiting_signature` snapshot carries `result.account_state_hash`
+    // + `result.output_coins_root`, AND that they equal the digests
+    // decoded from the proof above — so what the wallet signs from the
+    // thin path is bit-identical to the proof's public inputs.
+    let result = awaiting
+        .get("result")
+        .and_then(Value::as_object)
+        .expect("awaiting_signature job carries a result object");
+    let result_ash = result
+        .get("account_state_hash")
+        .and_then(Value::as_str)
+        .expect("result carries account_state_hash hex");
+    let result_ocr = result
+        .get("output_coins_root")
+        .and_then(Value::as_str)
+        .expect("result carries output_coins_root hex");
+    assert_eq!(
+        result_ash,
+        hex::encode(ash_bytes),
+        "awaiting_signature result.account_state_hash must equal the proof-decoded ash"
+    );
+    assert_eq!(
+        result_ocr,
+        hex::encode(ocr_bytes),
+        "awaiting_signature result.output_coins_root must equal the proof-decoded ocr"
     );
 
     // ---- Commit (phase 2: sign ash || ocr, attach, broadcast) ----

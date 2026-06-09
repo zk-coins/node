@@ -1,8 +1,8 @@
 //! Monolithic state-transition circuit for zkCoins (Plonky2 backend).
 //!
 //! Mirrors `program/src/main.rs` (the SP1 entrypoint), but built as a
-//! Plonky2 cyclic-recursive circuit per [`SPEC.md`] §8 / §10 and the
-//! `ROADMAP.md` Step 5 plan.
+//! Plonky2 cyclic-recursive circuit per the protocol specification
+//! §8 / §10 (<https://docs.zkcoins.app/specification>).
 //!
 //! ## Stage status
 //!
@@ -103,7 +103,7 @@ use crate::{C, D, F};
 /// Mirrors [`crate::types::ProofData::to_field_elements`]'s output length;
 /// the verifier-data slots added by `add_verifier_data_public_inputs`
 /// follow these and are not counted here.
-pub const N_PROOF_DATA_PUBLIC_INPUTS: usize = 16;
+pub const N_PROOF_DATA_PUBLIC_INPUTS: usize = 20;
 
 /// Fixed in-circuit MMR proof path length. Equal to
 /// `MMR_MAX_DEPTH - 1` because an MMR proof has one sibling per level
@@ -441,7 +441,7 @@ pub struct StateTransitionCircuit {
     /// Inner proof slot. Initial uses [`cyclic_base_proof`] dummy;
     /// AccountUpdate uses a real prev `ProofWithPublicInputs`.
     pub inner_proof_target: ProofWithPublicInputsTarget<D>,
-    /// 16 public-input slots for `ProofData::to_field_elements`.
+    /// 20 public-input slots for `ProofData::to_field_elements`.
     pub proof_data_pis: [Target; N_PROOF_DATA_PUBLIC_INPUTS],
     /// Witness target: `account_state.owner` (4 field elements).
     pub owner: HashOutTarget,
@@ -530,6 +530,15 @@ pub fn build_circuit() -> StateTransitionCircuit {
     // `add_verifier_data_public_inputs` per Plonky2 contract.
     let proof_data_pis: [Target; N_PROOF_DATA_PUBLIC_INPUTS] =
         std::array::from_fn(|_| builder.add_virtual_public_input());
+
+    let transition_asset_id = HashOutTarget {
+        elements: [
+            proof_data_pis[16],
+            proof_data_pis[17],
+            proof_data_pis[18],
+            proof_data_pis[19],
+        ],
+    };
 
     let verifier_data_target = builder.add_verifier_data_public_inputs();
     debug_assert_eq!(
@@ -950,7 +959,22 @@ pub fn build_circuit() -> StateTransitionCircuit {
         // `[agg_base + 12 .. agg_base + 16]` is the source's
         // `coin_history_root` — unused for §8 step 2 (it only ever
         // matters for an account's OWN in-coins).
-        let source_active_pi = aggregator_proof_target.public_inputs[agg_base + 16];
+        // `[agg_base + 16 .. agg_base + 20]` is the source's `asset_id`.
+        let source_active_pi = aggregator_proof_target.public_inputs[agg_base + 20];
+
+        let source_asset_id = HashOutTarget {
+            elements: [
+                aggregator_proof_target.public_inputs[agg_base + 16],
+                aggregator_proof_target.public_inputs[agg_base + 17],
+                aggregator_proof_target.public_inputs[agg_base + 18],
+                aggregator_proof_target.public_inputs[agg_base + 19],
+            ],
+        };
+        for j in 0..4 {
+            let diff = builder.sub(source_asset_id.elements[j], transition_asset_id.elements[j]);
+            let masked = builder.mul(slot.active.target, diff);
+            builder.assert_zero(masked);
+        }
 
         // Bind outer-slot active <-> aggregator-slot active. Both are
         // bool-constrained by their respective allocators, so this
@@ -1217,8 +1241,9 @@ pub fn build_circuit() -> StateTransitionCircuit {
     // match anything.
     for (i, slot) in out_coin_slots.iter().enumerate() {
         let i_const = builder.constant(F::from_canonical_u32(i as u32));
-        let mut id_input = Vec::with_capacity(5);
+        let mut id_input = Vec::with_capacity(9);
         id_input.extend_from_slice(&interim_account_state_hash.elements);
+        id_input.extend_from_slice(&transition_asset_id.elements);
         id_input.push(i_const);
         let computed_id = builder.hash_n_to_hash_no_pad::<PoseidonHash>(id_input);
         for j in 0..4 {
@@ -1565,6 +1590,7 @@ fn dummy_coin() -> Coin {
         identifier: ZERO_HASH,
         recipient: ZERO_HASH,
         amount: 0,
+        asset_id: ZERO_HASH,
     }
 }
 
@@ -1646,13 +1672,20 @@ pub fn prove_initial(
     circuit: &StateTransitionCircuit,
     account_state: &AccountState,
     history_root: HashDigest,
+    asset_id: HashDigest,
 ) -> Result<ProofWithPublicInputs<F, C, D>> {
     let dummy_nip = dummy_non_inclusion_proof();
     let dummy_coin = dummy_coin();
     let inactive_slots: Vec<(bool, &Coin, &NonInclusionProof)> = (0..MAX_IN_COINS)
         .map(|_| (false, &dummy_coin, &dummy_nip))
         .collect();
-    prove_initial_with_in_coins(circuit, account_state, history_root, &inactive_slots)
+    prove_initial_with_in_coins(
+        circuit,
+        account_state,
+        history_root,
+        &inactive_slots,
+        asset_id,
+    )
 }
 
 /// Like [`prove_initial`] but with caller-supplied in-coin slot
@@ -1667,6 +1700,7 @@ pub fn prove_initial_with_in_coins(
     account_state: &AccountState,
     history_root: HashDigest,
     in_coins: &[(bool, &Coin, &NonInclusionProof)],
+    asset_id: HashDigest,
 ) -> Result<ProofWithPublicInputs<F, C, D>> {
     assert_eq!(
         in_coins.len(),
@@ -1684,6 +1718,7 @@ pub fn prove_initial_with_in_coins(
         in_coins,
         &inactive_out_coins,
         &account_state.public_key,
+        asset_id,
     )
 }
 
@@ -1705,6 +1740,7 @@ pub fn prove_initial_with_in_and_out_coins(
     in_coins: &[(bool, &Coin, &NonInclusionProof)],
     out_coins: &[(bool, HashDigest, u64, &NonInclusionProof)],
     next_public_key: &PublicKey,
+    asset_id: HashDigest,
 ) -> Result<ProofWithPublicInputs<F, C, D>> {
     let sources: Vec<Option<InCoinSourceWitness>> = (0..MAX_IN_COINS).map(|_| None).collect();
     prove_initial_with_in_and_out_coins_and_sources(
@@ -1715,6 +1751,7 @@ pub fn prove_initial_with_in_and_out_coins(
         out_coins,
         next_public_key,
         &sources,
+        asset_id,
     )
 }
 
@@ -1743,6 +1780,7 @@ pub fn prove_initial_with_in_and_out_coins_and_sources(
     out_coins: &[(bool, HashDigest, u64, &NonInclusionProof)],
     next_public_key: &PublicKey,
     sources: &[Option<InCoinSourceWitness>],
+    asset_id: HashDigest,
 ) -> Result<ProofWithPublicInputs<F, C, D>> {
     assert_eq!(
         in_coins.len(),
@@ -1765,6 +1803,10 @@ pub fn prove_initial_with_in_and_out_coins_and_sources(
     set_account_state_witness(&mut pw, circuit, account_state);
     pw.set_hash_target(circuit.history_root, history_root)
         .unwrap();
+    for i in 0..4 {
+        pw.set_target(circuit.proof_data_pis[16 + i], asset_id.elements[i])
+            .unwrap();
+    }
     set_cmp_witness(&mut pw, circuit, &dummy_cmp());
     for (slot_targets, (active, coin, nip)) in circuit.in_coin_slots.iter().zip(in_coins.iter()) {
         set_in_coin_slot_witness(
@@ -1877,6 +1919,7 @@ pub fn prove_account_update(
     history_root: HashDigest,
     prev: &ProofWithPublicInputs<F, C, D>,
     cmp: &CommitmentMerkleProofs,
+    asset_id: HashDigest,
 ) -> Result<ProofWithPublicInputs<F, C, D>> {
     let dummy_nip = dummy_non_inclusion_proof();
     let dummy_coin = dummy_coin();
@@ -1890,6 +1933,7 @@ pub fn prove_account_update(
         prev,
         cmp,
         &inactive_slots,
+        asset_id,
     )
 }
 
@@ -1903,6 +1947,7 @@ pub fn prove_account_update_with_in_coins(
     prev: &ProofWithPublicInputs<F, C, D>,
     cmp: &CommitmentMerkleProofs,
     in_coins: &[(bool, &Coin, &NonInclusionProof)],
+    asset_id: HashDigest,
 ) -> Result<ProofWithPublicInputs<F, C, D>> {
     assert_eq!(
         in_coins.len(),
@@ -1922,6 +1967,7 @@ pub fn prove_account_update_with_in_coins(
         in_coins,
         &inactive_out_coins,
         &account_state.public_key,
+        asset_id,
     )
 }
 
@@ -1942,6 +1988,7 @@ pub fn prove_account_update_with_in_and_out_coins(
     in_coins: &[(bool, &Coin, &NonInclusionProof)],
     out_coins: &[(bool, HashDigest, u64, &NonInclusionProof)],
     next_public_key: &PublicKey,
+    asset_id: HashDigest,
 ) -> Result<ProofWithPublicInputs<F, C, D>> {
     let sources: Vec<Option<InCoinSourceWitness>> = (0..MAX_IN_COINS).map(|_| None).collect();
     prove_account_update_with_in_and_out_coins_and_sources(
@@ -1954,6 +2001,7 @@ pub fn prove_account_update_with_in_and_out_coins(
         out_coins,
         next_public_key,
         &sources,
+        asset_id,
     )
 }
 
@@ -1976,6 +2024,7 @@ pub fn prove_account_update_with_in_and_out_coins_and_sources(
     out_coins: &[(bool, HashDigest, u64, &NonInclusionProof)],
     next_public_key: &PublicKey,
     sources: &[Option<InCoinSourceWitness>],
+    asset_id: HashDigest,
 ) -> Result<ProofWithPublicInputs<F, C, D>> {
     assert_eq!(
         in_coins.len(),
@@ -1998,6 +2047,10 @@ pub fn prove_account_update_with_in_and_out_coins_and_sources(
     set_account_state_witness(&mut pw, circuit, account_state);
     pw.set_hash_target(circuit.history_root, history_root)
         .unwrap();
+    for i in 0..4 {
+        pw.set_target(circuit.proof_data_pis[16 + i], asset_id.elements[i])
+            .unwrap();
+    }
     set_cmp_witness(&mut pw, circuit, cmp);
     for (slot_targets, (active, coin, nip)) in circuit.in_coin_slots.iter().zip(in_coins.iter()) {
         set_in_coin_slot_witness(
@@ -2134,7 +2187,7 @@ mod tests {
         let mut post_source = source_account.clone();
         post_source.balance -= out_amount;
         let interim_source_asth = post_source.hash();
-        let coin_id = crate::types::calculate_coin_identifier(interim_source_asth, 0);
+        let coin_id = crate::types::calculate_coin_identifier(interim_source_asth, ZERO_HASH, 0);
         let out_id_key = digest_to_bytes(&coin_id);
         let empty_smt = SparseMerkleTree::new();
         let out_nip = empty_smt.generate_non_inclusion_proof(out_id_key).unwrap();
@@ -2151,13 +2204,14 @@ mod tests {
             &in_coins_inactive,
             &out_coins_source,
             &source_account.public_key,
+            ZERO_HASH,
         )
         .expect("prove source Init");
 
         // 2. Consumer prev: Initial with all-inactive in/out-coins.
         //    Goes against empty history (same bootstrap pattern as
         //    source).
-        let prev_proof = prove_initial(circuit, consumer_account_state, ZERO_HASH)
+        let prev_proof = prove_initial(circuit, consumer_account_state, ZERO_HASH, ZERO_HASH)
             .expect("prove consumer prev Init");
 
         // 3. Source's commitment SMT.
@@ -2309,7 +2363,7 @@ mod tests {
         let mut post_source = source_account.clone();
         post_source.balance -= out_amount;
         let interim_asth = post_source.hash();
-        let coin_id = crate::types::calculate_coin_identifier(interim_asth, 0);
+        let coin_id = crate::types::calculate_coin_identifier(interim_asth, ZERO_HASH, 0);
 
         // 3. Build the source's out-coin NIP in the empty SMT.
         let out_id_key = digest_to_bytes(&coin_id);
@@ -2332,6 +2386,7 @@ mod tests {
             &in_coins,
             &out_coins,
             &source_account.public_key,
+            ZERO_HASH,
         )
         .expect("prove source Init");
 
@@ -2421,7 +2476,8 @@ mod tests {
         assert_ne!(account_state.owner, *MINTING_ADDRESS);
 
         let history_root = hash_bytes(b"history@5c+-init");
-        let proof = prove_initial(&circuit, &account_state, history_root).expect("prove initial");
+        let proof = prove_initial(&circuit, &account_state, history_root, ZERO_HASH)
+            .expect("prove initial");
         verify(&circuit, &proof).expect("verify initial");
 
         let recovered = pis_as_proof_data(&proof);
@@ -2438,7 +2494,8 @@ mod tests {
         account_state.balance = 21_000_000_000_000;
 
         let history_root = hash_bytes(b"history@5c+-mint");
-        let proof = prove_initial(&circuit, &account_state, history_root).expect("prove mint");
+        let proof =
+            prove_initial(&circuit, &account_state, history_root, ZERO_HASH).expect("prove mint");
         verify(&circuit, &proof).expect("verify mint");
     }
 
@@ -2451,7 +2508,7 @@ mod tests {
         account_state.balance = 1;
 
         let history_root = hash_bytes(b"history@5c+-illegal");
-        assert!(prove_initial(&circuit, &account_state, history_root).is_err());
+        assert!(prove_initial(&circuit, &account_state, history_root, ZERO_HASH).is_err());
     }
 
     /// Build a `CommitmentMerkleProofs` witness for an Initial → AccountUpdate
@@ -2531,7 +2588,8 @@ mod tests {
         let prev_ocr = DEFAULT_HASHES[0];
         let (cmp, history_root_extended) = build_test_commitment_witness(prev_asth, prev_ocr);
 
-        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH).expect("prove init");
+        let init_proof =
+            prove_initial(&circuit, &account_state, ZERO_HASH, ZERO_HASH).expect("prove init");
         verify(&circuit, &init_proof).expect("verify init");
 
         let update_proof = prove_account_update(
@@ -2540,6 +2598,7 @@ mod tests {
             history_root_extended,
             &init_proof,
             &cmp,
+            ZERO_HASH,
         )
         .expect("prove update");
         verify(&circuit, &update_proof).expect("verify update");
@@ -2566,7 +2625,8 @@ mod tests {
         let prev_asth = prev_state.hash();
         let (cmp, history_root_extended) =
             build_test_commitment_witness(prev_asth, DEFAULT_HASHES[0]);
-        let prev_proof = prove_initial(&circuit, &prev_state, ZERO_HASH).expect("prove prev init");
+        let prev_proof =
+            prove_initial(&circuit, &prev_state, ZERO_HASH, ZERO_HASH).expect("prove prev init");
 
         // Try to update with a DIFFERENT account_state.
         let mut next_state = prev_state.clone();
@@ -2576,7 +2636,8 @@ mod tests {
             &next_state,
             history_root_extended,
             &prev_proof,
-            &cmp
+            &cmp,
+            ZERO_HASH,
         )
         .is_err());
     }
@@ -2595,7 +2656,8 @@ mod tests {
         let (mut cmp, history_root_extended) =
             build_test_commitment_witness(true_asth, DEFAULT_HASHES[0]);
 
-        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH).expect("prove init");
+        let init_proof =
+            prove_initial(&circuit, &account_state, ZERO_HASH, ZERO_HASH).expect("prove init");
 
         // Mutate ONLY the witnessed commitment_account_state_hash; leave
         // the SMT (which still contains the honest commitment) intact.
@@ -2607,7 +2669,8 @@ mod tests {
             &account_state,
             history_root_extended,
             &init_proof,
-            &cmp
+            &cmp,
+            ZERO_HASH,
         )
         .is_err());
     }
@@ -2701,6 +2764,7 @@ mod tests {
             identifier: coin_identifier,
             recipient: account_state.owner,
             amount: out_amount,
+            asset_id: ZERO_HASH,
         };
         let mut final_account_state = account_state.clone();
         final_account_state.balance += coin.amount;
@@ -2727,6 +2791,7 @@ mod tests {
             &inactive_out_coins,
             &account_state.public_key,
             &sources,
+            ZERO_HASH,
         )
         .expect("prove init with active in-coin + source");
         verify(&circuit, &proof).expect("verify");
@@ -2759,6 +2824,7 @@ mod tests {
             identifier: coin_identifier,
             recipient: account_state.owner,
             amount: 0,
+            asset_id: ZERO_HASH,
         };
         let dummy_nip = dummy_non_inclusion_proof();
         let dummy_c = dummy_coin();
@@ -2768,6 +2834,7 @@ mod tests {
             &account_state,
             hash_bytes(b"history"),
             &in_coins,
+            ZERO_HASH,
         )
         .is_err());
     }
@@ -2792,6 +2859,7 @@ mod tests {
             // Lie: this coin is addressed to a different account.
             recipient: hash_bytes(b"some-other-owner"),
             amount: 1,
+            asset_id: ZERO_HASH,
         };
         let dummy_nip = dummy_non_inclusion_proof();
         let dummy_c = dummy_coin();
@@ -2801,6 +2869,7 @@ mod tests {
             &account_state,
             hash_bytes(b"history"),
             &in_coins,
+            ZERO_HASH,
         )
         .is_err());
     }
@@ -2824,6 +2893,7 @@ mod tests {
             recipient: account_state.owner,
             // u64::MAX + 1 overflows.
             amount: 1,
+            asset_id: ZERO_HASH,
         };
         let dummy_nip = dummy_non_inclusion_proof();
         let dummy_c = dummy_coin();
@@ -2833,6 +2903,7 @@ mod tests {
             &account_state,
             hash_bytes(b"history"),
             &in_coins,
+            ZERO_HASH,
         )
         .is_err());
     }
@@ -2879,7 +2950,7 @@ mod tests {
         let mut interim_account_state = account_state.clone();
         interim_account_state.balance -= out_coin_amount;
         let interim_asth = interim_account_state.hash();
-        let expected_out_id = crate::types::calculate_coin_identifier(interim_asth, 0);
+        let expected_out_id = crate::types::calculate_coin_identifier(interim_asth, ZERO_HASH, 0);
 
         // Off-circuit: non-inclusion of expected_out_id in empty SMT.
         let out_id_key = digest_to_bytes(&expected_out_id);
@@ -2905,6 +2976,7 @@ mod tests {
             &in_coins,
             &out_coins,
             &next_pubkey,
+            ZERO_HASH,
         )
         .expect("prove init with out-coin");
         verify(&circuit, &proof).expect("verify");
@@ -2951,6 +3023,7 @@ mod tests {
             &in_coins,
             &out_coins,
             &next_pubkey,
+            ZERO_HASH,
         )
         .is_err());
     }
@@ -2967,7 +3040,7 @@ mod tests {
         // Compute the expected identifier so identifier-eq passes; the
         // underflow check is what should fire.
         let interim_asth = account_state.hash();
-        let expected_out_id = crate::types::calculate_coin_identifier(interim_asth, 0);
+        let expected_out_id = crate::types::calculate_coin_identifier(interim_asth, ZERO_HASH, 0);
         let out_id_key = digest_to_bytes(&expected_out_id);
         let empty_smt = SparseMerkleTree::new();
         let nip = empty_smt.generate_non_inclusion_proof(out_id_key).unwrap();
@@ -2987,6 +3060,7 @@ mod tests {
             &in_coins,
             &out_coins,
             &next_pubkey,
+            ZERO_HASH,
         )
         .is_err());
     }
@@ -3033,6 +3107,7 @@ mod tests {
             &in_coins,
             &[], // 0 out-coin slots, expected MAX_OUT_COINS
             &account_state.public_key,
+            ZERO_HASH,
         );
     }
 
@@ -3056,6 +3131,7 @@ mod tests {
             &[], // 0 in-coin slots, expected MAX_IN_COINS
             &out_coins,
             &account_state.public_key,
+            ZERO_HASH,
         );
     }
 
@@ -3093,6 +3169,7 @@ mod tests {
             &[], // wrong: expected MAX_IN_COINS
             &out_coins,
             &account_state.public_key,
+            ZERO_HASH,
         );
     }
 
@@ -3127,6 +3204,7 @@ mod tests {
             &in_coins,
             &[], // wrong: expected MAX_OUT_COINS
             &account_state.public_key,
+            ZERO_HASH,
         );
     }
 
@@ -3167,6 +3245,7 @@ mod tests {
             &account_state,
             ZERO_HASH,
             &[], // 0 slots, expected MAX_IN_COINS = 1
+            ZERO_HASH,
         );
     }
 
@@ -3184,7 +3263,8 @@ mod tests {
         account_state.balance = 1;
         let (cmp, history_root_extended) =
             build_test_commitment_witness(account_state.hash(), DEFAULT_HASHES[0]);
-        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH).expect("prove init");
+        let init_proof =
+            prove_initial(&circuit, &account_state, ZERO_HASH, ZERO_HASH).expect("prove init");
         let _ = prove_account_update_with_in_coins(
             &circuit,
             &account_state,
@@ -3192,6 +3272,7 @@ mod tests {
             &init_proof,
             &cmp,
             &[], // 0 slots, expected MAX_IN_COINS = 1
+            ZERO_HASH,
         );
     }
 
@@ -3207,14 +3288,16 @@ mod tests {
 
         let (mut cmp, history_root_extended) =
             build_test_commitment_witness(account_state.hash(), DEFAULT_HASHES[0]);
-        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH).expect("prove init");
+        let init_proof =
+            prove_initial(&circuit, &account_state, ZERO_HASH, ZERO_HASH).expect("prove init");
         cmp.commitment_root_history_proof.path[0] = hash_bytes(b"lying-mmr-a-sib");
         assert!(prove_account_update(
             &circuit,
             &account_state,
             history_root_extended,
             &init_proof,
-            &cmp
+            &cmp,
+            ZERO_HASH,
         )
         .is_err());
     }
@@ -3230,14 +3313,16 @@ mod tests {
 
         let (mut cmp, history_root_extended) =
             build_test_commitment_witness(account_state.hash(), DEFAULT_HASHES[0]);
-        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH).expect("prove init");
+        let init_proof =
+            prove_initial(&circuit, &account_state, ZERO_HASH, ZERO_HASH).expect("prove init");
         cmp.previous_root_history_proof.1.path[0] = hash_bytes(b"lying-mmr-b-sib");
         assert!(prove_account_update(
             &circuit,
             &account_state,
             history_root_extended,
             &init_proof,
-            &cmp
+            &cmp,
+            ZERO_HASH,
         )
         .is_err());
     }
@@ -3254,14 +3339,16 @@ mod tests {
 
         let (mut cmp, history_root_extended) =
             build_test_commitment_witness(account_state.hash(), DEFAULT_HASHES[0]);
-        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH).expect("prove init");
+        let init_proof =
+            prove_initial(&circuit, &account_state, ZERO_HASH, ZERO_HASH).expect("prove init");
         cmp.commitment_root_mmr_sibling = hash_bytes(b"lying-prev-mmr-root");
         assert!(prove_account_update(
             &circuit,
             &account_state,
             history_root_extended,
             &init_proof,
-            &cmp
+            &cmp,
+            ZERO_HASH,
         )
         .is_err());
     }
@@ -3279,7 +3366,8 @@ mod tests {
 
         let (cmp, _real_history_root) =
             build_test_commitment_witness(account_state.hash(), DEFAULT_HASHES[0]);
-        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH).expect("prove init");
+        let init_proof =
+            prove_initial(&circuit, &account_state, ZERO_HASH, ZERO_HASH).expect("prove init");
         // Lie about the history_root — neither MMR proof reconstructs to it.
         let lying_history_root = hash_bytes(b"lying-history");
         assert!(prove_account_update(
@@ -3287,7 +3375,8 @@ mod tests {
             &account_state,
             lying_history_root,
             &init_proof,
-            &cmp
+            &cmp,
+            ZERO_HASH,
         )
         .is_err());
     }
@@ -3329,6 +3418,7 @@ mod tests {
             identifier: in_coin_id,
             recipient: account_state.owner,
             amount: in_coin_amount,
+            asset_id: ZERO_HASH,
         };
         let expected_coin_history_root = in_nip.insert(in_coin_id);
 
@@ -3340,7 +3430,7 @@ mod tests {
         let mut interim_account_state = account_state.clone();
         interim_account_state.balance = account_state.balance + in_coin.amount - out_coin_amount;
         let interim_asth = interim_account_state.hash();
-        let expected_out_id = crate::types::calculate_coin_identifier(interim_asth, 0);
+        let expected_out_id = crate::types::calculate_coin_identifier(interim_asth, ZERO_HASH, 0);
 
         let out_id_key = digest_to_bytes(&expected_out_id);
         let out_nip = empty_smt.generate_non_inclusion_proof(out_id_key).unwrap();
@@ -3369,6 +3459,7 @@ mod tests {
             &out_coins,
             &next_pubkey,
             &sources,
+            ZERO_HASH,
         )
         .expect("prove init combined with source");
         verify(&circuit, &proof).expect("verify");
@@ -3419,6 +3510,7 @@ mod tests {
             identifier: in_coin_id,
             recipient: account_state.owner,
             amount: in_coin_amount,
+            asset_id: ZERO_HASH,
         };
         let expected_coin_history_root = in_nip.insert(in_coin_id);
 
@@ -3427,7 +3519,7 @@ mod tests {
         let mut interim_account_state = account_state.clone();
         interim_account_state.balance = account_state.balance + in_coin.amount - out_coin_amount;
         let interim_asth = interim_account_state.hash();
-        let expected_out_id = crate::types::calculate_coin_identifier(interim_asth, 0);
+        let expected_out_id = crate::types::calculate_coin_identifier(interim_asth, ZERO_HASH, 0);
         let out_id_key = digest_to_bytes(&expected_out_id);
         let out_nip = empty_smt.generate_non_inclusion_proof(out_id_key).unwrap();
         let expected_output_coins_root = out_nip.insert(expected_out_id);
@@ -3456,6 +3548,7 @@ mod tests {
             &out_coins,
             &next_pubkey,
             &sources,
+            ZERO_HASH,
         )
         .expect("prove account_update combined with source");
         verify(&circuit, &update_proof).expect("verify update");
@@ -3502,11 +3595,13 @@ mod tests {
             identifier: coin_id,
             recipient: account_state.owner,
             amount: 1,
+            asset_id: ZERO_HASH,
         };
         let coin2 = Coin {
             identifier: coin_id,
             recipient: account_state.owner,
             amount: 1,
+            asset_id: ZERO_HASH,
         };
         let dummy_nip = dummy_non_inclusion_proof();
         let dummy_c = dummy_coin();
@@ -3522,6 +3617,7 @@ mod tests {
             &account_state,
             hash_bytes(b"history"),
             &in_coins,
+            ZERO_HASH,
         )
         .is_err());
     }
@@ -3540,7 +3636,8 @@ mod tests {
         let (mut cmp, history_root_extended) =
             build_test_commitment_witness(true_asth, DEFAULT_HASHES[0]);
 
-        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH).expect("prove init");
+        let init_proof =
+            prove_initial(&circuit, &account_state, ZERO_HASH, ZERO_HASH).expect("prove init");
 
         // Tamper a sibling deep in the SMT path — the computed
         // commitment_root will differ from the witnessed one.
@@ -3551,7 +3648,8 @@ mod tests {
             &account_state,
             history_root_extended,
             &init_proof,
-            &cmp
+            &cmp,
+            ZERO_HASH,
         )
         .is_err());
     }
@@ -3596,6 +3694,7 @@ mod tests {
             identifier: in_coin_id,
             recipient: account_state.owner,
             amount: in_coin_amount,
+            asset_id: ZERO_HASH,
         };
 
         let dummy_nip = dummy_non_inclusion_proof();
@@ -3620,6 +3719,7 @@ mod tests {
             &inactive_out_coins,
             &account_state.public_key,
             &sources,
+            ZERO_HASH,
         )
         .is_err());
     }
@@ -3652,6 +3752,7 @@ mod tests {
             identifier: in_coin_id,
             recipient: account_state.owner,
             amount: in_coin_amount,
+            asset_id: ZERO_HASH,
         };
 
         let dummy_nip = dummy_non_inclusion_proof();
@@ -3676,6 +3777,7 @@ mod tests {
             &inactive_out_coins,
             &account_state.public_key,
             &sources,
+            ZERO_HASH,
         )
         .is_err());
     }
@@ -3729,6 +3831,10 @@ mod tests {
         pw.set_bool_target(circuit.condition, false).unwrap();
         set_account_state_witness(&mut pw, &circuit, &account_state);
         pw.set_hash_target(circuit.history_root, ZERO_HASH).unwrap();
+        for i in 0..4 {
+            pw.set_target(circuit.proof_data_pis[16 + i], ZERO_HASH.elements[i])
+                .unwrap();
+        }
         set_cmp_witness(&mut pw, &circuit, &dummy_cmp());
 
         let dummy_nip = dummy_non_inclusion_proof();

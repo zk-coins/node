@@ -42,10 +42,11 @@ use utoipa_swagger_ui::Config;
 use crate::db::{InscriptionKind, InscriptionSummary};
 use crate::job_store::JobStatus;
 use crate::router::{
-    BalanceResponse, Capabilities, CommitRequest, HistoryErrorResponse, HistoryItem,
-    HistoryResponse, InfoResponse, JobErrorResponse, JobStatusResponse, LnurlErrorResponse,
-    MintRequest, PublisherHealthErrorResponse, PublisherHealthResponse, ReadyResponse,
-    RootEndpoints, RootResponse, SendCoinRequest, SendCoinResponse, UsernameResponse,
+    BalanceResponse, BitcoinNetwork, Capabilities, CommitRequest, HistoryErrorResponse,
+    HistoryItem, HistoryResponse, InfoResponse, JobErrorResponse, JobStatusResponse,
+    LnurlErrorResponse, MintRequest, PublisherHealthErrorResponse, PublisherHealthResponse,
+    ReadyResponse, RootEndpoints, RootResponse, SendCoinRequest, SendCoinResponse, TxDetail,
+    UsernameResponse,
 };
 
 #[cfg(feature = "address-list")]
@@ -114,6 +115,7 @@ pub const DOCS_HTML: &str = concat!(
         crate::router::info_handler,
         crate::router::get_balance_handler,
         crate::router::get_history_handler,
+        crate::router::get_history_item_handler,
         crate::router::jobs_mint_handler,
         crate::router::jobs_send_handler,
         crate::router::jobs_commit_handler,
@@ -132,11 +134,13 @@ pub const DOCS_HTML: &str = concat!(
         PublisherHealthResponse,
         PublisherHealthErrorResponse,
         InfoResponse,
+        BitcoinNetwork,
         Capabilities,
         BalanceResponse,
         HistoryResponse,
         HistoryItem,
         HistoryErrorResponse,
+        TxDetail,
         SendCoinRequest,
         SendCoinResponse,
         MintRequest,

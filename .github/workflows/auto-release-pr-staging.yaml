@@ -8,6 +8,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  issues: write  # required by `gh label create`
 
 concurrency:
   group: auto-release-pr-staging
@@ -48,12 +49,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           COMMIT_COUNT: ${{ steps.check-diff.outputs.commit_count }}
         run: |
-          # Promote PRs intentionally do NOT apply the `ci:full` label.
-          # The heavy M3 Ultra test + coverage gate stays reserved for
-          # the develop → main Release PR (auto-release-pr.yaml), which
-          # remains the authoritative pre-PRD gate. Promote PRs run the
-          # slim `Lint & Build` job + Analyze / CodeQL, mirroring what
-          # every ready feature PR sees.
           printf '%s\n' \
             "## Automatic Promote PR" \
             "" \
@@ -64,14 +59,29 @@ jobs:
             "- [ ] Merge to promote staging to develop (deploys to DEV)" \
             > /tmp/pr-body.md
 
+          # `ci:full` opts the PR into the heavy M3 Ultra test +
+          # coverage gate (see ci.yaml). Promotions to `develop` deploy
+          # to DEV, so we want every promotion validated against the
+          # full gate (DB + prover + 100% coverage) rather than only
+          # the develop → main Release PR — apply the label on creation
+          # rather than relying on a human to remember the click.
+          # Mirrors auto-release-pr.yaml (develop → main).
+          gh label create ci:full \
+            --color FFA500 \
+            --description "Run heavy M3 Ultra test + coverage jobs on this PR" \
+            2>/dev/null || true
+
           # Created as DRAFT so the operator's `gh pr ready` is the
           # explicit gate that fires a `ready_for_review` event and
           # triggers ci.yaml — PRs opened via GITHUB_TOKEN would
           # otherwise hit GitHub's anti-recursion policy and skip
-          # downstream workflows entirely.
+          # downstream workflows entirely. The `ci:full` label is still
+          # applied at creation so the heavy gate runs as soon as the
+          # PR is marked ready.
           gh pr create \
             --draft \
             --base develop \
             --head staging \
             --title "Promote: staging -> develop" \
+            --label ci:full \
             --body-file /tmp/pr-body.md

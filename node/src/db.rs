@@ -75,7 +75,7 @@ impl InscriptionKind {
 ///
 /// Retries the inner connect + migrate pair up to
 /// `CONNECT_AND_MIGRATE_MAX_ATTEMPTS` times for transient host-level
-/// failures. The shared m3-ultra CI runner (dfx01) sits next to ~20
+/// failures. The shared m3-ultra CI runner sits next to ~20
 /// production containers and is sometimes hit by manual
 /// `cargo nextest` runs from operators; under that load the kernel /
 /// Colima vNIC has surfaced two transient failure modes:
@@ -866,6 +866,156 @@ pub async fn upsert_account(pool: &PgPool, address: &[u8], data: &[u8]) -> Resul
     Ok(())
 }
 
+// ---- Circuit-digest self-heal (issue: self-healing circuit digest) --------
+
+/// Load the persisted circuit digest blob, or `None` on a fresh
+/// database / a database last written by a build that predates the
+/// `circuit_digest_meta` table.
+///
+/// The blob is the bincode encoding of the active circuit's
+/// `verifier_only.circuit_digest` (a `HashOut<F>`), written by
+/// [`reset_proof_dependent_state_tx`] / [`store_circuit_digest`]. The
+/// boot path compares it byte-for-byte against the live circuit's
+/// digest to decide whether the persisted proofs are still
+/// circuit-compatible — see `crate::self_heal::reset_decision`.
+pub async fn load_circuit_digest(pool: &PgPool) -> Result<Option<Vec<u8>>, sqlx::Error> {
+    let row: Option<(Vec<u8>,)> =
+        sqlx::query_as("SELECT digest FROM circuit_digest_meta WHERE id = 1")
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(digest,)| digest))
+}
+
+/// Upsert the singleton circuit-digest row WITHOUT touching any other
+/// state.
+///
+/// Used on the "digest matches (or first boot on an otherwise-empty
+/// DB)" path: there is nothing to heal, we only record / refresh the
+/// digest so the next boot has a baseline to compare against. The
+/// "digest mismatch" path goes through [`reset_proof_dependent_state_tx`]
+/// instead, which wipes the proof-dependent state and stores the new
+/// digest in the same transaction.
+pub async fn store_circuit_digest(pool: &PgPool, digest: &[u8]) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO circuit_digest_meta (id, digest, updated_at) \
+         VALUES (1, $1, NOW()) \
+         ON CONFLICT (id) DO UPDATE \
+         SET digest = EXCLUDED.digest, updated_at = EXCLUDED.updated_at",
+    )
+    .bind(digest)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Delete the singleton circuit-digest row, WITHOUT touching any other
+/// state.
+///
+/// Used by the runtime prover-health watchdog: when the job dispatcher
+/// observes [`crate::prover_health::PROVE_FAILURE_THRESHOLD`] consecutive
+/// `prove failed` outcomes it clears the persisted digest to *arm* the
+/// boot self-heal. Removing the row makes the next boot's
+/// [`load_circuit_digest`] return `None`, which routes
+/// `heal_circuit_digest` through the canary-recursion branch instead of
+/// the steady-state `Keep` fast path — the restart then authoritatively
+/// re-checks whether the persisted proofs still recurse and resets to
+/// genesis IFF the canary says `Stale` (`Compatible` / `NoSample` just
+/// re-record the baseline: no reset, no data loss). Clearing the digest
+/// never wipes proof state itself; the destructive reset stays gated
+/// behind the canary. Idempotent: deleting an absent row is a no-op.
+pub async fn clear_circuit_digest(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM circuit_digest_meta WHERE id = 1")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Reset all proof-dependent state to genesis and store the new circuit
+/// digest, atomically, in a single transaction.
+///
+/// Invoked from the boot path when the live circuit's digest does not
+/// match the persisted one (a breaking circuit change). Because a
+/// circuit change invalidates EVERY proof in the system at once — each
+/// `account.proof`, every queued `CoinProof` source proof, every
+/// recipient-held proof — and the global SMT/MMR are append-only and
+/// shared across all accounts (they cannot be partially unwound per
+/// account without leaving a global-vs-account mismatch), the only
+/// provably-consistent recovery is a full reset to genesis. This is
+/// exactly the documented `reset-zkcoins-node` tabula rasa, permitted
+/// in the closed test env (CONTRIBUTING § "Closed test environment").
+///
+/// Tables wiped (the proof-dependent state-layer set, mirroring the
+/// DEV-recovery `TRUNCATE` in CONTRIBUTING § "DEV state recovery",
+/// minus `minting_meta` which migration 0005 dropped):
+///
+/// * `accounts`      — per-address ledger (carries the stale `proof`).
+/// * `smt_state`     — global commitment Sparse Merkle Tree.
+/// * `mmr_state`     — global Merkle Mountain Range of SMT roots.
+/// * `mmr_root_index`— `prev_mmr_root → (smt_root, leaf_index)` map.
+/// * `latest_block`  — scanner resume cursor (re-derived from the tip).
+///
+/// `_sqlx_migrations` is intentionally left untouched so
+/// `connect_and_migrate` skips re-applying the schema. The append-only
+/// log/audit tables (`account_history`, `state_update_log`, …) are NOT
+/// wiped — they are historical evidence, do not feed proof
+/// construction, and stop being appended to until the next user
+/// round-trip re-populates `accounts`.
+///
+/// `usernames` is deliberately PRESERVED (not in the DELETE set above):
+/// a `name → address` mapping is a human-facing handle, not
+/// proof-dependent state — it does not feed proof construction and
+/// survives a genesis reset so a user keeps their handle even though
+/// their balance/proof are wiped. (The address it points at simply has
+/// no `accounts` row until the next round-trip re-creates one.)
+///
+/// `coin_proof_store` (migration 0008) is deliberately NOT in the DELETE
+/// set either, but for a different reason: it is unused schema
+/// groundwork. Migration 0008 only CREATEs the table as a persisted view
+/// of the in-memory `ProofStore`; the bootstrap that would populate it is
+/// an explicit follow-up (see the migration 0008 comment), so there is no
+/// production INSERT today and nothing to wipe. MIGRATION_RESEARCH: if the
+/// DB-backed `ProofStore` bootstrap later lands and starts persisting
+/// proof bytes here, `coin_proof_store` becomes proof-dependent state and
+/// MUST be added to this DELETE set (its rows reference proof ids that a
+/// genesis reset invalidates).
+///
+/// The on-disk per-proof file store (`PROOFS_DIR`) is dropped by the
+/// caller (see `crate::self_heal::reset_proof_store_dir`) — it lives
+/// outside Postgres so it cannot ride this transaction, but the
+/// proof_id space resets cleanly because the files are content-
+/// addressed by id and no surviving row references them.
+pub async fn reset_proof_dependent_state_tx(
+    pool: &PgPool,
+    new_digest: &[u8],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM accounts")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM smt_state")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM mmr_state")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM mmr_root_index")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM latest_block")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO circuit_digest_meta (id, digest, updated_at) \
+         VALUES (1, $1, NOW()) \
+         ON CONFLICT (id) DO UPDATE \
+         SET digest = EXCLUDED.digest, updated_at = EXCLUDED.updated_at",
+    )
+    .bind(new_digest)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
+}
+
 // ---- Username persistence (PR-A3) -----------------------------------------
 
 /// Load every `(name, address)` pair from the `usernames` table.
@@ -1394,6 +1544,65 @@ pub struct AccountHistoryRow {
     /// `commit_broadcast`, `reveal_broadcast`, `complete`, `failed`).
     /// `None` while `commit_txid` is `None`.
     pub pending_status: Option<String>,
+    /// `pending_inscriptions.commit_output_value` for the matching
+    /// commit — the on-chain value (sats) locked in the commit output,
+    /// if a publisher inscription row exists. `None` for the list
+    /// (`list_account_history` does not select it to keep the page query
+    /// lean); populated only by [`get_account_history_item`], which the
+    /// transaction-detail endpoint uses.
+    pub commit_output_value: Option<i64>,
+}
+
+/// Fetch a single user-facing `account_history` row by its `id`, scoped
+/// to `address` so a caller can only read rows for an address it already
+/// knows (the same scoping `/api/history` applies to the list). Returns
+/// `Ok(None)` when no row matches `(id, address)` *or* the row's source
+/// is internal (`scanner` / `recovery`) — the detail endpoint treats
+/// both as "not found" so internal mutations stay unexposed.
+///
+/// Unlike [`list_account_history`] this also selects
+/// `pending_inscriptions.commit_output_value` (the detail endpoint
+/// surfaces it; the list does not).
+pub async fn get_account_history_item(
+    pool: &PgPool,
+    address: &[u8],
+    id: i64,
+) -> sqlx::Result<Option<AccountHistoryRow>> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT ah.id, \
+                EXTRACT(EPOCH FROM ah.changed_at)::BIGINT AS ts_secs, \
+                ah.source, ah.prev_data, ah.new_data, \
+                ah.triggering_commit_txid, \
+                oi.block_height, \
+                pi.status AS pending_status, \
+                pi.commit_output_value \
+         FROM account_history ah \
+         LEFT JOIN observed_inscriptions oi \
+             ON oi.commit_txid = ah.triggering_commit_txid \
+         LEFT JOIN pending_inscriptions pi \
+             ON pi.commit_txid = ah.triggering_commit_txid \
+         WHERE ah.id = $1 \
+           AND ah.address = $2 \
+           AND ah.source IN ('mint','send','receive') \
+         LIMIT 1",
+    )
+    .bind(id)
+    .bind(address)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|r| AccountHistoryRow {
+        id: r.get("id"),
+        timestamp_secs: r.get("ts_secs"),
+        source: r.get("source"),
+        prev_data: r.get("prev_data"),
+        new_data: r.get("new_data"),
+        commit_txid: r.get("triggering_commit_txid"),
+        block_height: r.get("block_height"),
+        pending_status: r.get("pending_status"),
+        commit_output_value: r.get("commit_output_value"),
+    }))
 }
 
 /// Fetch the `limit` most recent user-facing `account_history` rows for
@@ -1501,6 +1710,9 @@ pub async fn list_account_history(
                 commit_txid: r.get("triggering_commit_txid"),
                 block_height: r.get("block_height"),
                 pending_status: r.get("pending_status"),
+                // The list query omits commit_output_value to stay lean;
+                // only the detail endpoint surfaces it.
+                commit_output_value: None,
             })
         })
         .collect();

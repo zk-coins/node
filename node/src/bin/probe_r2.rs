@@ -23,7 +23,7 @@
 //!
 //! Run **locally** on the Mac Studio M3 Ultra (96 GB) — that is the
 //! reference machine ROADMAP step 9 budgets against. Do NOT run this
-//! on the dfx01 self-hosted CI runner: a single warm sweep dominates
+//! on the self-hosted CI runner: a single warm sweep dominates
 //! the m3-ultra runner slot for 5+ minutes and starves PR jobs.
 //!
 //! ```sh
@@ -416,7 +416,11 @@ fn run() -> Result<(), String> {
     eprintln!("[probe_r2] proving initial (cold) ...");
     let t = Instant::now();
     let init_proof = prover
-        .prove_initial(&account_state, ZERO_HASH)
+        .prove_initial(
+            &account_state,
+            ZERO_HASH,
+            *zkcoins_program::types::NATIVE_ASSET_ID,
+        )
         .map_err(|e| format!("prove_initial: {e}"))?;
     let prove_cold_wall_ms = t.elapsed().as_millis() as i64;
     eprintln!("[probe_r2] prove_cold_wall_ms = {prove_cold_wall_ms}");
@@ -442,7 +446,13 @@ fn run() -> Result<(), String> {
         eprintln!("[probe_r2] warm prove {} / {} ...", i + 1, args.warm_calls);
         let t = Instant::now();
         let update_proof = prover
-            .prove_account_update(&account_state, history_root_extended, &init_proof, &cmp)
+            .prove_account_update(
+                &account_state,
+                history_root_extended,
+                &init_proof,
+                &cmp,
+                *zkcoins_program::types::NATIVE_ASSET_ID,
+            )
             .map_err(|e| format!("warm prove_account_update #{i}: {e}"))?;
         let ms = t.elapsed().as_millis() as i64;
         prove_warm_wall_ms.push(ms);

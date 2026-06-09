@@ -80,6 +80,7 @@ fn spec_lists_every_always_on_route() {
         "/api/info",
         "/api/balance",
         "/api/history",
+        "/api/history/{id}",
         "/api/jobs/mint",
         "/api/jobs/send",
         "/api/jobs/{job_id}",
@@ -131,7 +132,12 @@ fn spec_registers_critical_schemas() {
     // page contract (issue #153). The wallet's transaction list reads
     // this shape directly; a missing schema here means a wallet build
     // would have no compile-time check against drift.
-    for name in ["HistoryResponse", "HistoryItem", "HistoryErrorResponse"] {
+    for name in [
+        "HistoryResponse",
+        "HistoryItem",
+        "HistoryErrorResponse",
+        "TxDetail",
+    ] {
         assert!(
             schemas.contains_key(name),
             "`{name}` must be registered under components.schemas — \
@@ -166,6 +172,32 @@ fn info_response_carries_username_domain() {
         properties.contains_key("username_domain"),
         "`InfoResponse` is missing the `username_domain` property — \
          did someone drop the field from the Rust struct?"
+    );
+}
+
+#[test]
+fn info_response_carries_typed_bitcoin_network() {
+    // Drift guard for the typed `bitcoin_network` enum: the wallet/SDK
+    // switch behaviour on the lowercase `mainnet`/`mutinynet` identifier
+    // rather than the free-text `network` label, so the property must
+    // exist and the `BitcoinNetwork` schema must be registered.
+    let v = parse_spec();
+    let properties = v["components"]["schemas"]["InfoResponse"]["properties"]
+        .as_object()
+        .expect("`InfoResponse.properties` must be a JSON object");
+    assert!(
+        properties.contains_key("bitcoin_network"),
+        "`InfoResponse` is missing the `bitcoin_network` property — \
+         did someone drop the field from the Rust struct?"
+    );
+
+    let schemas = v["components"]["schemas"]
+        .as_object()
+        .expect("`components.schemas` must be a JSON object");
+    assert!(
+        schemas.contains_key("BitcoinNetwork"),
+        "`BitcoinNetwork` must be registered under components.schemas — \
+         clients depend on the typed network enum"
     );
 }
 

@@ -73,6 +73,9 @@ async fn connect_and_migrate_creates_all_tables() {
     //     filter — included at the correct alphabetic position below.)
     //   * After 0014 (jobs):             23 tables + 1 view (#161
     //     introduces the async Job-API state table.)
+    //   * After 0015 (circuit digest):   24 tables + 1 view (the
+    //     circuit-digest self-heal singleton — sorts between
+    //     `boot_log` and `coin_proof_store`.)
     assert_eq!(
         names,
         vec![
@@ -81,6 +84,7 @@ async fn connect_and_migrate_creates_all_tables() {
             "accounts".to_string(),
             "block_log".to_string(),
             "boot_log".to_string(),
+            "circuit_digest_meta".to_string(),
             "coin_proof_store".to_string(),
             "error_log".to_string(),
             "esplora_log".to_string(),
@@ -291,6 +295,90 @@ async fn upsert_account_inserts_then_updates() {
     upsert_account(&pool, &addr, b"second").await.unwrap();
     let rows = load_all_accounts(&pool).await.unwrap();
     assert_eq!(rows, vec![(addr, b"second".to_vec())]);
+}
+
+// ---- Circuit-digest self-heal -------------------------------------------
+
+#[tokio::test]
+async fn load_circuit_digest_returns_none_initially() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    assert_eq!(load_circuit_digest(&pool).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn store_circuit_digest_inserts_then_updates_on_conflict() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    store_circuit_digest(&pool, b"first-digest").await.unwrap();
+    assert_eq!(
+        load_circuit_digest(&pool).await.unwrap(),
+        Some(b"first-digest".to_vec())
+    );
+    // Second call hits the `ON CONFLICT (id) DO UPDATE` arm.
+    store_circuit_digest(&pool, b"second-digest").await.unwrap();
+    assert_eq!(
+        load_circuit_digest(&pool).await.unwrap(),
+        Some(b"second-digest".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn reset_proof_dependent_state_tx_wipes_state_and_stores_digest() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+
+    // Seed every table the reset touches.
+    upsert_account(&pool, &[9u8; 32], b"acct").await.unwrap();
+    let prev_root = zkcoins_program::hash::digest_from_bytes(&[0x11u8; 32]);
+    let smt_root = zkcoins_program::hash::digest_from_bytes(&[0x22u8; 32]);
+    persist_state_tx(
+        &pool,
+        b"smt",
+        b"mmr",
+        &[0xCCu8; 32],
+        Some((&prev_root, &smt_root, 5)),
+    )
+    .await
+    .unwrap();
+    store_circuit_digest(&pool, b"OLD").await.unwrap();
+
+    // Sanity: everything present before the reset.
+    assert_eq!(load_all_accounts(&pool).await.unwrap().len(), 1);
+    assert!(load_smt(&pool).await.unwrap().is_some());
+    assert!(load_mmr(&pool).await.unwrap().is_some());
+    assert!(load_latest_block(&pool).await.unwrap().is_some());
+    assert_eq!(load_root_indices(&pool).await.unwrap().len(), 1);
+
+    reset_proof_dependent_state_tx(&pool, b"NEW").await.unwrap();
+
+    // All proof-dependent state gone, new digest stored, atomically.
+    assert!(load_all_accounts(&pool).await.unwrap().is_empty());
+    assert_eq!(load_smt(&pool).await.unwrap(), None);
+    assert_eq!(load_mmr(&pool).await.unwrap(), None);
+    assert_eq!(load_latest_block(&pool).await.unwrap(), None);
+    assert!(load_root_indices(&pool).await.unwrap().is_empty());
+    assert_eq!(
+        load_circuit_digest(&pool).await.unwrap(),
+        Some(b"NEW".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn reset_proof_dependent_state_tx_overwrites_existing_digest_row() {
+    // The reset's digest INSERT must hit the ON CONFLICT update arm when
+    // a digest row already exists (the common case: a build was running
+    // before, so a row is present).
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    store_circuit_digest(&pool, b"PREEXISTING").await.unwrap();
+    reset_proof_dependent_state_tx(&pool, b"AFTER-RESET")
+        .await
+        .unwrap();
+    assert_eq!(
+        load_circuit_digest(&pool).await.unwrap(),
+        Some(b"AFTER-RESET".to_vec())
+    );
 }
 
 #[tokio::test]
@@ -1447,4 +1535,96 @@ async fn list_account_history_filters_scanner_and_recovery_in_sql() {
             .all(|s| matches!(*s, "mint" | "send" | "receive")),
         "no scanner / recovery rows leak past the SQL filter"
     );
+}
+
+// ---- get_account_history_item (tx-detail endpoint) -------------------------
+
+#[tokio::test]
+async fn get_account_history_item_fetches_scoped_row_with_inscription_join() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let address = [0x1au8; 32];
+    let commit_txid = [0x77u8; 32];
+
+    // Plant an account_history row that carries a commit_txid, plus the
+    // matching pending_inscriptions row (commit_output_value = 12_345 via
+    // `seed_pending_row`) so the detail-only join column lights up.
+    let mut a = crate::account_node::Account::new();
+    a.balance = 9_000;
+    let new_data = bincode::serialize(&a).expect("serialize account");
+    let (id,): (i64,) = sqlx::query_as(
+        "INSERT INTO account_history \
+         (address, prev_data, new_data, source, triggering_commit_txid) \
+         VALUES ($1, NULL, $2, 'mint', $3) RETURNING id",
+    )
+    .bind(&address[..])
+    .bind(&new_data)
+    .bind(&commit_txid[..])
+    .fetch_one(&pool)
+    .await
+    .expect("insert history row");
+    seed_pending_row(&pool, &commit_txid, PENDING_STATUS_REVEAL_BROADCAST).await;
+
+    let row = get_account_history_item(&pool, &address[..], id)
+        .await
+        .expect("query ok")
+        .expect("row found");
+    assert_eq!(row.id, id);
+    assert_eq!(row.source, "mint");
+    assert_eq!(row.commit_txid.as_deref(), Some(&commit_txid[..]));
+    assert_eq!(
+        row.commit_output_value,
+        Some(12_345),
+        "detail query surfaces pending_inscriptions.commit_output_value"
+    );
+    assert_eq!(row.pending_status.as_deref(), Some("reveal_broadcast"));
+    let decoded: crate::account_node::Account =
+        bincode::deserialize(&row.new_data).expect("decode Account");
+    assert_eq!(decoded.balance, 9_000);
+}
+
+#[tokio::test]
+async fn get_account_history_item_scopes_by_address_and_filters_internal() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let address = [0x2bu8; 32];
+    let other = [0x3cu8; 32];
+
+    plant_history_row(&pool, &address[..], "mint", 100, 10).await;
+    plant_history_row(&pool, &address[..], "scanner", 110, 5).await;
+    let (rows, _) = list_account_history(&pool, &address[..], 10, 0)
+        .await
+        .unwrap();
+    let mint_id = rows[0].id;
+
+    // Fetch with the right address — found.
+    assert!(get_account_history_item(&pool, &address[..], mint_id)
+        .await
+        .unwrap()
+        .is_some());
+    // Same id, different address — scoped out (IDOR guard).
+    assert!(get_account_history_item(&pool, &other[..], mint_id)
+        .await
+        .unwrap()
+        .is_none());
+    // Unknown id — None.
+    assert!(
+        get_account_history_item(&pool, &address[..], mint_id + 9_999)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // The scanner row exists in the table but is internal — fetch its id
+    // directly and assert the item query refuses to surface it.
+    let (scanner_id,): (i64,) =
+        sqlx::query_as("SELECT id FROM account_history WHERE address = $1 AND source = 'scanner'")
+            .bind(&address[..])
+            .fetch_one(&pool)
+            .await
+            .expect("scanner row id");
+    assert!(get_account_history_item(&pool, &address[..], scanner_id)
+        .await
+        .unwrap()
+        .is_none());
 }

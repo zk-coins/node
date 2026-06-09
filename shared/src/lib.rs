@@ -26,11 +26,25 @@ pub type Address = HashDigest;
 pub struct Invoice {
     pub amount: Amount,
     pub recipient: Address,
+    #[serde(default = "default_native_asset_id")]
+    pub asset_id: zkcoins_program::hash::HashDigest,
+}
+
+fn default_native_asset_id() -> zkcoins_program::hash::HashDigest {
+    *zkcoins_program::types::NATIVE_ASSET_ID
 }
 
 impl Invoice {
-    pub fn new(amount: Amount, recipient: HashDigest) -> Self {
-        Invoice { amount, recipient }
+    pub fn new(
+        amount: Amount,
+        recipient: HashDigest,
+        asset_id: zkcoins_program::hash::HashDigest,
+    ) -> Self {
+        Invoice {
+            amount,
+            recipient,
+            asset_id,
+        }
     }
 }
 

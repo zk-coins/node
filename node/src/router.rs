@@ -149,6 +149,15 @@ pub struct AppState {
     /// listener binds, so container restart loops keyed on liveness
     /// are not triggered during the ~21 s warmup window.
     pub(crate) prover_warm: Arc<AtomicBool>,
+    /// Runtime prover-health signal: the count of consecutive
+    /// `prove failed` job outcomes (reset by the first success), updated
+    /// by the job dispatcher. Unlike `prover_warm` (a one-shot boot
+    /// flag), this reflects whether real mint/send proves are actually
+    /// succeeding. Consumed by `/health/ready` so a systemically failing
+    /// prover is reported as `prover: failing` + 503 instead of the
+    /// misleading `prover: ready`; the dispatcher also uses the same
+    /// threshold to arm the boot self-heal. See [`crate::prover_health`].
+    pub(crate) prover_health: Arc<crate::prover_health::ProverHealth>,
     /// Persistent state-layer wrapper around the `jobs` table.
     /// Routes admit through `JobStore::create`; the dispatcher
     /// reads + advances rows through it; `GET /api/jobs/:id`
@@ -299,6 +308,66 @@ pub struct HistoryResponse {
 #[derive(Serialize, ToSchema)]
 pub struct HistoryErrorResponse {
     pub error: &'static str,
+}
+
+/// Per-transaction detail returned by `GET /api/history/{id}`.
+///
+/// Extends the [`HistoryItem`] list shape with everything else the node
+/// can derive for one `account_history` row **without a schema change**:
+/// the decoded account-state snapshot the mutation produced (usable
+/// balance before/after, the post-mutation send counter and commitment
+/// public key), the verifier circuit digest every proof on this node is
+/// checked against, and the on-chain commit output value when a
+/// publisher inscription exists. Fields the current schema cannot
+/// populate stay `null` — the same honesty contract as [`HistoryItem`]
+/// (`txid` / `block_height` / `commit_output_value` light up only once
+/// the publisher threads `triggering_commit_txid`).
+#[derive(Serialize, ToSchema)]
+pub struct TxDetail {
+    // --- identity / core (mirrors HistoryItem) ---
+    /// Server-internal monotonic id (`account_history.id`).
+    pub id: i64,
+    /// The queried address, echoed as lower-case hex (32 bytes, no `0x`).
+    pub address: String,
+    /// Commit-inscription txid (lower-case hex), or `null` while unlinked.
+    pub txid: Option<String>,
+    /// Unix epoch in seconds of the state change.
+    pub timestamp: i64,
+    /// `"send"`, `"receive"`, or `"mint"`.
+    pub direction: &'static str,
+    /// Absolute balance delta in sats (`|balance_after − balance_before|`).
+    pub amount: u64,
+    /// Counterparty address — always `null` in the current schema.
+    pub counterparty: Option<String>,
+    /// `"pending"`, `"confirmed"`, or `"failed"`.
+    pub status: &'static str,
+    /// Bitcoin block height of the commit, or `null` while unconfirmed.
+    pub block_height: Option<i64>,
+    /// Free-text memo — always `null` (no memo column exists).
+    pub memo: Option<String>,
+    // --- decoded account-state snapshot for this mutation ---
+    /// Usable balance (settled + queued) AFTER this mutation, in sats.
+    pub balance_after: u64,
+    /// Usable balance BEFORE this mutation; `null` for the first row of
+    /// an address (no prior state to decode).
+    pub balance_before: Option<u64>,
+    /// The account's own-send counter after this mutation — the wallet's
+    /// authoritative BIP-32 child index (see `BalanceResponse.num_sends`).
+    pub num_sends_after: u32,
+    /// The account's commitment public key after this mutation
+    /// (compressed secp256k1, 33-byte lower-case hex); `null` before the
+    /// account has ever sent (genesis / mint-only state).
+    pub commitment_public_key: Option<String>,
+    // --- proof / verification ---
+    /// The verifier circuit digest (lower-case hex) every proof on this
+    /// node is checked against — the proof-system identity. `null` only
+    /// before the node has stored its digest (pre-first-proof boot).
+    pub circuit_digest: Option<String>,
+    // --- on-chain ---
+    /// Value (sats) locked in the commit inscription's output, when a
+    /// publisher inscription row exists for this mutation; `null`
+    /// otherwise (e.g. a faucet mint before broadcast).
+    pub commit_output_value: Option<i64>,
 }
 
 /// Decode the 64-char (or 64 char + 0x prefix) hex `address` argument
@@ -490,6 +559,64 @@ pub(crate) fn history_row_to_item(row: &crate::db::AccountHistoryRow) -> Option<
     })
 }
 
+/// Decode the post-mutation `num_sends` + `commitment_public_key` out of
+/// an `accounts.data` bincode blob, for the transaction-detail endpoint.
+/// Returns `None` on a decode failure (the caller maps that to a 500 — a
+/// corrupt blob is a server fault, not a user error). Mirrors
+/// [`balance_from_account_blob`], which handles the balance half.
+pub(crate) fn account_meta_from_blob(blob: &[u8]) -> Option<(u32, Option<String>)> {
+    let a = bincode::deserialize::<crate::account_node::Account>(blob).ok()?;
+    // `commitment_public_key` is a secp256k1 `PublicKey`; serialize to its
+    // 33-byte compressed form before hex-encoding (matches the wire form
+    // the wallet derives and sends in `prev_commitment_pubkey`).
+    let cpk = a
+        .commitment_public_key
+        .as_ref()
+        .map(|pk| hex::encode(pk.serialize()));
+    Some((a.num_sends, cpk))
+}
+
+/// Build a [`TxDetail`] from one history row + the node's circuit digest.
+///
+/// Reuses [`history_row_to_item`] for the shared list fields
+/// (direction / amount / status / txid …) so the two endpoints can never
+/// disagree on the core shape, then layers on the decoded account-state
+/// snapshot. Returns `None` when the row's source is internal or any
+/// state blob fails to decode — both map to a 500 at the call site (the
+/// db query already filtered to user-facing sources, so in practice only
+/// a corrupt blob reaches the `None` arm).
+pub(crate) fn tx_detail_from_row(
+    row: &crate::db::AccountHistoryRow,
+    address_hex: String,
+    circuit_digest: Option<Vec<u8>>,
+) -> Option<TxDetail> {
+    let item = history_row_to_item(row)?;
+    let balance_after = balance_from_account_blob(&row.new_data)?;
+    let balance_before = match row.prev_data.as_deref() {
+        None => None,
+        Some(blob) => Some(balance_from_account_blob(blob)?),
+    };
+    let (num_sends_after, commitment_public_key) = account_meta_from_blob(&row.new_data)?;
+    Some(TxDetail {
+        id: item.id,
+        address: address_hex,
+        txid: item.txid,
+        timestamp: item.timestamp,
+        direction: item.direction,
+        amount: item.amount,
+        counterparty: item.counterparty,
+        status: item.status,
+        block_height: item.block_height,
+        memo: item.memo,
+        balance_after,
+        balance_before,
+        num_sends_after,
+        commitment_public_key,
+        circuit_digest: circuit_digest.map(hex::encode),
+        commit_output_value: row.commit_output_value,
+    })
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
 pub struct SendCoinRequest {
     /// Sender account address (`0x`-prefixed 32-byte hex).
@@ -515,12 +642,18 @@ pub struct SendCoinRequest {
     pub(crate) signature: Option<String>,
     /// Unix epoch seconds the signature was produced at.
     pub(crate) timestamp: Option<u64>,
+    /// Asset identifier for multi-asset sends. Defaults to the native
+    /// asset when omitted (backward-compatible with single-asset wallets).
+    #[serde(default)]
+    pub(crate) asset_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
 pub struct MintRequest {
     pub(crate) account_address: String,
     pub(crate) amount: u64,
+    #[serde(default)]
+    pub(crate) asset_id: Option<String>,
 }
 
 // `ReceiveCoinRequest` was the SP1-era POST body shape for a coin
@@ -776,9 +909,32 @@ pub struct CommitRequest {
     pub(crate) message: String,
 }
 
+/// Normalized, machine-readable Bitcoin network identifier exposed on
+/// `/api/info` as `bitcoin_network`. Serializes to the lowercase string
+/// `"mainnet"` or `"mutinynet"`.
+///
+/// This is the typed counterpart to the free-text `network` field
+/// (e.g. `"Mainnet"` / `"Mutinynet"` from `NETWORK_CONFIG.network_name`),
+/// which stays a human-readable, operator-overridable label. Clients
+/// switch behaviour on `bitcoin_network` to avoid the case-sensitivity
+/// foot-gun of matching the free-text string.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BitcoinNetwork {
+    Mainnet,
+    Mutinynet,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct InfoResponse {
+    /// Human-readable network label (e.g. `"Mainnet"` / `"Mutinynet"`),
+    /// sourced from `NETWORK_CONFIG.network_name`. Operator-overridable
+    /// and intended for display only — clients gate behaviour on
+    /// `bitcoin_network` instead.
     network: String,
+    /// Typed, lowercase network identifier derived from the node's
+    /// `is_mainnet` flag. One of `"mainnet"` or `"mutinynet"`.
+    bitcoin_network: BitcoinNetwork,
     capabilities: Capabilities,
     /// External hostname this node serves, used by the client to render
     /// `<hex|username>@<domain>`. DEV and PRD share the chain identifier
@@ -804,6 +960,7 @@ pub struct Capabilities {
     /// the response so the app does not have to sniff build flags.
     pub username_claim: bool,
     pub lnurl: bool,
+    pub multi_asset: bool,
 }
 
 // --- Username & LNURL types ---
@@ -1080,6 +1237,136 @@ pub(crate) async fn get_history_handler(
         }),
     )
         .into_response()
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/history/{id}",
+    tag = "Accounts",
+    params(
+        ("id" = i64, Path,
+            description = "Server-internal `account_history.id` of the row (from a `HistoryItem.id`)."),
+        ("address" = String, Query,
+            description = "Account address (32-byte hex, with or without `0x` prefix) the row must belong to."),
+    ),
+    responses(
+        (status = 200, description = "Full per-transaction detail.", body = TxDetail),
+        (status = 404, description = "No user-facing row with that id for the address.",
+            body = HistoryErrorResponse),
+        (status = 422, description = "Missing/malformed `address` or non-integer `id`.",
+            body = HistoryErrorResponse),
+        (status = 500, description = "Database error / undecodable state blob.",
+            body = HistoryErrorResponse),
+    ),
+)]
+/// `GET /api/history/{id}?address=<hex>` — full detail for one
+/// transaction (one `account_history` row), scoped to `address`.
+///
+/// The list endpoint (`GET /api/history`) returns the lean per-row
+/// shape; this returns [`TxDetail`] — the same core fields plus the
+/// decoded account-state snapshot (balance before/after, post-mutation
+/// `num_sends` + commitment pubkey), the verifier circuit digest, and
+/// the on-chain commit output value when present.
+///
+/// Scoping: the row must both have `id` AND belong to `address`, and its
+/// source must be user-facing (`mint`/`send`/`receive`). A mismatch (or
+/// an internal `scanner`/`recovery` row) returns 404 — a caller cannot
+/// read another address's rows or the node's internal mutations by
+/// guessing ids.
+///
+/// Validation: missing/malformed `address` → 422; a non-integer `id` →
+/// 422 (parsed from the path as a string so the contract matches the
+/// list endpoint's 422-on-bad-input rather than axum's default 400).
+pub(crate) async fn get_history_item_handler(
+    State(state): State<AppState>,
+    Path(id_raw): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    // --- validation: address (required) ---
+    let address_hex = match params.get("address") {
+        Some(s) if !s.is_empty() => s.as_str(),
+        _ => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(HistoryErrorResponse {
+                    error: "Missing required `address` query parameter",
+                }),
+            )
+                .into_response();
+        }
+    };
+    let address_bytes = match decode_history_address(address_hex) {
+        Ok(b) => b,
+        Err(msg) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(HistoryErrorResponse { error: msg }),
+            )
+                .into_response();
+        }
+    };
+    // --- validation: id (positive integer) ---
+    let id = match id_raw.parse::<i64>() {
+        Ok(n) if n > 0 => n,
+        _ => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(HistoryErrorResponse {
+                    error: "id must be a positive integer",
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // --- DB read: the scoped row ---
+    let row = match db::get_account_history_item(&state.pool, &address_bytes, id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(HistoryErrorResponse {
+                    error: "Transaction not found",
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::warn!("get_history_item_handler: row query failed: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(HistoryErrorResponse {
+                    error: "Database error while reading transaction",
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // The verifier circuit digest is node-global (single row). A read
+    // failure degrades the field to `null` rather than failing the whole
+    // detail — it is metadata, not the row itself.
+    let circuit_digest = db::load_circuit_digest(&state.pool).await.ok().flatten();
+
+    // Echo the normalised (lower-case, no `0x`) address so the wire form
+    // is canonical regardless of how the caller spelled it.
+    let address_norm = hex::encode(address_bytes);
+    match tx_detail_from_row(&row, address_norm, circuit_digest) {
+        Some(detail) => (StatusCode::OK, Json(detail)).into_response(),
+        None => {
+            tracing::warn!(
+                "get_history_item_handler: row {} for address could not be decoded",
+                id
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(HistoryErrorResponse {
+                    error: "Database error while reading transaction",
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[utoipa::path(
@@ -1589,7 +1876,13 @@ pub(crate) async fn get_job_handler(
         } else {
             None
         },
-        result: if job.status == JobStatus::Completed {
+        // `awaiting_signature` carries the ash/ocr hex the wallet must
+        // sign (persisted in `response_body` by
+        // `JobStore::set_awaiting_signature`); `completed` carries the
+        // cached terminal body. Both live in `response_body`, so the
+        // same field surfaces on either status.
+        result: if job.status == JobStatus::Completed || job.status == JobStatus::AwaitingSignature
+        {
             job.response_body.clone()
         } else {
             None
@@ -1846,7 +2139,13 @@ pub(crate) fn initial_event_from_job(job: &Job) -> Event {
         } else {
             serde_json::Value::Null
         },
-        "result": if job.status == JobStatus::Completed {
+        "result": if job.status == JobStatus::Completed
+            || job.status == JobStatus::AwaitingSignature
+        {
+            // `awaiting_signature` carries the ash/ocr hex the wallet
+            // signs; `completed` carries the terminal body. Both are in
+            // `response_body`, so the SSE initial frame mirrors the GET
+            // snapshot for either status.
             job.response_body.clone().unwrap_or(serde_json::Value::Null)
         } else {
             serde_json::Value::Null
@@ -2229,10 +2528,15 @@ pub struct ReadyResponse {
     /// `ready: bool` so a parsing consumer can branch on a short
     /// string without re-deriving it from the bool + failures shape.
     status: &'static str,
-    /// Background-warmup tag. `"warming"` while
-    /// `AppState::prover_warm == false`, `"ready"` afterwards.
-    /// Emitted on every response (regardless of overall readiness) so
-    /// a deploy dashboard can show the warmup progress separately
+    /// Prover health tag. `"warming"` while
+    /// `AppState::prover_warm == false` (one-shot boot warmup), `"ready"`
+    /// once warm and proving normally, and `"failing"` once the
+    /// dispatcher has seen `prover_health::PROVE_FAILURE_THRESHOLD`
+    /// consecutive `prove failed` job outcomes (a systemically failing
+    /// prover — e.g. digest-unchanged proof staleness). `"failing"` and
+    /// `"warming"` both also add `"prover"` to `failures` and force the
+    /// overall 503. Emitted on every response (regardless of overall
+    /// readiness) so a deploy dashboard can show prover health separately
     /// from the DB/Esplora probes.
     prover: &'static str,
 }
@@ -2246,7 +2550,8 @@ pub struct ReadyResponse {
             prover warm. `failures` is empty, `status = \"ready\"`, `prover = \"ready\"`.",
             body = ReadyResponse),
         (status = 503, description = "Node is not ready. `failures` carries one or more of \
-            `\"db\"`, `\"esplora\"`, `\"prover\"`. Load balancers / Kuma monitors gate traffic \
+            `\"db\"`, `\"esplora\"`, `\"prover\"` (`prover` covers both `\"warming\"` and the \
+            systemic-failure `\"failing\"` states). Load balancers / Kuma monitors gate traffic \
             on this status.",
             body = ReadyResponse),
     ),
@@ -2266,9 +2571,9 @@ pub struct ReadyResponse {
 /// re-using the configured `ESPLORA_URL`) and returns 503 if either
 /// fails. A load balancer / uptime monitor uses this to decide
 /// "should traffic flow?" without using it to decide "should this
-/// process die?". The Kuma monitor at
-/// <https://kuma.dfxserve.com> watches `api.zkcoins.app/health/ready`
-/// on a 60 s interval — separate alert from the liveness check.
+/// process die?". An external uptime monitor (Uptime-Kuma) watches
+/// `api.zkcoins.app/health/ready` on a 60 s interval — separate alert
+/// from the liveness check.
 ///
 /// No caching: each call issues a fresh DB round-trip plus an Esplora
 /// HEAD-equivalent. Both are sub-100 ms in steady state, and a cached
@@ -2293,7 +2598,16 @@ pub(crate) async fn ready_handler(State(state): State<AppState>) -> impl IntoRes
     // the previous-gen pod by treating this readiness probe as the
     // gate, not the liveness probe.
     let prover_warm = state.prover_warm.load(Ordering::SeqCst);
-    if !prover_warm {
+    // Runtime prove-health gate. Unlike the one-shot warmup flag above,
+    // this reflects whether real mint/send proves are succeeding: the
+    // dispatcher counts consecutive `prove failed` outcomes and this
+    // trips at the `prover_health::PROVE_FAILURE_THRESHOLD`. Without it
+    // a node whose persisted proofs went stale (the digest-unchanged
+    // class — see `self_heal.rs`) kept reporting `prover: ready` while
+    // failing 100% of jobs, so neither the deploy smoke-test nor
+    // monitoring could see the outage.
+    let prover_failing = state.prover_health.is_failing();
+    if !prover_warm || prover_failing {
         failures.push("prover");
     }
 
@@ -2304,7 +2618,13 @@ pub(crate) async fn ready_handler(State(state): State<AppState>) -> impl IntoRes
         StatusCode::SERVICE_UNAVAILABLE
     };
     let lifecycle_status = if ready { "ready" } else { "starting" };
-    let prover_status = if prover_warm { "ready" } else { "warming" };
+    let prover_status = if prover_failing {
+        "failing"
+    } else if prover_warm {
+        "ready"
+    } else {
+        "warming"
+    };
     (
         status,
         Json(ReadyResponse {
@@ -2430,6 +2750,18 @@ pub(crate) async fn health_handler() -> &'static str {
     "ok"
 }
 
+/// Map the node's mainnet flag to the normalized, lowercase
+/// `bitcoin_network` enum exposed in `/api/info`. Pure so both arms are
+/// unit-testable without touching the env-derived `NETWORK_CONFIG`
+/// global.
+fn bitcoin_network_label(is_mainnet: bool) -> BitcoinNetwork {
+    if is_mainnet {
+        BitcoinNetwork::Mainnet
+    } else {
+        BitcoinNetwork::Mutinynet
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/api/info",
@@ -2443,10 +2775,12 @@ pub(crate) async fn health_handler() -> &'static str {
 pub(crate) async fn info_handler() -> impl IntoResponse {
     Json(InfoResponse {
         network: NETWORK_CONFIG.network_name.clone(),
+        bitcoin_network: bitcoin_network_label(NETWORK_CONFIG.is_mainnet),
         capabilities: Capabilities {
             address_list: cfg!(feature = "address-list"),
             username_claim: cfg!(feature = "username-claim"),
             lnurl: cfg!(feature = "lnurl"),
+            multi_asset: false,
         },
         username_domain: USERNAME_DOMAIN.clone(),
     })
@@ -2941,7 +3275,14 @@ pub(crate) fn create_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods([Method::GET, Method::POST])
-        .allow_headers([header::CONTENT_TYPE]);
+        // `Idempotency-Key` is required by the jobs-API admit handlers
+        // (`POST /api/jobs/{mint,send}`). A browser sending it triggers a
+        // CORS preflight; without the header here the preflight fails and the
+        // web frontend cannot mint or send.
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::HeaderName::from_static("idempotency-key"),
+        ]);
 
     // MVP routes — always compiled in.
     let app = Router::new()
@@ -2952,6 +3293,9 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/api/info", get(info_handler))
         .route("/api/balance", get(get_balance_handler))
         .route("/api/history", get(get_history_handler))
+        // axum 0.7 path-param syntax (`:id`); the OpenAPI annotation uses
+        // the spec's `{id}` form — both name the same segment.
+        .route("/api/history/:id", get(get_history_item_handler))
         .route("/api/receive", post(receive_coin_handler))
         .route("/api/proof/:id", get(get_proof_handler))
         // Job-API routes — the only path through which a wallet
