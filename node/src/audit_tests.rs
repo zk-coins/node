@@ -20,8 +20,6 @@ use tower::ServiceExt;
 use crate::publisher::EsploraConfig;
 use crate::router::{AppState, ProofStore};
 use crate::test_db::{setup_pool, SchemaScope};
-use bitcoin::bip32::Xpriv;
-use bitcoin::Network;
 use std::sync::{Arc, Mutex};
 
 /// Cover the binary-header branch of `headers_to_json`: a header value
@@ -126,11 +124,6 @@ async fn build_state_with_pool() -> (AppState, SchemaScope) {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
 
-    // Minting account: any deterministic Xpriv works; the audit
-    // middleware never reads it.
-    let xpriv = Xpriv::new_master(Network::Signet, &[0xAB; 32]).expect("xpriv");
-    let minting_account = shared::ClientAccount::new(xpriv);
-
     let state_arc = Arc::new(Mutex::new(crate::state::State::new()));
     let account_node = crate::account_node::AccountNode::new(state_arc);
     let esplora_config = EsploraConfig {
@@ -147,7 +140,7 @@ async fn build_state_with_pool() -> (AppState, SchemaScope) {
     let state = AppState {
         account_node: Arc::new(Mutex::new(account_node)),
         proof_store: Arc::new(ProofStore::new(&proof_dir)),
-        minting_account: Arc::new(Mutex::new(minting_account)),
+        mint_store: Arc::new(crate::router::MintStore::new()),
         username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
         pool: pool_arc.clone(),
         esplora_config: Arc::new(esplora_config),
@@ -210,6 +203,7 @@ async fn audit_middleware_persists_request_response_pair() {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 
+    #[allow(clippy::type_complexity)]
     let (
         method,
         path,

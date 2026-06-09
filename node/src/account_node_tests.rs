@@ -13,10 +13,41 @@ use shared::{commitment::Commitment, ProofData};
 use zkcoins_program::hash::{
     digest_from_bytes, digest_to_bytes, hash_bytes, hash_concat, ZERO_HASH,
 };
-use zkcoins_program::types::MINTING_ADDRESS;
 
 lazy_static! {
     static ref SECP256K1_TEST_CTX: Secp256k1<All> = Secp256k1::new();
+}
+
+/// A deterministic, non-zero asset_id used across these prover-driven
+/// fixtures now that there is no privileged native asset. Every test
+/// account holds this single asset; send/receive route by it.
+/// The asset every funded-sender fixture in this file mints and moves:
+/// the asset DERIVED from the fixture creator key
+/// (`TestAccountData::new_minting_account()`'s index-0 pubkey) with
+/// name "TestCoin" / 8 decimals. Under the neutral model an asset_id is
+/// not an arbitrary digest — it must equal
+/// `calculate_asset_id(creator_pubkey, H(name), decimals)` for the
+/// issuer gate to admit the mint that brings the balance into
+/// existence. Deriving the shared test asset from the same key
+/// [`mint_funded_asset`] mints with keeps every existing
+/// invoice/assertion in this file consistent with the real provenance.
+fn test_asset_id() -> AssetId {
+    let secret = include_bytes!("../minting_secret.bin");
+    let xpriv = Xpriv::new_master(Network::Bitcoin, secret)
+        .expect("Failed to create private key for test asset derivation.");
+    let pk0 = generate_test_public_key(&xpriv, 0).serialize();
+    zkcoins_program::types::calculate_asset_id_from_name(&pk0, "TestCoin", 8)
+}
+
+/// Build an `Account` pre-seeded with `balance` of [`test_asset_id`].
+/// Replaces the old centrally-minted account fixtures: under the
+/// neutral model an account is just an `(owner, asset_id)` ledger, so a
+/// test that needs a funded sender imports one of these directly
+/// (the funds' provenance is irrelevant to the send-path under test).
+fn seeded_account(balance: u64) -> Account {
+    let mut a = Account::new_for_asset(test_asset_id());
+    a.balance = balance;
+    a
 }
 
 fn generate_test_public_key(private_key: &Xpriv, index: u32) -> BitcoinPublicKey {
@@ -40,14 +71,22 @@ struct TestAccountData {
 }
 
 impl TestAccountData {
+    /// A funded source account fixture. Under the neutral model there
+    /// is no privileged minting account — this is just a generic
+    /// account whose address is derived (like any wallet) from its
+    /// first child pubkey. Tests that previously relied on the
+    /// "minting account" semantics now treat it as an ordinary funded
+    /// sender of [`test_asset_id`].
     fn new_minting_account() -> Self {
         let secret = include_bytes!("../minting_secret.bin");
         let xpriv = Xpriv::new_master(Network::Bitcoin, secret)
-            .expect("Failed to create private key for minting account.");
+            .expect("Failed to create private key for source account.");
+        let initial_pk_bytes = generate_test_public_key(&xpriv, 0).serialize().to_vec();
+        let address = hash_bytes(&initial_pk_bytes);
 
         TestAccountData {
             xpriv,
-            address: *MINTING_ADDRESS,
+            address,
             num_pubkeys: 0,
         }
     }
@@ -115,47 +154,146 @@ impl TestAccountData {
     }
 }
 
+/// Fund `acct`'s own `(owner, derived_asset_id)` account by running a
+/// REAL issuer mint — the only legitimate way to bring a non-zero
+/// balance into existence under the neutral model. A directly-seeded
+/// `Account { balance, proof: None }` has no circuit provenance, so the
+/// first `send`'s `prove_initial` (no in-coins, no `MintWitness`)
+/// rejects it; minting produces a valid `account.proof` so the send
+/// chains an AccountUpdate instead.
+///
+/// Drives the same prove → commit → state-advance → apply sequence as
+/// `flow::{mint_flow, mint_commit_flow}`: builds the issuer-mint proof
+/// (`prepare_mint`), signs the commitment with the creator key
+/// (index 0 — the commit leg binds `commitment.public_key ==
+/// creator_pubkey` off-circuit), advances the global SMT/MMR,
+/// and installs the funded account (`commit_mint`). Bumps
+/// `acct.num_pubkeys` to 1 (the mint consumed the index-0 creator key
+/// as the commitment key and rotated `next_public_key` to index 1, so
+/// the next `execute_send_coins` derives index 1). Returns the
+/// DERIVED `asset_id` — callers must use it for that account's invoices
+/// and assertions (it is not `test_asset_id()`).
+fn mint_funded_asset(
+    node: &mut AccountNode,
+    state_arc: &Arc<Mutex<State>>,
+    acct: &mut TestAccountData,
+    name: &str,
+    decimals: u8,
+    amount: u64,
+) -> AssetId {
+    // `prepare_mint` re-derives owner/asset_id from the 33-byte
+    // compressed bytes; `commit_mint` records the secp `PublicKey`
+    // object as the account's commitment key. Keep both forms.
+    let creator_pk_obj = generate_test_public_key(&acct.xpriv, 0);
+    let creator_pk = creator_pk_obj.serialize();
+    // The mint rotates to a fresh wallet key (index 1) so the creator's
+    // first follow-up send commits under a fresh map key.
+    let next_pk = generate_test_public_key(&acct.xpriv, 1).serialize();
+    let prepared = node
+        .prepare_mint(&creator_pk, name, decimals, amount, &next_pk)
+        .expect("prepare_mint should succeed for a fresh issuer account");
+
+    // Re-derive the hashes the creator signs (same path the commit leg
+    // re-derives), build the creator-signed commitment, and advance the
+    // global state with it before installing the account.
+    let pis: [zkcoins_program::F; zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] =
+        prepared.proof.public_inputs[..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
+            .try_into()
+            .expect("mint proof public_inputs too short");
+    let pd = ProofData::from_field_elements(&pis);
+    let commitment_hash_input = hash_concat(&pd.account_state_hash, &pd.output_coins_root);
+    let secret = derive_test_secret_key(&acct.xpriv, 0);
+    let commitment = Commitment::new(&secret, digest_to_bytes(&commitment_hash_input).to_vec())
+        .expect("mint commitment");
+    state_arc
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .update(std::slice::from_ref(&commitment))
+        .expect("state.update for mint commitment");
+
+    let asset_id = prepared.asset_id;
+    node.commit_mint(prepared.owner, prepared.mutated_account, creator_pk_obj);
+    // The mint consumed index 0 as the commitment key and rotated
+    // `next_public_key` to index 1, so the next `execute_send_coins` on
+    // this account derives index 1.
+    acct.num_pubkeys = 1;
+    asset_id
+}
+
+/// A second issuer mint into the SAME `(owner, asset_id)` account is
+/// explicitly rejected: `prepare_mint`'s AccountUpdate branch does not
+/// thread a `MintWitness` through the current circuit API, so it
+/// refuses rather than silently proving a non-mint update the issuer
+/// gate would not authorise. Covers the `Some(account_proof)` arm of
+/// `prepare_mint` (the happy `None` arm is covered by every
+/// [`mint_funded_asset`] caller).
+#[test]
+fn prepare_mint_rejects_remint_into_existing_asset_account() {
+    let state_arc = Arc::new(Mutex::new(State::new()));
+    let mut node = AccountNode::new(Arc::clone(&state_arc));
+
+    let mut minting = TestAccountData::new_minting_account();
+    mint_funded_asset(&mut node, &state_arc, &mut minting, "TestCoin", 8, 10_000);
+
+    let creator_pk = generate_test_public_key(&minting.xpriv, 0).serialize();
+    let next_pk = generate_test_public_key(&minting.xpriv, 1).serialize();
+    let result = node.prepare_mint(&creator_pk, "TestCoin", 8, 5_000, &next_pk);
+    assert_eq!(
+        result.err(),
+        Some("Re-mint into an existing asset account is not supported"),
+    );
+}
+
+/// `zero_asset_id` is the serde default for `Account.asset_id` on blobs
+/// persisted before the multi-asset migration. No such blob exists in
+/// the closed test environment (so the default never fires through
+/// deserialization), but the gate measures the helper — pin its
+/// contract directly.
+#[test]
+fn zero_asset_id_default_is_zero_hash() {
+    assert_eq!(zero_asset_id(), ZERO_HASH);
+}
+
 #[test]
 fn test_wallet_operations() {
     let state_arc = Arc::new(Mutex::new(State::new()));
     let mut node = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting_account_data = TestAccountData::new_minting_account();
-    node.import_account(
-        minting_account_data.address,
-        Account {
-            proof: None,
-            coin_queue: vec![],
-            coin_history: SparseMerkleTree::new(),
-            balance: 10_000,
-            num_sends: 0,
-            commitment_public_key: None,
-        },
+    mint_funded_asset(
+        &mut node,
+        &state_arc,
+        &mut minting_account_data,
+        "TestCoin",
+        8,
+        10_000,
     );
+    // The funded source account is now an ordinary (owner, asset_id)
+    // ledger — there is no privileged minting address to assert.
     assert_eq!(
-        *MINTING_ADDRESS,
-        node.get_minting_account_address().unwrap(),
-        "Minting address in node and program are different"
+        node.get_account_balance(&minting_account_data.address, &test_asset_id())
+            .unwrap(),
+        10_000
     );
 
     let mut account_1_data = TestAccountData::new_generic(&[1u8; 32], Network::Signet);
     let mut account_2_data = TestAccountData::new_generic(&[2u8; 32], Network::Signet);
 
-    assert_eq!(node.get_account_balance(&MINTING_ADDRESS).unwrap(), 10_000);
-    assert!(node.get_account_balance(&account_1_data.address).is_err());
-    assert!(node.get_account_balance(&account_2_data.address).is_err());
+    assert_eq!(
+        node.get_account_balance(&minting_account_data.address, &test_asset_id())
+            .unwrap(),
+        10_000
+    );
+    assert!(node
+        .get_account_balance(&account_1_data.address, &test_asset_id())
+        .is_err());
+    assert!(node
+        .get_account_balance(&account_2_data.address, &test_asset_id())
+        .is_err());
 
     // Note: Invoices use addresses.
-    let account_2_invoice = Invoice::new(
-        100,
-        account_2_data.address,
-        *zkcoins_program::types::NATIVE_ASSET_ID,
-    );
-    let account_1_invoice = Invoice::new(
-        100,
-        account_1_data.address,
-        *zkcoins_program::types::NATIVE_ASSET_ID,
-    );
+    let account_2_invoice = Invoice::new(100, account_2_data.address, test_asset_id());
+    let account_1_invoice = Invoice::new(100, account_1_data.address, test_asset_id());
 
     let mut coin_proofs = minting_account_data
         .execute_send_coins(&mut node, vec![account_2_invoice, account_1_invoice])
@@ -178,11 +316,13 @@ fn test_wallet_operations() {
         .expect("Unable to receive coin for account_2_invoice");
 
     assert_eq!(
-        node.get_account_balance(&account_1_data.address).unwrap(),
+        node.get_account_balance(&account_1_data.address, &test_asset_id())
+            .unwrap(),
         100
     );
     assert_eq!(
-        node.get_account_balance(&account_2_data.address).unwrap(),
+        node.get_account_balance(&account_2_data.address, &test_asset_id())
+            .unwrap(),
         100
     );
     println!("Minting successful");
@@ -203,22 +343,26 @@ fn test_wallet_operations() {
         .unwrap();
     // Balances before receiving the new coin by account_1
     assert_eq!(
-        node.get_account_balance(&account_1_data.address).unwrap(),
+        node.get_account_balance(&account_1_data.address, &test_asset_id())
+            .unwrap(),
         100
     );
     assert_eq!(
-        node.get_account_balance(&account_2_data.address).unwrap(),
+        node.get_account_balance(&account_2_data.address, &test_asset_id())
+            .unwrap(),
         0
     ); // account_2's balance reduced after send
 
     node.receive_coin(coin_proofs_from_acc2.pop().unwrap())
         .expect("Unable to receive coin by account_1 from account_2");
     assert_eq!(
-        node.get_account_balance(&account_1_data.address).unwrap(),
+        node.get_account_balance(&account_1_data.address, &test_asset_id())
+            .unwrap(),
         200
     );
     assert_eq!(
-        node.get_account_balance(&account_2_data.address).unwrap(),
+        node.get_account_balance(&account_2_data.address, &test_asset_id())
+            .unwrap(),
         0
     );
 
@@ -243,39 +387,32 @@ fn test_wallet_operations() {
     node.receive_coin(coin_proofs_from_acc1.pop().unwrap())
         .expect("Unable to receive coin by account_2 from account_1");
     assert_eq!(
-        node.get_account_balance(&account_1_data.address).unwrap(),
+        node.get_account_balance(&account_1_data.address, &test_asset_id())
+            .unwrap(),
         100
     ); // 200 - 100
     assert_eq!(
-        node.get_account_balance(&account_2_data.address).unwrap(),
+        node.get_account_balance(&account_2_data.address, &test_asset_id())
+            .unwrap(),
         100
     ); // 0 + 100
 }
 
 #[test]
-fn test_create_minting_account() {
+fn test_import_funded_account() {
+    // Neutral model: importing a funded `(owner, asset_id)` account is
+    // just an ordinary ledger insert — there is no privileged minting
+    // account to bootstrap. Verifies import + per-asset balance lookup.
     let state_arc = Arc::new(Mutex::new(State::new()));
     let mut node = AccountNode::new(state_arc);
 
-    let minting_account_data = TestAccountData::new_minting_account();
-
-    node.import_account(
-        minting_account_data.address, // This is MINTING_ADDRESS
-        Account {
-            proof: None,
-            coin_queue: vec![],
-            coin_history: SparseMerkleTree::new(),
-            balance: 10_000,
-            num_sends: 0,
-            commitment_public_key: None,
-        },
-    );
+    let account_data = TestAccountData::new_minting_account();
+    node.import_account(account_data.address, seeded_account(10_000));
     assert_eq!(
-        node.get_minting_account_address().unwrap(),
-        *MINTING_ADDRESS,
-        "Minting address is not stored in node correctly."
+        node.get_account_balance(&account_data.address, &test_asset_id())
+            .unwrap(),
+        10_000
     );
-    assert_eq!(node.get_account_balance(&MINTING_ADDRESS).unwrap(), 10_000);
 }
 
 #[test]
@@ -284,24 +421,17 @@ fn test_mint_single_invoice() {
     let mut node = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting_account_data = TestAccountData::new_minting_account();
-    node.import_account(
-        minting_account_data.address,
-        Account {
-            proof: None,
-            coin_queue: vec![],
-            coin_history: SparseMerkleTree::new(),
-            balance: 10_000,
-            num_sends: 0,
-            commitment_public_key: None,
-        },
+    mint_funded_asset(
+        &mut node,
+        &state_arc,
+        &mut minting_account_data,
+        "TestCoin",
+        8,
+        10_000,
     );
 
     let account_1_data = TestAccountData::new_generic(&[1u8; 32], Network::Signet);
-    let invoice = Invoice::new(
-        100,
-        account_1_data.address,
-        *zkcoins_program::types::NATIVE_ASSET_ID,
-    );
+    let invoice = Invoice::new(100, account_1_data.address, test_asset_id());
 
     let coin_proofs = minting_account_data
         .execute_send_coins(&mut node, vec![invoice])
@@ -316,24 +446,17 @@ fn test_receive_duplicate_coin_rejected() {
     let mut node = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting_account_data = TestAccountData::new_minting_account();
-    node.import_account(
-        minting_account_data.address,
-        Account {
-            proof: None,
-            coin_queue: vec![],
-            coin_history: SparseMerkleTree::new(),
-            balance: 10_000,
-            num_sends: 0,
-            commitment_public_key: None,
-        },
+    mint_funded_asset(
+        &mut node,
+        &state_arc,
+        &mut minting_account_data,
+        "TestCoin",
+        8,
+        10_000,
     );
 
     let account_1_data = TestAccountData::new_generic(&[1u8; 32], Network::Signet);
-    let invoice = Invoice::new(
-        100,
-        account_1_data.address,
-        *zkcoins_program::types::NATIVE_ASSET_ID,
-    );
+    let invoice = Invoice::new(100, account_1_data.address, test_asset_id());
 
     let coin_proofs = minting_account_data
         .execute_send_coins(&mut node, vec![invoice])
@@ -368,28 +491,22 @@ fn test_receive_updates_balance() {
     let mut node = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting_account_data = TestAccountData::new_minting_account();
-    node.import_account(
-        minting_account_data.address,
-        Account {
-            proof: None,
-            coin_queue: vec![],
-            coin_history: SparseMerkleTree::new(),
-            balance: 10_000,
-            num_sends: 0,
-            commitment_public_key: None,
-        },
+    mint_funded_asset(
+        &mut node,
+        &state_arc,
+        &mut minting_account_data,
+        "TestCoin",
+        8,
+        10_000,
     );
 
     let account_1_data = TestAccountData::new_generic(&[1u8; 32], Network::Signet);
-    let invoice = Invoice::new(
-        250,
-        account_1_data.address,
-        *zkcoins_program::types::NATIVE_ASSET_ID,
-    );
+    let invoice = Invoice::new(250, account_1_data.address, test_asset_id());
 
     // Balance should not exist before any receive
     assert!(
-        node.get_account_balance(&account_1_data.address).is_err(),
+        node.get_account_balance(&account_1_data.address, &test_asset_id())
+            .is_err(),
         "Account should not exist before receiving coins"
     );
 
@@ -414,7 +531,7 @@ fn test_receive_updates_balance() {
 
     // Balance should reflect the received coin amount
     let balance = node
-        .get_account_balance(&account_1_data.address)
+        .get_account_balance(&account_1_data.address, &test_asset_id())
         .expect("Account should exist after receive");
     assert_eq!(
         balance, 250,
@@ -430,20 +547,17 @@ fn test_mint_repro_live_setup() {
     let mut node = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting_account_data = TestAccountData::new_minting_account();
-    node.import_account(
-        minting_account_data.address,
-        Account {
-            proof: None,
-            coin_queue: vec![],
-            coin_history: SparseMerkleTree::new(),
-            balance: 1_000_000,
-            num_sends: 0,
-            commitment_public_key: None,
-        },
+    mint_funded_asset(
+        &mut node,
+        &state_arc,
+        &mut minting_account_data,
+        "TestCoin",
+        8,
+        1_000_000,
     );
 
     let recipient: Address = digest_from_bytes(&[1u8; 32]);
-    let invoice = Invoice::new(1, recipient, *zkcoins_program::types::NATIVE_ASSET_ID);
+    let invoice = Invoice::new(1, recipient, test_asset_id());
 
     let coin_proofs = minting_account_data
         .execute_send_coins(&mut node, vec![invoice])
@@ -467,23 +581,25 @@ async fn test_persist_and_load_from_pg_roundtrip() {
     let mut node = AccountNode::new(Arc::clone(&state_arc));
 
     let address: HashDigest = digest_from_bytes(&[42u8; 32]);
-    let mut acct = Account::new();
+    let asset_id = test_asset_id();
+    let mut acct = Account::new_for_asset(asset_id);
     acct.balance = 11;
     node.import_account(address, acct);
 
     // Snapshot + upsert mirrors the handler-site pattern.
-    let account_snapshot = node.get_account(&address).cloned_via_bincode();
+    let account_snapshot = node.get_account(&address, &asset_id).cloned_via_bincode();
     crate::account_node::persist_account(&pool, &address, &account_snapshot)
         .await
         .expect("persist_account ok");
 
-    // Rebuild from PG and verify the row came back. The prover is
-    // injected (built once by the bootstrap in production) — see
+    // Rebuild from PG and verify the row came back (keyed by the
+    // 64-byte (owner, asset_id) composite). The prover is injected
+    // (built once by the bootstrap in production) — see
     // `AccountNode::load_from_pg`.
     let loaded = AccountNode::load_from_pg(state_arc, &pool, Prover::new())
         .await
         .expect("load_from_pg ok");
-    assert_eq!(loaded.get_account_balance(&address).unwrap(), 11);
+    assert_eq!(loaded.get_account_balance(&address, &asset_id).unwrap(), 11);
 }
 
 /// `Account` does not implement `Clone` (its inner Plonky2 proof types
@@ -504,10 +620,13 @@ impl CloneViaBincode for Option<&Account> {
 }
 
 #[test]
-fn test_get_minting_account_address_returns_err_when_not_imported() {
+fn test_assets_for_owner_empty_when_not_imported() {
+    // Neutral model: there is no minting account to look up. An
+    // unobserved owner simply holds no assets.
     let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut node = AccountNode::new(state_arc);
-    assert!(node.get_minting_account_address().is_err());
+    let node = AccountNode::new(state_arc);
+    let unknown: Address = digest_from_bytes(&[7u8; 32]);
+    assert!(node.assets_for_owner(&unknown).is_empty());
 }
 
 #[test]
@@ -515,7 +634,9 @@ fn test_get_account_balance_returns_err_for_unknown_address() {
     let state_arc = Arc::new(Mutex::new(State::new()));
     let node = AccountNode::new(state_arc);
     let unknown: Address = digest_from_bytes(&[7u8; 32]);
-    assert!(node.get_account_balance(&unknown).is_err());
+    assert!(node
+        .get_account_balance(&unknown, &test_asset_id())
+        .is_err());
 }
 
 /// PR-A3 replacement for the previous `test_load_from_file_rejects_corrupted_bytes`:
@@ -529,7 +650,9 @@ async fn test_load_from_pg_rejects_corrupted_blob() {
     let scope = crate::test_db::setup_pool().await;
     let pool = scope.pool.clone();
 
-    let bad_addr = vec![0xAAu8; 32];
+    // 64-byte composite (owner||asset_id) key so the row passes the
+    // length guard and the loader reaches the bincode-deserialize step.
+    let bad_addr = vec![0xAAu8; 64];
     sqlx::query("INSERT INTO accounts (address, data) VALUES ($1, $2)")
         .bind(&bad_addr)
         .bind(b"not bincode".to_vec())
@@ -554,7 +677,8 @@ async fn test_load_from_pg_rejects_corrupted_blob() {
 }
 
 /// PR-A3 negative test: plant a row whose `address` column is not the
-/// expected 32 bytes and assert the loader surfaces the mismatch as
+/// expected 64 bytes (composite `owner(32) || asset_id(32)` key) and
+/// assert the loader surfaces the mismatch as
 /// `LoadAccountNodeError::BadAddressLength`.
 #[tokio::test]
 async fn test_load_from_pg_rejects_wrong_address_length() {
@@ -610,7 +734,7 @@ fn test_send_coins_returns_err_for_unknown_account() {
     let account_data = TestAccountData::new_generic(&[1u8; 32], Network::Bitcoin);
 
     let recipient: Address = digest_from_bytes(&[2u8; 32]);
-    let invoice = Invoice::new(1, recipient, *zkcoins_program::types::NATIVE_ASSET_ID);
+    let invoice = Invoice::new(1, recipient, test_asset_id());
 
     let current_pk = generate_test_public_key(&account_data.xpriv, 0);
     let next_pk = generate_test_public_key(&account_data.xpriv, 1);
@@ -630,10 +754,19 @@ fn test_send_coins_returns_err_insufficient_funds() {
     let state_arc = Arc::new(Mutex::new(State::new()));
     let mut node = AccountNode::new(state_arc);
     let account_data = TestAccountData::new_generic(&[1u8; 32], Network::Bitcoin);
-    node.import_account(account_data.address, Account::new());
+    // Key the empty account under the SAME asset the invoice moves —
+    // accounts are per-(owner, asset_id) (Model B), so an account
+    // imported under `ZERO_HASH` would miss the lookup and surface
+    // "Unknown account address" instead of the funds check under test.
+    // The insufficient-funds guard fires before any prove, so no mint
+    // provenance is needed here.
+    node.import_account(
+        account_data.address,
+        Account::new_for_asset(test_asset_id()),
+    );
 
     let recipient: Address = digest_from_bytes(&[2u8; 32]);
-    let invoice = Invoice::new(100, recipient, *zkcoins_program::types::NATIVE_ASSET_ID);
+    let invoice = Invoice::new(100, recipient, test_asset_id());
 
     let current_pk = generate_test_public_key(&account_data.xpriv, 0);
     let next_pk = generate_test_public_key(&account_data.xpriv, 1);
@@ -654,20 +787,17 @@ fn test_receive_coin_rejects_invalid_inclusion_proof() {
     let mut node = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting_account_data = TestAccountData::new_minting_account();
-    node.import_account(
-        minting_account_data.address,
-        Account {
-            proof: None,
-            coin_queue: vec![],
-            coin_history: SparseMerkleTree::new(),
-            balance: 10_000,
-            num_sends: 0,
-            commitment_public_key: None,
-        },
+    mint_funded_asset(
+        &mut node,
+        &state_arc,
+        &mut minting_account_data,
+        "TestCoin",
+        8,
+        10_000,
     );
 
     let recipient: Address = digest_from_bytes(&[1u8; 32]);
-    let invoice = Invoice::new(100, recipient, *zkcoins_program::types::NATIVE_ASSET_ID);
+    let invoice = Invoice::new(100, recipient, test_asset_id());
 
     let mut coin_proofs = minting_account_data
         .execute_send_coins(&mut node, vec![invoice])
@@ -691,29 +821,20 @@ fn test_send_coins_twice_from_same_account_uses_update_account() {
     let mut node = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting = TestAccountData::new_minting_account();
-    node.import_account(
-        minting.address,
-        Account {
-            proof: None,
-            coin_queue: vec![],
-            coin_history: SparseMerkleTree::new(),
-            balance: 10_000,
-            num_sends: 0,
-            commitment_public_key: None,
-        },
-    );
+    mint_funded_asset(&mut node, &state_arc, &mut minting, "TestCoin", 8, 10_000);
 
     let recipient: Address = digest_from_bytes(&[42u8; 32]);
 
-    // First send: account.proof is None -> create_account branch.
+    // The issuer mint already set `account.proof = Some` (and bumped
+    // num_sends to 1), so BOTH of the following sends take the
+    // AccountUpdate branch — the neutral model has no balance-without-a-
+    // proof state for the create branch to fund a settled-balance send
+    // from. (The send create/prove_initial branch is covered via the
+    // receive-then-send flow in `test_wallet_operations`.)
     let coin_proofs_1 = minting
         .execute_send_coins(
             &mut node,
-            vec![Invoice::new(
-                100,
-                recipient,
-                *zkcoins_program::types::NATIVE_ASSET_ID,
-            )],
+            vec![Invoice::new(100, recipient, test_asset_id())],
         )
         .expect("first send should succeed");
     state_arc
@@ -727,37 +848,33 @@ fn test_send_coins_twice_from_same_account_uses_update_account() {
         )
         .unwrap();
 
-    // After the first send, account.proof = Some. A second send from the
-    // same account must therefore take the AccountUpdateProof branch
-    // (update_account, not create_account).
+    // A second send from the same account also takes the
+    // AccountUpdateProof branch (update_account).
     let coin_proofs_2 = minting
         .execute_send_coins(
             &mut node,
-            vec![Invoice::new(
-                50,
-                recipient,
-                *zkcoins_program::types::NATIVE_ASSET_ID,
-            )],
+            vec![Invoice::new(50, recipient, test_asset_id())],
         )
         .expect("second send should succeed (update_account path)");
     assert_eq!(coin_proofs_2.len(), 1);
 
-    // Invariant check: after two sends the three coupled fields are
-    // all "updated" — `proof = Some`, `num_sends = 2`, and
+    // Invariant check: after the mint + two sends the three coupled
+    // fields are all "updated" — `proof = Some`, `num_sends = 3` (one
+    // bump per successful mint/send), and
     // `commitment_public_key = Some(pubkey_used_in_send_2)`. The
     // AccountUpdate branch reads this last value (not a caller
     // parameter) on the NEXT send, so its presence here is the
     // load-bearing post-condition.
     let acct = node
-        .get_account(&minting.address)
+        .get_account(&minting.address, &test_asset_id())
         .expect("minting account still in map after send");
     assert!(
         acct.proof.is_some(),
         "account.proof must be Some after send"
     );
     assert_eq!(
-        acct.num_sends, 2,
-        "num_sends bumps once per successful send_coins_inner"
+        acct.num_sends, 3,
+        "num_sends bumps once per successful mint + send_coins_inner"
     );
     let expected_cpk =
         generate_test_public_key(&minting.xpriv, minting.num_pubkeys.saturating_sub(1));
@@ -787,17 +904,7 @@ fn test_send_coins_second_send_succeeds_without_prev_commitment_pubkey() {
     let mut node = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting = TestAccountData::new_minting_account();
-    node.import_account(
-        minting.address,
-        Account {
-            proof: None,
-            coin_queue: vec![],
-            coin_history: SparseMerkleTree::new(),
-            balance: 10_000,
-            num_sends: 0,
-            commitment_public_key: None,
-        },
-    );
+    mint_funded_asset(&mut node, &state_arc, &mut minting, "TestCoin", 8, 10_000);
 
     let recipient: Address = digest_from_bytes(&[43u8; 32]);
 
@@ -808,11 +915,7 @@ fn test_send_coins_second_send_succeeds_without_prev_commitment_pubkey() {
     let coin_proofs_1 = minting
         .execute_send_coins(
             &mut node,
-            vec![Invoice::new(
-                100,
-                recipient,
-                *zkcoins_program::types::NATIVE_ASSET_ID,
-            )],
+            vec![Invoice::new(100, recipient, test_asset_id())],
         )
         .expect("first send should succeed");
     state_arc
@@ -835,11 +938,7 @@ fn test_send_coins_second_send_succeeds_without_prev_commitment_pubkey() {
     let next_pk = generate_test_public_key(&minting.xpriv, minting.num_pubkeys + 1);
     let coin_proofs_2 = node
         .send_coins(
-            vec![Invoice::new(
-                50,
-                recipient,
-                *zkcoins_program::types::NATIVE_ASSET_ID,
-            )],
+            vec![Invoice::new(50, recipient, test_asset_id())],
             minting.address,
             current_pk,
             next_pk,
@@ -849,9 +948,10 @@ fn test_send_coins_second_send_succeeds_without_prev_commitment_pubkey() {
     assert_eq!(coin_proofs_2.len(), 1);
 
     let acct = node
-        .get_account(&minting.address)
+        .get_account(&minting.address, &test_asset_id())
         .expect("minting account still in map after send");
-    assert_eq!(acct.num_sends, 2);
+    // mint (1) + first send (2) + second send (3).
+    assert_eq!(acct.num_sends, 3);
     assert_eq!(acct.commitment_public_key, Some(current_pk));
 }
 
@@ -861,26 +961,12 @@ fn test_receive_coin_rejects_replay_via_coin_history() {
     let mut node = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting = TestAccountData::new_minting_account();
-    node.import_account(
-        minting.address,
-        Account {
-            proof: None,
-            coin_queue: vec![],
-            coin_history: SparseMerkleTree::new(),
-            balance: 10_000,
-            num_sends: 0,
-            commitment_public_key: None,
-        },
-    );
+    mint_funded_asset(&mut node, &state_arc, &mut minting, "TestCoin", 8, 10_000);
     let recipient: Address = digest_from_bytes(&[9u8; 32]);
     let coin_proofs = minting
         .execute_send_coins(
             &mut node,
-            vec![Invoice::new(
-                50,
-                recipient,
-                *zkcoins_program::types::NATIVE_ASSET_ID,
-            )],
+            vec![Invoice::new(50, recipient, test_asset_id())],
         )
         .unwrap();
     let coin_proof = coin_proofs[0].clone();
@@ -892,7 +978,10 @@ fn test_receive_coin_rejects_replay_via_coin_history() {
     // Simulate the recipient having spent the coin: identifier goes
     // from coin_queue into coin_history.
     {
-        let recipient_account = node.accounts.get_mut(&recipient).unwrap();
+        let recipient_account = node
+            .accounts
+            .get_mut(&(recipient, test_asset_id()))
+            .unwrap();
         recipient_account
             .coin_history
             .insert(digest_to_bytes(&coin_id), coin_id)
@@ -928,17 +1017,7 @@ fn test_send_coins_rejects_tampered_source_proof_inclusion() {
     let mut node = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting = TestAccountData::new_minting_account();
-    node.import_account(
-        minting.address,
-        Account {
-            proof: None,
-            coin_queue: vec![],
-            coin_history: SparseMerkleTree::new(),
-            balance: 10_000,
-            num_sends: 0,
-            commitment_public_key: None,
-        },
-    );
+    mint_funded_asset(&mut node, &state_arc, &mut minting, "TestCoin", 8, 10_000);
 
     // Real recipient with a deterministic seed; pin the address so
     // we can reach back into `node.accounts` after `receive_coin`.
@@ -951,11 +1030,7 @@ fn test_send_coins_rejects_tampered_source_proof_inclusion() {
     let mut coin_proofs = minting
         .execute_send_coins(
             &mut node,
-            vec![Invoice::new(
-                100,
-                recipient_addr,
-                *zkcoins_program::types::NATIVE_ASSET_ID,
-            )],
+            vec![Invoice::new(100, recipient_addr, test_asset_id())],
         )
         .expect("mint send_coins");
     state_arc
@@ -980,7 +1055,7 @@ fn test_send_coins_rejects_tampered_source_proof_inclusion() {
     {
         let account = node
             .accounts
-            .get_mut(&recipient_addr)
+            .get_mut(&(recipient_addr, test_asset_id()))
             .expect("recipient account present after receive_coin");
         assert_eq!(
             account.coin_queue.len(),
@@ -998,7 +1073,7 @@ fn test_send_coins_rejects_tampered_source_proof_inclusion() {
         vec![Invoice::new(
             1,
             digest_from_bytes(&[99u8; 32]),
-            *zkcoins_program::types::NATIVE_ASSET_ID,
+            test_asset_id(),
         )],
         recipient_addr,
         current_pk,
@@ -1021,27 +1096,18 @@ fn test_send_coins_rejects_too_many_invoices() {
     use zkcoins_program::circuit::main::MAX_OUT_COINS;
     let state_arc = Arc::new(Mutex::new(State::new()));
     let mut node = AccountNode::new(Arc::clone(&state_arc));
-    let minting = TestAccountData::new_minting_account();
-    node.import_account(
-        minting.address,
-        Account {
-            proof: None,
-            coin_queue: vec![],
-            coin_history: SparseMerkleTree::new(),
-            balance: 1_000_000,
-            num_sends: 0,
-            commitment_public_key: None,
-        },
+    let mut minting = TestAccountData::new_minting_account();
+    mint_funded_asset(
+        &mut node,
+        &state_arc,
+        &mut minting,
+        "TestCoin",
+        8,
+        1_000_000,
     );
 
     let invoices: Vec<Invoice> = (0..(MAX_OUT_COINS + 1) as u8)
-        .map(|i| {
-            Invoice::new(
-                1,
-                digest_from_bytes(&[i; 32]),
-                *zkcoins_program::types::NATIVE_ASSET_ID,
-            )
-        })
+        .map(|i| Invoice::new(1, digest_from_bytes(&[i; 32]), test_asset_id()))
         .collect();
 
     let current_pk = generate_test_public_key(&minting.xpriv, minting.num_pubkeys);
@@ -1062,17 +1128,7 @@ fn test_send_coins_rejects_too_many_coins_in_queue() {
     let mut node = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting = TestAccountData::new_minting_account();
-    node.import_account(
-        minting.address,
-        Account {
-            proof: None,
-            coin_queue: vec![],
-            coin_history: SparseMerkleTree::new(),
-            balance: 10_000,
-            num_sends: 0,
-            commitment_public_key: None,
-        },
-    );
+    mint_funded_asset(&mut node, &state_arc, &mut minting, "TestCoin", 8, 10_000);
     let recipient_data = TestAccountData::new_generic(&[20u8; 32], Network::Signet);
     let recipient_addr = recipient_data.address;
 
@@ -1080,11 +1136,7 @@ fn test_send_coins_rejects_too_many_coins_in_queue() {
     let mut coin_proofs = minting
         .execute_send_coins(
             &mut node,
-            vec![Invoice::new(
-                100,
-                recipient_addr,
-                *zkcoins_program::types::NATIVE_ASSET_ID,
-            )],
+            vec![Invoice::new(100, recipient_addr, test_asset_id())],
         )
         .expect("mint send_coins");
     state_arc
@@ -1109,7 +1161,7 @@ fn test_send_coins_rejects_too_many_coins_in_queue() {
     {
         let account = node
             .accounts
-            .get_mut(&recipient_addr)
+            .get_mut(&(recipient_addr, test_asset_id()))
             .expect("recipient account present after receive_coin");
         for _ in 0..MAX_IN_COINS {
             account.coin_queue.push(cp.clone());
@@ -1126,7 +1178,7 @@ fn test_send_coins_rejects_too_many_coins_in_queue() {
         vec![Invoice::new(
             1,
             digest_from_bytes(&[99u8; 32]),
-            *zkcoins_program::types::NATIVE_ASSET_ID,
+            test_asset_id(),
         )],
         recipient_addr,
         current_pk,
@@ -1148,28 +1200,14 @@ fn test_send_coins_errors_when_state_lacks_commitment_for_in_coin() {
     let mut node = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting = TestAccountData::new_minting_account();
-    node.import_account(
-        minting.address,
-        Account {
-            proof: None,
-            coin_queue: vec![],
-            coin_history: SparseMerkleTree::new(),
-            balance: 10_000,
-            num_sends: 0,
-            commitment_public_key: None,
-        },
-    );
+    mint_funded_asset(&mut node, &state_arc, &mut minting, "TestCoin", 8, 10_000);
     let recipient_data = TestAccountData::new_generic(&[21u8; 32], Network::Signet);
     let recipient_addr = recipient_data.address;
 
     let mut coin_proofs = minting
         .execute_send_coins(
             &mut node,
-            vec![Invoice::new(
-                75,
-                recipient_addr,
-                *zkcoins_program::types::NATIVE_ASSET_ID,
-            )],
+            vec![Invoice::new(75, recipient_addr, test_asset_id())],
         )
         .expect("mint send_coins");
     // Intentionally SKIP `state_arc.update(...)` — state never sees
@@ -1184,7 +1222,7 @@ fn test_send_coins_errors_when_state_lacks_commitment_for_in_coin() {
         vec![Invoice::new(
             1,
             digest_from_bytes(&[99u8; 32]),
-            *zkcoins_program::types::NATIVE_ASSET_ID,
+            test_asset_id(),
         )],
         recipient_addr,
         current_pk,
@@ -1216,28 +1254,14 @@ fn test_send_coins_errors_when_state_lacks_commitment_for_prev_account_proof() {
     let mut node = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting = TestAccountData::new_minting_account();
-    node.import_account(
-        minting.address,
-        Account {
-            proof: None,
-            coin_queue: vec![],
-            coin_history: SparseMerkleTree::new(),
-            balance: 10_000,
-            num_sends: 0,
-            commitment_public_key: None,
-        },
-    );
+    mint_funded_asset(&mut node, &state_arc, &mut minting, "TestCoin", 8, 10_000);
     let recipient_data = TestAccountData::new_generic(&[22u8; 32], Network::Signet);
     let recipient_addr = recipient_data.address;
 
     let mut coin_proofs = minting
         .execute_send_coins(
             &mut node,
-            vec![Invoice::new(
-                50,
-                recipient_addr,
-                *zkcoins_program::types::NATIVE_ASSET_ID,
-            )],
+            vec![Invoice::new(50, recipient_addr, test_asset_id())],
         )
         .expect("mint send_coins");
     state_arc
@@ -1268,12 +1292,12 @@ fn test_send_coins_errors_when_state_lacks_commitment_for_prev_account_proof() {
     {
         let mint_account = node
             .accounts
-            .get_mut(&minting.address)
+            .get_mut(&(minting.address, test_asset_id()))
             .expect("minting account present");
         let proof = mint_account.proof.clone();
         let recipient_account = node
             .accounts
-            .get_mut(&recipient_addr)
+            .get_mut(&(recipient_addr, test_asset_id()))
             .expect("recipient account present after receive_coin");
         recipient_account.proof = proof;
         // Maintain the invariant documented on `Account`:
@@ -1299,7 +1323,7 @@ fn test_send_coins_errors_when_state_lacks_commitment_for_prev_account_proof() {
         vec![Invoice::new(
             1,
             digest_from_bytes(&[99u8; 32]),
-            *zkcoins_program::types::NATIVE_ASSET_ID,
+            test_asset_id(),
         )],
         recipient_addr,
         current_pk,
@@ -1318,26 +1342,12 @@ fn test_send_coins_rejects_coin_queue_entry_without_commitment() {
     let mut node = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting = TestAccountData::new_minting_account();
-    node.import_account(
-        minting.address,
-        Account {
-            proof: None,
-            coin_queue: vec![],
-            coin_history: SparseMerkleTree::new(),
-            balance: 10_000,
-            num_sends: 0,
-            commitment_public_key: None,
-        },
-    );
+    mint_funded_asset(&mut node, &state_arc, &mut minting, "TestCoin", 8, 10_000);
     let recipient: Address = digest_from_bytes(&[10u8; 32]);
     let coin_proofs = minting
         .execute_send_coins(
             &mut node,
-            vec![Invoice::new(
-                50,
-                recipient,
-                *zkcoins_program::types::NATIVE_ASSET_ID,
-            )],
+            vec![Invoice::new(50, recipient, test_asset_id())],
         )
         .unwrap();
     let mut coin_proof = coin_proofs[0].clone();
@@ -1357,7 +1367,7 @@ fn test_send_coins_rejects_coin_queue_entry_without_commitment() {
         vec![Invoice::new(
             1,
             digest_from_bytes(&[11u8; 32]),
-            *zkcoins_program::types::NATIVE_ASSET_ID,
+            test_asset_id(),
         )],
         recipient_data.address,
         current_pk,
@@ -1398,17 +1408,7 @@ fn test_send_coins_rejects_source_commitment_missing_from_history_mmr() {
     let mut node = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting = TestAccountData::new_minting_account();
-    node.import_account(
-        minting.address,
-        Account {
-            proof: None,
-            coin_queue: vec![],
-            coin_history: SparseMerkleTree::new(),
-            balance: 10_000,
-            num_sends: 0,
-            commitment_public_key: None,
-        },
-    );
+    mint_funded_asset(&mut node, &state_arc, &mut minting, "TestCoin", 8, 10_000);
 
     let recipient_data = TestAccountData::new_generic(&[43u8; 32], Network::Signet);
     let recipient_addr = recipient_data.address;
@@ -1416,11 +1416,7 @@ fn test_send_coins_rejects_source_commitment_missing_from_history_mmr() {
     let mut coin_proofs = minting
         .execute_send_coins(
             &mut node,
-            vec![Invoice::new(
-                100,
-                recipient_addr,
-                *zkcoins_program::types::NATIVE_ASSET_ID,
-            )],
+            vec![Invoice::new(100, recipient_addr, test_asset_id())],
         )
         .expect("mint send_coins");
     state_arc
@@ -1454,7 +1450,7 @@ fn test_send_coins_rejects_source_commitment_missing_from_history_mmr() {
         vec![Invoice::new(
             1,
             digest_from_bytes(&[99u8; 32]),
-            *zkcoins_program::types::NATIVE_ASSET_ID,
+            test_asset_id(),
         )],
         recipient_addr,
         current_pk,
@@ -1504,16 +1500,13 @@ fn history_row_to_item_balance_from_coin_queue_only() {
     let mut node = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting = TestAccountData::new_minting_account();
-    node.import_account(
-        minting.address,
-        Account {
-            proof: None,
-            coin_queue: vec![],
-            coin_history: SparseMerkleTree::new(),
-            balance: 1_000_000,
-            num_sends: 0,
-            commitment_public_key: None,
-        },
+    mint_funded_asset(
+        &mut node,
+        &state_arc,
+        &mut minting,
+        "TestCoin",
+        8,
+        1_000_000,
     );
 
     let recipient = TestAccountData::new_generic(&[42u8; 32], Network::Signet);
@@ -1530,7 +1523,7 @@ fn history_row_to_item_balance_from_coin_queue_only() {
             vec![Invoice::new(
                 MINT_AMOUNT,
                 recipient.address,
-                *zkcoins_program::types::NATIVE_ASSET_ID,
+                test_asset_id(),
             )],
         )
         .expect("mint send_coins");
@@ -1549,7 +1542,7 @@ fn history_row_to_item_balance_from_coin_queue_only() {
 
     let recipient_account = node
         .accounts
-        .get(&recipient.address)
+        .get(&(recipient.address, test_asset_id()))
         .expect("recipient account present after receive_coin");
     assert_eq!(
         recipient_account.balance, 0,
@@ -1607,26 +1600,20 @@ fn send_coins_rejects_queued_coin_with_foreign_asset() {
     let mut node = AccountNode::new(Arc::clone(&state_arc));
 
     let mut minting_account_data = TestAccountData::new_minting_account();
-    node.import_account(
-        minting_account_data.address,
-        Account {
-            proof: None,
-            coin_queue: vec![],
-            coin_history: SparseMerkleTree::new(),
-            balance: 10_000,
-            num_sends: 0,
-            commitment_public_key: None,
-        },
+    mint_funded_asset(
+        &mut node,
+        &state_arc,
+        &mut minting_account_data,
+        "TestCoin",
+        8,
+        10_000,
     );
 
-    // Mint a NATIVE coin to a fresh recipient and let them receive it,
-    // so the recipient's `coin_queue` holds exactly one NATIVE coin.
+    // Send a TestCoin coin to a fresh recipient and let them receive it,
+    // so the recipient's `(recipient, TestCoin)` account holds one
+    // TestCoin coin in its queue.
     let recipient_data = TestAccountData::new_generic(&[7u8; 32], Network::Signet);
-    let invoice = Invoice::new(
-        100,
-        recipient_data.address,
-        *zkcoins_program::types::NATIVE_ASSET_ID,
-    );
+    let invoice = Invoice::new(100, recipient_data.address, test_asset_id());
     let mut coin_proofs = minting_account_data
         .execute_send_coins(&mut node, vec![invoice])
         .expect("mint send_coins");
@@ -1640,20 +1627,34 @@ fn send_coins_rejects_queued_coin_with_foreign_asset() {
                 .collect::<Vec<_>>(),
         )
         .expect("state.update");
+    // Keep a clone of the received coin proof, but re-stamp its asset_id
+    // to a FOREIGN asset. Under Model B `receive_coin` routes a coin to
+    // its own `(recipient, asset_id)` account, so a foreign coin can
+    // never land in a TestCoin account's queue through the normal path —
+    // the queue-branch guard is defense-in-depth for a state that the
+    // routing makes unreachable. We inject it directly to drive the
+    // guard.
+    let mut foreign_cp = coin_proofs[0].clone();
+    foreign_cp.coin.asset_id = hash_bytes(b"foreign-asset");
     node.receive_coin(coin_proofs.pop().expect("one coin"))
         .expect("recipient receive_coin");
+    node.accounts
+        .get_mut(&(recipient_data.address, test_asset_id()))
+        .expect("recipient TestCoin account present after receive")
+        .coin_queue
+        .push(foreign_cp);
 
-    // Attempt to send a FOREIGN-asset invoice from the recipient.
-    // transition_asset_id = the foreign asset; the queued coin is NATIVE
-    // and therefore mismatches, so the queue-branch guard fires.
-    let foreign_asset = hash_bytes(b"foreign-asset");
+    // Send a TestCoin invoice from the recipient: transition_asset_id =
+    // TestCoin, the account is found, but the manually-injected foreign
+    // coin in the queue mismatches the transition asset, so the
+    // queue-branch guard rejects before any prove.
     let current_pk = generate_test_public_key(&recipient_data.xpriv, 0);
     let next_pk = generate_test_public_key(&recipient_data.xpriv, 1);
     let result = node.send_coins(
         vec![Invoice::new(
             1,
             digest_from_bytes(&[9u8; 32]),
-            foreign_asset,
+            test_asset_id(),
         )],
         recipient_data.address,
         current_pk,

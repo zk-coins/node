@@ -43,8 +43,8 @@ use zkcoins_program_plonky2::types::{AccountState, Coin, PublicKey};
 use zkcoins_program_plonky2::{C, D, F};
 
 // Re-export so node callers don't have to depend on
-// `zkcoins-program-plonky2` directly for the source-witness type.
-pub use zkcoins_program_plonky2::circuit::main::InCoinSourceWitness;
+// `zkcoins-program-plonky2` directly for the source-witness / mint-witness types.
+pub use zkcoins_program_plonky2::circuit::main::{InCoinSourceWitness, MintWitness};
 
 /// Type alias: a single state-transition proof carrying the
 /// `ProofData` public inputs plus the cyclic verifier-data digest.
@@ -88,8 +88,9 @@ impl Prover {
         account_state: &AccountState,
         history_root: HashDigest,
         asset_id: HashDigest,
+        mint: Option<MintWitness>,
     ) -> Result<Proof> {
-        prove_initial(&self.circuit, account_state, history_root, asset_id)
+        prove_initial(&self.circuit, account_state, history_root, asset_id, mint)
     }
 
     /// Prove an Initial-branch transition with caller-supplied
@@ -108,6 +109,7 @@ impl Prover {
         history_root: HashDigest,
         in_coins: &[(bool, &Coin, &NonInclusionProof)],
         asset_id: HashDigest,
+        mint: Option<MintWitness>,
     ) -> Result<Proof> {
         prove_initial_with_in_coins(
             &self.circuit,
@@ -115,6 +117,7 @@ impl Prover {
             history_root,
             in_coins,
             asset_id,
+            mint,
         )
     }
 
@@ -127,6 +130,7 @@ impl Prover {
     /// ALL inactive. Active in-coin slots require the
     /// [`Self::prove_initial_with_in_and_out_coins_and_sources`]
     /// variant.
+    #[allow(clippy::too_many_arguments)]
     pub fn prove_initial_with_in_and_out_coins(
         &self,
         account_state: &AccountState,
@@ -135,6 +139,7 @@ impl Prover {
         out_coins: &[(bool, HashDigest, u64, &NonInclusionProof)],
         next_public_key: &PublicKey,
         asset_id: HashDigest,
+        mint: Option<MintWitness>,
     ) -> Result<Proof> {
         prove_initial_with_in_and_out_coins(
             &self.circuit,
@@ -144,6 +149,7 @@ impl Prover {
             out_coins,
             next_public_key,
             asset_id,
+            mint,
         )
     }
 
@@ -241,6 +247,7 @@ impl Prover {
         next_public_key: &PublicKey,
         sources: &[Option<InCoinSourceWitness>],
         asset_id: HashDigest,
+        mint: Option<MintWitness>,
     ) -> Result<Proof> {
         prove_initial_with_in_and_out_coins_and_sources(
             &self.circuit,
@@ -251,6 +258,7 @@ impl Prover {
             next_public_key,
             sources,
             asset_id,
+            mint,
         )
     }
 
@@ -328,8 +336,7 @@ impl Prover {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zkcoins_program_plonky2::hash::ZERO_HASH;
-    use zkcoins_program_plonky2::types::MINTING_ADDRESS;
+    use zkcoins_program_plonky2::types::{calculate_asset_id, calculate_name_hash};
 
     fn dummy_pubkey(seed: u8) -> [u8; 33] {
         let mut pk = [0u8; 33];
@@ -352,13 +359,22 @@ mod tests {
     #[ignore]
     fn prover_init_roundtrip() {
         let prover = Prover::new();
-        let mut account_state = AccountState::new(dummy_pubkey(7));
-        account_state.owner = *MINTING_ADDRESS;
+        // Issuer-mint: the account is the creator of its own asset, so a
+        // non-zero initial supply is accepted by the issuer gate.
+        let creator_pubkey = dummy_pubkey(7);
+        let name_hash = calculate_name_hash("TEST");
+        let asset_id = calculate_asset_id(&creator_pubkey, &name_hash, 8);
+        let mut account_state = AccountState::new(creator_pubkey, asset_id);
         account_state.balance = 100;
+        let mint = MintWitness {
+            creator_pubkey,
+            name_hash,
+            decimals: 8,
+        };
 
         let history_root = zkcoins_program_plonky2::hash::hash_bytes(b"prover-test-history");
         let proof = prover
-            .prove_initial(&account_state, history_root, ZERO_HASH)
+            .prove_initial(&account_state, history_root, asset_id, Some(mint))
             .expect("prove initial");
         prover.verify(&proof).expect("verify");
     }

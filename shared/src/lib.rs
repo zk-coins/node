@@ -26,12 +26,10 @@ pub type Address = HashDigest;
 pub struct Invoice {
     pub amount: Amount,
     pub recipient: Address,
-    #[serde(default = "default_native_asset_id")]
+    /// The asset this invoice requests. There is no native/default
+    /// asset any more — callers must always specify which asset they
+    /// want to be paid in.
     pub asset_id: zkcoins_program::hash::HashDigest,
-}
-
-fn default_native_asset_id() -> zkcoins_program::hash::HashDigest {
-    *zkcoins_program::types::NATIVE_ASSET_ID
 }
 
 impl Invoice {
@@ -109,7 +107,11 @@ impl ClientAccount {
             num_pubkeys: 0,
             private_key,
         };
-        let account = AccountState::new(client_account.generate_public_key(0).serialize());
+        // The address is `H(initial_public_key)` and does not depend on
+        // the asset; a placeholder asset_id is fine here because only
+        // `account.owner` is read out.
+        let account =
+            AccountState::new(client_account.generate_public_key(0).serialize(), ZERO_HASH);
         client_account.address = account.owner;
         client_account
     }
