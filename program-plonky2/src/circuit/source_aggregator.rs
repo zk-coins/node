@@ -365,10 +365,30 @@ pub fn verify_aggregator(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::circuit::main::{build_circuit, prove_initial};
-    use crate::hash::{hash_bytes, ZERO_HASH};
-    use crate::types::{AccountState, MINTING_ADDRESS};
+    use crate::circuit::main::{build_circuit, prove_initial, MintWitness};
+    use crate::hash::{hash_bytes, HashDigest};
+    use crate::types::{calculate_asset_id, calculate_name_hash, AccountState};
     use plonky2::field::types::Field;
+
+    /// A self-consistent issuer-mint for `dummy_pubkey(seed)`: returns
+    /// the account (owned by + issuing its own asset), the asset_id, and
+    /// the matching mint witness.
+    fn mint_account(seed: u8, balance: u64) -> (AccountState, HashDigest, MintWitness) {
+        let creator_pubkey = dummy_pubkey(seed);
+        let name_hash = calculate_name_hash("TEST");
+        let asset_id = calculate_asset_id(&creator_pubkey, &name_hash, 8);
+        let mut acct = AccountState::new(creator_pubkey, asset_id);
+        acct.balance = balance;
+        (
+            acct,
+            asset_id,
+            MintWitness {
+                creator_pubkey,
+                name_hash,
+                decimals: 8,
+            },
+        )
+    }
 
     /// Smoke test: build the aggregator against the state-transition
     /// circuit's `common_data`, prove with all slots inactive, verify.
@@ -448,14 +468,17 @@ mod tests {
         let st_circuit = build_circuit();
         let aggregator = build_source_aggregator_circuit(&st_circuit.common_data);
 
-        // Build a real Initial source proof: mint account with balance.
-        let mut source_account = AccountState::new(dummy_pubkey(31));
-        source_account.owner = *MINTING_ADDRESS;
-        source_account.balance = 1_000_000;
+        // Build a real Initial source proof: an issuer-mint account.
+        let (source_account, asset_id, mint) = mint_account(31, 1_000_000);
         let source_history_root = hash_bytes(b"aggregator-init-source");
-        let source_proof =
-            prove_initial(&st_circuit, &source_account, source_history_root, ZERO_HASH)
-                .expect("prove init source");
+        let source_proof = prove_initial(
+            &st_circuit,
+            &source_account,
+            source_history_root,
+            asset_id,
+            Some(mint),
+        )
+        .expect("prove init source");
 
         // Slot 0 active, others inactive.
         let mut slot_witnesses: Vec<AggregatorSlotWitness> = Vec::with_capacity(MAX_IN_COINS);

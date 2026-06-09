@@ -97,8 +97,8 @@ use zkcoins_program::hash::{digest_to_bytes, hash_bytes, hash_concat, HashDigest
 use zkcoins_program::inputs::CommitmentMerkleProofs;
 use zkcoins_program::merkle::merkle_mountain_range::MerkleMountainRange;
 use zkcoins_program::merkle::sparse_merkle_tree::SparseMerkleTree;
-use zkcoins_program::types::{AccountState, MINTING_ADDRESS};
-use zkcoins_prover::Prover;
+use zkcoins_program::types::{calculate_asset_id, calculate_name_hash, AccountState};
+use zkcoins_prover::{MintWitness, Prover};
 
 // ROADMAP step 9 budgets (Mac Studio M3 Ultra reference). These are
 // the defaults; the CLI accepts overrides for experimentation.
@@ -407,20 +407,28 @@ fn run() -> Result<(), String> {
     let circuit_build_wall_ms = t.elapsed().as_millis() as i64;
     eprintln!("[probe_r2] circuit_build_wall_ms = {circuit_build_wall_ms}");
 
-    // 2) Account state for the init proof + downstream updates.
-    let mut account_state = AccountState::new(dummy_pubkey(7));
-    account_state.owner = *MINTING_ADDRESS;
+    // 2) Account state for the init proof + downstream updates. The
+    //    issuer-mint gate accepts a non-zero initial supply only when
+    //    the account IS the asset's creator (owner == H(creator_pubkey),
+    //    asset_id == calculate_asset_id(...)), so derive the asset from
+    //    the same dummy pubkey and supply the matching MintWitness.
+    let creator_pubkey = dummy_pubkey(7);
+    let name_hash = calculate_name_hash("PROBE");
+    let decimals: u8 = 8;
+    let asset_id = calculate_asset_id(&creator_pubkey, &name_hash, decimals);
+    let mut account_state = AccountState::new(creator_pubkey, asset_id);
     account_state.balance = 1_000_000;
+    let mint_witness = MintWitness {
+        creator_pubkey,
+        name_hash,
+        decimals,
+    };
 
     // 3) Cold prove — first prove_initial after build.
     eprintln!("[probe_r2] proving initial (cold) ...");
     let t = Instant::now();
     let init_proof = prover
-        .prove_initial(
-            &account_state,
-            ZERO_HASH,
-            *zkcoins_program::types::NATIVE_ASSET_ID,
-        )
+        .prove_initial(&account_state, ZERO_HASH, asset_id, Some(mint_witness))
         .map_err(|e| format!("prove_initial: {e}"))?;
     let prove_cold_wall_ms = t.elapsed().as_millis() as i64;
     eprintln!("[probe_r2] prove_cold_wall_ms = {prove_cold_wall_ms}");
@@ -451,7 +459,7 @@ fn run() -> Result<(), String> {
                 history_root_extended,
                 &init_proof,
                 &cmp,
-                *zkcoins_program::types::NATIVE_ASSET_ID,
+                asset_id,
             )
             .map_err(|e| format!("warm prove_account_update #{i}: {e}"))?;
         let ms = t.elapsed().as_millis() as i64;
