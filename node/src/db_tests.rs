@@ -76,12 +76,16 @@ async fn connect_and_migrate_creates_all_tables() {
     //   * After 0015 (circuit digest):   24 tables + 1 view (the
     //     circuit-digest self-heal singleton — sorts between
     //     `boot_log` and `coin_proof_store`.)
+    //   * After 0018 (asset_creators):   25 tables + 1 view (the
+    //     off-circuit per-asset creator binding — sorts between
+    //     `accounts` and `block_log`.)
     assert_eq!(
         names,
         vec![
             "_sqlx_migrations".to_string(),
             "account_history".to_string(),
             "accounts".to_string(),
+            "asset_creators".to_string(),
             "block_log".to_string(),
             "boot_log".to_string(),
             "circuit_digest_meta".to_string(),
@@ -287,7 +291,8 @@ async fn load_all_accounts_returns_empty_initially() {
 async fn upsert_account_inserts_then_updates() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
-    let addr = vec![0xAAu8; 32];
+    // 64-byte composite (owner||asset_id) account key (Model B).
+    let addr = vec![0xAAu8; 64];
     upsert_account(&pool, &addr, b"first").await.unwrap();
     let rows = load_all_accounts(&pool).await.unwrap();
     assert_eq!(rows, vec![(addr.clone(), b"first".to_vec())]);
@@ -329,7 +334,7 @@ async fn reset_proof_dependent_state_tx_wipes_state_and_stores_digest() {
     let pool = scope.pool.clone();
 
     // Seed every table the reset touches.
-    upsert_account(&pool, &[9u8; 32], b"acct").await.unwrap();
+    upsert_account(&pool, &[9u8; 64], b"acct").await.unwrap();
     let prev_root = zkcoins_program::hash::digest_from_bytes(&[0x11u8; 32]);
     let smt_root = zkcoins_program::hash::digest_from_bytes(&[0x22u8; 32]);
     persist_state_tx(
@@ -385,9 +390,9 @@ async fn reset_proof_dependent_state_tx_overwrites_existing_digest_row() {
 async fn load_all_accounts_returns_all_inserted() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
-    let a1 = vec![0x01u8; 32];
-    let a2 = vec![0x02u8; 32];
-    let a3 = vec![0x03u8; 32];
+    let a1 = vec![0x01u8; 64];
+    let a2 = vec![0x02u8; 64];
+    let a3 = vec![0x03u8; 64];
     upsert_account(&pool, &a1, b"d1").await.unwrap();
     upsert_account(&pool, &a2, b"d2").await.unwrap();
     upsert_account(&pool, &a3, b"d3").await.unwrap();
@@ -487,9 +492,9 @@ async fn connect_and_migrate_propagates_connect_failure() {
 async fn commit_mint_tx_upserts_every_account_atomically() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
-    let addr_a = [0xAAu8; 32];
+    let addr_a = [0xAAu8; 64];
     let data_a = vec![0xA1u8; 8];
-    let addr_b = [0xBBu8; 32];
+    let addr_b = [0xBBu8; 64];
     let data_b = vec![0xB1u8; 12];
     let accounts: Vec<(&[u8], &[u8])> = vec![(&addr_a[..], &data_a), (&addr_b[..], &data_b)];
     commit_mint_tx(&pool, &accounts)
@@ -516,7 +521,7 @@ async fn commit_mint_tx_upserts_every_account_atomically() {
 async fn commit_mint_tx_is_idempotent_on_conflict() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
-    let addr = [0xCCu8; 32];
+    let addr = [0xCCu8; 64];
     let first = vec![0x01u8; 16];
     let second = vec![0x02u8; 24];
 
@@ -1227,13 +1232,19 @@ async fn update_pending_failure_reason_records_error_without_changing_status() {
 async fn upsert_account_with_source_tags_history_via_trigger() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
-    let address = vec![0x10; 32];
+    // The `accounts.address` is the 64-byte composite owner||asset_id
+    // key (Model B). The history-capture trigger writes only the 32-byte
+    // OWNER prefix into `account_history.address`, so the history queries
+    // below resolve by that owner prefix.
+    let mut address = vec![0x10u8; 32]; // owner
+    address.extend_from_slice(&[0x20u8; 32]); // asset_id
+    let owner_prefix = &address[..32];
     upsert_account_with_source(&pool, &address, b"v1", "mint")
         .await
         .unwrap();
     let (src, prev_data): (String, Option<Vec<u8>>) =
         sqlx::query_as("SELECT source, prev_data FROM account_history WHERE address = $1")
-            .bind(&address[..])
+            .bind(owner_prefix)
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -1248,7 +1259,7 @@ async fn upsert_account_with_source_tags_history_via_trigger() {
     let rows: Vec<(String, Option<Vec<u8>>)> = sqlx::query_as(
         "SELECT source, prev_data FROM account_history WHERE address = $1 ORDER BY id",
     )
-    .bind(&address[..])
+    .bind(owner_prefix)
     .fetch_all(&pool)
     .await
     .unwrap();
@@ -1627,4 +1638,60 @@ async fn get_account_history_item_scopes_by_address_and_filters_internal() {
         .await
         .unwrap()
         .is_none());
+}
+
+// ---- Per-asset creator binding (off-circuit) ----------------------------
+
+#[tokio::test]
+async fn asset_creator_register_then_query_is_idempotent() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let asset_id = vec![0x11u8; 32];
+    let creator = vec![0x02u8; 33];
+
+    // Unregistered asset: no conflict (a fresh mint is allowed).
+    assert!(!asset_creator_conflict(&pool, &asset_id, &creator)
+        .await
+        .unwrap());
+
+    // Register, then a matching creator is still not a conflict.
+    register_asset_creator(&pool, &asset_id, &creator)
+        .await
+        .unwrap();
+    assert!(!asset_creator_conflict(&pool, &asset_id, &creator)
+        .await
+        .unwrap());
+
+    // Registration is idempotent on conflict: a second insert with a
+    // DIFFERENT creator is a no-op (ON CONFLICT DO NOTHING), so the
+    // original creator still owns the asset.
+    let other = vec![0x03u8; 33];
+    register_asset_creator(&pool, &asset_id, &other)
+        .await
+        .unwrap();
+    assert!(!asset_creator_conflict(&pool, &asset_id, &creator)
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn asset_creator_conflict_true_for_different_creator() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let asset_id = vec![0x22u8; 32];
+    let creator = vec![0x02u8; 33];
+    let other = vec![0x03u8; 33];
+
+    register_asset_creator(&pool, &asset_id, &creator)
+        .await
+        .unwrap();
+    // A different creator for the same asset_id is a conflict.
+    assert!(asset_creator_conflict(&pool, &asset_id, &other)
+        .await
+        .unwrap());
+    // A different asset_id is independent — no conflict.
+    let fresh_asset = vec![0x33u8; 32];
+    assert!(!asset_creator_conflict(&pool, &fresh_asset, &other)
+        .await
+        .unwrap());
 }

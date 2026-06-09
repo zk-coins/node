@@ -75,44 +75,62 @@ pub(crate) fn flow_err_from_send_coins(err: &str) -> FlowError {
     FlowError::new(status, body)
 }
 
-/// Pre-flight validation of a `MintRequest` body. Runs in the admit
-/// handler before the job is enqueued so a malformed request returns
-/// 4xx immediately rather than burning a job row.
-///
-/// Returns the 32-byte recipient `account_address` on success.
-pub(crate) fn validate_mint_request(req: &MintRequest) -> Result<[u8; 32], FlowError> {
-    let account_address_vec =
-        hex::decode(req.account_address.trim_start_matches("0x")).map_err(|_| {
-            FlowError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "account_address is not valid hex",
-            )
-        })?;
-    if account_address_vec.len() != 32 {
-        return Err(FlowError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "account_address must be 32 bytes (64 hex chars)",
-        ));
-    }
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&account_address_vec);
-    Ok(bytes)
+/// The server-derived identity of a mint: the creator's owner address
+/// (`H(creator_pubkey)`) and the derived `asset_id`. Both are computed
+/// from the signed request, never taken from the wire. The job is
+/// scoped to `owner`; `asset_id` is surfaced for callers that want to
+/// log or echo the derived asset.
+pub(crate) struct MintIdentity {
+    pub owner: zkcoins_program::hash::HashDigest,
+    #[allow(dead_code)]
+    pub asset_id: zkcoins_program::types::AssetId,
 }
 
-/// Resolve an optional caller-supplied `asset_id` hex string.
+/// Pre-flight validation of a creator-signed `MintRequest`. Runs in the
+/// admit handler before the job is enqueued so a malformed or
+/// unauthorised request returns 4xx/401 immediately rather than burning
+/// a job row. Mirrors [`validate_send_request`]: timestamp window first
+/// (so a stale clock surfaces distinctly), then the BIP-340 Schnorr
+/// signature over the mint fields.
 ///
-/// An ABSENT field (`None`) legitimately selects the native asset. A
-/// PRESENT field MUST be valid 32-byte hex: a malformed or wrong-length
-/// value is a hard `422`, never a silent fall-back to native — that
-/// would mint/send the wrong asset under a `200` the caller cannot
-/// notice.
-fn parse_optional_asset_id(
+/// Returns the DERIVED [`MintIdentity`] on success — the owner and
+/// asset_id are computed from `creator_pubkey` + `name` + `decimals`,
+/// not accepted from the request body.
+pub(crate) fn validate_mint_request(req: &MintRequest) -> Result<MintIdentity, FlowError> {
+    if let Err(e) = crate::router::check_timestamp_window(req.timestamp) {
+        tracing::info!("Mint timestamp window check failed: {}", e);
+        return Err(FlowError::new(StatusCode::UNAUTHORIZED, e));
+    }
+    if let Err(e) = crate::router::verify_mint_signature_pub(req) {
+        tracing::info!("Mint signature verification failed: {}", e);
+        return Err(FlowError::new(
+            StatusCode::UNAUTHORIZED,
+            "Signature verification failed",
+        ));
+    }
+    let creator_pubkey = req.creator_pubkey.serialize();
+    let owner = zkcoins_program::hash::hash_bytes(&creator_pubkey);
+    let name_hash = zkcoins_program::types::calculate_name_hash(&req.name);
+    let asset_id =
+        zkcoins_program::types::calculate_asset_id(&creator_pubkey, &name_hash, req.decimals);
+    Ok(MintIdentity { owner, asset_id })
+}
+
+/// Resolve a caller-supplied `asset_id` hex string for a SEND.
+///
+/// There is no native / default asset (Model B): the field is REQUIRED.
+/// A missing, malformed, or wrong-length value is a hard `422` — never
+/// a silent fall-back, which would send the wrong asset under a `200`
+/// the caller cannot notice.
+fn parse_send_asset_id(
     asset_id: Option<&str>,
 ) -> Result<zkcoins_program::types::AssetId, FlowError> {
-    let hex_str = match asset_id {
-        None => return Ok(*zkcoins_program::types::NATIVE_ASSET_ID),
-        Some(s) => s,
-    };
+    let hex_str = asset_id.ok_or_else(|| {
+        FlowError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "asset_id is required (no native asset)",
+        )
+    })?;
     let raw = hex::decode(hex_str.trim_start_matches("0x")).map_err(|_| {
         FlowError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -183,74 +201,67 @@ pub(crate) fn validate_send_request(
     Ok((from_b, to_b))
 }
 
-/// Drive a `mint` job through the prepare-then-broadcast-then-commit
-/// pipeline.
+/// Drive the PROVE leg of a two-phase, creator-signed mint (phase 1).
 ///
-/// Body shape is identical to the pre-refactor `mint_handler`; the
-/// only delta is that the prover is wrapped in `spawn_blocking` so
-/// the dispatcher's tokio worker is not blocked across the ~5 s
-/// prove call. See `mint_handler`'s pre-refactor doc-comment for the
-/// four-phase ordering + concurrency-gate rationale (preserved here
-/// verbatim).
-pub(crate) async fn mint_flow(state: &AppState, request: MintRequest) -> FlowResult {
-    let account_address_bytes = validate_mint_request(&request)?;
-    let account_address = digest_from_bytes(&account_address_bytes);
-    let mint_asset_id = parse_optional_asset_id(request.asset_id.as_deref())?;
-
-    // ---- 1. SNAPSHOT phase (no mutation) -----------------------------------
-    let state_arc = {
-        let guard = lock_or_recover(&state.account_node);
-        guard.state().clone()
-    };
-    let (expected_num_pubkeys, minting_pubkey, next_minting_pubkey, prev_commitment_pubkey) = {
-        let minting_account_guard = lock_or_recover(&state.minting_account);
-        let n = {
-            let state_guard = lock_or_recover(&state_arc);
-            crate::state::derive_num_pubkeys_from_smt(
-                &minting_account_guard.private_key,
-                &state_guard.smt,
-            )
-        };
-        let prev_pk = if n > 0 {
-            Some(minting_account_guard.generate_public_key(n - 1))
-        } else {
-            None
-        };
-        (
-            n,
-            minting_account_guard.generate_public_key(n),
-            minting_account_guard.generate_public_key(n + 1),
-            prev_pk,
-        )
-    };
-
-    // ---- 2. PROOF phase (clone-based) --------------------------------------
-    // The prove call is the only CPU-bound block — push it through
-    // `spawn_blocking` so the dispatcher's tokio worker can still
-    // serve concurrent `/api/jobs/:id` polls during the ~5 s prove
-    // window. Take the `account_node` guard on the blocking thread
-    // so the std::sync::Mutex never crosses an await point.
+/// Neutral, permissionless model: there is no central minting
+/// authority. The asset's creator signs the mint request; the node
+/// derives the owner (`H(creator_pubkey)`) and the asset_id, builds an
+/// issuer-mint proof on the creator's OWN `(owner, asset_id)` account
+/// that credits `amount` to the creator's own balance, and stages it.
+///
+/// This mirrors [`send_flow`]: the prove leg returns the
+/// `(proof_id, SendCommitHashes)` so the dispatcher can transition the
+/// job to `awaiting_signature` with the `account_state_hash` /
+/// `output_coins_root` hex on its result. The wallet signs those as a
+/// `Commitment` and POSTs them to `POST /api/jobs/:id/commit`; the
+/// broadcast + state-advance + apply leg lives in [`mint_commit_flow`].
+///
+/// The prove call is CPU-bound; it runs through `spawn_blocking` so the
+/// dispatcher's tokio worker is not blocked during the prove.
+pub(crate) async fn mint_flow(
+    state: &AppState,
+    request: MintRequest,
+) -> Result<(u64, SendCommitHashes), FlowError> {
+    // Re-validate (signature + timestamp). The admit handler already
+    // ran this, but the job may have been queued for a while;
+    // re-checking the timestamp here keeps the freshness window honest
+    // at prove time. `prepare_mint` re-derives owner/asset_id from the
+    // pubkey + name + decimals, so the derived identity is not needed
+    // here beyond the validation side-effect.
+    let identity = validate_mint_request(&request)?;
+    let creator_pubkey = request.creator_pubkey.serialize();
+    let next_public_key = request.next_public_key.serialize();
+    let name = request.name.clone();
+    let decimals = request.decimals;
     let amount = request.amount;
+
+    // Off-circuit creator binding (MULTI_ASSET.md §5.3): reject a mint
+    // of an `asset_id` already claimed by a DIFFERENT creator before
+    // paying for the prove. A matching (or absent) creator passes.
+    if db::asset_creator_conflict(
+        &state.pool,
+        &digest_to_bytes(&identity.asset_id),
+        &creator_pubkey,
+    )
+    .await
+    .map_err(|e| {
+        FlowError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("asset_creator lookup failed: {}", e),
+        )
+    })? {
+        return Err(FlowError::new(
+            StatusCode::CONFLICT,
+            "asset_id is registered to a different creator",
+        ));
+    }
+
     let account_node_clone = state.account_node.clone();
     let prepared = tokio::task::spawn_blocking(
         move || -> Result<crate::account_node::MintingPrepared, FlowError> {
             let guard = lock_or_recover(&account_node_clone);
-            if guard
-                .get_account(&zkcoins_program::types::MINTING_ADDRESS)
-                .is_none()
-            {
-                return Err(FlowError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Minting account not configured",
-                ));
-            }
             guard
-                .prepare_mint(
-                    vec![Invoice::new(amount, account_address, mint_asset_id)],
-                    minting_pubkey,
-                    next_minting_pubkey,
-                    prev_commitment_pubkey,
-                )
+                .prepare_mint(&creator_pubkey, &name, decimals, amount, &next_public_key)
                 .map_err(flow_err_from_send_coins)
         },
     )
@@ -261,48 +272,107 @@ pub(crate) async fn mint_flow(state: &AppState, request: MintRequest) -> FlowRes
             format!("spawn_blocking join error: {}", e),
         )
     })??;
-    let mut prepared = prepared;
-    tracing::info!("Mint prepare: ok");
+    tracing::info!("Mint prove: ok");
 
-    // Build commitment + re-derive gate.
-    let commitment = {
-        let minting_account_guard = lock_or_recover(&state.minting_account);
-        let current_num_pubkeys = {
-            let state_guard = lock_or_recover(&state_arc);
-            crate::state::derive_num_pubkeys_from_smt(
-                &minting_account_guard.private_key,
-                &state_guard.smt,
-            )
-        };
-        if current_num_pubkeys != expected_num_pubkeys {
-            eprintln!(
-                "Concurrent mint detected during proof phase: expected num_pubkeys={}, observed={}",
-                expected_num_pubkeys, current_num_pubkeys
-            );
+    // Derive the commit hashes the wallet must sign, from the same
+    // public-input path the commit leg re-derives.
+    let commit_hashes = mint_proof_commit_hashes(&prepared.proof);
+
+    // Stage the mint for the wallet-signed commit leg.
+    let proof_id = state.mint_store.add(crate::router::StagedMint {
+        proof: prepared.proof,
+        owner: prepared.owner,
+        asset_id: prepared.asset_id,
+        mutated_account: prepared.mutated_account,
+        creator_pubkey: request.creator_pubkey,
+    });
+
+    Ok((proof_id, commit_hashes))
+}
+
+/// Extract the `account_state_hash` / `output_coins_root` a mint proof
+/// commits, as lowercase hex (the digests the wallet signs). Shares the
+/// `ProofData::from_field_elements` path with [`send_commit_hashes`].
+pub(crate) fn mint_proof_commit_hashes(proof: &zkcoins_prover::Proof) -> SendCommitHashes {
+    let pis: [zkcoins_program::F; zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] =
+        proof.public_inputs[..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
+            .try_into()
+            .expect("Plonky2 Proof emits N_PROOF_DATA_PUBLIC_INPUTS field elements");
+    let proof_data = ProofData::from_field_elements(&pis);
+    SendCommitHashes {
+        account_state_hash: hex::encode(digest_to_bytes(&proof_data.account_state_hash)),
+        output_coins_root: hex::encode(digest_to_bytes(&proof_data.output_coins_root)),
+    }
+}
+
+/// Drive the COMMIT leg of a two-phase mint (phase 2): verify the
+/// creator's signed `Commitment`, ENFORCE the off-circuit creator
+/// binding (`commitment.public_key == staged.creator_pubkey`), broadcast
+/// the inscription, advance global state, swap the minted account in,
+/// and register the asset_id -> creator_pubkey row.
+///
+/// CREATOR BINDING (MULTI_ASSET.md §5.3): the per-asset creator binding
+/// lives off-circuit now (the mint rotates `next_public_key`, so it can
+/// no longer ride on the commitment key). Requiring the commitment's
+/// signing key to equal the creator key the prove leg derived owner /
+/// asset_id from makes the on-chain commitment provably signed by the
+/// asset's creator. Without it, a forger could witness `owner =
+/// H(victim_pk)` + a victim's asset_id (public values) and sign with
+/// their OWN key, forging inflation / theft of a foreign asset.
+pub(crate) async fn mint_commit_flow(state: &AppState, request: CommitRequest) -> FlowResult {
+    let staged = match state.mint_store.take(request.proof_id) {
+        Some(s) => s,
+        None => {
             return Err(FlowError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Concurrent mint detected",
+                StatusCode::NOT_FOUND,
+                "Unknown or expired mint proof_id",
             ));
         }
-        let pis: [zkcoins_program::F; zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] =
-            prepared.coin_proofs[0].proof.public_inputs
-                [..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
-                .try_into()
-                .expect("prover always emits N_PROOF_DATA_PUBLIC_INPUTS field elements");
-        let proof_data = ProofData::from_field_elements(&pis);
-        let signing_clone = shared::ClientAccount {
-            address: minting_account_guard.address,
-            num_pubkeys: expected_num_pubkeys + 1,
-            private_key: minting_account_guard.private_key,
-        };
-        signing_clone.create_commitment(
-            &proof_data.account_state_hash,
-            &proof_data.output_coins_root,
-        )
     };
-    prepared.coin_proofs[0].commitment = Some(commitment.clone());
 
-    // ---- 3. BROADCAST phase ------------------------------------------------
+    let message_bytes = hex::decode(&request.message).map_err(|_| {
+        FlowError::new(StatusCode::UNPROCESSABLE_ENTITY, "message is not valid hex")
+    })?;
+    let sig_bytes = hex::decode(&request.signature).map_err(|_| {
+        FlowError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "signature is not valid hex",
+        )
+    })?;
+    let signature = SchnorrSignature::from_slice(&sig_bytes).map_err(|_| {
+        FlowError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "signature is not a valid Schnorr signature",
+        )
+    })?;
+
+    let commitment = Commitment {
+        public_key: request.public_key,
+        signature,
+        message: message_bytes,
+    };
+
+    // 1. Self-attested signature check.
+    if !commitment.verify() {
+        return Err(FlowError::new(
+            StatusCode::UNAUTHORIZED,
+            "Commitment signature invalid",
+        ));
+    }
+
+    // 2. OFF-CIRCUIT CREATOR BINDING — the wallet-signed commitment
+    //    must be signed by the asset creator's key. MANDATORY for mint.
+    //    `staged.creator_pubkey` is the key the prove leg derived owner
+    //    and asset_id from; binding the commitment key to it makes the
+    //    on-chain commitment provably signed by the asset's creator.
+    if commitment.public_key != staged.creator_pubkey {
+        return Err(FlowError::new(
+            StatusCode::UNAUTHORIZED,
+            "Commitment must be signed by the asset creator's key",
+        ));
+    }
+
+    // 3. BROADCAST phase.
     let commitment_data = bincode::serialize(&commitment).expect("Failed to serialize commitment");
     let broadcast_outcome = create_and_broadcast_inscription(
         &commitment_data,
@@ -325,7 +395,7 @@ pub(crate) async fn mint_flow(state: &AppState, request: MintRequest) -> FlowRes
         }
     };
 
-    // ---- 3b. STATE_ADVANCE phase ------------------------------------------
+    // 4. STATE_ADVANCE phase.
     let state_advance_outcome = {
         let state_arc_for_advance = {
             let guard = lock_or_recover(&state.account_node);
@@ -338,7 +408,7 @@ pub(crate) async fn mint_flow(state: &AppState, request: MintRequest) -> FlowRes
         Ok(snapshot) => snapshot,
         Err(e) => {
             eprintln!(
-                "mint_flow: in-process state.update failed: {} (broadcast already landed; scanner-replay will reconcile)",
+                "mint_commit_flow: in-process state.update failed: {} (broadcast already landed; scanner-replay will reconcile)",
                 e
             );
             return Err(FlowError::new(
@@ -358,7 +428,7 @@ pub(crate) async fn mint_flow(state: &AppState, request: MintRequest) -> FlowRes
     .await
     {
         eprintln!(
-            "mint_flow: atomic persist + mark-complete failed: {} (scanner-replay will heal)",
+            "mint_commit_flow: atomic persist + mark-complete failed: {} (scanner-replay will heal)",
             e
         );
         return Err(FlowError::new(
@@ -367,57 +437,48 @@ pub(crate) async fn mint_flow(state: &AppState, request: MintRequest) -> FlowRes
         ));
     }
     println!(
-        "mint_flow: state.update persisted + row marked complete. New MMR root: {}",
+        "mint_commit_flow: state.update persisted + row marked complete. New MMR root: {}",
         hex::encode(digest_to_bytes(&new_root))
     );
 
-    // ---- 4. COMMIT phase ---------------------------------------------------
-    let minting_addr_bytes = digest_to_bytes(&zkcoins_program::types::MINTING_ADDRESS);
-    let minting_snapshot_bytes = AccountNode::serialize_account(&prepared.mutated_minting);
-
-    let recipient_snapshots: Vec<(zkcoins_program::hash::HashDigest, Vec<u8>)> = {
+    // 5. APPLY phase — swap the minted creator account in, persist it.
+    let owner = staged.owner;
+    let asset_id = staged.asset_id;
+    let signer = commitment.public_key;
+    let account_bytes = {
         let mut guard = lock_or_recover(&state.account_node);
-        guard.commit_mint(prepared.mutated_minting);
-        let mut snaps = Vec::with_capacity(prepared.coin_proofs.len());
-        for coin_proof in &prepared.coin_proofs {
-            let recipient = coin_proof.coin.recipient;
-            if let Err(e) = guard.receive_coin(coin_proof.clone()) {
-                eprintln!("Failed to receive minted coin into live recipient: {}", e);
-            }
-            if let Some(acct) = guard.get_account(&recipient) {
-                snaps.push((recipient, AccountNode::serialize_account(acct)));
-            }
-        }
-        snaps
+        guard.commit_mint(owner, staged.mutated_account, signer);
+        guard
+            .get_account(&owner, &asset_id)
+            .map(AccountNode::serialize_account)
     };
-
-    let mut commit_rows: Vec<(&[u8], &[u8])> = Vec::with_capacity(1 + recipient_snapshots.len());
-    commit_rows.push((&minting_addr_bytes[..], &minting_snapshot_bytes[..]));
-    let recipient_addr_bytes: Vec<[u8; 32]> = recipient_snapshots
-        .iter()
-        .map(|(addr, _)| digest_to_bytes(addr))
-        .collect();
-    for ((_, bytes), addr_bytes) in recipient_snapshots.iter().zip(recipient_addr_bytes.iter()) {
-        commit_rows.push((&addr_bytes[..], &bytes[..]));
-    }
-    if let Err(e) = db::commit_mint_tx(&state.pool, &commit_rows).await {
-        eprintln!("Failed to commit mint transaction to Postgres: {}", e);
-        return Err(FlowError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Failed to persist mint commit transaction",
-        ));
+    if let Some(bytes) = account_bytes {
+        let key_bytes = crate::account_node::account_key_bytes(&owner, &asset_id);
+        if let Err(e) =
+            db::upsert_account_with_source(&state.pool, &key_bytes, &bytes, "mint").await
+        {
+            eprintln!("Failed to upsert minted creator account: {}", e);
+        }
     }
 
-    let mut coin_proofs = prepared.coin_proofs;
-    let final_coin_proof = coin_proofs
-        .pop()
-        .expect("send_coins returns exactly one coin_proof for single-invoice mint");
-    let hashes = send_commit_hashes(&final_coin_proof);
-    let proof_id = state.proof_store.add_proof(final_coin_proof);
+    // Record the off-circuit creator binding (MULTI_ASSET.md §5.3) so a
+    // later mint of the same asset_id by a different key is rejected.
+    // Log-and-continue on error, like the sibling account upsert.
+    if let Err(e) = db::register_asset_creator(
+        &state.pool,
+        &digest_to_bytes(&asset_id),
+        &staged.creator_pubkey.serialize(),
+    )
+    .await
+    {
+        eprintln!("Failed to register asset creator: {}", e);
+    }
+
+    let hashes = mint_proof_commit_hashes(&staged.proof);
     Ok((
         json!({
             "success": true,
-            "proof_id": proof_id,
+            "proof_id": request.proof_id,
             "account_state_hash": hashes.account_state_hash,
             "output_coins_root": hashes.output_coins_root,
         }),
@@ -487,7 +548,7 @@ pub(crate) async fn send_flow(
     let next_public_key = request.next_public_key;
     let prev_commitment_pubkey = request.prev_commitment_pubkey;
     let amount = request.amount;
-    let send_asset_id = parse_optional_asset_id(request.asset_id.as_deref())?;
+    let send_asset_id = parse_send_asset_id(request.asset_id.as_deref())?;
 
     // The prove call is CPU-bound; push it through spawn_blocking so
     // the dispatcher's tokio worker is not blocked during the prove.
@@ -505,7 +566,7 @@ pub(crate) async fn send_flow(
             Ok(mut coin_proofs) => {
                 let snap = AccountNode::serialize_account(
                     guard
-                        .get_account(&from_address)
+                        .get_account(&from_address, &send_asset_id)
                         .expect("send_coins Ok implies the sender account is in memory"),
                 );
                 let proof = coin_proofs
@@ -536,9 +597,10 @@ pub(crate) async fn send_flow(
     let commit_hashes = send_commit_hashes(&coin_proof);
     let proof_id = state.proof_store.add_proof(coin_proof);
 
-    let addr_bytes = digest_to_bytes(&from_address);
+    // The sender account is keyed by `(from_address, send_asset_id)`.
+    let key_bytes = crate::account_node::account_key_bytes(&from_address, &send_asset_id);
     if let Err(e) =
-        db::upsert_account_with_source(&state.pool, &addr_bytes, &updated_account_bytes, "send")
+        db::upsert_account_with_source(&state.pool, &key_bytes, &updated_account_bytes, "send")
             .await
     {
         eprintln!("Failed to upsert sender account after send: {}", e);
@@ -611,19 +673,20 @@ pub(crate) async fn commit_flow(state: &AppState, request: CommitRequest) -> Flo
     let ocr_hex = hashes.output_coins_root;
 
     let recipient = updated_proof.coin.recipient;
+    let asset_id = updated_proof.coin.asset_id;
     let snapshot: Option<Vec<u8>> = {
         let mut guard = lock_or_recover(&state.account_node);
         if let Err(e) = guard.receive_coin(updated_proof) {
             eprintln!("Failed to receive coin after commit: {}", e);
         }
         guard
-            .get_account(&recipient)
+            .get_account(&recipient, &asset_id)
             .map(AccountNode::serialize_account)
     };
     if let Some(bytes) = snapshot {
-        let addr_bytes = digest_to_bytes(&recipient);
+        let key_bytes = crate::account_node::account_key_bytes(&recipient, &asset_id);
         if let Err(e) =
-            db::upsert_account_with_source(&state.pool, &addr_bytes, &bytes, "receive").await
+            db::upsert_account_with_source(&state.pool, &key_bytes, &bytes, "receive").await
         {
             eprintln!("Failed to upsert account after commit: {}", e);
         }

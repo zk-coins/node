@@ -250,7 +250,7 @@ mod tests {
     fn program_inputs_initial_proof_optional_fields() {
         let inputs = ProgramInputs {
             proof_type: ProofType::InitialProof,
-            account_state: AccountState::new(dummy_pk()),
+            account_state: AccountState::new(dummy_pk(), crate::hash::ZERO_HASH),
             current_history_root: crate::hash::ZERO_HASH,
             prev_proof_public_values: None,
             prev_proof_history_proofs: None,

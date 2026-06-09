@@ -1,8 +1,8 @@
 //! Monolithic state-transition circuit for zkCoins (Plonky2 backend).
 //!
 //! Mirrors `program/src/main.rs` (the SP1 entrypoint), but built as a
-//! Plonky2 cyclic-recursive circuit per [`SPEC.md`] §8 / §10 and the
-//! `ROADMAP.md` Step 5 plan.
+//! Plonky2 cyclic-recursive circuit per the protocol specification
+//! §8 / §10 (<https://docs.zkcoins.app/specification>).
 //!
 //! ## Stage status
 //!
@@ -94,7 +94,7 @@ use crate::merkle::merkle_mountain_range::MMR_MAX_DEPTH;
 use crate::merkle::sparse_merkle_tree::{
     InclusionProof, NonInclusionProof, DEFAULT_HASHES, TREE_DEPTH,
 };
-use crate::types::{AccountState, Coin, PublicKey, MINTING_ADDRESS};
+use crate::types::{AccountState, Coin, PublicKey, ASSET_GENESIS_DOMAIN_TAG};
 use crate::{C, D, F};
 
 /// Public-input count carried by the `ProofData` payload:
@@ -473,6 +473,24 @@ pub struct StateTransitionCircuit {
     /// driving out-coin identifier derivation.
     pub next_public_key_limbs: [Target; 5],
 
+    // ===== Issuer-gated mint witnesses (neutral multi-asset) =====
+    /// 5×56-bit limbs of the asset creator's public key. Private
+    /// witness (NOT a public input). Used by the issuer gate to derive
+    /// `owner_from_creator = H(creator_pubkey)` and the asset id. For a
+    /// legitimate issuer-mint these limbs are the minting account's
+    /// initial pubkey; for non-mint transitions they are unconstrained
+    /// (the gate they feed is masked off when `is_minting = false`).
+    pub creator_pubkey_limbs: [Target; 5],
+    /// The asset's name hash (4 elements). Private witness. Folds into
+    /// the in-circuit `derived_asset_id` preimage.
+    pub name_hash: HashOutTarget,
+    /// The asset's decimals (range-checked to 8 bits). Private witness.
+    pub decimals: Target,
+    /// The account's own `asset_id` (4 elements). Private witness, fed
+    /// into the 15-F `account_state_hash` and bound to
+    /// `transition_asset_id` so the account can only hold its own asset.
+    pub account_asset_id: HashOutTarget,
+
     // ===== Stage 5d-next-5 additions =====
     /// Source-proof aggregator circuit built against this circuit's
     /// `common_data`. The outer verifies an aggregator proof via the
@@ -593,19 +611,93 @@ pub fn build_circuit() -> StateTransitionCircuit {
 
     let history_root = builder.add_virtual_hash();
 
-    // is_minting = element-wise AND of (owner.elements[i] == MINTING_ADDRESS.elements[i]).
-    let minting_addr = builder.constant_hash(HashOut {
-        elements: MINTING_ADDRESS.elements,
+    // The account's own asset_id (witnessed) and the global transition
+    // asset_id (a public input). They must coincide: an account only
+    // ever holds its own asset. This binding is UNMASKED — it holds for
+    // BOTH Initial and AccountUpdate branches.
+    let account_asset_id = builder.add_virtual_hash();
+    for i in 0..4 {
+        builder.connect(
+            account_asset_id.elements[i],
+            transition_asset_id.elements[i],
+        );
+    }
+
+    // ===== Issuer-gated mint predicate (neutral, permissionless) =====
+    //
+    // There is no privileged minting authority. The "mint exception"
+    // (relaxing the "Initial balance must be 0" rule) is granted ONLY to
+    // an account that proves it is the legitimate issuer of its own
+    // asset, i.e.:
+    //   owner          == H(creator_pubkey)
+    //   transition_aid == calculate_asset_id(creator_pubkey, name_hash, decimals)
+    // Both derivations are recomputed cheaply in-circuit from private
+    // witnesses (`creator_pubkey_limbs`, `name_hash`, `decimals`). Anyone
+    // can mint THEIR OWN asset; nobody can forge or inflate someone
+    // else's, because forging would require a `creator_pubkey` that both
+    // hashes to the victim's `owner` AND derives the victim's `asset_id`.
+    let creator_pubkey_limbs: [Target; 5] = std::array::from_fn(|_| {
+        let t = builder.add_virtual_target();
+        builder.range_check(t, 56);
+        t
     });
+    let name_hash = builder.add_virtual_hash();
+    let decimals = builder.add_virtual_target();
+    builder.range_check(decimals, 8);
+
+    // derived_asset_id = Poseidon(genesis_tag[4] || creator_pubkey[5] ||
+    // name_hash[4] || decimals[1]) — matches off-circuit
+    // `crate::types::calculate_asset_id` (14-element fixed-width preimage).
+    let genesis_tag = builder.constant_hash(HashOut {
+        elements: ASSET_GENESIS_DOMAIN_TAG.elements,
+    });
+    let mut derived_aid_input: Vec<Target> = Vec::with_capacity(14);
+    derived_aid_input.extend_from_slice(&genesis_tag.elements);
+    derived_aid_input.extend_from_slice(&creator_pubkey_limbs);
+    derived_aid_input.extend_from_slice(&name_hash.elements);
+    derived_aid_input.push(decimals);
+    let derived_asset_id = builder.hash_n_to_hash_no_pad::<PoseidonHash>(derived_aid_input);
+
+    // owner_from_creator = H(creator_pubkey) == hash_bytes(pubkey)
+    // (the 33-byte pubkey packs into the same 5 limbs `pubkey_to_limbs`
+    // produces, so the in-circuit hash of the limbs equals the
+    // off-circuit `hash_bytes(&pubkey)`).
+    let owner_from_creator =
+        builder.hash_n_to_hash_no_pad::<PoseidonHash>(creator_pubkey_limbs.to_vec());
+
+    // asset_ok = AND over 4 elems (derived_asset_id == transition_asset_id)
+    // owner_ok  = AND over 4 elems (owner_from_creator == owner)
+    // is_minting = asset_ok AND owner_ok
     let mut is_minting = builder._true();
     for i in 0..4 {
-        let elem_eq = builder.is_equal(owner.elements[i], minting_addr.elements[i]);
-        is_minting = builder.and(is_minting, elem_eq);
+        let aid_eq = builder.is_equal(
+            derived_asset_id.elements[i],
+            transition_asset_id.elements[i],
+        );
+        is_minting = builder.and(is_minting, aid_eq);
+        let owner_eq = builder.is_equal(owner_from_creator.elements[i], owner.elements[i]);
+        is_minting = builder.and(is_minting, owner_eq);
+    }
+    // Bind the creator key to the account's own commitment key. The
+    // account's `public_key` (`pubkey_limbs`) is the key that signs the
+    // Bitcoin commitment verified at scan time; a mint may only be
+    // authorized by the asset's creator, so that signer MUST be the
+    // creator. Without this, a forger could witness owner==H(victim_pk)
+    // and asset_id==calculate_asset_id(victim_pk, ...) (both attacker-
+    // chosen public values) while signing the commitment with their OWN
+    // key — minting/inflating a foreign asset. Folding pubkey==creator
+    // into `is_minting` closes that path: the mint exception is then
+    // only granted when the commitment signer is provably the creator.
+    for j in 0..5 {
+        let pk_eq = builder.is_equal(creator_pubkey_limbs[j], pubkey_limbs[j]);
+        is_minting = builder.and(is_minting, pk_eq);
     }
     let not_minting = builder.not(is_minting);
     let not_condition = builder.not(condition);
 
-    // Mint exception (Initial-only):
+    // Mint exception (Initial-only): a non-mint Initial account must
+    // start with balance 0; only a valid issuer-mint may start with a
+    // non-zero (minted) supply.
     let mint_mask = builder.mul(not_condition.target, not_minting.target);
     let mul_lo = builder.mul(mint_mask, balance_lo);
     builder.assert_zero(mul_lo);
@@ -613,12 +705,14 @@ pub fn build_circuit() -> StateTransitionCircuit {
     builder.assert_zero(mul_hi);
 
     // Compute in-circuit account_state_hash. Layout per
-    // AccountState::hash: owner (4) + balance_lo + balance_hi + pubkey (5).
-    let mut state_elements: Vec<Target> = Vec::with_capacity(11);
+    // AccountState::hash: owner (4) + balance_lo + balance_hi + pubkey
+    // (5) + asset_id (4) = 15 F.
+    let mut state_elements: Vec<Target> = Vec::with_capacity(15);
     state_elements.extend_from_slice(&owner.elements);
     state_elements.push(balance_lo);
     state_elements.push(balance_hi);
     state_elements.extend_from_slice(&pubkey_limbs);
+    state_elements.extend_from_slice(&account_asset_id.elements);
     let account_state_hash = builder.hash_n_to_hash_no_pad::<PoseidonHash>(state_elements);
 
     // SPEC §8 (b) — state continuity (AccountUpdate-only):
@@ -1225,12 +1319,14 @@ pub fn build_circuit() -> StateTransitionCircuit {
     let final_balance_hi = running_balance_hi;
 
     // Interim account-state hash: owner + post-subtraction balance +
-    // INITIAL pubkey. Drives out-coin identifier derivation.
-    let mut interim_state_elements: Vec<Target> = Vec::with_capacity(11);
+    // INITIAL pubkey + asset_id. Drives out-coin identifier derivation.
+    // 15-F layout matches AccountState::hash.
+    let mut interim_state_elements: Vec<Target> = Vec::with_capacity(15);
     interim_state_elements.extend_from_slice(&owner.elements);
     interim_state_elements.push(final_balance_lo);
     interim_state_elements.push(final_balance_hi);
     interim_state_elements.extend_from_slice(&pubkey_limbs);
+    interim_state_elements.extend_from_slice(&account_asset_id.elements);
     let interim_account_state_hash =
         builder.hash_n_to_hash_no_pad::<PoseidonHash>(interim_state_elements);
 
@@ -1262,11 +1358,12 @@ pub fn build_circuit() -> StateTransitionCircuit {
     // out-coins), they set `next_public_key_limbs` to the same value
     // as `pubkey_limbs` and the final hash matches the initial-pubkey
     // hash.
-    let mut final_state_elements: Vec<Target> = Vec::with_capacity(11);
+    let mut final_state_elements: Vec<Target> = Vec::with_capacity(15);
     final_state_elements.extend_from_slice(&owner.elements);
     final_state_elements.push(final_balance_lo);
     final_state_elements.push(final_balance_hi);
     final_state_elements.extend_from_slice(&next_public_key_limbs);
+    final_state_elements.extend_from_slice(&account_asset_id.elements);
     let final_account_state_hash =
         builder.hash_n_to_hash_no_pad::<PoseidonHash>(final_state_elements);
 
@@ -1321,6 +1418,10 @@ pub fn build_circuit() -> StateTransitionCircuit {
         in_coin_slots,
         out_coin_slots,
         next_public_key_limbs,
+        creator_pubkey_limbs,
+        name_hash,
+        decimals,
+        account_asset_id,
         aggregator,
         aggregator_proof_target,
     }
@@ -1358,6 +1459,59 @@ fn set_account_state_witness(
         )
         .unwrap();
     }
+
+    // The account's own asset_id. The in-circuit `connect(account_asset_id,
+    // transition_asset_id)` ties this to the proof-data asset_id, so the
+    // caller must pass the SAME asset_id to the prove entrypoint.
+    pw.set_hash_target(circuit.account_asset_id, account_state.asset_id)
+        .unwrap();
+}
+
+/// Issuer-mint witness for the [`crate::circuit::main`] mint gate: the
+/// asset creator's pubkey, the asset name hash, and the decimals. Supply
+/// `Some(_)` when proving a legitimate issuer-mint (an Initial proof
+/// whose account starts with a non-zero, freshly-minted supply); the
+/// gate then re-derives `H(creator_pubkey) == owner` and
+/// `calculate_asset_id(creator_pubkey, name_hash, decimals) ==
+/// transition_asset_id` to grant the balance-may-be-nonzero exception.
+///
+/// For every non-mint path (send/receive/account-update, or an Initial
+/// proof with zero balance) pass `None` — the gate is masked off and the
+/// witnesses default to a deterministic placeholder.
+#[derive(Clone, Copy)]
+pub struct MintWitness {
+    pub creator_pubkey: PublicKey,
+    pub name_hash: HashDigest,
+    pub decimals: u8,
+}
+
+/// Set the issuer-mint witnesses (`creator_pubkey_limbs`, `name_hash`,
+/// `decimals`). When `mint` is `None`, deterministic placeholders are
+/// written: the gate they feed is masked off (`is_minting` cannot be
+/// satisfied by the placeholder against a real account), so the values
+/// are irrelevant to soundness — they only need to be assigned so the
+/// witness is complete.
+fn set_mint_witness(
+    pw: &mut PartialWitness<F>,
+    circuit: &StateTransitionCircuit,
+    mint: Option<MintWitness>,
+) {
+    let (creator_pubkey, name_hash, decimals) = match mint {
+        Some(m) => (m.creator_pubkey, m.name_hash, m.decimals),
+        None => ([0u8; 33], ZERO_HASH, 0u8),
+    };
+    for (i, chunk) in creator_pubkey.chunks(7).enumerate() {
+        let mut buf = [0u8; 8];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        pw.set_target(
+            circuit.creator_pubkey_limbs[i],
+            F::from_canonical_u64(u64::from_le_bytes(buf)),
+        )
+        .unwrap();
+    }
+    pw.set_hash_target(circuit.name_hash, name_hash).unwrap();
+    pw.set_target(circuit.decimals, F::from_canonical_u32(decimals as u32))
+        .unwrap();
 }
 
 /// Set the witnesses for a `CommitmentMerkleProofsTargets` bundle.
@@ -1673,6 +1827,7 @@ pub fn prove_initial(
     account_state: &AccountState,
     history_root: HashDigest,
     asset_id: HashDigest,
+    mint: Option<MintWitness>,
 ) -> Result<ProofWithPublicInputs<F, C, D>> {
     let dummy_nip = dummy_non_inclusion_proof();
     let dummy_coin = dummy_coin();
@@ -1685,6 +1840,7 @@ pub fn prove_initial(
         history_root,
         &inactive_slots,
         asset_id,
+        mint,
     )
 }
 
@@ -1701,6 +1857,7 @@ pub fn prove_initial_with_in_coins(
     history_root: HashDigest,
     in_coins: &[(bool, &Coin, &NonInclusionProof)],
     asset_id: HashDigest,
+    mint: Option<MintWitness>,
 ) -> Result<ProofWithPublicInputs<F, C, D>> {
     assert_eq!(
         in_coins.len(),
@@ -1719,6 +1876,7 @@ pub fn prove_initial_with_in_coins(
         &inactive_out_coins,
         &account_state.public_key,
         asset_id,
+        mint,
     )
 }
 
@@ -1733,6 +1891,7 @@ pub fn prove_initial_with_in_coins(
 /// slot without a source witness fails the `connect(slot.active,
 /// source.active)` constraint at proof time. Tests and producers that
 /// need an active in-coin must call the `_and_sources` variant.
+#[allow(clippy::too_many_arguments)]
 pub fn prove_initial_with_in_and_out_coins(
     circuit: &StateTransitionCircuit,
     account_state: &AccountState,
@@ -1741,6 +1900,7 @@ pub fn prove_initial_with_in_and_out_coins(
     out_coins: &[(bool, HashDigest, u64, &NonInclusionProof)],
     next_public_key: &PublicKey,
     asset_id: HashDigest,
+    mint: Option<MintWitness>,
 ) -> Result<ProofWithPublicInputs<F, C, D>> {
     let sources: Vec<Option<InCoinSourceWitness>> = (0..MAX_IN_COINS).map(|_| None).collect();
     prove_initial_with_in_and_out_coins_and_sources(
@@ -1752,6 +1912,7 @@ pub fn prove_initial_with_in_and_out_coins(
         next_public_key,
         &sources,
         asset_id,
+        mint,
     )
 }
 
@@ -1781,6 +1942,7 @@ pub fn prove_initial_with_in_and_out_coins_and_sources(
     next_public_key: &PublicKey,
     sources: &[Option<InCoinSourceWitness>],
     asset_id: HashDigest,
+    mint: Option<MintWitness>,
 ) -> Result<ProofWithPublicInputs<F, C, D>> {
     assert_eq!(
         in_coins.len(),
@@ -1801,6 +1963,7 @@ pub fn prove_initial_with_in_and_out_coins_and_sources(
     let mut pw = PartialWitness::new();
     pw.set_bool_target(circuit.condition, false).unwrap();
     set_account_state_witness(&mut pw, circuit, account_state);
+    set_mint_witness(&mut pw, circuit, mint);
     pw.set_hash_target(circuit.history_root, history_root)
         .unwrap();
     for i in 0..4 {
@@ -2045,6 +2208,9 @@ pub fn prove_account_update_with_in_and_out_coins_and_sources(
     let mut pw = PartialWitness::new();
     pw.set_bool_target(circuit.condition, true).unwrap();
     set_account_state_witness(&mut pw, circuit, account_state);
+    // AccountUpdate never mints: the mint gate is masked off when
+    // `condition = true`, so the witnesses are placeholders.
+    set_mint_witness(&mut pw, circuit, None);
     pw.set_hash_target(circuit.history_root, history_root)
         .unwrap();
     for i in 0..4 {
@@ -2109,6 +2275,45 @@ mod tests {
         pk
     }
 
+    /// Build a self-consistent issuer-mint fixture: an account that is
+    /// the legitimate issuer of its own asset. The account's `owner`
+    /// equals `hash_bytes(creator_pubkey)` (which is exactly what
+    /// `AccountState::new` sets) and its `asset_id` equals
+    /// `calculate_asset_id(creator_pubkey, name_hash, decimals)`, so the
+    /// in-circuit issuer gate grants the mint (balance-may-be-nonzero)
+    /// exception. Returns the account, its asset_id, and the matching
+    /// `MintWitness`. The creator pubkey is the account's own pubkey.
+    fn mint_account(seed: u8, balance: u64) -> (AccountState, HashDigest, MintWitness) {
+        let creator_pubkey = dummy_pubkey(seed);
+        let name_hash = crate::types::calculate_name_hash("TEST");
+        let decimals = 8u8;
+        let asset_id = crate::types::calculate_asset_id(&creator_pubkey, &name_hash, decimals);
+        let mut account = AccountState::new(creator_pubkey, asset_id);
+        account.balance = balance;
+        let mint = MintWitness {
+            creator_pubkey,
+            name_hash,
+            decimals,
+        };
+        (account, asset_id, mint)
+    }
+
+    /// Build a non-mint account that does NOT satisfy the issuer gate:
+    /// its `owner` is `hash_bytes(own pubkey)` but its `asset_id` is one
+    /// it did NOT create (derived from a *different* creator key). Such
+    /// an account is a legitimate holder of someone else's asset and may
+    /// receive coins, but it cannot grant itself the mint exception.
+    fn non_mint_account(seed: u8, asset_id: HashDigest) -> AccountState {
+        AccountState::new(dummy_pubkey(seed), asset_id)
+    }
+
+    /// An asset_id created by some *other* party — i.e. not derivable
+    /// from `dummy_pubkey(holder_seed)`. Used to populate non-mint
+    /// accounts that merely hold an asset they didn't issue.
+    fn foreign_asset_id() -> HashDigest {
+        crate::types::calculate_asset_id_from_name(&dummy_pubkey(250), "FOREIGN", 8)
+    }
+
     fn pis_as_proof_data(proof: &ProofWithPublicInputs<F, C, D>) -> ProofData {
         let pis: [F; N_PROOF_DATA_PUBLIC_INPUTS] = proof.public_inputs
             [..N_PROOF_DATA_PUBLIC_INPUTS]
@@ -2170,6 +2375,7 @@ mod tests {
         circuit: &StateTransitionCircuit,
         source_seed: u8,
         consumer_account_state: &AccountState,
+        consumer_mint: Option<MintWitness>,
         out_amount: u64,
     ) -> (
         ProofWithPublicInputs<F, C, D>,
@@ -2180,14 +2386,38 @@ mod tests {
         CommitmentMerkleProofs,
         HashDigest,
     ) {
-        // 1. Source: mint account emitting one out-coin.
-        let mut source_account = AccountState::new(dummy_pubkey(source_seed));
-        source_account.owner = *MINTING_ADDRESS;
+        // 1. Source: issuer-mint account emitting one out-coin. The
+        //    consumer must hold the SAME asset the source mints, so the
+        //    fixture mints the consumer's asset.
+        let asset_id = consumer_account_state.asset_id;
+        let (mut source_account, source_mint) = {
+            let creator_pubkey = dummy_pubkey(source_seed);
+            // The consumer's asset_id MUST be the one this source mints,
+            // else the per-slot `source_asset_id == transition_asset_id`
+            // gate rejects.
+            let mint = MintWitness {
+                creator_pubkey,
+                name_hash: crate::types::calculate_name_hash("TEST"),
+                decimals: 8,
+            };
+            let acct = AccountState::new(creator_pubkey, asset_id);
+            (acct, mint)
+        };
+        // Sanity: the consumer's asset really is this source's minted id.
+        assert_eq!(
+            asset_id,
+            crate::types::calculate_asset_id(
+                &source_mint.creator_pubkey,
+                &source_mint.name_hash,
+                source_mint.decimals,
+            ),
+            "fixture misuse: consumer asset_id must equal the source's minted asset_id"
+        );
         source_account.balance = out_amount + 1_000;
         let mut post_source = source_account.clone();
         post_source.balance -= out_amount;
         let interim_source_asth = post_source.hash();
-        let coin_id = crate::types::calculate_coin_identifier(interim_source_asth, ZERO_HASH, 0);
+        let coin_id = crate::types::calculate_coin_identifier(interim_source_asth, asset_id, 0);
         let out_id_key = digest_to_bytes(&coin_id);
         let empty_smt = SparseMerkleTree::new();
         let out_nip = empty_smt.generate_non_inclusion_proof(out_id_key).unwrap();
@@ -2204,15 +2434,23 @@ mod tests {
             &in_coins_inactive,
             &out_coins_source,
             &source_account.public_key,
-            ZERO_HASH,
+            asset_id,
+            Some(source_mint),
         )
         .expect("prove source Init");
 
         // 2. Consumer prev: Initial with all-inactive in/out-coins.
         //    Goes against empty history (same bootstrap pattern as
-        //    source).
-        let prev_proof = prove_initial(circuit, consumer_account_state, ZERO_HASH, ZERO_HASH)
-            .expect("prove consumer prev Init");
+        //    source). The consumer holds the source's asset with an
+        //    initial balance of 0 — a plain non-mint Initial.
+        let prev_proof = prove_initial(
+            circuit,
+            consumer_account_state,
+            ZERO_HASH,
+            asset_id,
+            consumer_mint,
+        )
+        .expect("prove consumer prev Init");
 
         // 3. Source's commitment SMT.
         let source_pd = pis_as_proof_data(&source_proof);
@@ -2352,18 +2590,19 @@ mod tests {
         CommitmentMerkleProofs,
         HashDigest,
         AccountState,
+        HashDigest,
     ) {
-        // 1. Source: mint account with enough balance to emit out_amount.
-        let mut source_account = AccountState::new(dummy_pubkey(source_seed));
-        source_account.owner = *MINTING_ADDRESS;
-        source_account.balance = out_amount + 1_000;
+        // 1. Source: issuer-mint account with enough balance to emit
+        //    out_amount. The minted `asset_id` is returned so the
+        //    consumer can hold the same asset.
+        let (source_account, asset_id, source_mint) = mint_account(source_seed, out_amount + 1_000);
 
         // 2. Compute interim asth (post out-coin subtraction, pre pubkey
         //    rotation) and derive the source's slot-0 out-coin identifier.
         let mut post_source = source_account.clone();
         post_source.balance -= out_amount;
         let interim_asth = post_source.hash();
-        let coin_id = crate::types::calculate_coin_identifier(interim_asth, ZERO_HASH, 0);
+        let coin_id = crate::types::calculate_coin_identifier(interim_asth, asset_id, 0);
 
         // 3. Build the source's out-coin NIP in the empty SMT.
         let out_id_key = digest_to_bytes(&coin_id);
@@ -2386,7 +2625,8 @@ mod tests {
             &in_coins,
             &out_coins,
             &source_account.public_key,
-            ZERO_HASH,
+            asset_id,
+            Some(source_mint),
         )
         .expect("prove source Init");
 
@@ -2462,6 +2702,7 @@ mod tests {
             source_cmp,
             history_root_ext,
             post_source,
+            asset_id,
         )
     }
 
@@ -2472,43 +2713,211 @@ mod tests {
     #[test]
     fn stage_5c_plus_initial_non_mint_zero_balance_accepted() {
         let circuit = build_circuit();
-        let account_state = AccountState::new(dummy_pubkey(7));
-        assert_ne!(account_state.owner, *MINTING_ADDRESS);
+        // A holder of a foreign asset with balance 0 — does NOT satisfy
+        // the issuer gate, but balance 0 needs no mint exception.
+        let asset_id = foreign_asset_id();
+        let account_state = non_mint_account(7, asset_id);
 
         let history_root = hash_bytes(b"history@5c+-init");
-        let proof = prove_initial(&circuit, &account_state, history_root, ZERO_HASH)
+        let proof = prove_initial(&circuit, &account_state, history_root, asset_id, None)
             .expect("prove initial");
         verify(&circuit, &proof).expect("verify initial");
 
         let recovered = pis_as_proof_data(&proof);
         assert_eq!(recovered.account_state_hash, account_state.hash());
         assert_eq!(recovered.coin_history_root, DEFAULT_HASHES[0]);
+        assert_eq!(recovered.asset_id, asset_id);
     }
 
-    /// Mint exception under the masked predicate.
+    /// Mint exception under the issuer gate: the account is the
+    /// legitimate issuer of its own asset, so a non-zero initial supply
+    /// is accepted.
     #[test]
     fn stage_5c_plus_initial_mint_with_balance_accepted() {
         let circuit = build_circuit();
-        let mut account_state = AccountState::new(dummy_pubkey(99));
-        account_state.owner = *MINTING_ADDRESS;
-        account_state.balance = 21_000_000_000_000;
+        let (account_state, asset_id, mint) = mint_account(99, 21_000_000_000_000);
 
         let history_root = hash_bytes(b"history@5c+-mint");
-        let proof =
-            prove_initial(&circuit, &account_state, history_root, ZERO_HASH).expect("prove mint");
+        let proof = prove_initial(&circuit, &account_state, history_root, asset_id, Some(mint))
+            .expect("prove mint");
         verify(&circuit, &proof).expect("verify mint");
     }
 
-    /// Mint-exception negative.
+    /// Mint-exception negative: a non-issuer account (holds a foreign
+    /// asset) with a non-zero initial balance is rejected — only the
+    /// asset's creator may bring supply into existence.
     #[test]
     fn stage_5c_plus_initial_non_mint_nonzero_balance_rejected() {
         let circuit = build_circuit();
-        let mut account_state = AccountState::new(dummy_pubkey(7));
-        assert_ne!(account_state.owner, *MINTING_ADDRESS);
+        let asset_id = foreign_asset_id();
+        let mut account_state = non_mint_account(7, asset_id);
         account_state.balance = 1;
 
         let history_root = hash_bytes(b"history@5c+-illegal");
-        assert!(prove_initial(&circuit, &account_state, history_root, ZERO_HASH).is_err());
+        assert!(prove_initial(&circuit, &account_state, history_root, asset_id, None).is_err());
+    }
+
+    /// Issuer gate positive: owner == hash_bytes(creator_pk) AND
+    /// transition asset_id == calculate_asset_id(creator_pk, name_hash,
+    /// decimals), Initial with non-zero balance → proof builds/verifies.
+    #[test]
+    fn issuer_gated_mint_accepted() {
+        let circuit = build_circuit();
+        let (account_state, asset_id, mint) = mint_account(45, 1_000_000);
+        // Precondition: the gate's two derivations hold for this fixture.
+        assert_eq!(account_state.owner, hash_bytes(&mint.creator_pubkey));
+        assert_eq!(
+            asset_id,
+            crate::types::calculate_asset_id(&mint.creator_pubkey, &mint.name_hash, mint.decimals)
+        );
+
+        let proof = prove_initial(
+            &circuit,
+            &account_state,
+            hash_bytes(b"issuer-gated-mint"),
+            asset_id,
+            Some(mint),
+        )
+        .expect("issuer-gated mint must prove");
+        verify(&circuit, &proof).expect("verify");
+        assert_eq!(
+            pis_as_proof_data(&proof).account_state_hash,
+            account_state.hash()
+        );
+    }
+
+    /// Issuer gate negative: owner != hash_bytes(creator_pk). The mint
+    /// witness supplies a creator key that does NOT hash to the
+    /// account's owner, so `owner_ok` is false → no mint exception →
+    /// the non-zero Initial balance is rejected.
+    #[test]
+    fn mint_rejected_when_owner_not_creator() {
+        let circuit = build_circuit();
+        // Build a self-consistent asset_id for `creator_pubkey`, but make
+        // the ACCOUNT owned by a DIFFERENT key. asset_ok holds, owner_ok
+        // does not.
+        let creator_pubkey = dummy_pubkey(70);
+        let name_hash = crate::types::calculate_name_hash("TEST");
+        let asset_id = crate::types::calculate_asset_id(&creator_pubkey, &name_hash, 8);
+        // Account owned by a different pubkey (71) but claims the same asset.
+        let mut account_state = AccountState::new(dummy_pubkey(71), asset_id);
+        account_state.balance = 1;
+        assert_ne!(account_state.owner, hash_bytes(&creator_pubkey));
+
+        let mint = MintWitness {
+            creator_pubkey,
+            name_hash,
+            decimals: 8,
+        };
+        assert!(prove_initial(
+            &circuit,
+            &account_state,
+            hash_bytes(b"owner-not-creator"),
+            asset_id,
+            Some(mint),
+        )
+        .is_err());
+    }
+
+    /// Issuer gate negative: transition asset_id is NOT
+    /// calculate_asset_id(creator_pk, ...). owner_ok holds (the account
+    /// is owned by creator_pk) but asset_ok does not → no exception →
+    /// the non-zero Initial balance is rejected.
+    #[test]
+    fn mint_rejected_when_asset_id_not_derived_from_creator() {
+        let circuit = build_circuit();
+        let creator_pubkey = dummy_pubkey(72);
+        // The account is owned by creator_pubkey, but its asset_id is a
+        // FOREIGN one (not derivable from creator_pubkey).
+        let asset_id = foreign_asset_id();
+        let mut account_state = AccountState::new(creator_pubkey, asset_id);
+        account_state.balance = 1;
+        assert_eq!(account_state.owner, hash_bytes(&creator_pubkey));
+        assert_ne!(
+            asset_id,
+            crate::types::calculate_asset_id(
+                &creator_pubkey,
+                &crate::types::calculate_name_hash("TEST"),
+                8
+            )
+        );
+
+        let mint = MintWitness {
+            creator_pubkey,
+            name_hash: crate::types::calculate_name_hash("TEST"),
+            decimals: 8,
+        };
+        assert!(prove_initial(
+            &circuit,
+            &account_state,
+            hash_bytes(b"asset-not-derived"),
+            asset_id,
+            Some(mint),
+        )
+        .is_err());
+    }
+
+    /// Issuer gate negative (forged inflation): owner == H(creator_pk)
+    /// AND asset_id == calculate_asset_id(creator_pk, ...) both hold, but
+    /// the account's own `public_key` — the key that signs the Bitcoin
+    /// commitment verified at scan time — is a DIFFERENT key. This is the
+    /// forgery an attacker would attempt: pick the victim's public
+    /// owner/asset values, sign with your own key. The pubkey==creator
+    /// binding makes `is_minting` false, so the non-zero Initial balance
+    /// is rejected.
+    #[test]
+    fn mint_rejected_when_commitment_key_not_creator() {
+        let circuit = build_circuit();
+        let creator_pubkey = dummy_pubkey(73);
+        let name_hash = crate::types::calculate_name_hash("TEST");
+        let asset_id = crate::types::calculate_asset_id(&creator_pubkey, &name_hash, 8);
+        // owner == H(creator_pk) and asset_id derives from creator_pk, but
+        // the account's signing key is a different pubkey.
+        let mut account_state = AccountState::new(creator_pubkey, asset_id);
+        account_state.public_key = dummy_pubkey(74);
+        account_state.balance = 1;
+        assert_eq!(account_state.owner, hash_bytes(&creator_pubkey));
+        assert_ne!(account_state.public_key, creator_pubkey);
+
+        let mint = MintWitness {
+            creator_pubkey,
+            name_hash,
+            decimals: 8,
+        };
+        assert!(prove_initial(
+            &circuit,
+            &account_state,
+            hash_bytes(b"commitment-key-not-creator"),
+            asset_id,
+            Some(mint),
+        )
+        .is_err());
+    }
+
+    /// Account-asset binding negative: the witnessed `account_asset_id`
+    /// (from `account_state.asset_id`) differs from the
+    /// `transition_asset_id` public input. The unmasked
+    /// `connect(account_asset_id, transition_asset_id)` constraint fires
+    /// at prove time. Uses a zero-balance non-mint account so the only
+    /// failing constraint is the asset binding.
+    #[test]
+    fn account_asset_id_must_equal_transition_asset_id() {
+        let circuit = build_circuit();
+        let account_asset = foreign_asset_id();
+        let account_state = non_mint_account(7, account_asset);
+        // Pass a DIFFERENT transition asset_id than the account holds.
+        let transition_asset =
+            crate::types::calculate_asset_id_from_name(&dummy_pubkey(251), "DIFFERENT", 8);
+        assert_ne!(account_asset, transition_asset);
+
+        assert!(prove_initial(
+            &circuit,
+            &account_state,
+            hash_bytes(b"asset-binding"),
+            transition_asset,
+            None,
+        )
+        .is_err());
     }
 
     /// Build a `CommitmentMerkleProofs` witness for an Initial → AccountUpdate
@@ -2573,10 +2982,8 @@ mod tests {
     fn stage_5c_plus_initial_then_account_update_with_commitment_proofs() {
         let circuit = build_circuit();
 
-        // Initial proof: mint account.
-        let mut account_state = AccountState::new(dummy_pubkey(11));
-        account_state.owner = *MINTING_ADDRESS;
-        account_state.balance = 1_000_000;
+        // Initial proof: issuer-mint account.
+        let (account_state, asset_id, mint) = mint_account(11, 1_000_000);
 
         // Bootstrap pattern: Init commits to the EMPTY history
         // (`prev.commitment_history_root == ZERO_HASH`); after Init the
@@ -2588,8 +2995,8 @@ mod tests {
         let prev_ocr = DEFAULT_HASHES[0];
         let (cmp, history_root_extended) = build_test_commitment_witness(prev_asth, prev_ocr);
 
-        let init_proof =
-            prove_initial(&circuit, &account_state, ZERO_HASH, ZERO_HASH).expect("prove init");
+        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH, asset_id, Some(mint))
+            .expect("prove init");
         verify(&circuit, &init_proof).expect("verify init");
 
         let update_proof = prove_account_update(
@@ -2598,7 +3005,7 @@ mod tests {
             history_root_extended,
             &init_proof,
             &cmp,
-            ZERO_HASH,
+            asset_id,
         )
         .expect("prove update");
         verify(&circuit, &update_proof).expect("verify update");
@@ -2618,15 +3025,13 @@ mod tests {
     fn stage_5c_plus_account_update_state_discontinuity_rejected() {
         let circuit = build_circuit();
 
-        let mut prev_state = AccountState::new(dummy_pubkey(42));
-        prev_state.owner = *MINTING_ADDRESS;
-        prev_state.balance = 500;
+        let (prev_state, asset_id, mint) = mint_account(42, 500);
 
         let prev_asth = prev_state.hash();
         let (cmp, history_root_extended) =
             build_test_commitment_witness(prev_asth, DEFAULT_HASHES[0]);
-        let prev_proof =
-            prove_initial(&circuit, &prev_state, ZERO_HASH, ZERO_HASH).expect("prove prev init");
+        let prev_proof = prove_initial(&circuit, &prev_state, ZERO_HASH, asset_id, Some(mint))
+            .expect("prove prev init");
 
         // Try to update with a DIFFERENT account_state.
         let mut next_state = prev_state.clone();
@@ -2637,7 +3042,7 @@ mod tests {
             history_root_extended,
             &prev_proof,
             &cmp,
-            ZERO_HASH,
+            asset_id,
         )
         .is_err());
     }
@@ -2648,16 +3053,14 @@ mod tests {
     fn stage_5c_plus_account_update_wrong_commitment_account_state_hash_rejected() {
         let circuit = build_circuit();
 
-        let mut account_state = AccountState::new(dummy_pubkey(123));
-        account_state.owner = *MINTING_ADDRESS;
-        account_state.balance = 1;
+        let (account_state, asset_id, mint) = mint_account(123, 1);
 
         let true_asth = account_state.hash();
         let (mut cmp, history_root_extended) =
             build_test_commitment_witness(true_asth, DEFAULT_HASHES[0]);
 
-        let init_proof =
-            prove_initial(&circuit, &account_state, ZERO_HASH, ZERO_HASH).expect("prove init");
+        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH, asset_id, Some(mint))
+            .expect("prove init");
 
         // Mutate ONLY the witnessed commitment_account_state_hash; leave
         // the SMT (which still contains the honest commitment) intact.
@@ -2670,7 +3073,7 @@ mod tests {
             history_root_extended,
             &init_proof,
             &cmp,
-            ZERO_HASH,
+            asset_id,
         )
         .is_err());
     }
@@ -2744,12 +3147,19 @@ mod tests {
         // worth `out_amount`. Returns the source proof + inclusion +
         // CMP + the extended history_root the consumer must use.
         let out_amount: u64 = 42;
-        let (source_proof, coin_identifier, source_inclusion, source_cmp, history_root, _post) =
-            build_test_source_witness(&circuit, 11, out_amount);
+        let (
+            source_proof,
+            coin_identifier,
+            source_inclusion,
+            source_cmp,
+            history_root,
+            _post,
+            asset_id,
+        ) = build_test_source_witness(&circuit, 11, out_amount);
 
-        // Consumer: a non-mint account absorbing the source's coin.
-        let mut account_state = AccountState::new(dummy_pubkey(111));
-        account_state.owner = *MINTING_ADDRESS;
+        // Consumer: a non-mint account holding the SOURCE's asset,
+        // absorbing the source's coin.
+        let mut account_state = non_mint_account(111, asset_id);
         account_state.balance = 0;
 
         // Off-circuit coin-history NIP for the source-emitted
@@ -2764,7 +3174,7 @@ mod tests {
             identifier: coin_identifier,
             recipient: account_state.owner,
             amount: out_amount,
-            asset_id: ZERO_HASH,
+            asset_id,
         };
         let mut final_account_state = account_state.clone();
         final_account_state.balance += coin.amount;
@@ -2791,7 +3201,8 @@ mod tests {
             &inactive_out_coins,
             &account_state.public_key,
             &sources,
-            ZERO_HASH,
+            asset_id,
+            None,
         )
         .expect("prove init with active in-coin + source");
         verify(&circuit, &proof).expect("verify");
@@ -2808,9 +3219,7 @@ mod tests {
     #[test]
     fn stage_5d_initial_with_tampered_nip_path_rejected() {
         let circuit = build_circuit();
-        let mut account_state = AccountState::new(dummy_pubkey(11));
-        account_state.owner = *MINTING_ADDRESS;
-        account_state.balance = 1;
+        let (account_state, asset_id, mint) = mint_account(11, 1);
 
         let coin_identifier = hash_bytes(b"5d-tampered");
         let coin_key = digest_to_bytes(&coin_identifier);
@@ -2824,7 +3233,7 @@ mod tests {
             identifier: coin_identifier,
             recipient: account_state.owner,
             amount: 0,
-            asset_id: ZERO_HASH,
+            asset_id,
         };
         let dummy_nip = dummy_non_inclusion_proof();
         let dummy_c = dummy_coin();
@@ -2834,7 +3243,8 @@ mod tests {
             &account_state,
             hash_bytes(b"history"),
             &in_coins,
-            ZERO_HASH,
+            asset_id,
+            Some(mint),
         )
         .is_err());
     }
@@ -2845,9 +3255,7 @@ mod tests {
     #[test]
     fn stage_5d_initial_in_coin_wrong_recipient_rejected() {
         let circuit = build_circuit();
-        let mut account_state = AccountState::new(dummy_pubkey(11));
-        account_state.owner = *MINTING_ADDRESS;
-        account_state.balance = 1;
+        let (account_state, asset_id, mint) = mint_account(11, 1);
 
         let coin_identifier = hash_bytes(b"5d-wrong-recipient");
         let coin_key = digest_to_bytes(&coin_identifier);
@@ -2859,7 +3267,7 @@ mod tests {
             // Lie: this coin is addressed to a different account.
             recipient: hash_bytes(b"some-other-owner"),
             amount: 1,
-            asset_id: ZERO_HASH,
+            asset_id,
         };
         let dummy_nip = dummy_non_inclusion_proof();
         let dummy_c = dummy_coin();
@@ -2869,7 +3277,8 @@ mod tests {
             &account_state,
             hash_bytes(b"history"),
             &in_coins,
-            ZERO_HASH,
+            asset_id,
+            Some(mint),
         )
         .is_err());
     }
@@ -2879,9 +3288,7 @@ mod tests {
     #[test]
     fn stage_5d_initial_in_coin_overflow_rejected() {
         let circuit = build_circuit();
-        let mut account_state = AccountState::new(dummy_pubkey(11));
-        account_state.owner = *MINTING_ADDRESS;
-        account_state.balance = u64::MAX;
+        let (account_state, asset_id, mint) = mint_account(11, u64::MAX);
 
         let coin_identifier = hash_bytes(b"5d-overflow");
         let coin_key = digest_to_bytes(&coin_identifier);
@@ -2893,7 +3300,7 @@ mod tests {
             recipient: account_state.owner,
             // u64::MAX + 1 overflows.
             amount: 1,
-            asset_id: ZERO_HASH,
+            asset_id,
         };
         let dummy_nip = dummy_non_inclusion_proof();
         let dummy_c = dummy_coin();
@@ -2903,7 +3310,8 @@ mod tests {
             &account_state,
             hash_bytes(b"history"),
             &in_coins,
-            ZERO_HASH,
+            asset_id,
+            Some(mint),
         )
         .is_err());
     }
@@ -2937,9 +3345,7 @@ mod tests {
     #[test]
     fn stage_5d_next_3_initial_with_one_active_out_coin() {
         let circuit = build_circuit();
-        let mut account_state = AccountState::new(dummy_pubkey(21));
-        account_state.owner = *MINTING_ADDRESS;
-        account_state.balance = 100;
+        let (account_state, asset_id, mint) = mint_account(21, 100);
 
         // Per SPEC §8 `send_coins`, the interim account-state hash
         // (used for identifier derivation) is computed AFTER balance
@@ -2950,7 +3356,7 @@ mod tests {
         let mut interim_account_state = account_state.clone();
         interim_account_state.balance -= out_coin_amount;
         let interim_asth = interim_account_state.hash();
-        let expected_out_id = crate::types::calculate_coin_identifier(interim_asth, ZERO_HASH, 0);
+        let expected_out_id = crate::types::calculate_coin_identifier(interim_asth, asset_id, 0);
 
         // Off-circuit: non-inclusion of expected_out_id in empty SMT.
         let out_id_key = digest_to_bytes(&expected_out_id);
@@ -2976,7 +3382,8 @@ mod tests {
             &in_coins,
             &out_coins,
             &next_pubkey,
-            ZERO_HASH,
+            asset_id,
+            Some(mint),
         )
         .expect("prove init with out-coin");
         verify(&circuit, &proof).expect("verify");
@@ -2998,11 +3405,9 @@ mod tests {
     #[test]
     fn stage_5d_next_3_initial_out_coin_wrong_identifier_rejected() {
         let circuit = build_circuit();
-        let mut account_state = AccountState::new(dummy_pubkey(22));
-        account_state.owner = *MINTING_ADDRESS;
-        account_state.balance = 100;
+        let (account_state, asset_id, mint) = mint_account(22, 100);
 
-        // A lying identifier that is NOT `H(interim_asth || 0)`.
+        // A lying identifier that is NOT `H(interim_asth || asset_id || 0)`.
         let lying_id = hash_bytes(b"5d-next-3-lying-out-id");
         let out_id_key = digest_to_bytes(&lying_id);
         let empty_smt = SparseMerkleTree::new();
@@ -3023,7 +3428,8 @@ mod tests {
             &in_coins,
             &out_coins,
             &next_pubkey,
-            ZERO_HASH,
+            asset_id,
+            Some(mint),
         )
         .is_err());
     }
@@ -3033,14 +3439,12 @@ mod tests {
     #[test]
     fn stage_5d_next_3_initial_out_coin_underflow_rejected() {
         let circuit = build_circuit();
-        let mut account_state = AccountState::new(dummy_pubkey(23));
-        account_state.owner = *MINTING_ADDRESS;
-        account_state.balance = 5; // less than the requested out-coin amount
+        let (account_state, asset_id, mint) = mint_account(23, 5); // balance < requested out amount
 
         // Compute the expected identifier so identifier-eq passes; the
         // underflow check is what should fire.
         let interim_asth = account_state.hash();
-        let expected_out_id = crate::types::calculate_coin_identifier(interim_asth, ZERO_HASH, 0);
+        let expected_out_id = crate::types::calculate_coin_identifier(interim_asth, asset_id, 0);
         let out_id_key = digest_to_bytes(&expected_out_id);
         let empty_smt = SparseMerkleTree::new();
         let nip = empty_smt.generate_non_inclusion_proof(out_id_key).unwrap();
@@ -3060,7 +3464,8 @@ mod tests {
             &in_coins,
             &out_coins,
             &next_pubkey,
-            ZERO_HASH,
+            asset_id,
+            Some(mint),
         )
         .is_err());
     }
@@ -3094,7 +3499,7 @@ mod tests {
     )]
     fn stage_5d_next_3_prove_initial_panics_on_wrong_out_slot_count() {
         let circuit = build_circuit();
-        let account_state = AccountState::new(dummy_pubkey(7));
+        let account_state = non_mint_account(7, foreign_asset_id());
         let dummy_nip = dummy_non_inclusion_proof();
         let dummy_c = dummy_coin();
         let in_coins = (0..MAX_IN_COINS)
@@ -3108,6 +3513,7 @@ mod tests {
             &[], // 0 out-coin slots, expected MAX_OUT_COINS
             &account_state.public_key,
             ZERO_HASH,
+            None,
         );
     }
 
@@ -3119,7 +3525,7 @@ mod tests {
     )]
     fn stage_5d_next_3_prove_initial_panics_on_wrong_in_slot_count() {
         let circuit = build_circuit();
-        let account_state = AccountState::new(dummy_pubkey(7));
+        let account_state = non_mint_account(7, foreign_asset_id());
         let dummy_nip = dummy_non_inclusion_proof();
         let out_coins = (0..MAX_OUT_COINS)
             .map(|_| (false, ZERO_HASH, 0u64, &dummy_nip))
@@ -3132,6 +3538,7 @@ mod tests {
             &out_coins,
             &account_state.public_key,
             ZERO_HASH,
+            None,
         );
     }
 
@@ -3148,7 +3555,7 @@ mod tests {
         // to generate a real Init proof — the panic short-circuits
         // before `prev` is consumed.
         let circuit = build_circuit();
-        let account_state = AccountState::new(dummy_pubkey(8));
+        let account_state = non_mint_account(8, foreign_asset_id());
         let cmp = dummy_cmp();
         let dummy_inner_pis = std::iter::empty::<(usize, F)>().collect();
         let dummy_prev = cyclic_base_proof(
@@ -3182,7 +3589,7 @@ mod tests {
     fn stage_5d_next_3_prove_account_update_panics_on_wrong_out_slot_count() {
         // Same `cyclic_base_proof` short-circuit as the in-slot test.
         let circuit = build_circuit();
-        let account_state = AccountState::new(dummy_pubkey(9));
+        let account_state = non_mint_account(9, foreign_asset_id());
         let cmp = dummy_cmp();
         let dummy_inner_pis = std::iter::empty::<(usize, F)>().collect();
         let dummy_prev = cyclic_base_proof(
@@ -3239,13 +3646,14 @@ mod tests {
     )]
     fn stage_5d_prove_initial_panics_on_wrong_slot_count() {
         let circuit = build_circuit();
-        let account_state = AccountState::new(dummy_pubkey(7));
+        let account_state = non_mint_account(7, foreign_asset_id());
         let _ = prove_initial_with_in_coins(
             &circuit,
             &account_state,
             ZERO_HASH,
             &[], // 0 slots, expected MAX_IN_COINS = 1
             ZERO_HASH,
+            None,
         );
     }
 
@@ -3258,13 +3666,11 @@ mod tests {
     )]
     fn stage_5d_prove_account_update_panics_on_wrong_slot_count() {
         let circuit = build_circuit();
-        let mut account_state = AccountState::new(dummy_pubkey(11));
-        account_state.owner = *MINTING_ADDRESS;
-        account_state.balance = 1;
+        let (account_state, asset_id, mint) = mint_account(11, 1);
         let (cmp, history_root_extended) =
             build_test_commitment_witness(account_state.hash(), DEFAULT_HASHES[0]);
-        let init_proof =
-            prove_initial(&circuit, &account_state, ZERO_HASH, ZERO_HASH).expect("prove init");
+        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH, asset_id, Some(mint))
+            .expect("prove init");
         let _ = prove_account_update_with_in_coins(
             &circuit,
             &account_state,
@@ -3272,7 +3678,7 @@ mod tests {
             &init_proof,
             &cmp,
             &[], // 0 slots, expected MAX_IN_COINS = 1
-            ZERO_HASH,
+            asset_id,
         );
     }
 
@@ -3282,14 +3688,12 @@ mod tests {
     #[test]
     fn stage_5e_account_update_tampered_mmr_a_path_rejected() {
         let circuit = build_circuit();
-        let mut account_state = AccountState::new(dummy_pubkey(31));
-        account_state.owner = *MINTING_ADDRESS;
-        account_state.balance = 1;
+        let (account_state, asset_id, mint) = mint_account(31, 1);
 
         let (mut cmp, history_root_extended) =
             build_test_commitment_witness(account_state.hash(), DEFAULT_HASHES[0]);
-        let init_proof =
-            prove_initial(&circuit, &account_state, ZERO_HASH, ZERO_HASH).expect("prove init");
+        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH, asset_id, Some(mint))
+            .expect("prove init");
         cmp.commitment_root_history_proof.path[0] = hash_bytes(b"lying-mmr-a-sib");
         assert!(prove_account_update(
             &circuit,
@@ -3297,7 +3701,7 @@ mod tests {
             history_root_extended,
             &init_proof,
             &cmp,
-            ZERO_HASH,
+            asset_id,
         )
         .is_err());
     }
@@ -3307,14 +3711,12 @@ mod tests {
     #[test]
     fn stage_5e_account_update_tampered_mmr_b_path_rejected() {
         let circuit = build_circuit();
-        let mut account_state = AccountState::new(dummy_pubkey(32));
-        account_state.owner = *MINTING_ADDRESS;
-        account_state.balance = 1;
+        let (account_state, asset_id, mint) = mint_account(32, 1);
 
         let (mut cmp, history_root_extended) =
             build_test_commitment_witness(account_state.hash(), DEFAULT_HASHES[0]);
-        let init_proof =
-            prove_initial(&circuit, &account_state, ZERO_HASH, ZERO_HASH).expect("prove init");
+        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH, asset_id, Some(mint))
+            .expect("prove init");
         cmp.previous_root_history_proof.1.path[0] = hash_bytes(b"lying-mmr-b-sib");
         assert!(prove_account_update(
             &circuit,
@@ -3322,7 +3724,7 @@ mod tests {
             history_root_extended,
             &init_proof,
             &cmp,
-            ZERO_HASH,
+            asset_id,
         )
         .is_err());
     }
@@ -3333,14 +3735,12 @@ mod tests {
     #[test]
     fn stage_5e_account_update_wrong_mmr_sibling_rejected() {
         let circuit = build_circuit();
-        let mut account_state = AccountState::new(dummy_pubkey(33));
-        account_state.owner = *MINTING_ADDRESS;
-        account_state.balance = 1;
+        let (account_state, asset_id, mint) = mint_account(33, 1);
 
         let (mut cmp, history_root_extended) =
             build_test_commitment_witness(account_state.hash(), DEFAULT_HASHES[0]);
-        let init_proof =
-            prove_initial(&circuit, &account_state, ZERO_HASH, ZERO_HASH).expect("prove init");
+        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH, asset_id, Some(mint))
+            .expect("prove init");
         cmp.commitment_root_mmr_sibling = hash_bytes(b"lying-prev-mmr-root");
         assert!(prove_account_update(
             &circuit,
@@ -3348,7 +3748,7 @@ mod tests {
             history_root_extended,
             &init_proof,
             &cmp,
-            ZERO_HASH,
+            asset_id,
         )
         .is_err());
     }
@@ -3360,14 +3760,12 @@ mod tests {
     #[test]
     fn stage_5e_account_update_wrong_history_root_rejected() {
         let circuit = build_circuit();
-        let mut account_state = AccountState::new(dummy_pubkey(34));
-        account_state.owner = *MINTING_ADDRESS;
-        account_state.balance = 1;
+        let (account_state, asset_id, mint) = mint_account(34, 1);
 
         let (cmp, _real_history_root) =
             build_test_commitment_witness(account_state.hash(), DEFAULT_HASHES[0]);
-        let init_proof =
-            prove_initial(&circuit, &account_state, ZERO_HASH, ZERO_HASH).expect("prove init");
+        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH, asset_id, Some(mint))
+            .expect("prove init");
         // Lie about the history_root — neither MMR proof reconstructs to it.
         let lying_history_root = hash_bytes(b"lying-history");
         assert!(prove_account_update(
@@ -3376,7 +3774,7 @@ mod tests {
             lying_history_root,
             &init_proof,
             &cmp,
-            ZERO_HASH,
+            asset_id,
         )
         .is_err());
     }
@@ -3403,11 +3801,21 @@ mod tests {
         let circuit = build_circuit();
 
         let in_coin_amount: u64 = 30;
-        let (source_proof, in_coin_id, source_inclusion, source_cmp, history_root, _post) =
+        let (source_proof, in_coin_id, source_inclusion, source_cmp, history_root, _post, asset_id) =
             build_test_source_witness(&circuit, 60, in_coin_amount);
 
-        let mut account_state = AccountState::new(dummy_pubkey(160));
-        account_state.owner = *MINTING_ADDRESS;
+        // Consumer holds the SOURCE's asset and is its issuer-mint (the
+        // consumer also starts with a freshly-minted supply of 100). The
+        // consumer's owner must therefore be the asset's creator. Build
+        // the consumer as the issuer of `asset_id`: same creator key the
+        // source used (dummy_pubkey(60)).
+        let creator_pubkey = dummy_pubkey(60);
+        let mint = MintWitness {
+            creator_pubkey,
+            name_hash: crate::types::calculate_name_hash("TEST"),
+            decimals: 8,
+        };
+        let mut account_state = AccountState::new(creator_pubkey, asset_id);
         account_state.balance = 100;
 
         // ===== Consumer's in-coin side =====
@@ -3418,7 +3826,7 @@ mod tests {
             identifier: in_coin_id,
             recipient: account_state.owner,
             amount: in_coin_amount,
-            asset_id: ZERO_HASH,
+            asset_id,
         };
         let expected_coin_history_root = in_nip.insert(in_coin_id);
 
@@ -3430,7 +3838,7 @@ mod tests {
         let mut interim_account_state = account_state.clone();
         interim_account_state.balance = account_state.balance + in_coin.amount - out_coin_amount;
         let interim_asth = interim_account_state.hash();
-        let expected_out_id = crate::types::calculate_coin_identifier(interim_asth, ZERO_HASH, 0);
+        let expected_out_id = crate::types::calculate_coin_identifier(interim_asth, asset_id, 0);
 
         let out_id_key = digest_to_bytes(&expected_out_id);
         let out_nip = empty_smt.generate_non_inclusion_proof(out_id_key).unwrap();
@@ -3459,7 +3867,8 @@ mod tests {
             &out_coins,
             &next_pubkey,
             &sources,
-            ZERO_HASH,
+            asset_id,
+            Some(mint),
         )
         .expect("prove init combined with source");
         verify(&circuit, &proof).expect("verify");
@@ -3488,9 +3897,23 @@ mod tests {
         let circuit = build_circuit();
 
         let in_coin_amount: u64 = 30;
-        let mut account_state = AccountState::new(dummy_pubkey(161));
-        account_state.owner = *MINTING_ADDRESS;
+        // The consumer holds (and here is also the issuer of) the asset
+        // the source mints. The source fixture mints with creator
+        // dummy_pubkey(61), so the consumer's asset_id must be that
+        // creator's asset and the consumer is owned by that same key.
+        let creator_pubkey = dummy_pubkey(61);
+        let asset_id = crate::types::calculate_asset_id(
+            &creator_pubkey,
+            &crate::types::calculate_name_hash("TEST"),
+            8,
+        );
+        let mut account_state = AccountState::new(creator_pubkey, asset_id);
         account_state.balance = 100;
+        let consumer_mint = MintWitness {
+            creator_pubkey,
+            name_hash: crate::types::calculate_name_hash("TEST"),
+            decimals: 8,
+        };
 
         let (
             source_proof,
@@ -3500,7 +3923,13 @@ mod tests {
             prev_proof,
             consumer_cmp,
             history_root_ext,
-        ) = build_test_source_and_prev_witnesses(&circuit, 61, &account_state, in_coin_amount);
+        ) = build_test_source_and_prev_witnesses(
+            &circuit,
+            61,
+            &account_state,
+            Some(consumer_mint),
+            in_coin_amount,
+        );
 
         // ===== Consumer's in-coin side =====
         let in_coin_key = digest_to_bytes(&in_coin_id);
@@ -3510,7 +3939,7 @@ mod tests {
             identifier: in_coin_id,
             recipient: account_state.owner,
             amount: in_coin_amount,
-            asset_id: ZERO_HASH,
+            asset_id,
         };
         let expected_coin_history_root = in_nip.insert(in_coin_id);
 
@@ -3519,7 +3948,7 @@ mod tests {
         let mut interim_account_state = account_state.clone();
         interim_account_state.balance = account_state.balance + in_coin.amount - out_coin_amount;
         let interim_asth = interim_account_state.hash();
-        let expected_out_id = crate::types::calculate_coin_identifier(interim_asth, ZERO_HASH, 0);
+        let expected_out_id = crate::types::calculate_coin_identifier(interim_asth, asset_id, 0);
         let out_id_key = digest_to_bytes(&expected_out_id);
         let out_nip = empty_smt.generate_non_inclusion_proof(out_id_key).unwrap();
         let expected_output_coins_root = out_nip.insert(expected_out_id);
@@ -3548,7 +3977,7 @@ mod tests {
             &out_coins,
             &next_pubkey,
             &sources,
-            ZERO_HASH,
+            asset_id,
         )
         .expect("prove account_update combined with source");
         verify(&circuit, &update_proof).expect("verify update");
@@ -3572,9 +4001,7 @@ mod tests {
     #[test]
     fn stage_5e_double_spend_same_coin_twice_rejected() {
         let circuit = build_circuit();
-        let mut account_state = AccountState::new(dummy_pubkey(50));
-        account_state.owner = *MINTING_ADDRESS;
-        account_state.balance = 100;
+        let (account_state, asset_id, mint) = mint_account(50, 100);
 
         // First in-coin: non-inclusion in empty SMT.
         let coin_id = hash_bytes(b"5e-double-spend");
@@ -3595,13 +4022,13 @@ mod tests {
             identifier: coin_id,
             recipient: account_state.owner,
             amount: 1,
-            asset_id: ZERO_HASH,
+            asset_id,
         };
         let coin2 = Coin {
             identifier: coin_id,
             recipient: account_state.owner,
             amount: 1,
-            asset_id: ZERO_HASH,
+            asset_id,
         };
         let dummy_nip = dummy_non_inclusion_proof();
         let dummy_c = dummy_coin();
@@ -3617,7 +4044,8 @@ mod tests {
             &account_state,
             hash_bytes(b"history"),
             &in_coins,
-            ZERO_HASH,
+            asset_id,
+            Some(mint),
         )
         .is_err());
     }
@@ -3628,16 +4056,14 @@ mod tests {
     fn stage_5c_plus_account_update_tampered_smt_path_rejected() {
         let circuit = build_circuit();
 
-        let mut account_state = AccountState::new(dummy_pubkey(77));
-        account_state.owner = *MINTING_ADDRESS;
-        account_state.balance = 1;
+        let (account_state, asset_id, mint) = mint_account(77, 1);
 
         let true_asth = account_state.hash();
         let (mut cmp, history_root_extended) =
             build_test_commitment_witness(true_asth, DEFAULT_HASHES[0]);
 
-        let init_proof =
-            prove_initial(&circuit, &account_state, ZERO_HASH, ZERO_HASH).expect("prove init");
+        let init_proof = prove_initial(&circuit, &account_state, ZERO_HASH, asset_id, Some(mint))
+            .expect("prove init");
 
         // Tamper a sibling deep in the SMT path — the computed
         // commitment_root will differ from the witnessed one.
@@ -3649,7 +4075,7 @@ mod tests {
             history_root_extended,
             &init_proof,
             &cmp,
-            ZERO_HASH,
+            asset_id,
         )
         .is_err());
     }
@@ -3674,8 +4100,15 @@ mod tests {
         let circuit = build_circuit();
 
         let in_coin_amount: u64 = 7;
-        let (source_proof, in_coin_id, source_inclusion, mut source_cmp, history_root, _post) =
-            build_test_source_witness(&circuit, 201, in_coin_amount);
+        let (
+            source_proof,
+            in_coin_id,
+            source_inclusion,
+            mut source_cmp,
+            history_root,
+            _post,
+            asset_id,
+        ) = build_test_source_witness(&circuit, 201, in_coin_amount);
 
         // Tamper the (e) MMR path — claim source's commitment_history
         // is somewhere it is not. The masked `mmr_b_computed ==
@@ -3683,8 +4116,8 @@ mod tests {
         source_cmp.previous_root_history_proof.1.path[0] =
             hash_bytes(b"phase-3-lying-source-mmr-e-sib");
 
-        let mut account_state = AccountState::new(dummy_pubkey(202));
-        account_state.owner = *MINTING_ADDRESS;
+        // Consumer holds the source's asset, balance 0 (non-mint).
+        let mut account_state = non_mint_account(202, asset_id);
         account_state.balance = 0;
 
         let coin_key = digest_to_bytes(&in_coin_id);
@@ -3694,7 +4127,7 @@ mod tests {
             identifier: in_coin_id,
             recipient: account_state.owner,
             amount: in_coin_amount,
-            asset_id: ZERO_HASH,
+            asset_id,
         };
 
         let dummy_nip = dummy_non_inclusion_proof();
@@ -3719,7 +4152,8 @@ mod tests {
             &inactive_out_coins,
             &account_state.public_key,
             &sources,
-            ZERO_HASH,
+            asset_id,
+            None,
         )
         .is_err());
     }
@@ -3734,15 +4168,22 @@ mod tests {
         let circuit = build_circuit();
 
         let in_coin_amount: u64 = 9;
-        let (source_proof, in_coin_id, mut source_inclusion, source_cmp, history_root, _post) =
-            build_test_source_witness(&circuit, 211, in_coin_amount);
+        let (
+            source_proof,
+            in_coin_id,
+            mut source_inclusion,
+            source_cmp,
+            history_root,
+            _post,
+            asset_id,
+        ) = build_test_source_witness(&circuit, 211, in_coin_amount);
 
         // Tamper the inclusion proof's first sibling — the recomputed
         // source-OCR no longer matches what the source actually published.
         source_inclusion.siblings[0] = hash_bytes(b"phase-3-lying-source-incl-sib");
 
-        let mut account_state = AccountState::new(dummy_pubkey(212));
-        account_state.owner = *MINTING_ADDRESS;
+        // Consumer holds the source's asset, balance 0 (non-mint).
+        let mut account_state = non_mint_account(212, asset_id);
         account_state.balance = 0;
 
         let coin_key = digest_to_bytes(&in_coin_id);
@@ -3752,7 +4193,7 @@ mod tests {
             identifier: in_coin_id,
             recipient: account_state.owner,
             amount: in_coin_amount,
-            asset_id: ZERO_HASH,
+            asset_id,
         };
 
         let dummy_nip = dummy_non_inclusion_proof();
@@ -3777,7 +4218,8 @@ mod tests {
             &inactive_out_coins,
             &account_state.public_key,
             &sources,
-            ZERO_HASH,
+            asset_id,
+            None,
         )
         .is_err());
     }
@@ -3825,11 +4267,16 @@ mod tests {
             .expect("lying aggregator proof is structurally valid");
 
         // Now construct the outer witness manually so we can plug in
-        // the lying aggregator proof instead of an honest one.
-        let account_state = AccountState::new(dummy_pubkey(221));
+        // the lying aggregator proof instead of an honest one. The
+        // account holds the ZERO_HASH asset (balance 0, non-mint) so the
+        // `account_asset_id == transition_asset_id (== ZERO_HASH)`
+        // binding and the mint exception are both satisfied — the ONLY
+        // failing constraint is the vk mismatch.
+        let account_state = AccountState::new(dummy_pubkey(221), ZERO_HASH);
         let mut pw = PartialWitness::new();
         pw.set_bool_target(circuit.condition, false).unwrap();
         set_account_state_witness(&mut pw, &circuit, &account_state);
+        set_mint_witness(&mut pw, &circuit, None);
         pw.set_hash_target(circuit.history_root, ZERO_HASH).unwrap();
         for i in 0..4 {
             pw.set_target(circuit.proof_data_pis[16 + i], ZERO_HASH.elements[i])
